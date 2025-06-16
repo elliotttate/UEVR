@@ -56,7 +56,7 @@ Download the latest release from the [Releases page](https://github.com/praydog/
 
 ## In-Game Menu
 
-Press the **Insert** key or **L3+R3** on an XInput based controller to access the in-game menu, which opens by default at startup. With the menu open, hold **RT** for various shortcuts:
+Press the **Insert** key or **L3+R3** on an XInput or DirectInput (DualSense) controller to access the in-game menu, which opens by default at startup. With the menu open, hold **RT** for various shortcuts:
 
 - RT + Left Stick: Move the camera left/right/forward/back
 - RT + Right Stick: Move the camera up/down

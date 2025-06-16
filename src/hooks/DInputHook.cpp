@@ -1,10 +1,12 @@
 #include <chrono>
+#include <algorithm>
 
 #include <spdlog/spdlog.h>
 #include <utility/String.hpp>
 
 #include "Framework.hpp"
 #include "mods/VR.hpp"
+#include "mods/FrameworkConfig.hpp"
 #include "utility/Logging.hpp"
 
 #include "DInputHook.hpp"
@@ -12,6 +14,8 @@
 DInputHook* g_dinput_hook{nullptr};
 
 constexpr size_t ENUM_DEVICES_VTABLE_INDEX = 4;
+constexpr size_t CREATE_DEVICE_VTABLE_INDEX = 3;
+constexpr size_t GET_STATE_VTABLE_INDEX = 9;
 
 DInputHook::DInputHook() {
     SPDLOG_INFO("[DInputHook] Constructing DInputHook");
@@ -90,15 +94,19 @@ HRESULT WINAPI DInputHook::create_hooked(
 
         auto iface = (LPDIRECTINPUT8W)*ppvOut;
 
-        // TODO: IID_IDirectInput8A or we don't care?
         if (iface != nullptr && memcmp(&riidltf, &IID_IDirectInput8W, sizeof(GUID)) == 0) {
-            // Its not necessary to make a full blown vtable hook for this because
-            // the vtable will always be the same for IDirectInput8W
             if (g_dinput_hook->m_enum_devices_hook == nullptr) {
                 SPDLOG_INFO("[DInputHook] Hooking IDirectInput8::EnumDevices");
                 void** enum_devices_ptr = (void**)&(*(uintptr_t**)iface)[ENUM_DEVICES_VTABLE_INDEX];
                 g_dinput_hook->m_enum_devices_hook = std::make_unique<PointerHook>(enum_devices_ptr, (void*)&enum_devices_hooked);
                 SPDLOG_INFO("[DInputHook] Hooked IDirectInput8::EnumDevices");
+            }
+
+            if (g_dinput_hook->m_create_device_hook == nullptr) {
+                SPDLOG_INFO("[DInputHook] Hooking IDirectInput8::CreateDevice");
+                void** create_device_ptr = (void**)&(*(uintptr_t**)iface)[CREATE_DEVICE_VTABLE_INDEX];
+                g_dinput_hook->m_create_device_hook = std::make_unique<PointerHook>(create_device_ptr, (void*)&create_device_hooked);
+                SPDLOG_INFO("[DInputHook] Hooked IDirectInput8::CreateDevice");
             }
         }
     } else {
@@ -143,4 +151,88 @@ HRESULT DInputHook::enum_devices_hooked(
     }
 
     return DI_OK;
+}
+
+HRESULT DInputHook::create_device_hooked(
+    LPDIRECTINPUT8W This,
+    REFGUID rguid,
+    LPDIRECTINPUTDEVICE8W* device,
+    LPUNKNOWN punkOuter
+)
+{
+    std::scoped_lock _{g_dinput_hook->m_mutex};
+
+    const auto og = g_dinput_hook->m_create_device_hook->get_original<decltype(&create_device_hooked)>();
+
+    if (og == nullptr) {
+        return DIERR_GENERIC;
+    }
+
+    const auto result = og(This, rguid, device, punkOuter);
+
+    if (result == DI_OK && device != nullptr && *device != nullptr) {
+        auto dev_ptr = *device;
+        void** vtable = *(void***)dev_ptr;
+        void** get_state_ptr = &vtable[GET_STATE_VTABLE_INDEX];
+
+        Device dev{};
+        dev.ptr = dev_ptr;
+        dev.get_state_hook = std::make_unique<PointerHook>(get_state_ptr, (void*)&get_device_state_hooked);
+
+        m_devices.push_back(std::move(dev));
+        SPDLOG_INFO("[DInputHook] Hooked IDirectInputDevice8::GetDeviceState {:x}", (uintptr_t)get_state_ptr);
+    }
+
+    return result;
+}
+
+HRESULT DInputHook::get_device_state_hooked(
+    LPDIRECTINPUTDEVICE8W This,
+    DWORD cbData,
+    LPVOID lpvData
+)
+{
+    auto it = std::find_if(g_dinput_hook->m_devices.begin(), g_dinput_hook->m_devices.end(), [This](const Device& d) { return d.ptr == This; });
+
+    if (it == g_dinput_hook->m_devices.end()) {
+        return DIERR_GENERIC;
+    }
+
+    const auto og = it->get_state_hook->get_original<decltype(&get_device_state_hooked)>();
+    auto ret = og(This, cbData, lpvData);
+
+    if (SUCCEEDED(ret) && lpvData != nullptr && cbData >= sizeof(DIJOYSTATE2)) {
+        auto js = reinterpret_cast<DIJOYSTATE2*>(lpvData);
+
+        const bool l3 = (js->rgbButtons[8] & 0x80) != 0;
+        const bool r3 = (js->rgbButtons[9] & 0x80) != 0;
+
+        if (l3 && r3 && FrameworkConfig::get()->is_enable_directinput_l3_r3_toggle()) {
+            bool should_open = true;
+            const auto now = std::chrono::steady_clock::now();
+
+            if (FrameworkConfig::get()->is_l3_r3_long_press() && !g_framework->is_drawing_ui()) {
+                if (!g_dinput_hook->m_di_context.menu_longpress_begin_held) {
+                    g_dinput_hook->m_di_context.menu_longpress_begin = now;
+                }
+
+                g_dinput_hook->m_di_context.menu_longpress_begin_held = true;
+                should_open = (now - g_dinput_hook->m_di_context.menu_longpress_begin) >= std::chrono::seconds(1);
+            } else {
+                g_dinput_hook->m_di_context.menu_longpress_begin_held = false;
+            }
+
+            if (should_open && now - g_dinput_hook->m_last_di_l3_r3_menu_open >= std::chrono::seconds(1)) {
+                g_dinput_hook->m_last_di_l3_r3_menu_open = std::chrono::steady_clock::now();
+                g_framework->set_draw_ui(!g_framework->is_drawing_ui());
+            }
+
+            js->rgbButtons[8] &= ~0x80;
+            js->rgbButtons[9] &= ~0x80;
+        } else if (!l3 && !r3) {
+            g_dinput_hook->m_di_context.menu_longpress_begin_held = false;
+        }
+    }
+
+    return ret;
 }
