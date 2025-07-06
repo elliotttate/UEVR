@@ -973,6 +973,8 @@ private:
     const ModToggle::Ptr m_lerp_camera_roll{ ModToggle::create(generate_name("LerpCameraRoll"), false) };
     const ModSlider::Ptr m_lerp_camera_speed{ ModSlider::create(generate_name("LerpCameraSpeed"), 0.01f, 10.0f, 1.0f) };
 
+    const ModToggle::Ptr m_dampen_cutscene_camera{ ModToggle::create(generate_name("CutsceneCameraDampen"), false) };
+
     std::chrono::high_resolution_clock::time_point m_last_lerp_update{};
 
     struct DecoupledPitchData {
@@ -994,6 +996,11 @@ private:
         glm::vec3 last_position{};
         glm::vec3 last_rotation{};
     } m_camera_lerp{};
+
+    struct CameraDampen {
+        glm::vec3 last_position{};
+        glm::vec3 last_rotation{};
+    } m_cutscene_dampen{};
 
     struct CameraData {
         glm::vec3 offset{};
@@ -1078,6 +1085,7 @@ public:
             *m_lerp_camera_yaw,
             *m_lerp_camera_roll,
             *m_lerp_camera_speed,
+            *m_dampen_cutscene_camera,
         };
 
         add_components_vr();
