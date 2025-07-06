@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <dbt.h>
+#include <cmath>
 
 #include <imgui.h>
 #include <utility/Module.hpp>
@@ -1506,6 +1507,69 @@ void VR::on_pre_calculate_stereo_view_offset(void* stereo_device, const int32_t 
             view_rotation->roll = m_camera_freeze.rotation.z;
         }
     }
+
+    if (m_dampen_cutscene_camera->value()) {
+        glm::vec3 cur_rot{};
+        glm::vec3 cur_pos{};
+
+        if (is_double) {
+            cur_rot = glm::vec3{
+                (float)view_rotation_double->pitch,
+                (float)view_rotation_double->yaw,
+                (float)view_rotation_double->roll };
+            cur_pos = glm::vec3{
+                (float)view_location_double->x,
+                (float)view_location_double->y,
+                (float)view_location_double->z };
+        } else {
+            cur_rot = glm::vec3{ view_rotation->pitch, view_rotation->yaw, view_rotation->roll };
+            cur_pos = glm::vec3{ view_location->x, view_location->y, view_location->z };
+        }
+
+        auto wrap = [](float a) {
+            if (a > 180.0f) a -= 360.0f;
+            if (a < -180.0f) a += 360.0f;
+            return a;
+        };
+
+        glm::vec3 diff_rot = cur_rot - m_cutscene_dampen.last_rotation;
+        diff_rot.x = wrap(diff_rot.x);
+        diff_rot.y = wrap(diff_rot.y);
+        diff_rot.z = wrap(diff_rot.z);
+
+        constexpr float ROT_THRESHOLD = 0.5f; // degrees
+        constexpr float POS_THRESHOLD = 1.0f; // units
+
+        if (std::abs(diff_rot.x) < ROT_THRESHOLD &&
+            std::abs(diff_rot.y) < ROT_THRESHOLD &&
+            std::abs(diff_rot.z) < ROT_THRESHOLD) {
+            if (is_double) {
+                view_rotation_double->pitch = m_cutscene_dampen.last_rotation.x;
+                view_rotation_double->yaw = m_cutscene_dampen.last_rotation.y;
+                view_rotation_double->roll = m_cutscene_dampen.last_rotation.z;
+            } else {
+                view_rotation->pitch = m_cutscene_dampen.last_rotation.x;
+                view_rotation->yaw = m_cutscene_dampen.last_rotation.y;
+                view_rotation->roll = m_cutscene_dampen.last_rotation.z;
+            }
+        } else {
+            m_cutscene_dampen.last_rotation = cur_rot;
+        }
+
+        if (glm::distance(cur_pos, m_cutscene_dampen.last_position) < POS_THRESHOLD) {
+            if (is_double) {
+                view_location_double->x = m_cutscene_dampen.last_position.x;
+                view_location_double->y = m_cutscene_dampen.last_position.y;
+                view_location_double->z = m_cutscene_dampen.last_position.z;
+            } else {
+                view_location->x = m_cutscene_dampen.last_position.x;
+                view_location->y = m_cutscene_dampen.last_position.y;
+                view_location->z = m_cutscene_dampen.last_position.z;
+            }
+        } else {
+            m_cutscene_dampen.last_position = cur_pos;
+        }
+    }
 }
 
 void VR::on_pre_viewport_client_draw(void* viewport_client, void* viewport, void* canvas){
@@ -2573,6 +2637,12 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             m_lerp_camera_roll->draw("Lerp Roll");
             m_lerp_camera_speed->draw("Lerp Speed");
 
+            ImGui::TreePop();
+        }
+
+        ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
+        if (ImGui::TreeNode("Camera Dampening")) {
+            m_dampen_cutscene_camera->draw("Ignore Small Movements");
             ImGui::TreePop();
         }
 
