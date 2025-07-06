@@ -155,6 +155,11 @@ type = "plugin"
 sources = ["examples/example_plugin/**.cpp", "examples/example_plugin/**.c"]
 headers = ["examples/example_plugin/**.hpp", "examples/example_plugin/**.h"]
 
+[target.cutscene_detection_plugin]
+type = "plugin"
+sources = ["examples/cutscene_detection_plugin/**.cpp", "examples/cutscene_detection_plugin/**.c"]
+headers = ["examples/cutscene_detection_plugin/**.hpp", "examples/cutscene_detection_plugin/**.h"]
+
 [target.sdk-test]
 type = "shared"
 sources = ["side-projects/sdk-test/**.cpp", "side-projects/sdk-test/**.c"]
