@@ -1,0 +1,14 @@
+{
+    "hide": true,
+    "hide_legacy": true,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "FirstPersonSkeletalMeshComponent",
+        "Properties",
+        "AttachChildren",
+        "ChildActorComponent First Person Upper Body"
+    ],
+    "properties": [],
+    "type": "properties"
+}

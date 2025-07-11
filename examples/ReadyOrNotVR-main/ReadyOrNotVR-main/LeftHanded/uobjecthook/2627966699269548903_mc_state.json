@@ -1,0 +1,28 @@
+{
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "InventoryComp",
+        "Properties",
+        "InventoryItems",
+        "Device_Taser7_C Device_Taser7_C_2147423354",
+        "Components",
+        "SkeletalMeshComponent ItemMesh"
+    ],
+    "state": {
+        "hand": 0,
+        "location_offset": {
+            "x": -10.0,
+            "y": -2.0,
+            "z": 0.0
+        },
+        "permanent": true,
+        "rotation_offset": {
+            "w": -0.704555332660675,
+            "x": 0.0,
+            "y": 0.7096490859985352,
+            "z": 0.0
+        }
+    },
+    "type": "motion_controller"
+}

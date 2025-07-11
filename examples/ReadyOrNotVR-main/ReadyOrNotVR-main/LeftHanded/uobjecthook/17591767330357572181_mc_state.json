@@ -1,0 +1,28 @@
+{
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "InventoryComp",
+        "Properties",
+        "InventoryItems",
+        "Device_Multitool_v2_C Device_Multitool_v2_C_2147423327",
+        "Components",
+        "SkeletalMeshComponent ItemMesh"
+    ],
+    "state": {
+        "hand": 0,
+        "location_offset": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+        },
+        "permanent": false,
+        "rotation_offset": {
+            "w": -0.620372474193573,
+            "x": 0.14525628089904785,
+            "y": 0.7504427433013916,
+            "z": 0.1757110357284546
+        }
+    },
+    "type": "motion_controller"
+}

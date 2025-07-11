@@ -1,0 +1,23 @@
+{
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "Melee_Attach"
+    ],
+    "state": {
+        "hand": 1,
+        "location_offset": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+        },
+        "permanent": true,
+        "rotation_offset": {
+            "w": 0.6853973865509033,
+            "x": 0.17501097917556763,
+            "y": 0.6848516464233398,
+            "z": -0.1748710423707962
+        }
+    },
+    "type": "motion_controller"
+}

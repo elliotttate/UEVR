@@ -1,0 +1,18 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "Mesh",
+        "Properties",
+        "AnimScriptInstance"
+    ],
+    "properties": [
+        {
+            "data": 0,
+            "name": "K2Node_PropertyAccess_12"
+        }
+    ],
+    "type": "properties"
+}

@@ -1,0 +1,28 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "WeaponsPairingComponent",
+        "Properties",
+        "TorchActor",
+        "Properties",
+        "1_PointLight"
+    ],
+    "properties": [
+        {
+            "data": 1159479296,
+            "name": "Radius"
+        },
+        {
+            "data": 1086282793,
+            "name": "SourceRadius"
+        },
+        {
+            "data": 1165623296,
+            "name": "Temperature"
+        }
+    ],
+    "type": "properties"
+}

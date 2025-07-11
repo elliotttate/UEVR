@@ -1,0 +1,22 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Acknowledged Pawn",
+        "Components",
+        "SkeletalMeshComponent CharacterMesh1P",
+        "Properties",
+        "AnimScriptInstance",
+        "Properties",
+        "AnimGraphNode_SequencePlayer_1",
+        "Properties",
+        "Sequence"
+    ],
+    "properties": [
+        {
+            "data": 0,
+            "name": "RateScale"
+        }
+    ],
+    "type": "properties"
+}

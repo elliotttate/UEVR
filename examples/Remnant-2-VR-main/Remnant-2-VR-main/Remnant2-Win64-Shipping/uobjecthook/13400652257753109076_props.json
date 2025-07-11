@@ -1,0 +1,14 @@
+{
+    "hide": true,
+    "hide_legacy": true,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "1R_Stow_01",
+        "Properties",
+        "AttachChildren",
+        "StaticMeshComponent StowMesh"
+    ],
+    "properties": [],
+    "type": "properties"
+}

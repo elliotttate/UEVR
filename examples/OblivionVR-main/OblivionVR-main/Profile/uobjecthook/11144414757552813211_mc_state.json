@@ -1,0 +1,26 @@
+{
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "FirstPersonHandsChildActorComponent",
+        "Properties",
+        "AttachChildren",
+        "SkeletalMeshComponent Root Skeletal Mesh"
+    ],
+    "state": {
+        "hand": 1,
+        "location_offset": {
+            "x": 32.310001373291016,
+            "y": 141.2100067138672,
+            "z": 58.43000030517578
+        },
+        "permanent": false,
+        "rotation_offset": {
+            "w": -0.31260430812835693,
+            "x": -0.2214694768190384,
+            "y": 0.9052006006240845,
+            "z": -0.18396106362342834
+        }
+    },
+    "type": "motion_controller"
+}

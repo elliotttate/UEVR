@@ -1,0 +1,26 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "WeaponsPairingComponent",
+        "Properties",
+        "ShieldActor",
+        "Components",
+        "VHitBoxComponent VHitBoxComponent_2147401947",
+        "Properties",
+        "BodyInstance"
+    ],
+    "properties": [
+        {
+            "data": 1,
+            "name": "CollisionEnabled"
+        },
+        {
+            "data": 22,
+            "name": "ObjectType"
+        }
+    ],
+    "type": "properties"
+}

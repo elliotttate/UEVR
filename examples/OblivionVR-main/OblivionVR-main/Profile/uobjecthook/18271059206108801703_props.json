@@ -1,0 +1,23 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "Mesh",
+        "Properties",
+        "AttachChildren",
+        "VHumanoidHeadComponent Head Component",
+        "Properties",
+        "AttachChildren",
+        "ChildActorComponent Headwear",
+        "Properties",
+        "AttachChildren",
+        "SkeletalMeshComponent Root Skeletal Mesh",
+        "Properties",
+        "AttachChildren",
+        "StaticMeshComponent StaticMesh"
+    ],
+    "properties": [],
+    "type": "properties"
+}

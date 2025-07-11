@@ -1,0 +1,31 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "m_currentEquipment",
+        "Properties",
+        "m_attachments",
+        "BP_Collimator01_C BP_Collimator01_C_2147445558"
+    ],
+    "properties": [
+        {
+            "data": 0,
+            "name": "m_dofBlurIntensity"
+        },
+        {
+            "data": 0,
+            "name": "m_cameraDistanceOffset"
+        },
+        {
+            "data": 0,
+            "name": "m_cameraFOV"
+        },
+        {
+            "data": 0,
+            "name": "m_eyeDistanceOffset"
+        }
+    ],
+    "type": "properties"
+}

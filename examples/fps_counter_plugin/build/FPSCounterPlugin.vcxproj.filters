@@ -1,0 +1,46 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\fps_counter_plugin\Plugin.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\examples\renderlib\rendering\d3d11.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\examples\renderlib\rendering\d3d12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\examples\renderlib\imgui\imgui_impl_dx11.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\examples\renderlib\imgui\imgui_impl_dx12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\examples\renderlib\imgui\imgui_impl_win32.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\dependencies\submodules\imgui\imgui.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\dependencies\submodules\imgui\imgui_demo.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\dependencies\submodules\imgui\imgui_draw.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\dependencies\submodules\imgui\imgui_tables.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\dependencies\submodules\imgui\imgui_widgets.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\fps_counter_plugin\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{54893DB1-BA1B-3DF9-8DBA-2998D290AE70}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

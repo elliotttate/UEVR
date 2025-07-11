@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\GitHub\UEVR\plugins\FPSPlotterPlugin\build\CMakeFiles\5eb217538cc8d7d2f44cfeaaac172563\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{BB37298E-86E3-392D-A4A5-E3224F3845B7}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

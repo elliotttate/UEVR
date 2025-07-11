@@ -1,0 +1,16 @@
+{
+    "hide": true,
+    "hide_legacy": true,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "m_currentEquipment",
+        "Properties",
+        "m_attachments",
+        "BP_Collimator01_C BP_Collimator01_C_2147453233",
+        "Properties",
+        "sightBlockingPlane"
+    ],
+    "properties": [],
+    "type": "properties"
+}

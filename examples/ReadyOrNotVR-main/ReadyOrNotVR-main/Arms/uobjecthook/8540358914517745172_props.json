@@ -1,0 +1,20 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Acknowledged Pawn",
+        "Components",
+        "SkeletalMeshComponent CharacterMesh1P",
+        "Properties",
+        "AnimScriptInstance",
+        "Properties",
+        "AnimGraphNode_ModifyBone_10"
+    ],
+    "properties": [
+        {
+            "data": 0,
+            "name": "Alpha"
+        }
+    ],
+    "type": "properties"
+}

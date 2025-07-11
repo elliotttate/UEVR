@@ -1,0 +1,22 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "RemnantStateCamera",
+        "Properties",
+        "CurrentCamera"
+    ],
+    "properties": [
+        {
+            "data": 0,
+            "name": "SwayAdjustSpeed"
+        },
+        {
+            "data": 0,
+            "name": "SwayPeriodScale"
+        }
+    ],
+    "type": "properties"
+}

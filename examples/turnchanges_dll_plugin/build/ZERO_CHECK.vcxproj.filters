@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\examples\turnchanges_dll_plugin\build\CMakeFiles\b4ed721f64af27c3cd068924c2e0ae01\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{E46B6BE0-8412-369A-B036-ABD124D5C663}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

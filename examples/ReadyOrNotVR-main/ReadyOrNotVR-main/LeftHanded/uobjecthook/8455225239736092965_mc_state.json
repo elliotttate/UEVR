@@ -1,0 +1,28 @@
+{
+    "path": [
+        "Acknowledged Pawn",
+        "Components",
+        "InventoryComponent InventoryComp",
+        "Properties",
+        "InventoryItems",
+        "Device_Tablet_C Device_Tablet_C_2147404199",
+        "Components",
+        "SkeletalMeshComponent ItemMesh"
+    ],
+    "state": {
+        "hand": 1,
+        "location_offset": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+        },
+        "permanent": false,
+        "rotation_offset": {
+            "w": 0.4376956820487976,
+            "x": 0.6428836584091187,
+            "y": -0.5499835014343262,
+            "z": -0.304370254278183
+        }
+    },
+    "type": "motion_controller"
+}

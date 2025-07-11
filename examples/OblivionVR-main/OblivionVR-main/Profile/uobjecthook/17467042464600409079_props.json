@@ -1,0 +1,15 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "HeadwearChildActorComponent",
+        "Properties",
+        "ChildActor",
+        "Properties",
+        "RootSkeletalMeshComponent"
+    ],
+    "properties": [],
+    "type": "properties"
+}

@@ -1,0 +1,14 @@
+r.MotionBlur.Max=0
+r.MotionBlurQuality=0
+r.DefaultFeature.MotionBlur=0
+r.SceneColorFringe.Max=0
+r.SceneColorFringeQuality=0
+r.Tonemapper.GrainQuantization=0
+r.Tonemapper.Quality=0
+r.MaxAnisotropy=16
+r.DepthOfFieldQuality=0
+r.fog=0
+r.atmosphere=0
+r.Tonemapper.Sharpen=2
+r.postprocessing.disablematerials 1
+r.LightCulling.Quality 0

@@ -1,0 +1,16 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Acknowledged Pawn",
+        "Components",
+        "SpotLightComponent Flashlight"
+    ],
+    "properties": [
+        {
+            "data": 0,
+            "name": "CastDynamicShadows"
+        }
+    ],
+    "type": "properties"
+}

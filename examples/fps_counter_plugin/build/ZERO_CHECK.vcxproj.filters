@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\fps_counter_plugin\build\CMakeFiles\14860d010024831e819946da7c29ecaf\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{9364CF0A-142F-329F-94A9-C851D9CE336F}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

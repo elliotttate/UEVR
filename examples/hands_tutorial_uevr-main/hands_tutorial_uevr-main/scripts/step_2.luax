@@ -1,0 +1,80 @@
+--[[
+	1) Look at the text file of bone names that you created in step_1.lua. Find the left and right bones that
+		you wish to target. If you want to see only hands then the bone name will probably be something with "wrist"
+		in the name. If you want to see the forearm and hand then it will likely have "lowerarm" in the name. Find
+		these for the left and right wrists and put them in lines 37 and 45
+	2) If you needed the offset in step 5 of step_1.lua then you will need it here as well
+	3) If you needed the FOV adjustment in step 6 of step_1.lua then you will need it here as well for both hands
+	4) Run UEVR and press the Spawn Debug Console button. Go into the game and you should see your arms attached to
+		the controllers although they will probably be at weird angles.
+	5) Press F1 on the keyboard while the game window is topmost. You should see text in the console window that starts with
+		"Adjust Mode Hand Rotation" and "Current hand: Right". This means you will now be adjusting the rotation of the right hand
+	6) On the number pad (be sure number pad lock is on) press 8 and 2, 4 and 6, and 1 and 3 to adjust the rotation of the various axis
+		Again be sure the game window is the active window. To switch hands press the Number 7 key. To adjust position instead
+		of rotation press the Number 5 key until the console says Adjust Mode Hand Location
+	7) When you press a key, you will see updated Rotation and Location values for the current hand in the console window. When you
+		have the hands positioned correctly, you can then use the values from the console window to set the values in the handParams
+		structure below.
+	8) Shut down the game, rename this file to step_2.luax and rename step_3.luax to step_3.lua
+	9) Open step_3.lua to continue the tutorial
+
+]]--
+
+local uevrUtils = require("libs/uevr_utils")
+uevrUtils.setLogLevel(LogLevel.Debug)
+uevrUtils.initUEVR(uevr)
+local flickerFixer = require("libs/flicker_fixer")
+local controllers = require("libs/controllers")
+local animation = require("libs/animation")
+local hands = require("libs/hands")
+
+local handParams = 
+{
+	Arms = 
+	{
+		Left = 
+		{
+			Name = "l_LowerArm_JNT", -- Replace this with your findings from Step 1
+			Rotation = {0, 0, 0},	-- Replace this with your findings from Step 7
+			Location = {0, 0, 0},	-- Replace this with your findings from Step 7
+			Scale = {1, 1, 1},			
+			AnimationID = "left_hand"
+		},
+		Right = 
+		{
+			Name = "r_LowerArm_JNT", -- Replace this with your findings from Step 1
+			Rotation = {0, 0, 0},	-- Replace this with your findings from Step 7
+			Location = {0, 0, 0},	-- Replace this with your findings from Step 7		
+			Scale = {1, 1, 1},			
+			AnimationID = "right_hand"
+		}
+	}
+}
+
+function on_level_change(level)
+	print("Level changed\n")
+	flickerFixer.create()
+	controllers.onLevelChange()
+	controllers.createController(0)
+	controllers.createController(1)
+	controllers.createController(2)
+	hands.reset()
+end
+
+function on_lazy_poll()
+	if not hands.exists() then
+		--hands.setOffset({X=0, Y=0, Z=0, Pitch=0, Yaw=90, Roll=0})	
+		
+		hands.create(pawn.FPVMesh, handParams) --replace pawn.FPVMesh with what you found in Step 1 of step_1.lua		
+	end
+	if hands.exists() then
+		--uevrUtils.fixMeshFOV(hands.getHandComponent(0), "ForegroundPriorityEnabled", 0.0, true, true, false)
+		--uevrUtils.fixMeshFOV(hands.getHandComponent(1), "ForegroundPriorityEnabled", 0.0, true, true, false)
+	end
+
+end
+
+register_key_bind("F1", function()
+    print("F1 pressed\n")
+	hands.enableHandAdjustments()
+end)

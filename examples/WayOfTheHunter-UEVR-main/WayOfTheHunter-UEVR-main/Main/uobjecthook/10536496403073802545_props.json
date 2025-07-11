@@ -1,0 +1,18 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Camera Manager"
+    ],
+    "properties": [
+        {
+            "data": 1119661588,
+            "name": "defaultFOV"
+        },
+        {
+            "data": 1119661588,
+            "name": "m_defaultFirstPersonFOV"
+        }
+    ],
+    "type": "properties"
+}

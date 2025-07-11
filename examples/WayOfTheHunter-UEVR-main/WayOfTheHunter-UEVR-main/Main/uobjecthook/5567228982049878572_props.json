@@ -1,0 +1,17 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "Children",
+        "BP_RifleLever01_C BP_RifleLever01_C_2147453215",
+        "Properties",
+        "m_attachments",
+        "BP_Scope01_C BP_Scope01_C_2147453158",
+        "Properties",
+        "FP_Scope"
+    ],
+    "properties": [],
+    "type": "properties"
+}

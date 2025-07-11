@@ -1,0 +1,23 @@
+{
+    "path": [
+        "Acknowledged Pawn",
+        "Components",
+        "SkeletalMeshComponent Defu_Hand"
+    ],
+    "state": {
+        "hand": 1,
+        "location_offset": {
+            "x": 1.8733901977539063,
+            "y": 60.47799301147461,
+            "z": -49.837852478027344
+        },
+        "permanent": true,
+        "rotation_offset": {
+            "w": -0.9761785268783569,
+            "x": -0.06489445269107819,
+            "y": -0.18615096807479858,
+            "z": -0.09062130749225616
+        }
+    },
+    "type": "motion_controller"
+}

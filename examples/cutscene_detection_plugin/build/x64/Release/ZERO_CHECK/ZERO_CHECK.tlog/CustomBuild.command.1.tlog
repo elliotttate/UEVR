@@ -1,0 +1,10 @@
+^C:\USERS\ELLIO\ONEDRIVE\DOCUMENTS\GITHUB\UEVR3\CUTSCENE_DETECTION_PLUGIN\BUILD\CMAKEFILES\5FAD0B26CF7969CEEE928ECA5443207B\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -SC:/Users/ellio/OneDrive/Documents/GitHub/UEVR3/cutscene_detection_plugin -BC:/Users/ellio/OneDrive/Documents/GitHub/UEVR3/cutscene_detection_plugin/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/ellio/OneDrive/Documents/GitHub/UEVR3/cutscene_detection_plugin/build/CutsceneDetectionPlugin.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

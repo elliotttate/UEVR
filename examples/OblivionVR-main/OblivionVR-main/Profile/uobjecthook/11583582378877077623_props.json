@@ -1,0 +1,46 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "WeaponsPairingComponent",
+        "Properties",
+        "WeaponActor",
+        "Properties",
+        "VHitBox",
+        "Properties",
+        "BodyInstance",
+        "Properties",
+        "CollisionResponses",
+        "Properties",
+        "ResponseToChannels"
+    ],
+    "properties": [
+        {
+            "data": 1,
+            "name": "PhysicsBody"
+        },
+        {
+            "data": 1,
+            "name": "Pawn"
+        },
+        {
+            "data": 1,
+            "name": "WorldDynamic"
+        },
+        {
+            "data": 1,
+            "name": "Visibility"
+        },
+        {
+            "data": 1,
+            "name": "Vehicle"
+        },
+        {
+            "data": 1,
+            "name": "WorldStatic"
+        }
+    ],
+    "type": "properties"
+}

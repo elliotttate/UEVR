@@ -1,0 +1,9 @@
+
+Renderer_r.DefaultFeature.AmbientOcclusion=1
+
+Renderer_r.HZBOcclusion=0
+Renderer_r.LightCulling.Quality=0
+Renderer_r.SSGI.Enable=0
+Renderer_r.SubsurfaceScattering=0
+Renderer_r.TranslucentLightingVolume=0
+

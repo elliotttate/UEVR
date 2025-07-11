@@ -1,0 +1,14 @@
+
+*.vsidx
+.vs/
+*.obj
+*.tlog
+*.iobj
+*.pdb
+*.ipdb
+*.log
+*.pch
+*.recipe
+*.exp
+AimJester/x64/Release/AimJester.vcxproj.FileListAbsolute.txt
+*.lib

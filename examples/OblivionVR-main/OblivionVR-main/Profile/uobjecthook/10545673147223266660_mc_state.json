@@ -1,0 +1,26 @@
+{
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "Children",
+        "BP_Torch02_C BP_Torch02_C_2147474246",
+        "Components",
+        "StaticMeshComponent StaticMesh_Component"
+    ],
+    "state": {
+        "hand": 0,
+        "location_offset": {
+            "x": -0.10999999940395355,
+            "y": 3.0399999618530273,
+            "z": 4.090000152587891
+        },
+        "permanent": true,
+        "rotation_offset": {
+            "w": 0.53379887342453,
+            "x": -0.453276664018631,
+            "y": 0.5441487431526184,
+            "z": 0.4620618224143982
+        }
+    },
+    "type": "motion_controller"
+}

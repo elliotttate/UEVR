@@ -1,0 +1,12 @@
+{
+  "ID": "00000000-0000-0000-0000-000000000000",
+  "exeName": "OblivionRemastered-WinGDK-Shipping",
+  "gameName": "Oblivion Remastered",
+  "gameVersion": "",
+  "authorName": "Pande4360",
+  "minUEVRVersionDay": "2024-10-31T00:00:00",
+  "nullifyPlugins": false,
+  "lateInjection": true,
+  "modifiedDate": "2025-05-10T00:00:00+02:00",
+  "remarks": "V1.16b 6DofProfile"
+}

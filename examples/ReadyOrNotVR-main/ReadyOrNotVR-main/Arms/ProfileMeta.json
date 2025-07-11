@@ -1,0 +1,12 @@
+{
+  "ID": "00000000-0000-0000-0000-000000000000",
+  "exeName": "ReadyOrNot-Win64-Shipping",
+  "gameName": "Ready or Not",
+  "gameVersion": "DarkWaters DLC Patch 1",
+  "authorName": "Pande4360",
+  "minUEVRVersionDay": "2024-10-31T00:00:00",
+  "nullifyPlugins": true,
+  "lateInjection": true,
+  "modifiedDate": "2025-02-13T00:00:00+01:00",
+  "remarks": "V2.02 Full 6DOF with motion controls, Visible Arms Profile"
+}

@@ -724,6 +724,7 @@ list(APPEND uevr_SOURCES
 	"src/hooks/D3D11Hook.cpp"
 	"src/hooks/D3D12Hook.cpp"
 	"src/hooks/DInputHook.cpp"
+	"src/hooks/DualSenseHook.cpp"
 	"src/hooks/WindowsMessageHook.cpp"
 	"src/hooks/XInputHook.cpp"
 	"src/mods/FrameworkConfig.cpp"
@@ -767,6 +768,7 @@ list(APPEND uevr_SOURCES
 	"src/hooks/D3D11Hook.hpp"
 	"src/hooks/D3D12Hook.hpp"
 	"src/hooks/DInputHook.hpp"
+	"src/hooks/DualSenseHook.hpp"
 	"src/hooks/WindowsMessageHook.hpp"
 	"src/hooks/XInputHook.hpp"
 	"src/mods/FrameworkConfig.hpp"
@@ -856,6 +858,7 @@ target_link_libraries(uevr PUBLIC
 	sdkgenny
 	asmjit
 	luavrlib
+	dualsense
 )
 
 target_link_libraries(uevr PUBLIC
@@ -896,6 +899,49 @@ add_custom_command(
 add_custom_command(
     TARGET uevr POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:openvr> $<TARGET_FILE_DIR:uevr>)
+
+unset(CMKR_TARGET)
+unset(CMKR_SOURCES)
+
+# Target dualsense
+set(CMKR_TARGET dualsense)
+set(dualsense_SOURCES "")
+
+list(APPEND dualsense_SOURCES
+	"DualSense-Windows/VS19_Solution/DualSenseWindows/src/DualSenseWindows/DS5_Input.cpp"
+	"DualSense-Windows/VS19_Solution/DualSenseWindows/src/DualSenseWindows/DS5_Output.cpp"
+	"DualSense-Windows/VS19_Solution/DualSenseWindows/src/DualSenseWindows/DS_CRC32.cpp"
+	"DualSense-Windows/VS19_Solution/DualSenseWindows/src/DualSenseWindows/Helpers.cpp"
+	"DualSense-Windows/VS19_Solution/DualSenseWindows/src/DualSenseWindows/IO.cpp"
+)
+
+list(APPEND dualsense_SOURCES
+	cmake.toml
+)
+
+set(CMKR_SOURCES ${dualsense_SOURCES})
+add_library(dualsense STATIC)
+
+if(dualsense_SOURCES)
+	target_sources(dualsense PRIVATE ${dualsense_SOURCES})
+endif()
+
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${dualsense_SOURCES})
+
+target_compile_definitions(dualsense PUBLIC
+	DS5W_BUILD_LIB
+)
+
+target_include_directories(dualsense PUBLIC
+	"DualSense-Windows/VS19_Solution/DualSenseWindows/include"
+	"DualSense-Windows/VS19_Solution/DualSenseWindows/src"
+	"DualSense-Windows/VS19_Solution/DualSenseWindows/src/DualSenseWindows"
+)
+
+target_link_libraries(dualsense PUBLIC
+	setupapi
+	hid
+)
 
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)

@@ -255,7 +255,8 @@ link-libraries = [
     "DirectXTK12",
     "sdkgenny",
     "asmjit",
-    "luavrlib"
+    "luavrlib",
+    "dualsense"
 ]
 
 [template.ue4template.properties]
@@ -291,3 +292,14 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:openvr> $<TARGET_FILE_DIR:uevr>)
 
 """
+
+[target.dualsense]
+type = "static"
+sources = ["DualSense-Windows/VS19_Solution/DualSenseWindows/src/DualSenseWindows/*.cpp"]
+include-directories = [
+    "DualSense-Windows/VS19_Solution/DualSenseWindows/include",
+    "DualSense-Windows/VS19_Solution/DualSenseWindows/src",
+    "DualSense-Windows/VS19_Solution/DualSenseWindows/src/DualSenseWindows"
+]
+compile-definitions = ["DS5W_BUILD_LIB"]
+link-libraries = ["setupapi", "hid"]

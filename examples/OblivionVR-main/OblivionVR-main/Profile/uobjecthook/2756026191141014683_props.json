@@ -1,0 +1,11 @@
+{
+    "hide": true,
+    "hide_legacy": true,
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "FirstPersonHandsChildActorComponent"
+    ],
+    "properties": [],
+    "type": "properties"
+}

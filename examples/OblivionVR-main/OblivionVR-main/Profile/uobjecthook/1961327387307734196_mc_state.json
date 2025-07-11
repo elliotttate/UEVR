@@ -1,0 +1,27 @@
+{
+    "path": [
+        "Acknowledged Pawn",
+        "Properties",
+        "WeaponsPairingComponent",
+        "Properties",
+        "QuiverActor",
+        "Properties",
+        "MainStaticMeshComponent"
+    ],
+    "state": {
+        "hand": 2,
+        "location_offset": {
+            "x": 1.7999999523162842,
+            "y": -0.5299999713897705,
+            "z": -100.01000213623047
+        },
+        "permanent": false,
+        "rotation_offset": {
+            "w": 1.0,
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+        }
+    },
+    "type": "motion_controller"
+}

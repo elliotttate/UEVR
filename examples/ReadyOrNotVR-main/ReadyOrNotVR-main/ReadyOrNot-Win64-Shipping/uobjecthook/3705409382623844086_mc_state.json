@@ -1,0 +1,28 @@
+{
+    "path": [
+        "Acknowledged Pawn",
+        "Components",
+        "InventoryComponent InventoryComp",
+        "Properties",
+        "InventoryItems",
+        "Mirrorgun_C Mirrorgun_C_2147404327",
+        "Components",
+        "SkeletalMeshComponent ItemMesh"
+    ],
+    "state": {
+        "hand": 1,
+        "location_offset": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+        },
+        "permanent": false,
+        "rotation_offset": {
+            "w": -0.7009982466697693,
+            "x": 0.0,
+            "y": 0.7131629586219788,
+            "z": 0.0
+        }
+    },
+    "type": "motion_controller"
+}
