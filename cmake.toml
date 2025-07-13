@@ -155,6 +155,11 @@ type = "plugin"
 sources = ["examples/example_plugin/**.cpp", "examples/example_plugin/**.c"]
 headers = ["examples/example_plugin/**.hpp", "examples/example_plugin/**.h"]
 
+[target.cvar_plugin]
+type = "plugin"
+sources = ["examples/cvar_plugin/**.cpp", "examples/cvar_plugin/**.c"]
+headers = ["examples/cvar_plugin/**.hpp", "examples/cvar_plugin/**.h"]
+
 [target.sdk-test]
 type = "shared"
 sources = ["side-projects/sdk-test/**.cpp", "side-projects/sdk-test/**.c"]

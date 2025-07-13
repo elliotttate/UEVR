@@ -419,6 +419,43 @@ target_link_libraries(example_plugin PUBLIC
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
 
+# Target cvar_plugin
+set(CMKR_TARGET cvar_plugin)
+set(cvar_plugin_SOURCES "")
+
+list(APPEND cvar_plugin_SOURCES
+        "examples/cvar_plugin/Plugin.cpp"
+)
+
+list(APPEND cvar_plugin_SOURCES
+        cmake.toml
+)
+
+set(CMKR_SOURCES ${cvar_plugin_SOURCES})
+add_library(cvar_plugin SHARED)
+
+if(cvar_plugin_SOURCES)
+        target_sources(cvar_plugin PRIVATE ${cvar_plugin_SOURCES})
+endif()
+
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${cvar_plugin_SOURCES})
+
+target_compile_features(cvar_plugin PUBLIC
+        cxx_std_23
+)
+
+target_include_directories(cvar_plugin PUBLIC
+        "include/"
+        "examples/renderlib"
+)
+
+target_link_libraries(cvar_plugin PUBLIC
+        plugin_renderlib
+)
+
+unset(CMKR_TARGET)
+unset(CMKR_SOURCES)
+
 # Target sdk-test
 set(CMKR_TARGET sdk-test)
 set(sdk-test_SOURCES "")
