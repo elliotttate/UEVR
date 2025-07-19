@@ -1,0 +1,34 @@
+name: Dev Release
+on: [push, workflow_dispatch]
+env:
+  BUILD_TYPE: Release
+jobs:
+  dev-release:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target: [sh2r]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure CMake
+        run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
+
+      - name: Build
+        run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target ${{matrix.target}}
+
+      - name: Compress release
+        run: |
+          7z a ${{github.workspace}}/${{matrix.target}}.zip ${{github.workspace}}/build/${{env.BUILD_TYPE}}/sh2r.dll
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3
+        with:
+          name: ${{matrix.target}}
+          path: ${{github.workspace}}/${{matrix.target}}.zip
+          if-no-files-found: error

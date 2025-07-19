@@ -40,6 +40,10 @@ public:
         m_auto_scale = true;
         m_graph_max_fps = 120.0f;
         m_graph_min_fps = 0.0f;
+        m_attach_to_controller = false;
+        m_controller_upside_down = false;
+        m_use_left_controller = false;
+        m_flip_threshold = -0.7f; // Controller is considered upside down when up vector Z < -0.7
         reset_stats();
     }
 
@@ -87,6 +91,46 @@ public:
         m_initialized = false;
     }
 
+    void on_post_render_vr_framework_dx11(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, ID3D11RenderTargetView* rtv) override {
+        std::scoped_lock _{m_imgui_mutex};
+        if (!m_initialized) {
+            if (!initialize_imgui()) {
+                return;
+            }
+        }
+        
+        ImGui_ImplWin32_NewFrame();
+        ImGui_ImplDX11_NewFrame();
+        ImGui::NewFrame();
+        
+        setup_imgui_style();
+        draw_ui();
+        
+        ImGui::EndFrame();
+        ImGui::Render();
+        g_d3d11.render_imgui_vr(ctx, rtv);
+    }
+
+    void on_post_render_vr_framework_dx12(ID3D12GraphicsCommandList* cmd_list, ID3D12Resource* tex, D3D12_CPU_DESCRIPTOR_HANDLE* rtv) override {
+        std::scoped_lock _{m_imgui_mutex};
+        if (!m_initialized) {
+            if (!initialize_imgui()) {
+                return;
+            }
+        }
+        
+        ImGui_ImplWin32_NewFrame();
+        ImGui_ImplDX12_NewFrame();
+        ImGui::NewFrame();
+        
+        setup_imgui_style();
+        draw_ui();
+        
+        ImGui::EndFrame();
+        ImGui::Render();
+        g_d3d12.render_imgui_vr(cmd_list, rtv);
+    }
+
     void on_pre_engine_tick(API::UGameEngine* engine, float delta) override {
         m_frame_count++;
         m_elapsed_time += delta;
@@ -99,6 +143,11 @@ public:
             update_stats();
             m_frame_count = 0;
             m_elapsed_time = 0.0f;
+        }
+        
+        // Check controller orientation for both controllers
+        if (API::get()->param()->vr->is_using_controllers()) {
+            check_controller_orientation();
         }
     }
 
@@ -216,9 +265,20 @@ private:
     void draw_ui() {
         if (!m_window_open) return;
         
-        ImGui::SetNextWindowSize(ImVec2(m_graph_width + 50, m_graph_height + 300), ImGuiCond_FirstUseEver);
+        // If attached to controller and controller is upside down, position window accordingly
+        if (m_attach_to_controller && m_controller_upside_down) {
+            position_window_at_controller();
+        } else {
+            // Normal window positioning
+            ImGui::SetNextWindowSize(ImVec2(m_graph_width + 50, m_graph_height + 300), ImGuiCond_FirstUseEver);
+        }
         
-        if (ImGui::Begin("🎯 FPS Counter & Performance Monitor", &m_window_open, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGuiWindowFlags window_flags = ImGuiWindowFlags_AlwaysAutoResize;
+        if (m_attach_to_controller && m_controller_upside_down) {
+            window_flags |= ImGuiWindowFlags_NoMove; // Don't allow manual movement when attached
+        }
+        
+        if (ImGui::Begin("🎯 FPS Counter & Performance Monitor", &m_window_open, window_flags)) {
             // Performance status indicator
             draw_performance_status();
             
@@ -319,6 +379,21 @@ private:
             ImGui::SliderFloat("Critical FPS", &m_critical_fps, 10.0f, 40.0f, "%.0f");
             
             ImGui::Columns(1);
+            
+            ImGui::Separator();
+            ImGui::Text("Controller Attachment:");
+            ImGui::Checkbox("Attach to Controller When Flipped", &m_attach_to_controller);
+            if (m_attach_to_controller) {
+                ImGui::Indent();
+                ImGui::Checkbox("Use Left Controller", &m_use_left_controller);
+                ImGui::SliderFloat("Flip Threshold", &m_flip_threshold, -1.0f, 0.0f, "%.2f");
+                if (m_controller_upside_down) {
+                    ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Controller is upside down!");
+                } else {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Controller is right-side up");
+                }
+                ImGui::Unindent();
+            }
         }
     }
 
@@ -619,6 +694,69 @@ private:
         
         m_avg_fps = sum / m_fps_history.size();
     }
+    
+    void check_controller_orientation() {
+        const auto vr = API::get()->param()->vr;
+        if (!vr) return;
+        
+        // Get the controller index based on user preference
+        uint32_t controller_index = m_use_left_controller ? vr->get_left_controller_index() : vr->get_right_controller_index();
+        if (controller_index == vr->get_hmd_index()) return; // Invalid controller index
+        
+        // Get controller transform using UEVR API
+        UEVR_Matrix4x4f transform{};
+        vr->get_transform(controller_index, &transform);
+        
+        // Extract the up vector (Y axis) from the transform matrix
+        // In the transform matrix, the Y axis is the second column
+        float up_x = transform.m[0][1];
+        float up_y = transform.m[1][1];
+        float up_z = transform.m[2][1];
+        
+        // Check if the controller is upside down by checking the Z component of the up vector
+        bool was_upside_down = m_controller_upside_down;
+        m_controller_upside_down = up_z < m_flip_threshold;
+        
+        // Log state changes for debugging
+        if (was_upside_down != m_controller_upside_down) {
+            if (m_controller_upside_down) {
+                API::get()->log_info("[FPSCounterPlugin] Controller flipped upside down!");
+            } else {
+                API::get()->log_info("[FPSCounterPlugin] Controller returned to normal orientation");
+            }
+        }
+    }
+    
+    void position_window_at_controller() {
+        const auto vr = API::get()->param()->vr;
+        if (!vr) return;
+        
+        uint32_t controller_index = m_use_left_controller ? vr->get_left_controller_index() : vr->get_right_controller_index();
+        if (controller_index == vr->get_hmd_index()) return;
+        
+        // Get controller position and rotation using UEVR types
+        UEVR_Vector3f position{};
+        UEVR_Quaternionf rotation{};
+        vr->get_pose(controller_index, &position, &rotation);
+        
+        // Convert position to screen space for ImGui
+        // This is a simplified approach - in a real implementation you'd need to
+        // project the 3D position to 2D screen coordinates based on the VR view
+        
+        // For now, we'll position the window at a fixed screen position when controller is flipped
+        // This ensures it's visible and doesn't interfere with gameplay
+        float window_x = 100.0f;
+        float window_y = 100.0f;
+        
+        if (m_use_left_controller) {
+            window_x = 100.0f; // Left side of screen
+        } else {
+            window_x = 1500.0f; // Right side of screen (adjust based on resolution)
+        }
+        
+        ImGui::SetNextWindowPos(ImVec2(window_x, window_y), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(400, 300), ImGuiCond_Always); // Compact size when attached
+    }
 
     HWND m_wnd{};
     bool m_initialized{false};
@@ -646,6 +784,12 @@ private:
     float m_target_fps{60.0f};
     float m_warning_fps{45.0f};
     float m_critical_fps{30.0f};
+    
+    // Controller attachment settings
+    bool m_attach_to_controller{false};
+    bool m_controller_upside_down{false};
+    bool m_use_left_controller{false};
+    float m_flip_threshold{-0.7f};
 };
 
 static FPSCounterPlugin g_plugin; 

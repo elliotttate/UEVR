@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\examples\button_remapper_plugin\build\CMakeFiles\7626de02157285d10c6015e7c8250e0d\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{892700F3-D3F7-3B9B-BDFE-BEA6F9A771C8}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

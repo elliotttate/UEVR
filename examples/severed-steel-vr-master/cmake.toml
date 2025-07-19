@@ -1,0 +1,108 @@
+# Reference: https://build-cpp.github.io/cmkr/cmake-toml
+# to build:
+# > cmake -B build
+# > cmake --build build --config Release
+[project]
+name = "steel-proj"
+cmake-before=""" 
+add_compile_options($<$<CXX_COMPILER_ID:MSVC>:/MP>)
+"""
+cmake-after = """
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /MP")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
+
+set(ASMJIT_STATIC ON CACHE BOOL "" FORCE)
+set(SAFETYHOOK_FETCH_ZYDIS ON)
+
+if ("${CMAKE_BUILD_TYPE}" MATCHES "Release")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /MT")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MT")
+
+    # Statically compile runtime
+    string(REGEX REPLACE "/MD" "/MT" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    string(REGEX REPLACE "/MD" "/MT" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+    string(REGEX REPLACE "/MD" "/MT" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
+    string(REGEX REPLACE "/MD" "/MT" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
+
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    message(NOTICE "Building in Release mode")
+endif()
+"""
+
+# used by kananlib and safetyhook
+[fetch-content.bddisasm]
+git = "https://github.com/bitdefender/bddisasm"
+tag = "v1.34.10"
+
+[fetch-content.safetyhook]
+git = "https://github.com/cursey/safetyhook"
+tag = "b046e123dc69821f2c375161e0adef3c6d9c9db4"
+
+[target.imgui]
+type = "static"
+sources = ["dependencies/submodules/imgui/*.cpp"]
+include-directories = ["dependencies/submodules/imgui", "src/imgui/"]
+compile-definitions = [
+    "IMGUI_USER_CONFIG=\"${CMAKE_CURRENT_SOURCE_DIR}/src/imgui/plugin_imconfig.hpp\"",
+]
+
+# used by kananlib
+[fetch-content.spdlog]
+git = "https://github.com/gabime/spdlog"
+tag = "76fb40d95455f249bd70824ecfcae7a8f0930fa3"
+
+[target.glm_static]
+type = "static"
+sources = ["dependencies/submodules/glm/glm/**.cpp"]
+include-directories = ["dependencies/submodules/glm"]
+
+[fetch-content.kananlib]
+git = "https://github.com/cursey/kananlib"
+tag = "ab8e010a1b98287a8d69478908b5dcc098349782"
+
+[target.uevr_api]
+type = "interface"
+headers = ["dependencies/uevr_api/**.hpp", "dependencies/uevr_api/**.h"]
+include-directories = ["dependencies/uevr_api/include"]
+
+[target.steelsdk]
+type = "static"
+sources = ["dependencies/steelsdk/**.cpp", "dependencies/steelsdk/**.c"]
+headers = ["dependencies/steelsdk/**.hpp", "dependencies/steelsdk/**.h"]
+compile-options = ["/EHa", "/bigobj", "/MP"]
+compile-features = ["cxx_std_20"]
+include-directories = [
+    "dependencies/steelsdk/src",
+    "dependencies/steelsdk/"
+]
+link-libraries = [
+    "kananlib",
+    "uevr_api"
+]
+
+[target.steel]
+type = "shared"
+sources = ["src/**.cpp", "src/**.c"]
+headers = ["src/**.hpp", "src/**.h"]
+include-directories = [
+    "shared/", 
+    "src/", 
+    "include/"
+]
+compile-options = ["/GS-", "/bigobj", "/EHa", "/MP"]
+compile-features = ["cxx_std_20"]
+compile-definitions = []
+link-libraries = [
+    "kananlib",
+    "steelsdk",
+    "uevr_api",
+    "glm_static",
+    "safetyhook",
+    "imgui"
+]
+cmake-after = """
+target_compile_definitions(steel PUBLIC 
+    NOMINMAX
+    WINVER=0x0A00
+)
+"""

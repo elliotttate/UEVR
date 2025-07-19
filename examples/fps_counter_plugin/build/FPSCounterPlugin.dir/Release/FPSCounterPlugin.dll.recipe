@@ -2,10 +2,10 @@
 <Project>
   <ProjectOutputs>
     <ProjectOutput>
-      <FullPath>C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\fps_counter_plugin\build\x64\Release\ZERO_CHECK</FullPath>
+      <FullPath>C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\examples\fps_counter_plugin\build\x64\Release\ZERO_CHECK</FullPath>
     </ProjectOutput>
     <ProjectOutput>
-      <FullPath>C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\fps_counter_plugin\build\bin\Release\FPSCounterPlugin.dll</FullPath>
+      <FullPath>C:\Users\ellio\OneDrive\Documents\GitHub\UEVR3\examples\fps_counter_plugin\build\bin\Release\FPSCounterPlugin.dll</FullPath>
     </ProjectOutput>
   </ProjectOutputs>
   <ContentFiles />

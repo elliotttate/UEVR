@@ -48,11 +48,11 @@ message(STATUS "Found renderlib at: ${RENDERLIB_INCLUDE_DIR}")
 
 # Find imgui sources
 set(IMGUI_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/../dependencies/submodules/imgui/imgui.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../dependencies/submodules/imgui/imgui_demo.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../dependencies/submodules/imgui/imgui_draw.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../dependencies/submodules/imgui/imgui_tables.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../dependencies/submodules/imgui/imgui_widgets.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../dependencies/submodules/imgui/imgui.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../dependencies/submodules/imgui/imgui_demo.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../dependencies/submodules/imgui/imgui_draw.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../dependencies/submodules/imgui/imgui_tables.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../dependencies/submodules/imgui/imgui_widgets.cpp
 )
 
 # Add the plugin with renderlib sources
@@ -70,8 +70,8 @@ add_library(FPSCounterPlugin SHARED
 target_include_directories(FPSCounterPlugin PRIVATE
     ${UEVR_INCLUDE_DIR}
     ${RENDERLIB_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../dependencies/submodules/imgui
-    ${CMAKE_CURRENT_SOURCE_DIR}/../dependencies/submodules/imgui/backends
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../dependencies/submodules/imgui
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../dependencies/submodules/imgui/backends
 )
 
 # Link libraries
