@@ -413,7 +413,44 @@ target_include_directories(example_plugin PUBLIC
 )
 
 target_link_libraries(example_plugin PUBLIC
-	plugin_renderlib
+        plugin_renderlib
+)
+
+unset(CMKR_TARGET)
+unset(CMKR_SOURCES)
+
+# Target hzbocclusion_plugin
+set(CMKR_TARGET hzbocclusion_plugin)
+set(hzbocclusion_plugin_SOURCES "")
+
+list(APPEND hzbocclusion_plugin_SOURCES
+        "examples/hzbocclusion_plugin/Plugin.cpp"
+)
+
+list(APPEND hzbocclusion_plugin_SOURCES
+        cmake.toml
+)
+
+set(CMKR_SOURCES ${hzbocclusion_plugin_SOURCES})
+add_library(hzbocclusion_plugin SHARED)
+
+if(hzbocclusion_plugin_SOURCES)
+        target_sources(hzbocclusion_plugin PRIVATE ${hzbocclusion_plugin_SOURCES})
+endif()
+
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${hzbocclusion_plugin_SOURCES})
+
+target_compile_features(hzbocclusion_plugin PUBLIC
+        cxx_std_23
+)
+
+target_include_directories(hzbocclusion_plugin PUBLIC
+        "include/"
+        "examples/renderlib"
+)
+
+target_link_libraries(hzbocclusion_plugin PUBLIC
+        plugin_renderlib
 )
 
 unset(CMKR_TARGET)
