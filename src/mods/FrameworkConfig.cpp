@@ -18,6 +18,7 @@ void FrameworkConfig::draw_main() {
     m_enable_l3_r3_toggle->draw("Enable L3 + R3 Toggle");
     ImGui::SameLine();
     m_l3_r3_long_press->draw("L3 + R3 Long Press Menu Toggle");
+    m_enable_directinput_l3_r3_toggle->draw("Enable DirectInput L3+R3 Toggle");
     m_always_show_cursor->draw("Always Show Cursor");
 
     ImGui::Separator();

@@ -17,6 +17,7 @@ public:
             *m_remember_menu_state,
             *m_enable_l3_r3_toggle,
             *m_l3_r3_long_press,
+            *m_enable_directinput_l3_r3_toggle,
             *m_advanced_mode,
             *m_imgui_theme,
             *m_log_level,
@@ -59,6 +60,10 @@ public:
 
     bool is_enable_l3_r3_toggle() {
         return m_enable_l3_r3_toggle->value();
+    }
+
+    bool is_enable_directinput_l3_r3_toggle() {
+        return m_enable_directinput_l3_r3_toggle->value();
     }
 
     bool is_l3_r3_long_press() {
@@ -119,6 +124,7 @@ private:
     ModToggle::Ptr m_remember_menu_state{ ModToggle::create(generate_name("RememberMenuState"), false) };
     ModToggle::Ptr m_enable_l3_r3_toggle{ ModToggle::create(generate_name("EnableL3R3Toggle"), true) };
     ModToggle::Ptr m_l3_r3_long_press{ ModToggle::create(generate_name("L3R3LongPress"), false) };
+    ModToggle::Ptr m_enable_directinput_l3_r3_toggle{ ModToggle::create(generate_name("EnableDInputL3R3Toggle"), true) };
     ModToggle::Ptr m_always_show_cursor{ ModToggle::create(generate_name("AlwaysShowCursor"), false) };
     ModToggle::Ptr m_advanced_mode{ ModToggle::create(generate_name("AdvancedMode"), false) };
     
