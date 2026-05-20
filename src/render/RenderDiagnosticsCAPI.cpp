@@ -13,6 +13,8 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <mutex>
 #include <optional>
@@ -20,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -67,7 +70,14 @@ const char* backend_name(render::ShaderOverrideRegistry::Backend backend) {
 }
 
 const char* stage_name(render::ShaderOverrideRegistry::Stage stage) {
-    return stage == render::ShaderOverrideRegistry::Stage::Pixel ? "PS" : "VS";
+    switch (stage) {
+    case render::ShaderOverrideRegistry::Stage::Vertex: return "VS";
+    case render::ShaderOverrideRegistry::Stage::Pixel: return "PS";
+    case render::ShaderOverrideRegistry::Stage::Compute: return "CS";
+    case render::ShaderOverrideRegistry::Stage::Amplification: return "AS";
+    case render::ShaderOverrideRegistry::Stage::Mesh: return "MS";
+    default: return "Unknown";
+    }
 }
 
 template <typename Vec>
@@ -163,6 +173,248 @@ json warning_to_json(const render::D3D12Diagnostics::WarningEvent& e) {
     return {{"frame", e.frame}, {"source", e.source}, {"message", e.message}};
 }
 
+template <typename Array>
+json root_slot_array_to_json(const Array& values) {
+    json result = json::array();
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (values[i] == 0) {
+            continue;
+        }
+
+        result.push_back({
+            {"slot", i},
+            {"value", format_pointer(static_cast<uintptr_t>(values[i]))},
+        });
+    }
+    return result;
+}
+
+template <typename Array>
+json root_hash_array_to_json(const Array& values) {
+    json result = json::array();
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (values[i] == 0) {
+            continue;
+        }
+
+        result.push_back({
+            {"slot", i},
+            {"hash", format_pointer(static_cast<uintptr_t>(values[i]))},
+        });
+    }
+    return result;
+}
+
+json root_bind_to_json(const render::D3D12Diagnostics::RootBindEvent& e) {
+    return {
+        {"frame", e.frame},
+        {"sequence", e.sequence},
+        {"source", e.source},
+        {"pipeline", e.pipeline},
+        {"kind", e.kind},
+        {"command_list", format_pointer(e.command_list)},
+        {"pipeline_state", format_pointer(e.pipeline_state)},
+        {"eye_bucket", e.eye_bucket},
+        {"root_parameter", e.root_parameter},
+        {"value", format_pointer(e.value)},
+        {"value_count", e.value_count},
+        {"value_hash", format_pointer(static_cast<uintptr_t>(e.value_hash))},
+    };
+}
+
+json draw_event_to_json(const render::D3D12Diagnostics::DrawEvent& e) {
+    json descriptor_reads = json::array();
+    for (const auto& read : e.descriptor_reads) {
+        descriptor_reads.push_back({
+            {"root_parameter", read.root_parameter},
+            {"descriptor_index", read.descriptor_index},
+            {"descriptor_cpu", format_pointer(read.descriptor_cpu)},
+            {"resource", format_pointer(read.resource)},
+            {"descriptor_type", read.descriptor_type},
+            {"producer_frame", read.producer_frame},
+            {"producer_draw", read.producer_draw},
+            {"producer_pso", format_pointer(read.producer_pso)},
+        });
+    }
+
+    return {
+        {"frame", e.frame},
+        {"draw_index", e.draw_index},
+        {"source", e.source},
+        {"kind", e.kind},
+        {"command_list", format_pointer(e.command_list)},
+        {"pipeline_state", format_pointer(e.pipeline_state)},
+        {"root_signature", format_pointer(e.root_signature)},
+        {"eye_bucket", e.eye_bucket},
+        {"arg0", e.arg0},
+        {"arg1", e.arg1},
+        {"arg2", e.arg2},
+        {"arg3", e.arg3},
+        {"arg4", e.arg4},
+        {"rtv0", format_pointer(e.rtv0)},
+        {"rtv0_resource", format_pointer(e.rtv0_resource)},
+        {"prior_rtv0_producer_frame", e.prior_rtv0_producer_frame},
+        {"prior_rtv0_producer_draw", e.prior_rtv0_producer_draw},
+        {"prior_rtv0_producer_pso", format_pointer(e.prior_rtv0_producer_pso)},
+        {"graphics_root_descriptor_tables", root_slot_array_to_json(e.graphics_root_descriptor_tables)},
+        {"compute_root_descriptor_tables", root_slot_array_to_json(e.compute_root_descriptor_tables)},
+        {"graphics_root_cbvs", root_slot_array_to_json(e.graphics_root_cbvs)},
+        {"compute_root_cbvs", root_slot_array_to_json(e.compute_root_cbvs)},
+        {"graphics_root_srvs", root_slot_array_to_json(e.graphics_root_srvs)},
+        {"compute_root_srvs", root_slot_array_to_json(e.compute_root_srvs)},
+        {"graphics_root_uavs", root_slot_array_to_json(e.graphics_root_uavs)},
+        {"compute_root_uavs", root_slot_array_to_json(e.compute_root_uavs)},
+        {"graphics_root_cbv_hash", root_hash_array_to_json(e.graphics_root_cbv_hash)},
+        {"compute_root_cbv_hash", root_hash_array_to_json(e.compute_root_cbv_hash)},
+        {"graphics_root_constants_hash", root_hash_array_to_json(e.graphics_root_constants_hash)},
+        {"compute_root_constants_hash", root_hash_array_to_json(e.compute_root_constants_hash)},
+        {"graphics_root_descriptor_table_resource_hash", root_hash_array_to_json(e.graphics_root_descriptor_table_resource_hash)},
+        {"compute_root_descriptor_table_resource_hash", root_hash_array_to_json(e.compute_root_descriptor_table_resource_hash)},
+        {"descriptor_reads", std::move(descriptor_reads)},
+    };
+}
+
+json gpu_timing_to_json(const render::D3D12Diagnostics::GpuTimingInfo& t) {
+    return {
+        {"pipeline_state", format_pointer(t.pipeline_state)},
+        {"kind", t.kind},
+        {"eye_bucket", t.eye_bucket},
+        {"samples", t.samples},
+        {"avg_ms", t.avg_ms},
+        {"max_ms", t.max_ms},
+        {"last_frame", t.last_frame},
+    };
+}
+
+void hash_u64(uint64_t& hash, uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+        hash ^= (value >> (i * 8)) & 0xffu;
+        hash *= 1099511628211ull;
+    }
+}
+
+template <typename Array>
+void hash_root_array(uint64_t& hash, const Array& values) {
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (values[i] == 0) {
+            continue;
+        }
+        hash_u64(hash, i);
+        hash_u64(hash, static_cast<uint64_t>(values[i]));
+    }
+}
+
+uint64_t draw_resource_fingerprint(const render::D3D12Diagnostics::DrawEvent& e) {
+    uint64_t hash = 1469598103934665603ull;
+    hash_u64(hash, e.root_signature);
+    hash_u64(hash, e.rtv0);
+    hash_u64(hash, e.rtv0_resource);
+    hash_root_array(hash, e.graphics_root_descriptor_tables);
+    hash_root_array(hash, e.compute_root_descriptor_tables);
+    hash_root_array(hash, e.graphics_root_cbvs);
+    hash_root_array(hash, e.compute_root_cbvs);
+    hash_root_array(hash, e.graphics_root_srvs);
+    hash_root_array(hash, e.compute_root_srvs);
+    hash_root_array(hash, e.graphics_root_uavs);
+    hash_root_array(hash, e.compute_root_uavs);
+    hash_root_array(hash, e.graphics_root_cbv_hash);
+    hash_root_array(hash, e.compute_root_cbv_hash);
+    hash_root_array(hash, e.graphics_root_constants_hash);
+    hash_root_array(hash, e.compute_root_constants_hash);
+    hash_root_array(hash, e.graphics_root_descriptor_table_resource_hash);
+    hash_root_array(hash, e.compute_root_descriptor_table_resource_hash);
+    for (const auto& read : e.descriptor_reads) {
+        hash_u64(hash, read.root_parameter);
+        hash_u64(hash, read.descriptor_index);
+        hash_u64(hash, read.descriptor_cpu);
+        hash_u64(hash, read.resource);
+        hash_u64(hash, read.producer_draw);
+        hash_u64(hash, read.producer_pso);
+    }
+    return hash;
+}
+
+json symmetry_oracle_to_json(const std::vector<render::D3D12Diagnostics::DrawEvent>& events) {
+    struct Aggregate {
+        uintptr_t pipeline_state{};
+        uint64_t left_count{};
+        uint64_t right_count{};
+        uint64_t unknown_count{};
+        uint64_t left_fingerprint{};
+        uint64_t right_fingerprint{};
+        uint64_t left_draw_index{};
+        uint64_t right_draw_index{};
+    };
+
+    std::unordered_map<uintptr_t, Aggregate> by_pso{};
+    uint64_t analyzed = 0;
+    for (const auto& e : events) {
+        if (e.pipeline_state == 0) {
+            continue;
+        }
+
+        ++analyzed;
+        auto& aggregate = by_pso[e.pipeline_state];
+        aggregate.pipeline_state = e.pipeline_state;
+        const auto fingerprint = draw_resource_fingerprint(e);
+
+        if (e.eye_bucket == 1) {
+            ++aggregate.left_count;
+            aggregate.left_fingerprint = fingerprint;
+            aggregate.left_draw_index = e.draw_index;
+        } else if (e.eye_bucket == 2) {
+            ++aggregate.right_count;
+            aggregate.right_fingerprint = fingerprint;
+            aggregate.right_draw_index = e.draw_index;
+        } else {
+            ++aggregate.unknown_count;
+        }
+    }
+
+    std::vector<Aggregate> asymmetric{};
+    asymmetric.reserve(by_pso.size());
+    for (const auto& [_, aggregate] : by_pso) {
+        const bool has_both = aggregate.left_count > 0 && aggregate.right_count > 0;
+        const bool count_mismatch = aggregate.left_count != aggregate.right_count;
+        const bool bind_mismatch = has_both && aggregate.left_fingerprint != aggregate.right_fingerprint;
+        if (count_mismatch || bind_mismatch) {
+            asymmetric.push_back(aggregate);
+        }
+    }
+
+    std::sort(asymmetric.begin(), asymmetric.end(), [](const auto& lhs, const auto& rhs) {
+        const auto lhs_total = lhs.left_count + lhs.right_count + lhs.unknown_count;
+        const auto rhs_total = rhs.left_count + rhs.right_count + rhs.unknown_count;
+        return lhs_total > rhs_total;
+    });
+
+    json result{
+        {"recent_draws_analyzed", analyzed},
+        {"tracked_pso_count", by_pso.size()},
+        {"asymmetric_pso_count", asymmetric.size()},
+        {"asymmetric_psos", json::array()},
+    };
+
+    const size_t take = std::min<size_t>(asymmetric.size(), 64);
+    for (size_t i = 0; i < take; ++i) {
+        const auto& a = asymmetric[i];
+        result["asymmetric_psos"].push_back({
+            {"pipeline_state", format_pointer(a.pipeline_state)},
+            {"left_count", a.left_count},
+            {"right_count", a.right_count},
+            {"unknown_count", a.unknown_count},
+            {"left_fingerprint", format_pointer(static_cast<uintptr_t>(a.left_fingerprint))},
+            {"right_fingerprint", format_pointer(static_cast<uintptr_t>(a.right_fingerprint))},
+            {"left_draw_index", a.left_draw_index},
+            {"right_draw_index", a.right_draw_index},
+            {"count_mismatch", a.left_count != a.right_count},
+            {"binding_mismatch", a.left_count > 0 && a.right_count > 0 && a.left_fingerprint != a.right_fingerprint},
+        });
+    }
+
+    return result;
+}
+
 json bind_context_to_json(const render::D3D12Diagnostics::CurrentBindContext& c) {
     json result{
         {"frame", c.frame},
@@ -177,6 +429,44 @@ json bind_context_to_json(const render::D3D12Diagnostics::CurrentBindContext& c)
         result["depth_target"] = bound_target_to_json(*c.depth_target);
     }
     return result;
+}
+
+json root_signature_to_json(const render::D3D12Diagnostics::RootSignatureInfo& r) {
+    json parameters = json::array();
+    for (const auto& p : r.parameters) {
+        json ranges = json::array();
+        for (const auto& range : p.ranges) {
+            ranges.push_back({
+                {"type", range.type},
+                {"base_shader_register", range.base_shader_register},
+                {"num_descriptors", range.num_descriptors},
+                {"register_space", range.register_space},
+                {"offset_from_table_start", range.offset_from_table_start},
+            });
+        }
+
+        parameters.push_back({
+            {"index", p.index},
+            {"parameter_type", p.parameter_type},
+            {"visibility", p.visibility},
+            {"shader_register", p.shader_register},
+            {"register_space", p.register_space},
+            {"num_32bit_values", p.num_32bit_values},
+            {"ranges", std::move(ranges)},
+        });
+    }
+
+    return {
+        {"pointer", format_pointer(r.pointer)},
+        {"first_seen_frame", r.first_seen_frame},
+        {"last_seen_frame", r.last_seen_frame},
+        {"blob_size", r.blob_size},
+        {"version", r.version},
+        {"flags", r.flags},
+        {"static_sampler_count", r.static_sampler_count},
+        {"parameters", std::move(parameters)},
+        {"decode_error", r.decode_error},
+    };
 }
 
 json bound_shader_to_json(const render::ShaderOverrideRegistry::BoundShaderInfo& s) {
@@ -259,10 +549,108 @@ json override_entry_to_json(const render::ShaderOverrideRegistry::OverrideEntryI
         {"compiled", e.compiled},
         {"apply_supported", e.apply_supported},
         {"from_profile_dir", e.from_profile_dir},
+        {"per_eye_variants", e.per_eye_variants},
         {"generation", e.generation},
         {"status", e.status},
         {"compiler", e.compiler},
         {"last_error", e.last_error},
+    };
+}
+
+json bind_override_entry_to_json(const render::ShaderOverrideRegistry::BindOverrideEntryInfo& e) {
+    return {
+        {"key", e.key},
+        {"name", e.name},
+        {"target_hash", e.target_hash},
+        {"stage", e.stage},
+        {"pipeline", e.pipeline},
+        {"eye", e.eye},
+        {"kind", e.kind},
+        {"root_parameter", e.root_parameter},
+        {"value_count", e.value_count},
+        {"dest_offset", e.dest_offset},
+        {"enabled", e.enabled},
+        {"from_profile_dir", e.from_profile_dir},
+        {"manifest_path", e.manifest_path},
+        {"status", e.status},
+        {"last_error", e.last_error},
+    };
+}
+
+json pso_churn_to_json(const render::ShaderOverrideRegistry::D3D12PsoChurnInfo& c) {
+    json recent_frames = json::array();
+    for (const auto& f : c.recent_frames) {
+        recent_frames.push_back({
+            {"frame", f.frame},
+            {"graphics_creations", f.graphics_creations},
+            {"compute_creations", f.compute_creations},
+            {"stream_creations", f.stream_creations},
+            {"total_creations", f.graphics_creations + f.compute_creations + f.stream_creations},
+        });
+    }
+
+    return {
+        {"tracked_pso_count", c.tracked_pso_count},
+        {"current_frame_graphics_creations", c.current_frame_graphics_creations},
+        {"current_frame_compute_creations", c.current_frame_compute_creations},
+        {"current_frame_stream_creations", c.current_frame_stream_creations},
+        {"current_frame_total_creations", c.current_frame_graphics_creations + c.current_frame_compute_creations + c.current_frame_stream_creations},
+        {"recent_window_frames", c.recent_window_frames},
+        {"recent_graphics_creations", c.recent_graphics_creations},
+        {"recent_compute_creations", c.recent_compute_creations},
+        {"recent_stream_creations", c.recent_stream_creations},
+        {"recent_total_creations", c.recent_graphics_creations + c.recent_compute_creations + c.recent_stream_creations},
+        {"recent_frames", std::move(recent_frames)},
+    };
+}
+
+json shader_chunk_to_json(const render::ShaderContainerChunkInfo& c) {
+    return {
+        {"fourcc", c.fourcc},
+        {"offset", c.offset},
+        {"size", c.size},
+    };
+}
+
+json shader_bytecode_inspection_to_json(const render::ShaderOverrideRegistry::D3D12ShaderBytecodeInspection& i) {
+    json bytecode{
+        {"ok", i.bytecode.ok},
+        {"container", i.bytecode.container},
+        {"container_kind", i.bytecode.container_kind},
+        {"container_hash", i.bytecode.container_hash},
+        {"container_version", i.bytecode.container_version},
+        {"declared_size", i.bytecode.declared_size},
+        {"bytecode_size", i.bytecode.bytecode_size},
+        {"compiler", i.bytecode.compiler},
+        {"error", i.bytecode.error},
+        {"chunks", json::array()},
+    };
+
+    for (const auto& c : i.bytecode.chunks) {
+        bytecode["chunks"].push_back(shader_chunk_to_json(c));
+    }
+
+    if (!i.bytecode.disassembly.empty()) {
+        bytecode["disassembly"] = i.bytecode.disassembly;
+    }
+
+    if (!i.bytecode.recovered_sources.empty()) {
+        bytecode["recovered_sources"] = json::array();
+        for (const auto& source : i.bytecode.recovered_sources) {
+            bytecode["recovered_sources"].push_back({
+                {"name", source.name},
+                {"text", source.text},
+            });
+        }
+    }
+
+    return {
+        {"found", i.found},
+        {"requested_stage", i.requested_stage},
+        {"requested_hash", i.requested_hash},
+        {"matched_stage", i.matched_stage},
+        {"pipeline_state", format_pointer(i.pipeline_state)},
+        {"bytecode", std::move(bytecode)},
     };
 }
 
@@ -300,6 +688,8 @@ json d3d12_snapshot_to_json(const render::D3D12Diagnostics::Snapshot& s, int max
         {"descriptor_heap_switches_this_frame", s.descriptor_heap_switches_this_frame},
         {"resource_barriers_this_frame", s.resource_barriers_this_frame},
         {"rtv_binds_this_frame", s.rtv_binds_this_frame},
+        {"root_binds_this_frame", s.root_binds_this_frame},
+        {"draw_events_this_frame", s.draw_events_this_frame},
         {"transient_heap_creations_this_frame", s.transient_heap_creations_this_frame},
         {"transient_resource_creations_this_frame", s.transient_resource_creations_this_frame},
         {"transient_resource_bytes_this_frame", s.transient_resource_bytes_this_frame},
@@ -317,6 +707,12 @@ json d3d12_snapshot_to_json(const render::D3D12Diagnostics::Snapshot& s, int max
     }
     result["heaps"] = std::move(heaps);
 
+    json root_signatures = json::array();
+    for (const auto& r : s.root_signatures) {
+        root_signatures.push_back(root_signature_to_json(r));
+    }
+    result["root_signatures"] = std::move(root_signatures);
+
     auto tail = [&](const auto& src, auto&& cb) {
         json arr = json::array();
         const size_t take = (max_events > 0 && static_cast<size_t>(max_events) < src.size())
@@ -329,6 +725,10 @@ json d3d12_snapshot_to_json(const render::D3D12Diagnostics::Snapshot& s, int max
     };
 
     result["recent_bindings"] = tail(s.recent_bindings, [](const auto& e) { return binding_to_json(e); });
+    result["recent_root_binds"] = tail(s.recent_root_binds, [](const auto& e) { return root_bind_to_json(e); });
+    result["recent_draw_events"] = tail(s.recent_draw_events, [](const auto& e) { return draw_event_to_json(e); });
+    result["gpu_timings"] = tail(s.gpu_timings, [](const auto& e) { return gpu_timing_to_json(e); });
+    result["symmetry_oracle"] = symmetry_oracle_to_json(s.recent_draw_events);
     result["recent_barriers"] = tail(s.recent_barriers, [](const auto& e) { return barrier_to_json(e); });
     result["recent_warnings"] = tail(s.recent_warnings, [](const auto& e) { return warning_to_json(e); });
     return result;
@@ -341,6 +741,7 @@ json shaders_snapshot_to_json(
 ) {
     json result{
         {"auto_reload", s.auto_reload},
+        {"runtime_overrides_enabled", s.runtime_overrides_enabled},
         {"frame", s.frame},
         {"global_override_dir", s.global_override_dir},
         {"profile_override_dir", s.profile_override_dir},
@@ -349,9 +750,11 @@ json shaders_snapshot_to_json(
         {"capture_next_d3d12_change_armed", s.capture_next_d3d12_change_armed},
         {"total_d3d12_pair_samples", s.total_d3d12_pair_samples},
         {"total_d3d12_pso_samples", s.total_d3d12_pso_samples},
+        {"d3d12_pso_churn", pso_churn_to_json(s.d3d12_pso_churn)},
         {"distinct_d3d12_pairs", json::array()},
         {"d3d12_pso_aggregates", json::array()},
         {"overrides", json::array()},
+        {"bind_overrides", json::array()},
         {"recent_events", json::array()},
     };
 
@@ -376,6 +779,9 @@ json shaders_snapshot_to_json(
 
     for (const auto& e : s.overrides) {
         result["overrides"].push_back(override_entry_to_json(e));
+    }
+    for (const auto& e : s.bind_overrides) {
+        result["bind_overrides"].push_back(bind_override_entry_to_json(e));
     }
     for (const auto& msg : s.recent_events) {
         result["recent_events"].push_back(msg);
@@ -498,6 +904,66 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_shaders_json(
     }
 }
 
+extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_shader_bytecode_json(
+    const char* stage,
+    const char* hash,
+    int disassemble,
+    int max_disassembly_chars
+) {
+    try {
+        if (hash == nullptr || *hash == '\0') {
+            return publish(json{{"found", false}, {"error", "hash is required"}});
+        }
+
+        const auto max_chars = max_disassembly_chars > 0
+            ? static_cast<size_t>(max_disassembly_chars)
+            : static_cast<size_t>(128 * 1024);
+
+        auto inspection = render::ShaderOverrideRegistry::get().inspect_d3d12_shader_bytecode(
+            stage != nullptr ? stage : "any",
+            hash,
+            disassemble != 0,
+            max_chars);
+
+        return publish(shader_bytecode_inspection_to_json(inspection));
+    } catch (const std::exception& e) {
+        return publish(json{{"error", e.what()}});
+    }
+}
+
+extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_hunter_capture_active_override_stub(int stage) {
+    try {
+        auto hunter_stage = render::ShaderOverrideRegistry::HunterStage::Pixel;
+        if (stage == 1) {
+            hunter_stage = render::ShaderOverrideRegistry::HunterStage::Vertex;
+        } else if (stage == 2) {
+            hunter_stage = render::ShaderOverrideRegistry::HunterStage::Compute;
+        }
+
+        std::filesystem::path manifest_path{};
+        std::filesystem::path source_path{};
+        std::string error{};
+        const bool ok = render::ShaderOverrideRegistry::get().hunter_capture_active_as_override_stub(
+            hunter_stage,
+            manifest_path,
+            source_path,
+            error);
+
+        if (!ok) {
+            return publish(json{{"ok", false}, {"error", error}});
+        }
+
+        return publish(json{
+            {"ok", true},
+            {"manifest_path", manifest_path.string()},
+            {"source_path", source_path.string()},
+            {"enabled", false},
+        });
+    } catch (const std::exception& e) {
+        return publish(json{{"ok", false}, {"error", e.what()}});
+    }
+}
+
 extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_preview_info_json() {
     try {
         auto& ri = *RenderInspector::get();
@@ -562,6 +1028,16 @@ extern "C" UEVR_RENDER_CAPI void uevr_render_diag_request_shader_reload() {
     }
 }
 
+extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_set_runtime_overrides_enabled(int enabled) {
+    try {
+        auto& registry = render::ShaderOverrideRegistry::get();
+        registry.set_runtime_overrides_enabled(enabled != 0);
+        return publish(json{{"ok", true}, {"runtime_overrides_enabled", registry.runtime_overrides_enabled()}});
+    } catch (const std::exception& e) {
+        return publish(json{{"ok", false}, {"error", e.what()}});
+    }
+}
+
 extern "C" UEVR_RENDER_CAPI void uevr_render_diag_capture_next_d3d12_change() {
     try {
         render::ShaderOverrideRegistry::get().request_capture_next_d3d12_change();
@@ -600,6 +1076,48 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_export_d3d12_pairs(int 
             return publish(json{{"ok", true}, {"path", path.string()}});
         }
         return publish(json{{"ok", false}, {"error", error}});
+    } catch (const std::exception& e) {
+        return publish(json{{"ok", false}, {"error", e.what()}});
+    }
+}
+
+extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_export_frame_pair_diff_json(int max_events) {
+    try {
+        if (g_framework == nullptr || !g_framework->is_ready()) {
+            return publish(json{{"ok", false}, {"error", "framework not ready"}});
+        }
+
+        const auto snapshot = render::D3D12Diagnostics::get().snapshot();
+        auto payload = d3d12_snapshot_to_json(snapshot, max_events > 0 ? max_events : 512);
+        payload["export_kind"] = "frame_pair_diff";
+        payload["export_note"] = "Left/right draw and binding diff from the recent D3D12 diagnostics ring";
+
+        const auto base = Framework::get_persistent_dir("render_inspector") / "frame_diffs";
+        std::error_code ec{};
+        std::filesystem::create_directories(base, ec);
+        if (ec) {
+            return publish(json{{"ok", false}, {"error", ec.message()}});
+        }
+
+        std::ostringstream name{};
+        name << "d3d12_frame_pair_diff_f" << snapshot.frame << ".json";
+        const auto path = base / name.str();
+
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            return publish(json{{"ok", false}, {"error", "failed to open output file"}, {"path", path.string()}});
+        }
+
+        file << payload.dump(2);
+        file.close();
+
+        return publish(json{
+            {"ok", true},
+            {"path", path.string()},
+            {"frame", snapshot.frame},
+            {"draw_events", snapshot.recent_draw_events.size()},
+            {"root_binds", snapshot.recent_root_binds.size()},
+        });
     } catch (const std::exception& e) {
         return publish(json{{"ok", false}, {"error", e.what()}});
     }

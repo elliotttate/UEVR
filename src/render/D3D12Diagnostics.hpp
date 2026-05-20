@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -14,6 +15,10 @@
 namespace render {
 class D3D12Diagnostics {
 public:
+    static constexpr size_t MAX_ROOT_BIND_SLOTS = 32;
+    using RootSlotArray = std::array<uintptr_t, MAX_ROOT_BIND_SLOTS>;
+    using RootHashArray = std::array<uint64_t, MAX_ROOT_BIND_SLOTS>;
+
     struct HeapInfo {
         uintptr_t pointer{};
         std::string name{};
@@ -47,6 +52,47 @@ public:
         std::string descriptor_type{};
     };
 
+    struct RootDescriptorRangeInfo {
+        std::string type{};
+        uint32_t base_shader_register{};
+        uint32_t num_descriptors{};
+        uint32_t register_space{};
+        uint32_t offset_from_table_start{};
+    };
+
+    struct RootParameterInfo {
+        uint32_t index{};
+        std::string parameter_type{};
+        std::string visibility{};
+        uint32_t shader_register{};
+        uint32_t register_space{};
+        uint32_t num_32bit_values{};
+        std::vector<RootDescriptorRangeInfo> ranges{};
+    };
+
+    struct RootSignatureInfo {
+        uintptr_t pointer{};
+        uint64_t first_seen_frame{};
+        uint64_t last_seen_frame{};
+        uint32_t blob_size{};
+        std::string version{};
+        std::string flags{};
+        uint32_t static_sampler_count{};
+        std::vector<RootParameterInfo> parameters{};
+        std::string decode_error{};
+    };
+
+    struct DescriptorReadInfo {
+        uint32_t root_parameter{};
+        uint32_t descriptor_index{};
+        uintptr_t descriptor_cpu{};
+        uintptr_t resource{};
+        std::string descriptor_type{};
+        uint64_t producer_frame{};
+        uint64_t producer_draw{};
+        uintptr_t producer_pso{};
+    };
+
     struct BindingEvent {
         uint64_t frame{};
         std::string source{};
@@ -62,6 +108,67 @@ public:
         uint64_t frame{};
         std::string source{};
         std::string message{};
+    };
+
+    struct RootBindEvent {
+        uint64_t frame{};
+        uint64_t sequence{};
+        std::string source{};
+        std::string pipeline{};
+        std::string kind{};
+        uintptr_t command_list{};
+        uintptr_t pipeline_state{};
+        int32_t eye_bucket{-1};
+        uint32_t root_parameter{};
+        uintptr_t value{};
+        uint32_t value_count{};
+        uint64_t value_hash{};
+    };
+
+    struct DrawEvent {
+        uint64_t frame{};
+        uint64_t draw_index{};
+        std::string source{};
+        std::string kind{};
+        uintptr_t command_list{};
+        uintptr_t pipeline_state{};
+        uintptr_t root_signature{};
+        int32_t eye_bucket{-1};
+        uint32_t arg0{};
+        uint32_t arg1{};
+        uint32_t arg2{};
+        int32_t arg3{};
+        uint32_t arg4{};
+        uintptr_t rtv0{};
+        uintptr_t rtv0_resource{};
+        uint64_t prior_rtv0_producer_frame{};
+        uint64_t prior_rtv0_producer_draw{};
+        uintptr_t prior_rtv0_producer_pso{};
+        RootSlotArray graphics_root_descriptor_tables{};
+        RootSlotArray compute_root_descriptor_tables{};
+        RootSlotArray graphics_root_cbvs{};
+        RootSlotArray compute_root_cbvs{};
+        RootSlotArray graphics_root_srvs{};
+        RootSlotArray compute_root_srvs{};
+        RootSlotArray graphics_root_uavs{};
+        RootSlotArray compute_root_uavs{};
+        RootHashArray graphics_root_cbv_hash{};
+        RootHashArray compute_root_cbv_hash{};
+        RootHashArray graphics_root_constants_hash{};
+        RootHashArray compute_root_constants_hash{};
+        RootHashArray graphics_root_descriptor_table_resource_hash{};
+        RootHashArray compute_root_descriptor_table_resource_hash{};
+        std::vector<DescriptorReadInfo> descriptor_reads{};
+    };
+
+    struct GpuTimingInfo {
+        uintptr_t pipeline_state{};
+        std::string kind{};
+        int32_t eye_bucket{-1};
+        uint64_t samples{};
+        double avg_ms{};
+        double max_ms{};
+        uint64_t last_frame{};
     };
 
     struct CurrentBindContext {
@@ -90,6 +197,8 @@ public:
         uint32_t descriptor_heap_switches_this_frame{};
         uint32_t resource_barriers_this_frame{};
         uint32_t rtv_binds_this_frame{};
+        uint32_t root_binds_this_frame{};
+        uint32_t draw_events_this_frame{};
         uint32_t transient_heap_creations_this_frame{};
         uint32_t transient_resource_creations_this_frame{};
         uint64_t transient_resource_bytes_this_frame{};
@@ -97,7 +206,11 @@ public:
         uint64_t tracked_transient_resource_bytes_total{};
         std::optional<CurrentBindContext> current_bind_context{};
         std::vector<HeapInfo> heaps{};
+        std::vector<RootSignatureInfo> root_signatures{};
         std::vector<BindingEvent> recent_bindings{};
+        std::vector<RootBindEvent> recent_root_binds{};
+        std::vector<DrawEvent> recent_draw_events{};
+        std::vector<GpuTimingInfo> gpu_timings{};
         std::vector<BarrierEvent> recent_barriers{};
         std::vector<WarningEvent> recent_warnings{};
     };
@@ -148,6 +261,39 @@ public:
         std::string_view name = {}
     );
 
+    void register_srv_descriptor(
+        std::string_view source,
+        ID3D12Resource* resource,
+        D3D12_CPU_DESCRIPTOR_HANDLE handle,
+        std::string_view name = {}
+    );
+
+    void register_uav_descriptor(
+        std::string_view source,
+        ID3D12Resource* resource,
+        D3D12_CPU_DESCRIPTOR_HANDLE handle,
+        std::string_view name = {}
+    );
+
+    void record_descriptor_copy(
+        std::string_view source,
+        D3D12_CPU_DESCRIPTOR_HANDLE dst,
+        D3D12_CPU_DESCRIPTOR_HANDLE src
+    );
+
+    void register_root_signature(
+        std::string_view source,
+        ID3D12RootSignature* root_signature,
+        const void* blob,
+        size_t blob_size
+    );
+
+    void register_pipeline_root_signature(
+        std::string_view source,
+        ID3D12PipelineState* pipeline_state,
+        ID3D12RootSignature* root_signature
+    );
+
     void record_descriptor_heaps_set(
         std::string_view source,
         uint32_t count,
@@ -165,6 +311,61 @@ public:
         uint32_t rtv_count,
         const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs,
         const D3D12_CPU_DESCRIPTOR_HANDLE* dsv
+    );
+
+    void record_root_bind(
+        std::string_view source,
+        uintptr_t command_list,
+        uintptr_t pipeline_state,
+        int32_t eye_bucket,
+        std::string_view pipeline,
+        std::string_view kind,
+        uint32_t root_parameter,
+        uintptr_t value,
+        uint32_t value_count = 0,
+        uint64_t value_hash = 0
+    );
+
+    void record_draw_event(
+        std::string_view source,
+        std::string_view kind,
+        uintptr_t command_list,
+        uintptr_t pipeline_state,
+        int32_t eye_bucket,
+        uint32_t arg0,
+        uint32_t arg1,
+        uint32_t arg2,
+        int32_t arg3,
+        uint32_t arg4,
+        uintptr_t rtv0,
+        const RootSlotArray& graphics_root_descriptor_tables,
+        const RootSlotArray& compute_root_descriptor_tables,
+        const RootSlotArray& graphics_root_cbvs,
+        const RootSlotArray& compute_root_cbvs,
+        const RootSlotArray& graphics_root_srvs,
+        const RootSlotArray& compute_root_srvs,
+        const RootSlotArray& graphics_root_uavs,
+        const RootSlotArray& compute_root_uavs,
+        const RootHashArray& graphics_root_cbv_hash,
+        const RootHashArray& compute_root_cbv_hash,
+        const RootHashArray& graphics_root_constants_hash,
+        const RootHashArray& compute_root_constants_hash,
+        const RootHashArray& graphics_root_descriptor_table_resource_hash,
+        const RootHashArray& compute_root_descriptor_table_resource_hash,
+        const std::vector<DescriptorReadInfo>& descriptor_reads
+    );
+
+    std::optional<DescriptorReadInfo> resolve_descriptor_read(
+        uint32_t root_parameter,
+        uint32_t descriptor_index,
+        D3D12_CPU_DESCRIPTOR_HANDLE descriptor
+    ) const;
+
+    void record_gpu_timing_sample(
+        std::string_view source,
+        uintptr_t pipeline_state,
+        int32_t eye_bucket,
+        double milliseconds
     );
 
     Snapshot snapshot() const;
@@ -195,6 +396,23 @@ private:
         uint64_t last_seen_frame{};
     };
 
+    struct ResourceProducerInfo {
+        uint64_t frame{};
+        uint64_t draw_index{};
+        uintptr_t pipeline_state{};
+        uintptr_t command_list{};
+    };
+
+    struct GpuTimingAggregate {
+        uintptr_t pipeline_state{};
+        std::string kind{};
+        int32_t eye_bucket{-1};
+        uint64_t samples{};
+        double total_ms{};
+        double max_ms{};
+        uint64_t last_frame{};
+    };
+
     void push_warning(std::string_view source, std::string message);
     void note_frame_warning_if_needed();
     void clear_state_locked();
@@ -205,7 +423,15 @@ private:
     std::unordered_map<uintptr_t, ResourceInfo> m_resources{};
     std::unordered_map<uintptr_t, DescriptorInfo> m_rtv_descriptors{};
     std::unordered_map<uintptr_t, DescriptorInfo> m_dsv_descriptors{};
+    std::unordered_map<uintptr_t, DescriptorInfo> m_srv_descriptors{};
+    std::unordered_map<uintptr_t, DescriptorInfo> m_uav_descriptors{};
+    std::unordered_map<uintptr_t, RootSignatureInfo> m_root_signatures{};
+    std::unordered_map<uintptr_t, uintptr_t> m_pso_root_signatures{};
+    std::unordered_map<uintptr_t, ResourceProducerInfo> m_last_resource_writes{};
+    std::unordered_map<std::string, GpuTimingAggregate> m_gpu_timings{};
     std::vector<BindingEvent> m_recent_bindings{};
+    std::vector<RootBindEvent> m_recent_root_binds{};
+    std::vector<DrawEvent> m_recent_draw_events{};
     std::vector<BarrierEvent> m_recent_barriers{};
     std::vector<WarningEvent> m_recent_warnings{};
     std::optional<CurrentBindContext> m_current_bind_context{};
@@ -226,6 +452,9 @@ private:
     uint32_t m_descriptor_heap_switches_this_frame{};
     uint32_t m_resource_barriers_this_frame{};
     uint32_t m_rtv_binds_this_frame{};
+    uint32_t m_root_binds_this_frame{};
+    uint32_t m_draw_events_this_frame{};
+    uint64_t m_root_bind_sequence{};
     uint32_t m_transient_heap_creations_this_frame{};
     uint32_t m_transient_resource_creations_this_frame{};
     uint64_t m_transient_resource_bytes_this_frame{};

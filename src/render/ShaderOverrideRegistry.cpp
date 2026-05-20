@@ -125,6 +125,12 @@ std::string stage_to_string(render::ShaderOverrideRegistry::Stage stage) {
         return "vs";
     case render::ShaderOverrideRegistry::Stage::Pixel:
         return "ps";
+    case render::ShaderOverrideRegistry::Stage::Compute:
+        return "cs";
+    case render::ShaderOverrideRegistry::Stage::Amplification:
+        return "as";
+    case render::ShaderOverrideRegistry::Stage::Mesh:
+        return "ms";
     default:
         return "unknown";
     }
@@ -177,6 +183,18 @@ std::optional<render::ShaderOverrideRegistry::Stage> parse_stage(std::string_vie
 
     if (_stricmp(value.data(), "ps") == 0 || _stricmp(value.data(), "pixel") == 0) {
         return render::ShaderOverrideRegistry::Stage::Pixel;
+    }
+
+    if (_stricmp(value.data(), "cs") == 0 || _stricmp(value.data(), "compute") == 0) {
+        return render::ShaderOverrideRegistry::Stage::Compute;
+    }
+
+    if (_stricmp(value.data(), "as") == 0 || _stricmp(value.data(), "amplification") == 0) {
+        return render::ShaderOverrideRegistry::Stage::Amplification;
+    }
+
+    if (_stricmp(value.data(), "ms") == 0 || _stricmp(value.data(), "mesh") == 0) {
+        return render::ShaderOverrideRegistry::Stage::Mesh;
     }
 
     return std::nullopt;
@@ -258,7 +276,14 @@ const std::unordered_set<std::string>& shader_hunter_suppression_blocklist() {
 
 std::string default_profile(render::ShaderOverrideRegistry::Backend backend, render::ShaderOverrideRegistry::Stage stage) {
     if (backend == render::ShaderOverrideRegistry::Backend::D3D12) {
-        return stage == render::ShaderOverrideRegistry::Stage::Vertex ? "vs_6_0" : "ps_6_0";
+        switch (stage) {
+        case render::ShaderOverrideRegistry::Stage::Vertex: return "vs_6_0";
+        case render::ShaderOverrideRegistry::Stage::Pixel: return "ps_6_0";
+        case render::ShaderOverrideRegistry::Stage::Compute: return "cs_6_0";
+        case render::ShaderOverrideRegistry::Stage::Amplification: return "as_6_5";
+        case render::ShaderOverrideRegistry::Stage::Mesh: return "ms_6_5";
+        default: return "ps_6_0";
+        }
     }
 
     return stage == render::ShaderOverrideRegistry::Stage::Vertex ? "vs_5_0" : "ps_5_0";
@@ -284,9 +309,70 @@ std::string source_kind_to_string(render::ShaderOverrideRegistry::OverrideSource
         return "bytecode";
     case render::ShaderOverrideRegistry::OverrideSourceKind::DxilPatch:
         return "dxil_patch";
+    case render::ShaderOverrideRegistry::OverrideSourceKind::DxilTextPatch:
+        return "dxil_text_patch";
+    case render::ShaderOverrideRegistry::OverrideSourceKind::ContainerPatch:
+        return "container_patch";
+    case render::ShaderOverrideRegistry::OverrideSourceKind::DxilTransform:
+        return "dxil_transform";
     default:
         return "unknown";
     }
+}
+
+std::string eye_target_to_string(render::ShaderOverrideRegistry::EyeTarget eye) {
+    switch (eye) {
+    case render::ShaderOverrideRegistry::EyeTarget::Any: return "any";
+    case render::ShaderOverrideRegistry::EyeTarget::Unknown: return "unknown";
+    case render::ShaderOverrideRegistry::EyeTarget::Left: return "left";
+    case render::ShaderOverrideRegistry::EyeTarget::Right: return "right";
+    case render::ShaderOverrideRegistry::EyeTarget::Full: return "full";
+    case render::ShaderOverrideRegistry::EyeTarget::Multi: return "multi";
+    default: return "any";
+    }
+}
+
+std::optional<render::ShaderOverrideRegistry::EyeTarget> parse_eye_target(std::string_view value) {
+    if (value.empty() || _stricmp(value.data(), "any") == 0 || _stricmp(value.data(), "both") == 0) {
+        return render::ShaderOverrideRegistry::EyeTarget::Any;
+    }
+    if (_stricmp(value.data(), "unknown") == 0) return render::ShaderOverrideRegistry::EyeTarget::Unknown;
+    if (_stricmp(value.data(), "left") == 0 || _stricmp(value.data(), "l") == 0) return render::ShaderOverrideRegistry::EyeTarget::Left;
+    if (_stricmp(value.data(), "right") == 0 || _stricmp(value.data(), "r") == 0) return render::ShaderOverrideRegistry::EyeTarget::Right;
+    if (_stricmp(value.data(), "full") == 0) return render::ShaderOverrideRegistry::EyeTarget::Full;
+    if (_stricmp(value.data(), "multi") == 0) return render::ShaderOverrideRegistry::EyeTarget::Multi;
+    return std::nullopt;
+}
+
+render::ShaderOverrideRegistry::EyeTarget eye_bucket_to_target(int eye_bucket) {
+    switch (eye_bucket) {
+    case 0: return render::ShaderOverrideRegistry::EyeTarget::Unknown;
+    case 1: return render::ShaderOverrideRegistry::EyeTarget::Left;
+    case 2: return render::ShaderOverrideRegistry::EyeTarget::Right;
+    case 3: return render::ShaderOverrideRegistry::EyeTarget::Full;
+    case 4: return render::ShaderOverrideRegistry::EyeTarget::Multi;
+    default: return render::ShaderOverrideRegistry::EyeTarget::Unknown;
+    }
+}
+
+std::string bind_override_kind_to_string(render::ShaderOverrideRegistry::BindOverrideKind kind) {
+    switch (kind) {
+    case render::ShaderOverrideRegistry::BindOverrideKind::Cbv: return "cbv";
+    case render::ShaderOverrideRegistry::BindOverrideKind::RootConstants: return "root_constants";
+    default: return "unknown";
+    }
+}
+
+std::optional<render::ShaderOverrideRegistry::BindOverrideKind> parse_bind_override_kind(std::string_view value) {
+    if (_stricmp(value.data(), "cbv") == 0 || _stricmp(value.data(), "constant_buffer") == 0) {
+        return render::ShaderOverrideRegistry::BindOverrideKind::Cbv;
+    }
+    if (_stricmp(value.data(), "constants") == 0 ||
+        _stricmp(value.data(), "root_constants") == 0 ||
+        _stricmp(value.data(), "32bit_constants") == 0) {
+        return render::ShaderOverrideRegistry::BindOverrideKind::RootConstants;
+    }
+    return std::nullopt;
 }
 
 std::filesystem::file_time_type file_write_time_or_empty(const std::filesystem::path& path) {
@@ -360,6 +446,56 @@ bool write_binary_file(const std::filesystem::path& path, const void* data, size
     }
 
     return true;
+}
+
+std::vector<uint32_t> json_u32_array(const json& value) {
+    std::vector<uint32_t> out{};
+    if (!value.is_array()) {
+        return out;
+    }
+
+    out.reserve(value.size());
+    for (const auto& item : value) {
+        if (item.is_number_unsigned()) {
+            out.emplace_back(item.get<uint32_t>());
+        } else if (item.is_number_integer()) {
+            out.emplace_back(static_cast<uint32_t>(item.get<int64_t>()));
+        } else if (item.is_string()) {
+            const auto raw = item.get<std::string>();
+            out.emplace_back(static_cast<uint32_t>(std::stoul(raw, nullptr, raw.starts_with("0x") || raw.starts_with("0X") ? 16 : 10)));
+        }
+    }
+
+    return out;
+}
+
+std::vector<uint8_t> u32_vector_to_bytes(const std::vector<uint32_t>& values) {
+    std::vector<uint8_t> bytes(values.size() * sizeof(uint32_t));
+    if (!values.empty()) {
+        std::memcpy(bytes.data(), values.data(), bytes.size());
+    }
+    return bytes;
+}
+
+std::vector<uint8_t> hex_string_to_bytes(std::string value) {
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0 || ch == ',' || ch == '_' || ch == '-';
+    }), value.end());
+
+    if (value.starts_with("0x") || value.starts_with("0X")) {
+        value.erase(0, 2);
+    }
+
+    if ((value.size() % 2) != 0) {
+        value.insert(value.begin(), '0');
+    }
+
+    std::vector<uint8_t> bytes{};
+    bytes.reserve(value.size() / 2);
+    for (size_t i = 0; i + 1 < value.size(); i += 2) {
+        bytes.emplace_back(static_cast<uint8_t>(std::stoul(value.substr(i, 2), nullptr, 16)));
+    }
+    return bytes;
 }
 
 std::filesystem::path current_module_dir() {
@@ -969,6 +1105,19 @@ void ShaderOverrideRegistry::on_present(Framework&) {
     std::scoped_lock _{m_mutex};
     ++m_frame;
 
+    m_recent_d3d12_pso_churn.push_back(D3D12PsoChurnFrameInfo{
+        m_frame,
+        m_d3d12_graphics_pso_creations_this_frame,
+        m_d3d12_compute_pso_creations_this_frame,
+        m_d3d12_stream_pso_creations_this_frame
+    });
+    if (m_recent_d3d12_pso_churn.size() > 120) {
+        m_recent_d3d12_pso_churn.erase(m_recent_d3d12_pso_churn.begin());
+    }
+    m_d3d12_graphics_pso_creations_this_frame = 0;
+    m_d3d12_compute_pso_creations_this_frame = 0;
+    m_d3d12_stream_pso_creations_this_frame = 0;
+
     // === ShaderHunter periodic stats dump ===
     // Every 120 frames (~2s at 60fps), log hook-firing counters so we can tell
     // whether draw-skip is actually reaching the GPU. If draw_hits stays at
@@ -1054,6 +1203,19 @@ bool ShaderOverrideRegistry::should_record_d3d12_pipeline_creations() const {
 void ShaderOverrideRegistry::request_reload() {
     std::scoped_lock _{m_mutex};
     m_force_reload = true;
+}
+
+void ShaderOverrideRegistry::set_runtime_overrides_enabled(bool enabled) {
+    m_runtime_overrides_enabled.store(enabled, std::memory_order_relaxed);
+    std::scoped_lock _{m_mutex};
+    for (auto& [_, record] : m_d3d12_graphics_pso_records) {
+        record.logged_substitution = false;
+    }
+    push_event(enabled ? "Runtime shader overrides enabled" : "Runtime shader overrides disabled");
+}
+
+bool ShaderOverrideRegistry::runtime_overrides_enabled() const {
+    return m_runtime_overrides_enabled.load(std::memory_order_relaxed);
 }
 
 void ShaderOverrideRegistry::request_capture_next_d3d12_change() {
@@ -1200,10 +1362,100 @@ bool ShaderOverrideRegistry::export_d3d12_pairs_csv(std::filesystem::path& out_p
     }
 }
 
+ShaderOverrideRegistry::D3D12ShaderBytecodeInspection ShaderOverrideRegistry::inspect_d3d12_shader_bytecode(
+    std::string_view stage,
+    std::string_view hash,
+    bool disassemble,
+    size_t max_disassembly_chars
+) const {
+    D3D12ShaderBytecodeInspection result{};
+    result.requested_stage = std::string{stage};
+    result.requested_hash = std::string{hash};
+    const std::string requested_hash{hash};
+
+    auto normalized_stage = std::string{stage};
+    std::transform(normalized_stage.begin(), normalized_stage.end(), normalized_stage.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+
+    std::vector<uint8_t> bytecode{};
+
+    {
+        std::scoped_lock _{m_mutex};
+
+        auto match_stage = [&](const D3D12GraphicsPsoRecord& record, const char* stage_name, const std::string& candidate_hash, const std::vector<uint8_t>& candidate_bytecode) {
+            if (result.found || candidate_hash.empty() || candidate_bytecode.empty()) {
+                return;
+            }
+
+            const bool stage_matches =
+                normalized_stage.empty() ||
+                normalized_stage == "any" ||
+                normalized_stage == stage_name ||
+                (normalized_stage == "vertex" && std::strcmp(stage_name, "vs") == 0) ||
+                (normalized_stage == "pixel" && std::strcmp(stage_name, "ps") == 0) ||
+                (normalized_stage == "compute" && std::strcmp(stage_name, "cs") == 0) ||
+                (normalized_stage == "amplification" && std::strcmp(stage_name, "as") == 0) ||
+                (normalized_stage == "mesh" && std::strcmp(stage_name, "ms") == 0);
+
+            if (!stage_matches || candidate_hash != requested_hash) {
+                return;
+            }
+
+            result.found = true;
+            result.matched_stage = stage_name;
+            result.pipeline_state = record.pipeline_state_pointer;
+            bytecode = candidate_bytecode;
+        };
+
+        for (const auto& [_, record] : m_d3d12_graphics_pso_records) {
+            const auto& vs = record.is_pipeline_stream ? record.owned_stream.vertex_shader : record.owned_desc.vertex_shader;
+            const auto& ps = record.is_pipeline_stream ? record.owned_stream.pixel_shader : record.owned_desc.pixel_shader;
+            const auto& ds = record.is_pipeline_stream ? record.owned_stream.domain_shader : record.owned_desc.domain_shader;
+            const auto& hs = record.is_pipeline_stream ? record.owned_stream.hull_shader : record.owned_desc.hull_shader;
+            const auto& gs = record.is_pipeline_stream ? record.owned_stream.geometry_shader : record.owned_desc.geometry_shader;
+
+            match_stage(record, "vs", record.vertex_hash, vs);
+            match_stage(record, "ps", record.pixel_hash, ps);
+            match_stage(record, "cs", record.compute_hash, record.owned_stream.compute_shader);
+            match_stage(record, "as", record.amplification_hash, record.owned_stream.amplification_shader);
+            match_stage(record, "ms", record.mesh_hash, record.owned_stream.mesh_shader);
+
+            // These stages are not currently surfaced as hashes in the UI, but
+            // allow stage=any lookups by recomputing when needed.
+            if (!result.found && (normalized_stage.empty() || normalized_stage == "any" || normalized_stage == "ds")) {
+                const auto ds_hash = hash_shader_bytecode(ds.data(), ds.size());
+                match_stage(record, "ds", ds_hash, ds);
+            }
+            if (!result.found && (normalized_stage.empty() || normalized_stage == "any" || normalized_stage == "hs")) {
+                const auto hs_hash = hash_shader_bytecode(hs.data(), hs.size());
+                match_stage(record, "hs", hs_hash, hs);
+            }
+            if (!result.found && (normalized_stage.empty() || normalized_stage == "any" || normalized_stage == "gs")) {
+                const auto gs_hash = hash_shader_bytecode(gs.data(), gs.size());
+                match_stage(record, "gs", gs_hash, gs);
+            }
+
+            if (result.found) {
+                break;
+            }
+        }
+    }
+
+    if (!result.found) {
+        result.bytecode.error = "No tracked D3D12 shader bytecode matched the requested stage/hash";
+        return result;
+    }
+
+    result.bytecode = inspect_shader_bytecode(bytecode.data(), bytecode.size(), disassemble, max_disassembly_chars);
+    return result;
+}
+
 ShaderOverrideRegistry::Snapshot ShaderOverrideRegistry::snapshot() const {
     std::scoped_lock _{m_mutex};
 
     Snapshot out{};
+    out.runtime_overrides_enabled = m_runtime_overrides_enabled.load(std::memory_order_relaxed);
     out.frame = m_frame;
     out.global_override_dir = global_override_dir().string();
     out.profile_override_dir = profile_override_dir().string();
@@ -1216,6 +1468,18 @@ ShaderOverrideRegistry::Snapshot ShaderOverrideRegistry::snapshot() const {
     out.distinct_d3d12_pairs = m_distinct_d3d12_pairs;
     out.total_d3d12_pso_samples = m_total_d3d12_pso_samples;
     out.recent_events = m_recent_events;
+
+    out.d3d12_pso_churn.tracked_pso_count = m_d3d12_graphics_pso_records.size();
+    out.d3d12_pso_churn.current_frame_graphics_creations = m_d3d12_graphics_pso_creations_this_frame;
+    out.d3d12_pso_churn.current_frame_compute_creations = m_d3d12_compute_pso_creations_this_frame;
+    out.d3d12_pso_churn.current_frame_stream_creations = m_d3d12_stream_pso_creations_this_frame;
+    out.d3d12_pso_churn.recent_window_frames = m_recent_d3d12_pso_churn.size();
+    out.d3d12_pso_churn.recent_frames = m_recent_d3d12_pso_churn;
+    for (const auto& frame : m_recent_d3d12_pso_churn) {
+        out.d3d12_pso_churn.recent_graphics_creations += frame.graphics_creations;
+        out.d3d12_pso_churn.recent_compute_creations += frame.compute_creations;
+        out.d3d12_pso_churn.recent_stream_creations += frame.stream_creations;
+    }
 
     out.d3d12_pso_aggregates.reserve(m_d3d12_pso_aggregates.size());
     for (const auto& [_, aggregate] : m_d3d12_pso_aggregates) {
@@ -1293,6 +1557,7 @@ ShaderOverrideRegistry::Snapshot ShaderOverrideRegistry::snapshot() const {
         info.compiled = entry.compiled;
         info.apply_supported = entry.apply_supported;
         info.from_profile_dir = entry.from_profile_dir;
+        info.per_eye_variants = entry.per_eye_variants;
         info.generation = entry.generation;
         info.status = entry.status;
         info.compiler = entry.compiler;
@@ -1308,6 +1573,36 @@ ShaderOverrideRegistry::Snapshot ShaderOverrideRegistry::snapshot() const {
             return lhs.stage < rhs.stage;
         }
         return lhs.target_hash < rhs.target_hash;
+    });
+
+    out.bind_overrides.reserve(m_bind_overrides.size());
+    for (const auto& [_, entry] : m_bind_overrides) {
+        BindOverrideEntryInfo info{};
+        info.key = entry.key;
+        info.name = entry.name;
+        info.target_hash = entry.target_hash;
+        info.stage = entry.any_stage ? "any" : stage_to_string(entry.stage);
+        info.pipeline = entry.graphics && entry.compute ? "any" : (entry.graphics ? "graphics" : "compute");
+        info.eye = eye_target_to_string(entry.eye);
+        info.kind = bind_override_kind_to_string(entry.kind);
+        info.root_parameter = entry.root_parameter;
+        info.value_count = entry.kind == BindOverrideKind::RootConstants
+            ? static_cast<uint32_t>(entry.constants.size())
+            : static_cast<uint32_t>(entry.cbv_data.size());
+        info.dest_offset = entry.dest_offset;
+        info.enabled = entry.enabled;
+        info.from_profile_dir = entry.from_profile_dir;
+        info.manifest_path = entry.manifest_path.string();
+        info.status = entry.status;
+        info.last_error = entry.last_error;
+        out.bind_overrides.emplace_back(std::move(info));
+    }
+
+    std::sort(out.bind_overrides.begin(), out.bind_overrides.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.enabled != rhs.enabled) {
+            return lhs.enabled > rhs.enabled;
+        }
+        return lhs.key < rhs.key;
     });
 
     return out;
@@ -1350,6 +1645,10 @@ ID3D11VertexShader* ShaderOverrideRegistry::resolve_d3d11_vertex_shader(ID3D11De
         return shader;
     }
 
+    if (!m_runtime_overrides_enabled.load(std::memory_order_relaxed)) {
+        return shader;
+    }
+
     std::scoped_lock _{m_mutex};
 
     if (shader == nullptr) {
@@ -1373,6 +1672,10 @@ ID3D11VertexShader* ShaderOverrideRegistry::resolve_d3d11_vertex_shader(ID3D11De
 
 ID3D11PixelShader* ShaderOverrideRegistry::resolve_d3d11_pixel_shader(ID3D11Device* device, ID3D11PixelShader* shader) {
     if (!should_track_d3d11_shaders()) {
+        return shader;
+    }
+
+    if (!m_runtime_overrides_enabled.load(std::memory_order_relaxed)) {
         return shader;
     }
 
@@ -1460,6 +1763,7 @@ void ShaderOverrideRegistry::register_d3d12_graphics_pipeline_state_creation(
     record.is_pipeline_stream = false;
     record.tracking_note.clear();
     record.owned_stream = {};
+    record.compute_desc = {};
     record.owned_desc.desc = *desc;
     record.owned_desc.root_signature = desc->pRootSignature;
     record.owned_desc.vertex_shader = copy_shader_bytecode_blob(desc->VS);
@@ -1517,6 +1821,7 @@ void ShaderOverrideRegistry::register_d3d12_graphics_pipeline_state_creation(
     record.mesh_crc32 = 0;
     record.last_seen_frame = m_frame;
     if (record.first_seen_frame == 0) {
+        ++m_d3d12_graphics_pso_creations_this_frame;
         record.first_seen_frame = m_frame;
         record.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
         if (verbose_pso_logging_enabled()) {
@@ -1560,8 +1865,12 @@ void ShaderOverrideRegistry::register_d3d12_compute_pipeline_state_creation(
     record.tracking_note = "compute pso";
     record.last_error.clear();
     record.override_pipeline_state.Reset();
+    record.override_pipeline_state_left.Reset();
+    record.override_pipeline_state_right.Reset();
     record.owned_desc = {};
     record.owned_stream = {};
+    record.compute_desc = {};
+    record.compute_desc = *desc;
     record.owned_stream.root_signature = desc->pRootSignature;
     record.owned_stream.compute_shader = copy_shader_bytecode_blob(desc->CS);
     record.vertex_hash.clear();
@@ -1578,6 +1887,7 @@ void ShaderOverrideRegistry::register_d3d12_compute_pipeline_state_creation(
     record.last_seen_frame = m_frame;
 
     if (record.first_seen_frame == 0) {
+        ++m_d3d12_compute_pso_creations_this_frame;
         record.first_seen_frame = m_frame;
         record.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
         if (verbose_pso_logging_enabled()) {
@@ -1646,6 +1956,7 @@ void ShaderOverrideRegistry::register_d3d12_pipeline_state_stream_creation(
     record.last_seen_frame = m_frame;
 
     if (record.first_seen_frame == 0) {
+        ++m_d3d12_stream_pso_creations_this_frame;
         record.first_seen_frame = m_frame;
         record.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
         if (verbose_pso_logging_enabled()) {
@@ -1682,6 +1993,10 @@ ID3D12PipelineState* ShaderOverrideRegistry::resolve_d3d12_pipeline_state(ID3D12
         return pipeline_state;
     }
 
+    if (!m_runtime_overrides_enabled.load(std::memory_order_relaxed)) {
+        return pipeline_state;
+    }
+
     std::scoped_lock _{m_mutex};
 
     if (pipeline_state == nullptr) {
@@ -1711,6 +2026,142 @@ ID3D12PipelineState* ShaderOverrideRegistry::resolve_d3d12_pipeline_state(ID3D12
     }
 
     return pipeline_state;
+}
+
+ID3D12PipelineState* ShaderOverrideRegistry::resolve_d3d12_pipeline_state_for_eye(ID3D12PipelineState* pipeline_state, int eye_bucket) {
+    if (!should_track_d3d12_pipelines() || !m_runtime_overrides_enabled.load(std::memory_order_relaxed)) {
+        return pipeline_state;
+    }
+
+    std::scoped_lock _{m_mutex};
+
+    const auto it = m_d3d12_graphics_pso_records.find(reinterpret_cast<uintptr_t>(pipeline_state));
+    if (it == m_d3d12_graphics_pso_records.end()) {
+        return pipeline_state;
+    }
+
+    auto& record = it->second;
+    update_d3d12_override_pipeline_state(record);
+
+    if (eye_bucket == 1 && record.override_pipeline_state_left != nullptr) {
+        return record.override_pipeline_state_left.Get();
+    }
+
+    if (eye_bucket == 2 && record.override_pipeline_state_right != nullptr) {
+        return record.override_pipeline_state_right.Get();
+    }
+
+    if (record.override_active && record.override_pipeline_state != nullptr) {
+        return record.override_pipeline_state.Get();
+    }
+
+    return pipeline_state;
+}
+
+bool ShaderOverrideRegistry::record_matches_bind_override(const D3D12GraphicsPsoRecord& record, const BindOverrideEntry& entry) const {
+    auto crc_matches = [](uint32_t crc, const std::string& target) {
+        if (crc == 0 || target.size() != 8) {
+            return false;
+        }
+        char buf[16]{};
+        std::snprintf(buf, sizeof(buf), "%08x", crc);
+        return _stricmp(buf, target.c_str()) == 0;
+    };
+
+    auto stage_matches = [&](Stage stage) {
+        switch (stage) {
+        case Stage::Vertex:
+            return record.vertex_hash == entry.target_hash || crc_matches(record.vertex_crc32, entry.target_hash);
+        case Stage::Pixel:
+            return record.pixel_hash == entry.target_hash || crc_matches(record.pixel_crc32, entry.target_hash);
+        case Stage::Compute:
+            return record.compute_hash == entry.target_hash || crc_matches(record.compute_crc32, entry.target_hash);
+        case Stage::Amplification:
+            return record.amplification_hash == entry.target_hash || crc_matches(record.amplification_crc32, entry.target_hash);
+        case Stage::Mesh:
+            return record.mesh_hash == entry.target_hash || crc_matches(record.mesh_crc32, entry.target_hash);
+        default:
+            return false;
+        }
+    };
+
+    if (!entry.any_stage) {
+        return stage_matches(entry.stage);
+    }
+
+    return stage_matches(Stage::Vertex) ||
+        stage_matches(Stage::Pixel) ||
+        stage_matches(Stage::Compute) ||
+        stage_matches(Stage::Amplification) ||
+        stage_matches(Stage::Mesh);
+}
+
+std::optional<ShaderOverrideRegistry::D3D12CbvBindOverride> ShaderOverrideRegistry::resolve_d3d12_cbv_bind_override(
+    bool graphics,
+    uintptr_t pipeline_state,
+    int eye_bucket,
+    uint32_t root_parameter
+) const {
+    if (pipeline_state == 0 || !m_runtime_overrides_enabled.load(std::memory_order_relaxed)) {
+        return std::nullopt;
+    }
+
+    std::scoped_lock _{m_mutex};
+    const auto record_it = m_d3d12_graphics_pso_records.find(pipeline_state);
+    if (record_it == m_d3d12_graphics_pso_records.end()) {
+        return std::nullopt;
+    }
+
+    const auto current_eye = eye_bucket_to_target(eye_bucket);
+    for (const auto& [_, entry] : m_bind_overrides) {
+        if (!entry.enabled ||
+            entry.kind != BindOverrideKind::Cbv ||
+            entry.root_parameter != root_parameter ||
+            (graphics && !entry.graphics) ||
+            (!graphics && !entry.compute) ||
+            (entry.eye != EyeTarget::Any && entry.eye != current_eye) ||
+            !record_matches_bind_override(record_it->second, entry)) {
+            continue;
+        }
+
+        return D3D12CbvBindOverride{entry.name, entry.cbv_data};
+    }
+
+    return std::nullopt;
+}
+
+std::optional<ShaderOverrideRegistry::D3D12RootConstantsBindOverride> ShaderOverrideRegistry::resolve_d3d12_root_constants_bind_override(
+    bool graphics,
+    uintptr_t pipeline_state,
+    int eye_bucket,
+    uint32_t root_parameter
+) const {
+    if (pipeline_state == 0 || !m_runtime_overrides_enabled.load(std::memory_order_relaxed)) {
+        return std::nullopt;
+    }
+
+    std::scoped_lock _{m_mutex};
+    const auto record_it = m_d3d12_graphics_pso_records.find(pipeline_state);
+    if (record_it == m_d3d12_graphics_pso_records.end()) {
+        return std::nullopt;
+    }
+
+    const auto current_eye = eye_bucket_to_target(eye_bucket);
+    for (const auto& [_, entry] : m_bind_overrides) {
+        if (!entry.enabled ||
+            entry.kind != BindOverrideKind::RootConstants ||
+            entry.root_parameter != root_parameter ||
+            (graphics && !entry.graphics) ||
+            (!graphics && !entry.compute) ||
+            (entry.eye != EyeTarget::Any && entry.eye != current_eye) ||
+            !record_matches_bind_override(record_it->second, entry)) {
+            continue;
+        }
+
+        return D3D12RootConstantsBindOverride{entry.name, entry.constants, entry.dest_offset};
+    }
+
+    return std::nullopt;
 }
 
 void ShaderOverrideRegistry::note_d3d12_pipeline_state_bound(ID3D12PipelineState* original_pipeline_state, ID3D12PipelineState* bound_pipeline_state) {
@@ -1794,23 +2245,25 @@ void ShaderOverrideRegistry::note_d3d12_pipeline_state_bound(ID3D12PipelineState
 
 void ShaderOverrideRegistry::scan_override_directories() {
     std::unordered_map<std::string, std::filesystem::path> discovered_entries{};
+    std::unordered_map<std::string, std::filesystem::path> discovered_bind_overrides{};
 
     const auto global_dir = global_override_dir();
     const auto profile_dir = profile_override_dir();
     spdlog::info("[ShaderOverrideRegistry] scan tick: global={} profile={} overrides_before={}",
         global_dir.string(), profile_dir.string(), m_overrides.size());
 
-    scan_single_directory(global_dir, false);
+    scan_single_directory(global_dir, false, discovered_bind_overrides);
     for (const auto& [key, entry] : m_overrides) {
         discovered_entries[key] = entry.manifest_path;
     }
 
-    scan_single_directory(profile_dir, true);
+    scan_single_directory(profile_dir, true, discovered_bind_overrides);
     for (const auto& [key, entry] : m_overrides) {
         discovered_entries[key] = entry.manifest_path;
     }
 
     remove_deleted_entries(discovered_entries);
+    remove_deleted_bind_overrides(discovered_bind_overrides);
     refresh_active_override_flags_locked();
 
     spdlog::info("[ShaderOverrideRegistry] scan done: overrides_after={} d3d12_active={} d3d11_active={}",
@@ -1823,7 +2276,11 @@ void ShaderOverrideRegistry::scan_override_directories() {
     }
 }
 
-void ShaderOverrideRegistry::scan_single_directory(const std::filesystem::path& dir, bool from_profile_dir) {
+void ShaderOverrideRegistry::scan_single_directory(
+    const std::filesystem::path& dir,
+    bool from_profile_dir,
+    std::unordered_map<std::string, std::filesystem::path>& discovered_bind_overrides
+) {
     std::error_code ec{};
     std::filesystem::create_directories(dir, ec);
 
@@ -1852,6 +2309,31 @@ void ShaderOverrideRegistry::scan_single_directory(const std::filesystem::path& 
         }
 
         if (file.path().extension() != ".json") {
+            continue;
+        }
+
+        if (auto bind = parse_bind_override_manifest(file.path(), from_profile_dir); bind.has_value()) {
+            auto& entry = bind.value();
+            discovered_bind_overrides[entry.key] = entry.manifest_path;
+            auto existing = m_bind_overrides.find(entry.key);
+            if (existing == m_bind_overrides.end()) {
+                push_event("Loaded bind override " + entry.key);
+                m_bind_overrides[entry.key] = std::move(entry);
+            } else {
+                auto& current = existing->second;
+                const bool profile_override_replaces_global = from_profile_dir && !current.from_profile_dir;
+                const bool same_origin = current.manifest_path == entry.manifest_path;
+                if (!profile_override_replaces_global && !same_origin && current.from_profile_dir && !from_profile_dir) {
+                    continue;
+                }
+
+                if (current.manifest_write_time != entry.manifest_write_time ||
+                    current.enabled != entry.enabled ||
+                    current.from_profile_dir != entry.from_profile_dir) {
+                    push_event("Reloaded bind override " + entry.key);
+                }
+                current = std::move(entry);
+            }
             continue;
         }
 
@@ -1885,6 +2367,7 @@ void ShaderOverrideRegistry::scan_single_directory(const std::filesystem::path& 
             current.patch_path != entry.patch_path ||
             current.patch_tool_path != entry.patch_tool_path ||
             current.enabled != entry.enabled ||
+            current.per_eye_variants != entry.per_eye_variants ||
             current.entry_point != entry.entry_point ||
             current.profile != entry.profile ||
             current.name != entry.name ||
@@ -1926,6 +2409,21 @@ void ShaderOverrideRegistry::remove_deleted_entries(const std::unordered_map<std
     }
 }
 
+void ShaderOverrideRegistry::remove_deleted_bind_overrides(const std::unordered_map<std::string, std::filesystem::path>& discovered_entries) {
+    std::vector<std::string> dead_keys{};
+
+    for (const auto& [key, entry] : m_bind_overrides) {
+        if (!discovered_entries.contains(key)) {
+            dead_keys.emplace_back(key);
+        }
+    }
+
+    for (const auto& key : dead_keys) {
+        push_event("Removed bind override " + key);
+        m_bind_overrides.erase(key);
+    }
+}
+
 void ShaderOverrideRegistry::compile_or_refresh_entry(OverrideEntry& entry) {
     if (!entry.enabled) {
         entry.status = "Disabled";
@@ -1937,10 +2435,15 @@ void ShaderOverrideRegistry::compile_or_refresh_entry(OverrideEntry& entry) {
     std::string error{};
     if (compile_entry(entry, error)) {
         ++entry.generation;
-        entry.compiled = entry.source_kind != OverrideSourceKind::DxilPatch || !entry.compiled_bytecode.empty();
+        const bool deferred_patch =
+            entry.source_kind == OverrideSourceKind::DxilPatch ||
+            entry.source_kind == OverrideSourceKind::DxilTextPatch ||
+            entry.source_kind == OverrideSourceKind::ContainerPatch ||
+            entry.source_kind == OverrideSourceKind::DxilTransform;
+        entry.compiled = !deferred_patch || !entry.compiled_bytecode.empty();
         entry.last_error.clear();
         ++m_override_revision;
-        push_event((entry.source_kind == OverrideSourceKind::DxilPatch ? "Loaded shader override " : "Compiled shader override ") + entry.key + " with " + entry.compiler);
+        push_event((deferred_patch ? "Loaded shader override " : "Compiled shader override ") + entry.key + " with " + entry.compiler);
     } else {
         entry.compiled = !entry.compiled_bytecode.empty();
         entry.status = "Compile failed";
@@ -1948,6 +2451,144 @@ void ShaderOverrideRegistry::compile_or_refresh_entry(OverrideEntry& entry) {
         const auto compiler_name = entry.compiler.empty() ? compiler_to_string(entry.preferred_compiler) : entry.compiler;
         push_event("Failed to compile shader override " + entry.key + " with " + compiler_name);
         spdlog::error("[ShaderOverrideRegistry] Failed to compile {}: {}", entry.key, error);
+    }
+}
+
+std::optional<ShaderOverrideRegistry::BindOverrideEntry> ShaderOverrideRegistry::parse_bind_override_manifest(const std::filesystem::path& manifest_path, bool from_profile_dir) {
+    try {
+        std::ifstream file{manifest_path};
+        if (!file) {
+            return std::nullopt;
+        }
+
+        const auto manifest = json::parse(file);
+        if (!manifest.is_object()) {
+            return std::nullopt;
+        }
+
+        const auto kind_value = manifest.value("kind", std::string{});
+        const bool explicit_bind_manifest =
+            _stricmp(kind_value.c_str(), "bind_override") == 0 ||
+            _stricmp(kind_value.c_str(), "root_bind_override") == 0;
+        const bool shape_matches =
+            manifest.contains("target_hash") &&
+            manifest.contains("root_parameter") &&
+            (manifest.contains("override") || manifest.contains("bind_kind") || manifest.contains("type")) &&
+            (manifest.contains("values_u32") || manifest.contains("data_u32") || manifest.contains("data_hex") || manifest.contains("data_bytes"));
+
+        if (!explicit_bind_manifest && !shape_matches) {
+            return std::nullopt;
+        }
+
+        BindOverrideEntry entry{};
+        entry.manifest_path = manifest_path;
+        entry.from_profile_dir = from_profile_dir;
+        entry.enabled = manifest.value("enabled", true);
+        entry.name = manifest.value("name", manifest_path.stem().string());
+        entry.target_hash = normalize_hash(manifest.at("target_hash").get<std::string>());
+        entry.root_parameter = manifest.value("root_parameter", 0u);
+        entry.dest_offset = manifest.value("dest_offset", 0u);
+
+        const auto stage_value = manifest.value("stage", std::string{"any"});
+        if (_stricmp(stage_value.c_str(), "any") == 0 || stage_value.empty()) {
+            entry.any_stage = true;
+        } else if (auto stage = parse_stage(stage_value); stage.has_value()) {
+            entry.any_stage = false;
+            entry.stage = *stage;
+        } else {
+            entry.status = "Invalid";
+            entry.last_error = "invalid stage: " + stage_value;
+            return entry;
+        }
+
+        const auto pipeline_value = manifest.value("pipeline", std::string{"graphics"});
+        if (_stricmp(pipeline_value.c_str(), "any") == 0) {
+            entry.graphics = true;
+            entry.compute = true;
+        } else if (_stricmp(pipeline_value.c_str(), "graphics") == 0) {
+            entry.graphics = true;
+            entry.compute = false;
+        } else if (_stricmp(pipeline_value.c_str(), "compute") == 0) {
+            entry.graphics = false;
+            entry.compute = true;
+        } else {
+            entry.status = "Invalid";
+            entry.last_error = "invalid pipeline: " + pipeline_value;
+            return entry;
+        }
+
+        const auto eye_value = manifest.value("eye", std::string{"any"});
+        if (auto eye = parse_eye_target(eye_value); eye.has_value()) {
+            entry.eye = *eye;
+        } else {
+            entry.status = "Invalid";
+            entry.last_error = "invalid eye: " + eye_value;
+            return entry;
+        }
+
+        const auto bind_kind_value =
+            manifest.contains("override") ? manifest.at("override").get<std::string>() :
+            manifest.contains("bind_kind") ? manifest.at("bind_kind").get<std::string>() :
+            manifest.value("type", std::string{"cbv"});
+        if (auto bind_kind = parse_bind_override_kind(bind_kind_value); bind_kind.has_value()) {
+            entry.kind = *bind_kind;
+        } else {
+            entry.status = "Invalid";
+            entry.last_error = "invalid bind override kind: " + bind_kind_value;
+            return entry;
+        }
+
+        std::vector<uint32_t> values{};
+        if (manifest.contains("values_u32")) {
+            values = json_u32_array(manifest.at("values_u32"));
+        } else if (manifest.contains("data_u32")) {
+            values = json_u32_array(manifest.at("data_u32"));
+        }
+
+        if (entry.kind == BindOverrideKind::RootConstants) {
+            entry.constants = std::move(values);
+            if (entry.constants.empty()) {
+                entry.status = "Invalid";
+                entry.last_error = "root constant override has no values_u32/data_u32";
+                return entry;
+            }
+        } else {
+            if (!values.empty()) {
+                entry.cbv_data = u32_vector_to_bytes(values);
+            } else if (manifest.contains("data_hex")) {
+                entry.cbv_data = hex_string_to_bytes(manifest.at("data_hex").get<std::string>());
+            } else if (manifest.contains("data_bytes")) {
+                auto raw = json_u32_array(manifest.at("data_bytes"));
+                entry.cbv_data.reserve(raw.size());
+                for (const auto v : raw) {
+                    entry.cbv_data.emplace_back(static_cast<uint8_t>(v & 0xffu));
+                }
+            }
+
+            if (entry.cbv_data.empty()) {
+                entry.status = "Invalid";
+                entry.last_error = "CBV override has no data_u32/data_hex/data_bytes";
+                return entry;
+            }
+
+            const auto aligned = (entry.cbv_data.size() + 255u) & ~size_t{255u};
+            entry.cbv_data.resize(aligned, 0);
+        }
+
+        std::ostringstream key{};
+        key << entry.target_hash << ':' << (entry.any_stage ? "any" : stage_to_string(entry.stage))
+            << ':' << (entry.graphics && entry.compute ? "any" : (entry.graphics ? "graphics" : "compute"))
+            << ':' << entry.root_parameter << ':' << bind_override_kind_to_string(entry.kind)
+            << ':' << eye_target_to_string(entry.eye) << ':' << entry.name;
+        entry.key = key.str();
+
+        std::error_code ec{};
+        entry.manifest_write_time = std::filesystem::last_write_time(entry.manifest_path, ec);
+        entry.status = entry.enabled ? "Ready" : "Disabled";
+        return entry;
+    } catch (const std::exception& e) {
+        spdlog::error("[ShaderOverrideRegistry] Failed to parse bind override {}: {}", manifest_path.string(), e.what());
+        return std::nullopt;
     }
 }
 
@@ -2002,6 +2643,7 @@ std::optional<ShaderOverrideRegistry::OverrideEntry> ShaderOverrideRegistry::par
         entry.preferred_compiler = ShaderCompilerBackend::Auto;
         entry.from_profile_dir = from_profile_dir;
         entry.apply_supported = true;
+        entry.per_eye_variants = manifest.value("per_eye_variants", false);
 
         if (manifest.contains("compiler")) {
             const auto compiler_value = manifest.at("compiler").get<std::string>();
@@ -2013,10 +2655,19 @@ std::optional<ShaderOverrideRegistry::OverrideEntry> ShaderOverrideRegistry::par
         const bool has_source = manifest.contains("source");
         const bool has_bytecode = manifest.contains("bytecode");
         const bool has_patch = manifest.contains("patch") || manifest.contains("dxil_patch");
-        const int source_count = static_cast<int>(has_source) + static_cast<int>(has_bytecode) + static_cast<int>(has_patch);
+        const bool has_text_patch = manifest.contains("dxil_text_patch") || manifest.contains("dxil_ir_patch");
+        const bool has_container_patch = manifest.contains("container_patch") || manifest.contains("container_edits");
+        const bool has_transform = manifest.contains("dxil_transform") || manifest.contains("dxil_stereo_transform");
+        const int source_count =
+            static_cast<int>(has_source) +
+            static_cast<int>(has_bytecode) +
+            static_cast<int>(has_patch) +
+            static_cast<int>(has_text_patch) +
+            static_cast<int>(has_container_patch) +
+            static_cast<int>(has_transform);
         if (source_count != 1) {
             push_event("Skipped invalid shader override manifest " + manifest_path.string());
-            spdlog::error("[ShaderOverrideRegistry] {} must specify exactly one of source, bytecode, or patch/dxil_patch", manifest_path.string());
+            spdlog::error("[ShaderOverrideRegistry] {} must specify exactly one of source, bytecode, patch/dxil_patch, dxil_text_patch, container_patch, or dxil_transform", manifest_path.string());
             return std::nullopt;
         }
 
@@ -2028,7 +2679,7 @@ std::optional<ShaderOverrideRegistry::OverrideEntry> ShaderOverrideRegistry::par
             entry.bytecode_path = resolve_manifest_relative_path(manifest_path, manifest.at("bytecode").get<std::string>());
             entry.source_path = entry.bytecode_path;
             entry.compiler = "bytecode";
-        } else {
+        } else if (has_patch) {
             entry.source_kind = OverrideSourceKind::DxilPatch;
             const auto patch_key = manifest.contains("patch") ? "patch" : "dxil_patch";
             entry.patch_path = resolve_manifest_relative_path(manifest_path, manifest.at(patch_key).get<std::string>());
@@ -2036,6 +2687,115 @@ std::optional<ShaderOverrideRegistry::OverrideEntry> ShaderOverrideRegistry::par
             entry.compiler = "dxil-patch";
             if (manifest.contains("patch_tool")) {
                 entry.patch_tool_path = resolve_manifest_relative_path(manifest_path, manifest.at("patch_tool").get<std::string>());
+            }
+        } else if (has_transform) {
+            entry.source_kind = OverrideSourceKind::DxilTransform;
+            const auto patch_key = manifest.contains("dxil_transform") ? "dxil_transform" : "dxil_stereo_transform";
+            entry.patch_path = resolve_manifest_relative_path(manifest_path, manifest.at(patch_key).get<std::string>());
+            entry.source_path = entry.patch_path;
+            entry.compiler = "dxil-transform";
+            if (manifest.contains("patch_tool")) {
+                entry.patch_tool_path = resolve_manifest_relative_path(manifest_path, manifest.at("patch_tool").get<std::string>());
+            }
+        } else if (has_text_patch) {
+            entry.source_kind = OverrideSourceKind::DxilTextPatch;
+            const auto patch_key = manifest.contains("dxil_text_patch") ? "dxil_text_patch" : "dxil_ir_patch";
+            const auto& patch_value = manifest.at(patch_key);
+            entry.compiler = "dxc-assembler";
+            if (patch_value.is_string()) {
+                entry.patch_path = resolve_manifest_relative_path(manifest_path, patch_value.get<std::string>());
+                entry.source_path = entry.patch_path;
+
+                std::ifstream patch_file{entry.patch_path};
+                if (!patch_file) {
+                    push_event("Skipped invalid DXIL text patch manifest " + manifest_path.string());
+                    spdlog::error("[ShaderOverrideRegistry] failed to open DXIL text patch file {}", entry.patch_path.string());
+                    return std::nullopt;
+                }
+
+                const auto patch_json = json::parse(patch_file);
+                const auto& replacements = patch_json.contains("replacements") ? patch_json.at("replacements") : patch_json;
+                if (!replacements.is_array()) {
+                    spdlog::error("[ShaderOverrideRegistry] DXIL text patch file {} must contain replacements[]", entry.patch_path.string());
+                    return std::nullopt;
+                }
+
+                for (const auto& replacement : replacements) {
+                    entry.dxil_text_patches.push_back({
+                        replacement.value("find", std::string{}),
+                        replacement.value("replace", std::string{})
+                    });
+                }
+            } else if (patch_value.is_array()) {
+                entry.source_path = manifest_path;
+                for (const auto& replacement : patch_value) {
+                    entry.dxil_text_patches.push_back({
+                        replacement.value("find", std::string{}),
+                        replacement.value("replace", std::string{})
+                    });
+                }
+            } else if (patch_value.is_object()) {
+                entry.source_path = manifest_path;
+                const json replacements = patch_value.contains("replacements") ? patch_value.at("replacements") : json::array({patch_value});
+                if (!replacements.is_array()) {
+                    return std::nullopt;
+                }
+                for (const auto& replacement : replacements) {
+                    entry.dxil_text_patches.push_back({
+                        replacement.value("find", std::string{}),
+                        replacement.value("replace", std::string{})
+                    });
+                }
+            }
+        } else {
+            entry.source_kind = OverrideSourceKind::ContainerPatch;
+            entry.compiler = "dxc-container-builder";
+            entry.source_path = manifest_path;
+
+            const auto patch_key = manifest.contains("container_patch") ? "container_patch" : "container_edits";
+            const auto& patch_value = manifest.at(patch_key);
+            json edits_json{};
+            if (patch_value.is_string()) {
+                entry.patch_path = resolve_manifest_relative_path(manifest_path, patch_value.get<std::string>());
+                entry.source_path = entry.patch_path;
+                std::ifstream patch_file{entry.patch_path};
+                if (!patch_file) {
+                    spdlog::error("[ShaderOverrideRegistry] failed to open container patch file {}", entry.patch_path.string());
+                    return std::nullopt;
+                }
+                const auto patch_doc = json::parse(patch_file);
+                edits_json = patch_doc.contains("edits") ? patch_doc.at("edits") : patch_doc;
+            } else if (patch_value.is_object()) {
+                edits_json = patch_value.contains("edits") ? patch_value.at("edits") : json::array({patch_value});
+            } else {
+                edits_json = patch_value;
+            }
+
+            if (!edits_json.is_array()) {
+                spdlog::error("[ShaderOverrideRegistry] container patch {} must be an edit array", manifest_path.string());
+                return std::nullopt;
+            }
+
+            for (const auto& edit_json : edits_json) {
+                ShaderContainerEdit edit{};
+                edit.fourcc = edit_json.value("fourcc", std::string{});
+                edit.remove = edit_json.value("remove", false);
+                if (!edit.remove) {
+                    if (edit_json.contains("path")) {
+                        std::vector<uint8_t> data{};
+                        std::string read_error{};
+                        if (!read_binary_file(resolve_manifest_relative_path(manifest_path, edit_json.at("path").get<std::string>()), data, read_error)) {
+                            spdlog::error("[ShaderOverrideRegistry] failed to read container patch part: {}", read_error);
+                            return std::nullopt;
+                        }
+                        edit.data = std::move(data);
+                    } else if (edit_json.contains("data_hex")) {
+                        edit.data = hex_string_to_bytes(edit_json.at("data_hex").get<std::string>());
+                    } else if (edit_json.contains("data_u32")) {
+                        edit.data = u32_vector_to_bytes(json_u32_array(edit_json.at("data_u32")));
+                    }
+                }
+                entry.container_edits.emplace_back(std::move(edit));
             }
         }
 
@@ -2056,6 +2816,13 @@ std::optional<ShaderOverrideRegistry::OverrideEntry> ShaderOverrideRegistry::par
 bool ShaderOverrideRegistry::compile_entry(OverrideEntry& entry, std::string& error_out) {
     if (!std::filesystem::exists(entry.source_path)) {
         error_out = "Source file does not exist: " + entry.source_path.string();
+        return false;
+    }
+
+    if (entry.backend == Backend::D3D11 &&
+        entry.stage != Stage::Vertex &&
+        entry.stage != Stage::Pixel) {
+        error_out = "DX11 live shader overrides only support VS and PS stages";
         return false;
     }
 
@@ -2096,6 +2863,66 @@ bool ShaderOverrideRegistry::compile_entry(OverrideEntry& entry, std::string& er
 
         entry.compiler = "dxil-patch";
         entry.status = "Deferred DXIL patch";
+        return true;
+    }
+
+    if (entry.source_kind == OverrideSourceKind::DxilTransform) {
+        if (entry.backend != Backend::D3D12) {
+            error_out = "DXIL transform overrides are only supported for DX12";
+            return false;
+        }
+
+        if (!std::filesystem::exists(entry.patch_path)) {
+            error_out = "DXIL transform file does not exist: " + entry.patch_path.string();
+            return false;
+        }
+
+        entry.compiler = "dxil-transform";
+        entry.status = "Deferred DXIL transform";
+        return true;
+    }
+
+    if (entry.source_kind == OverrideSourceKind::DxilTextPatch) {
+        if (entry.backend != Backend::D3D12) {
+            error_out = "DXIL text patch overrides are only supported for DX12";
+            return false;
+        }
+
+        if (entry.dxil_text_patches.empty()) {
+            error_out = "DXIL text patch override has no replacements";
+            return false;
+        }
+
+        entry.compiler = "dxc-assembler";
+        entry.status = "Deferred DXIL text patch";
+        return true;
+    }
+
+    if (entry.source_kind == OverrideSourceKind::ContainerPatch) {
+        if (entry.backend != Backend::D3D12) {
+            error_out = "Container patch overrides are only supported for DX12";
+            return false;
+        }
+
+        if (entry.container_edits.empty()) {
+            error_out = "Container patch override has no edits";
+            return false;
+        }
+
+        for (const auto& edit : entry.container_edits) {
+            if (edit.fourcc.empty()) {
+                error_out = "Container patch override has an edit with no fourcc";
+                return false;
+            }
+
+            if (!edit.remove && edit.data.empty()) {
+                error_out = "Container patch replacement for " + edit.fourcc + " has no data";
+                return false;
+            }
+        }
+
+        entry.compiler = "dxc-container-builder";
+        entry.status = "Deferred container patch";
         return true;
     }
 
@@ -2145,7 +2972,10 @@ bool ShaderOverrideRegistry::ensure_d3d12_patch_entry_compiled(
     std::string_view original_hash,
     std::string& error_out
 ) {
-    if (entry.source_kind != OverrideSourceKind::DxilPatch) {
+    if (entry.source_kind != OverrideSourceKind::DxilPatch &&
+        entry.source_kind != OverrideSourceKind::DxilTextPatch &&
+        entry.source_kind != OverrideSourceKind::ContainerPatch &&
+        entry.source_kind != OverrideSourceKind::DxilTransform) {
         return true;
     }
 
@@ -2158,17 +2988,133 @@ bool ShaderOverrideRegistry::ensure_d3d12_patch_entry_compiled(
         return true;
     }
 
+    if (entry.source_kind == OverrideSourceKind::DxilTextPatch) {
+        const auto cache_root = profile_override_dir() / "cache" / "dxil_text_patch";
+        std::error_code ec{};
+        std::filesystem::create_directories(cache_root, ec);
+        if (ec) {
+            error_out = "Failed to create DXIL text patch cache: " + ec.message();
+            return false;
+        }
+
+        const auto manifest_stamp = std::filesystem::exists(entry.manifest_path)
+            ? std::filesystem::last_write_time(entry.manifest_path, ec).time_since_epoch().count()
+            : 0;
+        ec.clear();
+        const auto patch_stamp = std::filesystem::exists(entry.patch_path)
+            ? std::filesystem::last_write_time(entry.patch_path, ec).time_since_epoch().count()
+            : 0;
+
+        std::ostringstream key{};
+        key << entry.target_hash << "_" << original_hash << "_" << manifest_stamp << "_" << patch_stamp;
+        const auto output_path = cache_root / (key.str() + ".patched.dxbc");
+
+        if (!std::filesystem::exists(output_path)) {
+            ShaderDxilTextPatchRequest request{};
+            request.bytecode = original_bytecode;
+            request.bytecode_size = original_bytecode_size;
+            request.patches = entry.dxil_text_patches;
+            request.validate_and_sign = true;
+            const auto patched = patch_dxil_text(request);
+            if (!patched.succeeded) {
+                error_out = patched.error;
+                return false;
+            }
+
+            if (!write_binary_file(output_path, patched.bytecode.data(), patched.bytecode.size(), error_out)) {
+                return false;
+            }
+        }
+
+        if (!read_binary_file(output_path, entry.compiled_bytecode, error_out)) {
+            return false;
+        }
+
+        if (entry.compiled_bytecode.empty()) {
+            error_out = "DXIL text patch produced an empty output: " + output_path.string();
+            return false;
+        }
+
+        entry.compiled_original_hash = std::string{original_hash};
+        entry.cached_bytecode_path = output_path;
+        entry.compiled = true;
+        entry.status = "Patched DXIL text";
+        entry.compiler = "dxc-assembler";
+        entry.last_error.clear();
+        push_event("Patched DXIL text override " + entry.key + " -> " + output_path.string());
+        return true;
+    }
+
+    if (entry.source_kind == OverrideSourceKind::ContainerPatch) {
+        const auto cache_root = profile_override_dir() / "cache" / "container_patch";
+        std::error_code ec{};
+        std::filesystem::create_directories(cache_root, ec);
+        if (ec) {
+            error_out = "Failed to create container patch cache: " + ec.message();
+            return false;
+        }
+
+        const auto manifest_stamp = std::filesystem::exists(entry.manifest_path)
+            ? std::filesystem::last_write_time(entry.manifest_path, ec).time_since_epoch().count()
+            : 0;
+        ec.clear();
+        const auto patch_stamp = std::filesystem::exists(entry.patch_path)
+            ? std::filesystem::last_write_time(entry.patch_path, ec).time_since_epoch().count()
+            : 0;
+
+        std::ostringstream key{};
+        key << entry.target_hash << "_" << original_hash << "_" << manifest_stamp << "_" << patch_stamp;
+        const auto output_path = cache_root / (key.str() + ".patched.dxbc");
+
+        if (!std::filesystem::exists(output_path)) {
+            ShaderContainerEditRequest request{};
+            request.bytecode = original_bytecode;
+            request.bytecode_size = original_bytecode_size;
+            request.edits = entry.container_edits;
+            request.validate_and_sign = true;
+
+            const auto patched = edit_shader_container(request);
+            if (!patched.succeeded) {
+                error_out = patched.error;
+                return false;
+            }
+
+            if (!write_binary_file(output_path, patched.bytecode.data(), patched.bytecode.size(), error_out)) {
+                return false;
+            }
+        }
+
+        if (!read_binary_file(output_path, entry.compiled_bytecode, error_out)) {
+            return false;
+        }
+
+        if (entry.compiled_bytecode.empty()) {
+            error_out = "Container patch produced an empty output: " + output_path.string();
+            return false;
+        }
+
+        entry.compiled_original_hash = std::string{original_hash};
+        entry.cached_bytecode_path = output_path;
+        entry.compiled = true;
+        entry.status = "Patched container";
+        entry.compiler = "dxc-container-builder";
+        entry.last_error.clear();
+        push_event("Patched container override " + entry.key + " -> " + output_path.string());
+        return true;
+    }
+
     const auto tool_path = entry.patch_tool_path.empty() ? default_dxil_patch_tool_path() : entry.patch_tool_path;
     if (tool_path.empty() || !std::filesystem::exists(tool_path)) {
         error_out = "dxil-patch tool not found: " + tool_path.string() + " (set UEVR_DXIL_PATCH_TOOL or use manifest patch_tool)";
         return false;
     }
 
-    const auto cache_root = profile_override_dir() / "cache" / "dxil_patch";
+    const bool is_transform = entry.source_kind == OverrideSourceKind::DxilTransform;
+    const auto cache_root = profile_override_dir() / "cache" / (is_transform ? "dxil_transform" : "dxil_patch");
     std::error_code ec{};
     std::filesystem::create_directories(cache_root, ec);
     if (ec) {
-        error_out = "Failed to create DXIL patch cache: " + ec.message();
+        error_out = std::string{"Failed to create "} + (is_transform ? "DXIL transform" : "DXIL patch") + " cache: " + ec.message();
         return false;
     }
 
@@ -2183,7 +3129,7 @@ bool ShaderOverrideRegistry::ensure_d3d12_patch_entry_compiled(
     std::ostringstream key{};
     key << entry.target_hash << "_" << original_hash << "_" << manifest_stamp << "_" << patch_stamp;
     const auto original_path = cache_root / (key.str() + ".original.dxbc");
-    const auto output_path = cache_root / (key.str() + ".patched.dxbc");
+    const auto output_path = cache_root / (key.str() + (is_transform ? ".transformed.dxbc" : ".patched.dxbc"));
     const auto report_path = cache_root / (key.str() + ".report.json");
 
     if (!std::filesystem::exists(output_path)) {
@@ -2192,7 +3138,7 @@ bool ShaderOverrideRegistry::ensure_d3d12_patch_entry_compiled(
         }
 
         const std::wstring args =
-            L"patch " +
+            std::wstring{is_transform ? L"transform " : L"patch "} +
             quote_command_arg(original_path) +
             L" " +
             quote_command_arg(entry.patch_path) +
@@ -2209,7 +3155,7 @@ bool ShaderOverrideRegistry::ensure_d3d12_patch_entry_compiled(
         }
 
         if (exit_code != 0) {
-            error_out = "dxil-patch failed with exit code " + std::to_string(exit_code);
+            error_out = std::string{is_transform ? "dxil-transform" : "dxil-patch"} + " failed with exit code " + std::to_string(exit_code);
             if (std::filesystem::exists(report_path)) {
                 std::ifstream report{report_path, std::ios::binary};
                 if (report) {
@@ -2228,7 +3174,7 @@ bool ShaderOverrideRegistry::ensure_d3d12_patch_entry_compiled(
     }
 
     if (patched.empty()) {
-        error_out = "dxil-patch produced an empty output: " + output_path.string();
+        error_out = std::string{is_transform ? "dxil-transform" : "dxil-patch"} + " produced an empty output: " + output_path.string();
         return false;
     }
 
@@ -2236,12 +3182,13 @@ bool ShaderOverrideRegistry::ensure_d3d12_patch_entry_compiled(
     entry.compiled_original_hash = std::string{original_hash};
     entry.cached_bytecode_path = output_path;
     entry.compiled = true;
-    entry.status = "Patched DXIL";
-    entry.compiler = "dxil-patch";
+    entry.status = is_transform ? "Transformed DXIL" : "Patched DXIL";
+    entry.compiler = is_transform ? "dxil-transform" : "dxil-patch";
     entry.last_error.clear();
 
-    push_event("Patched DXIL override " + entry.key + " -> " + output_path.string());
-    spdlog::info("[ShaderOverrideRegistry] Patched DXIL override key={} input={} output={} bytes={}",
+    push_event(std::string{is_transform ? "Transformed DXIL override " : "Patched DXIL override "} + entry.key + " -> " + output_path.string());
+    spdlog::info("[ShaderOverrideRegistry] {} DXIL override key={} input={} output={} bytes={}",
+        is_transform ? "Transformed" : "Patched",
         entry.key, original_path.string(), output_path.string(), entry.compiled_bytecode.size());
     return true;
 }
@@ -2261,7 +3208,11 @@ void ShaderOverrideRegistry::refresh_active_override_flags_locked() {
     for (const auto& [_, entry] : m_overrides) {
         const bool can_activate = entry.enabled &&
             entry.apply_supported &&
-            (entry.compiled || entry.source_kind == OverrideSourceKind::DxilPatch);
+            (entry.compiled ||
+                entry.source_kind == OverrideSourceKind::DxilPatch ||
+                entry.source_kind == OverrideSourceKind::DxilTextPatch ||
+                entry.source_kind == OverrideSourceKind::ContainerPatch ||
+                entry.source_kind == OverrideSourceKind::DxilTransform);
         if (!can_activate) {
             continue;
         }
@@ -2486,6 +3437,9 @@ void ShaderOverrideRegistry::update_d3d11_override_shader(D3D11ShaderRecord& rec
 void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsPsoRecord& record) {
     const auto vertex_key = record.vertex_hash.empty() ? std::string{} : make_override_key(Backend::D3D12, Stage::Vertex, record.vertex_hash);
     const auto pixel_key = record.pixel_hash.empty() ? std::string{} : make_override_key(Backend::D3D12, Stage::Pixel, record.pixel_hash);
+    const auto compute_key = record.compute_hash.empty() ? std::string{} : make_override_key(Backend::D3D12, Stage::Compute, record.compute_hash);
+    const auto amplification_key = record.amplification_hash.empty() ? std::string{} : make_override_key(Backend::D3D12, Stage::Amplification, record.amplification_hash);
+    const auto mesh_key = record.mesh_hash.empty() ? std::string{} : make_override_key(Backend::D3D12, Stage::Mesh, record.mesh_hash);
     // Parallel CRC32 lookup keys. A manifest whose target_hash is 8 hex chars
     // (== ShaderToggler-format CRC32) lives in m_overrides at this key. This
     // lets users drop their ShaderToggler hashes straight into UEVR manifests.
@@ -2496,9 +3450,21 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
     std::snprintf(crc_buf, sizeof(crc_buf), "%08x", record.pixel_crc32);
     const auto pixel_crc_key = record.pixel_crc32 == 0 ? std::string{}
         : make_override_key(Backend::D3D12, Stage::Pixel, crc_buf);
+    std::snprintf(crc_buf, sizeof(crc_buf), "%08x", record.compute_crc32);
+    const auto compute_crc_key = record.compute_crc32 == 0 ? std::string{}
+        : make_override_key(Backend::D3D12, Stage::Compute, crc_buf);
+    std::snprintf(crc_buf, sizeof(crc_buf), "%08x", record.amplification_crc32);
+    const auto amplification_crc_key = record.amplification_crc32 == 0 ? std::string{}
+        : make_override_key(Backend::D3D12, Stage::Amplification, crc_buf);
+    std::snprintf(crc_buf, sizeof(crc_buf), "%08x", record.mesh_crc32);
+    const auto mesh_crc_key = record.mesh_crc32 == 0 ? std::string{}
+        : make_override_key(Backend::D3D12, Stage::Mesh, crc_buf);
 
     OverrideEntry* vertex_entry = nullptr;
     OverrideEntry* pixel_entry = nullptr;
+    OverrideEntry* compute_entry = nullptr;
+    OverrideEntry* amplification_entry = nullptr;
+    OverrideEntry* mesh_entry = nullptr;
 
     auto try_lookup = [this](const std::string& key) -> OverrideEntry* {
         if (key.empty()) return nullptr;
@@ -2506,7 +3472,11 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
         if (it == m_overrides.end() ||
             !it->second.enabled ||
             !it->second.apply_supported ||
-            (!it->second.compiled && it->second.source_kind != OverrideSourceKind::DxilPatch)) {
+            (!it->second.compiled &&
+                it->second.source_kind != OverrideSourceKind::DxilPatch &&
+                it->second.source_kind != OverrideSourceKind::DxilTextPatch &&
+                it->second.source_kind != OverrideSourceKind::ContainerPatch &&
+                it->second.source_kind != OverrideSourceKind::DxilTransform)) {
             return nullptr;
         }
         return &it->second;
@@ -2516,6 +3486,12 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
     if (vertex_entry == nullptr) vertex_entry = try_lookup(vertex_crc_key);
     pixel_entry = try_lookup(pixel_key);
     if (pixel_entry == nullptr) pixel_entry = try_lookup(pixel_crc_key);
+    compute_entry = try_lookup(compute_key);
+    if (compute_entry == nullptr) compute_entry = try_lookup(compute_crc_key);
+    amplification_entry = try_lookup(amplification_key);
+    if (amplification_entry == nullptr) amplification_entry = try_lookup(amplification_crc_key);
+    mesh_entry = try_lookup(mesh_key);
+    if (mesh_entry == nullptr) mesh_entry = try_lookup(mesh_crc_key);
 
     // === Highlight mode: if PS hash is in highlight set OR the cycle-mode
     // highlight flag is on AND the hash matches the active hunted PS hash,
@@ -2563,37 +3539,51 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
     }
 
     auto ensure_patch_entry = [this, &record](OverrideEntry*& entry, Stage stage) {
-        if (entry == nullptr || entry->source_kind != OverrideSourceKind::DxilPatch) {
+        if (entry == nullptr ||
+            (entry->source_kind != OverrideSourceKind::DxilPatch &&
+                entry->source_kind != OverrideSourceKind::DxilTextPatch &&
+                entry->source_kind != OverrideSourceKind::ContainerPatch &&
+                entry->source_kind != OverrideSourceKind::DxilTransform)) {
             return;
         }
 
         const std::vector<uint8_t>* original = nullptr;
         std::string_view original_hash{};
         if (record.is_pipeline_stream) {
-            if (stage == Stage::Vertex) {
-                original = &record.owned_stream.vertex_shader;
-                original_hash = record.vertex_hash;
-            } else {
-                original = &record.owned_stream.pixel_shader;
-                original_hash = record.pixel_hash;
+            switch (stage) {
+            case Stage::Vertex:
+                original = &record.owned_stream.vertex_shader; original_hash = record.vertex_hash; break;
+            case Stage::Pixel:
+                original = &record.owned_stream.pixel_shader; original_hash = record.pixel_hash; break;
+            case Stage::Compute:
+                original = &record.owned_stream.compute_shader; original_hash = record.compute_hash; break;
+            case Stage::Amplification:
+                original = &record.owned_stream.amplification_shader; original_hash = record.amplification_hash; break;
+            case Stage::Mesh:
+                original = &record.owned_stream.mesh_shader; original_hash = record.mesh_hash; break;
             }
         } else {
-            if (stage == Stage::Vertex) {
-                original = &record.owned_desc.vertex_shader;
-                original_hash = record.vertex_hash;
-            } else {
-                original = &record.owned_desc.pixel_shader;
-                original_hash = record.pixel_hash;
+            switch (stage) {
+            case Stage::Vertex:
+                original = &record.owned_desc.vertex_shader; original_hash = record.vertex_hash; break;
+            case Stage::Pixel:
+                original = &record.owned_desc.pixel_shader; original_hash = record.pixel_hash; break;
+            case Stage::Compute:
+                original = &record.owned_stream.compute_shader; original_hash = record.compute_hash; break;
+            case Stage::Amplification:
+                original = &record.owned_stream.amplification_shader; original_hash = record.amplification_hash; break;
+            case Stage::Mesh:
+                original = &record.owned_stream.mesh_shader; original_hash = record.mesh_hash; break;
             }
         }
 
         std::string patch_error{};
         if (original == nullptr || original->empty() ||
             !ensure_d3d12_patch_entry_compiled(*entry, original->data(), original->size(), original_hash, patch_error)) {
-            const auto stage_name = stage == Stage::Vertex ? "VS" : "PS";
-            record.last_error = std::string{"Failed to build DXIL patch "} + stage_name + "=" + entry->name + ": " + patch_error;
+            const auto stage_name = stage_to_string(stage);
+            record.last_error = std::string{"Failed to build DXIL override "} + stage_name + "=" + entry->name + ": " + patch_error;
             entry->last_error = record.last_error;
-            entry->status = "DXIL patch failed";
+            entry->status = "DXIL override failed";
             entry->compiled = false;
             entry = nullptr;
             push_event(record.last_error);
@@ -2616,12 +3606,18 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
 
     ensure_patch_entry(vertex_entry, Stage::Vertex);
     ensure_patch_entry(pixel_entry, Stage::Pixel);
+    ensure_patch_entry(compute_entry, Stage::Compute);
+    ensure_patch_entry(amplification_entry, Stage::Amplification);
+    ensure_patch_entry(mesh_entry, Stage::Mesh);
     const auto preflight_error = record.last_error;
 
     record.applied_override_revision = m_override_revision;
     record.override_active = false;
     record.vertex_override_name.clear();
     record.pixel_override_name.clear();
+    record.compute_override_name.clear();
+    record.amplification_override_name.clear();
+    record.mesh_override_name.clear();
     record.last_error.clear();
     record.override_pipeline_state.Reset();
 
@@ -2630,7 +3626,11 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
         return;
     }
 
-    if (vertex_entry == nullptr && pixel_entry == nullptr) {
+    if (vertex_entry == nullptr &&
+        pixel_entry == nullptr &&
+        compute_entry == nullptr &&
+        amplification_entry == nullptr &&
+        mesh_entry == nullptr) {
         if (!preflight_error.empty()) {
             record.last_error = preflight_error;
         }
@@ -2645,8 +3645,26 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
         record.pixel_override_name = pixel_entry->name;
     }
 
+    if (compute_entry != nullptr) {
+        record.compute_override_name = compute_entry->name;
+    }
+
+    if (amplification_entry != nullptr) {
+        record.amplification_override_name = amplification_entry->name;
+    }
+
+    if (mesh_entry != nullptr) {
+        record.mesh_override_name = mesh_entry->name;
+    }
+
     Microsoft::WRL::ComPtr<ID3D12PipelineState> replacement_pso{};
     HRESULT hr = E_FAIL;
+    const bool wants_per_eye_variants =
+        (vertex_entry != nullptr && vertex_entry->per_eye_variants) ||
+        (pixel_entry != nullptr && pixel_entry->per_eye_variants) ||
+        (compute_entry != nullptr && compute_entry->per_eye_variants) ||
+        (amplification_entry != nullptr && amplification_entry->per_eye_variants) ||
+        (mesh_entry != nullptr && mesh_entry->per_eye_variants);
 
     if (record.is_pipeline_stream) {
         if (record.owned_stream.empty()) {
@@ -2664,6 +3682,18 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
             replacement_stream.pixel_shader = pixel_entry->compiled_bytecode;
         }
 
+        if (compute_entry != nullptr) {
+            replacement_stream.compute_shader = compute_entry->compiled_bytecode;
+        }
+
+        if (amplification_entry != nullptr) {
+            replacement_stream.amplification_shader = amplification_entry->compiled_bytecode;
+        }
+
+        if (mesh_entry != nullptr) {
+            replacement_stream.mesh_shader = mesh_entry->compiled_bytecode;
+        }
+
         replacement_stream.refresh_views();
 
         Microsoft::WRL::ComPtr<ID3D12Device2> device2{};
@@ -2673,6 +3703,9 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
             record.last_error = "ID3D12Device2 unavailable for pipeline-stream override";
             record.vertex_override_name.clear();
             record.pixel_override_name.clear();
+            record.compute_override_name.clear();
+            record.amplification_override_name.clear();
+            record.mesh_override_name.clear();
             return;
         }
 
@@ -2693,7 +3726,29 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
                 }
             }
         }
+        if (SUCCEEDED(hr) && wants_per_eye_variants) {
+            (void)device2->CreatePipelineState(&replacement_stream.desc, IID_PPV_ARGS(&record.override_pipeline_state_left));
+            (void)device2->CreatePipelineState(&replacement_stream.desc, IID_PPV_ARGS(&record.override_pipeline_state_right));
+        }
+    } else if (compute_entry != nullptr && record.vertex_hash.empty() && record.pixel_hash.empty() && !record.compute_hash.empty()) {
+        auto replacement_desc = record.compute_desc;
+        replacement_desc.pRootSignature = record.owned_stream.root_signature.Get();
+        replacement_desc.CS = make_shader_bytecode_blob(compute_entry->compiled_bytecode);
+
+        ScopedD3D12OverridePipelineCreation scoped_creation{};
+        hr = record.device->CreateComputePipelineState(&replacement_desc, IID_PPV_ARGS(&replacement_pso));
+        if (SUCCEEDED(hr) && wants_per_eye_variants) {
+            (void)record.device->CreateComputePipelineState(&replacement_desc, IID_PPV_ARGS(&record.override_pipeline_state_left));
+            (void)record.device->CreateComputePipelineState(&replacement_desc, IID_PPV_ARGS(&record.override_pipeline_state_right));
+        }
     } else {
+        if (amplification_entry != nullptr || mesh_entry != nullptr) {
+            record.last_error = "AS/MS overrides require a tracked pipeline-state stream PSO";
+            record.amplification_override_name.clear();
+            record.mesh_override_name.clear();
+            return;
+        }
+
         auto replacement_desc = record.owned_desc;
 
         if (vertex_entry != nullptr) {
@@ -2708,6 +3763,10 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
 
         ScopedD3D12OverridePipelineCreation scoped_creation{};
         hr = record.device->CreateGraphicsPipelineState(&replacement_desc.desc, IID_PPV_ARGS(&replacement_pso));
+        if (SUCCEEDED(hr) && wants_per_eye_variants) {
+            (void)record.device->CreateGraphicsPipelineState(&replacement_desc.desc, IID_PPV_ARGS(&record.override_pipeline_state_left));
+            (void)record.device->CreateGraphicsPipelineState(&replacement_desc.desc, IID_PPV_ARGS(&record.override_pipeline_state_right));
+        }
     }
 
     if (FAILED(hr) || replacement_pso == nullptr) {
@@ -2719,6 +3778,15 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
         if (!record.pixel_override_name.empty()) {
             ss << " PS=" << record.pixel_override_name;
         }
+        if (!record.compute_override_name.empty()) {
+            ss << " CS=" << record.compute_override_name;
+        }
+        if (!record.amplification_override_name.empty()) {
+            ss << " AS=" << record.amplification_override_name;
+        }
+        if (!record.mesh_override_name.empty()) {
+            ss << " MS=" << record.mesh_override_name;
+        }
         ss << " (" << format_hresult(hr) << ")";
 
         record.last_error = ss.str();
@@ -2726,6 +3794,9 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
         spdlog::error("[ShaderOverrideRegistry] {}", ss.str());
         record.vertex_override_name.clear();
         record.pixel_override_name.clear();
+        record.compute_override_name.clear();
+        record.amplification_override_name.clear();
+        record.mesh_override_name.clear();
         return;
     }
 
@@ -2739,6 +3810,18 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
     }
     if (!record.pixel_override_name.empty()) {
         ss << " PS=" << record.pixel_override_name;
+    }
+    if (!record.compute_override_name.empty()) {
+        ss << " CS=" << record.compute_override_name;
+    }
+    if (!record.amplification_override_name.empty()) {
+        ss << " AS=" << record.amplification_override_name;
+    }
+    if (!record.mesh_override_name.empty()) {
+        ss << " MS=" << record.mesh_override_name;
+    }
+    if (record.override_pipeline_state_left != nullptr || record.override_pipeline_state_right != nullptr) {
+        ss << " per-eye-variants";
     }
     push_event(ss.str());
 }
@@ -4108,6 +5191,80 @@ void ShaderOverrideRegistry::hunter_inc_dispatch_mesh_hit() {
 
 void ShaderOverrideRegistry::hunter_inc_dispatch_mesh_skipped() {
     g_hunter_dispatch_mesh_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool ShaderOverrideRegistry::hunter_capture_active_as_override_stub(
+    HunterStage hunter_stage,
+    std::filesystem::path& manifest_path,
+    std::filesystem::path& source_path,
+    std::string& error_out
+) {
+    std::scoped_lock _{m_mutex};
+
+    const std::string hash =
+        hunter_stage == HunterStage::Vertex ? m_hunter_active_hash_vs :
+        hunter_stage == HunterStage::Compute ? m_hunter_active_hash_cs :
+        m_hunter_active_hash;
+
+    if (hash.empty()) {
+        error_out = "no active hunter hash for the requested stage";
+        return false;
+    }
+
+    Stage stage = Stage::Pixel;
+    switch (hunter_stage) {
+    case HunterStage::Vertex:
+        stage = Stage::Vertex;
+        break;
+    case HunterStage::Compute:
+        stage = Stage::Compute;
+        break;
+    default:
+        stage = Stage::Pixel;
+        break;
+    }
+
+    namespace fs = std::filesystem;
+    const auto stage_name = stage_to_string(stage);
+    fs::path dir = profile_override_dir() / ("override_" + stage_name + "_" + hash);
+    std::error_code ec{};
+    fs::create_directories(dir, ec);
+    if (ec) {
+        error_out = ec.message();
+        return false;
+    }
+
+    source_path = dir / "main.hlsl";
+    manifest_path = dir / "manifest.json";
+
+    if (!fs::exists(source_path, ec)) {
+        std::ofstream source{source_path, std::ios::binary | std::ios::trunc};
+        source << "// Disabled starter override captured from Shader Hunter.\n";
+        source << "// Fill this with compatible HLSL, then set enabled=true in manifest.json.\n";
+        source << "// target_hash=" << hash << " stage=" << stage_name << "\n";
+    }
+
+    std::ofstream manifest{manifest_path, std::ios::binary | std::ios::trunc};
+    if (!manifest) {
+        error_out = "failed to open manifest for writing";
+        return false;
+    }
+
+    manifest << "{\n";
+    manifest << "  \"backend\": \"dx12\",\n";
+    manifest << "  \"stage\": \"" << stage_name << "\",\n";
+    manifest << "  \"target_hash\": \"" << hash << "\",\n";
+    manifest << "  \"name\": \"override_" << stage_name << "_" << hash << "\",\n";
+    manifest << "  \"enabled\": false,\n";
+    manifest << "  \"entry_point\": \"main\",\n";
+    manifest << "  \"profile\": \"" << default_profile(Backend::D3D12, stage) << "\",\n";
+    manifest << "  \"compiler\": \"dxc\",\n";
+    manifest << "  \"source\": \"main.hlsl\"\n";
+    manifest << "}\n";
+
+    push_event("Captured disabled override stub for " + stage_name + " hash " + hash);
+    request_reload();
+    return true;
 }
 
 bool ShaderOverrideRegistry::hunter_save_marked_as_manifests(std::string& error_out) {

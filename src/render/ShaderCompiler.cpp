@@ -1,7 +1,10 @@
 #include "render/ShaderCompiler.hpp"
 
 #include <algorithm>
+#include <cstring>
+#include <cwchar>
 #include <fstream>
+#include <iomanip>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -10,6 +13,7 @@
 #include <Windows.h>
 #include <d3dcompiler.h>
 #include <dxcapi.h>
+#include <oleauto.h>
 #include <wrl/client.h>
 
 #include <spdlog/spdlog.h>
@@ -38,6 +42,30 @@ std::string hr_to_string(HRESULT hr) {
     return ss.str();
 }
 
+uint32_t read_u32_le(const uint8_t* data) {
+    uint32_t value{};
+    std::memcpy(&value, data, sizeof(value));
+    return value;
+}
+
+std::string bytes_to_hex(const uint8_t* data, size_t size) {
+    std::ostringstream ss{};
+    ss << std::hex << std::setfill('0');
+    for (size_t i = 0; i < size; ++i) {
+        ss << std::setw(2) << static_cast<unsigned>(data[i]);
+    }
+    return ss.str();
+}
+
+std::string fourcc_to_string(const uint8_t* data) {
+    std::string out(4, '\0');
+    for (size_t i = 0; i < 4; ++i) {
+        const char ch = static_cast<char>(data[i]);
+        out[i] = (ch >= 32 && ch <= 126) ? ch : '?';
+    }
+    return out;
+}
+
 int shader_model_major(std::string_view profile) {
     const auto underscore = profile.find('_');
     if (underscore == std::string_view::npos || underscore + 1 >= profile.size()) {
@@ -58,6 +86,7 @@ struct DxcRuntime {
     std::once_flag init_once{};
     HMODULE dxil_module{};
     HMODULE dxcompiler_module{};
+    DxcCreateInstanceProc create_instance{};
     ComPtr<IDxcUtils> utils{};
     ComPtr<IDxcCompiler3> compiler{};
     std::filesystem::path loaded_from{};
@@ -84,6 +113,19 @@ struct DxcRuntime {
     bool ensure_loaded() {
         std::call_once(init_once, [this] { load(); });
         return compiler != nullptr && utils != nullptr;
+    }
+
+    HRESULT create(REFCLSID clsid, REFIID riid, void** out) {
+        if (out == nullptr) {
+            return E_POINTER;
+        }
+
+        *out = nullptr;
+        if (!ensure_loaded() || create_instance == nullptr) {
+            return E_FAIL;
+        }
+
+        return create_instance(clsid, riid, out);
     }
 
     std::vector<std::filesystem::path> candidate_directories() {
@@ -165,7 +207,7 @@ struct DxcRuntime {
                 continue;
             }
 
-            const auto create_instance = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(dxcompiler_module, "DxcCreateInstance"));
+            create_instance = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(dxcompiler_module, "DxcCreateInstance"));
             if (create_instance == nullptr) {
                 failure_reason = "dxcompiler.dll is missing DxcCreateInstance";
                 FreeLibrary(dxcompiler_module);
@@ -214,6 +256,207 @@ struct DxcRuntime {
         spdlog::error("[ShaderCompiler] DXC NOT LOADED: {}", failure_reason);
     }
 };
+
+uint32_t fourcc_value(std::string_view fourcc) {
+    if (fourcc.size() != 4) {
+        return 0;
+    }
+
+    return static_cast<uint32_t>(static_cast<uint8_t>(fourcc[0])) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(fourcc[1])) << 8) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(fourcc[2])) << 16) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(fourcc[3])) << 24);
+}
+
+std::string bstr_to_utf8(BSTR value) {
+    if (value == nullptr) {
+        return {};
+    }
+
+    const auto chars = SysStringLen(value);
+    if (chars == 0) {
+        return {};
+    }
+
+    const auto required = WideCharToMultiByte(CP_UTF8, 0, value, static_cast<int>(chars), nullptr, 0, nullptr, nullptr);
+    if (required <= 0) {
+        return {};
+    }
+
+    std::string out(static_cast<size_t>(required), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value, static_cast<int>(chars), out.data(), required, nullptr, nullptr);
+    return out;
+}
+
+bool create_blob_from_bytes(
+    DxcRuntime& runtime,
+    const void* data,
+    size_t size,
+    UINT32 code_page,
+    ComPtr<IDxcBlobEncoding>& blob,
+    std::string& error_out
+) {
+    if (data == nullptr || size == 0) {
+        error_out = "Input blob is empty";
+        return false;
+    }
+
+    if (size > UINT32_MAX) {
+        error_out = "Input blob is larger than DXC's 32-bit blob API limit";
+        return false;
+    }
+
+    if (!runtime.ensure_loaded()) {
+        error_out = runtime.failure_reason;
+        return false;
+    }
+
+    const auto hr = runtime.utils->CreateBlob(data, static_cast<UINT32>(size), code_page, &blob);
+    if (FAILED(hr) || blob == nullptr) {
+        error_out = "DXC failed to create blob: " + hr_to_string(hr);
+        return false;
+    }
+
+    return true;
+}
+
+bool read_operation_result(
+    IDxcOperationResult* op,
+    std::vector<uint8_t>& out,
+    std::string& error_out
+) {
+    if (op == nullptr) {
+        error_out = "DXC operation returned no result object";
+        return false;
+    }
+
+    HRESULT status = E_FAIL;
+    op->GetStatus(&status);
+
+    ComPtr<IDxcBlobEncoding> errors{};
+    std::string error_text{};
+    if (SUCCEEDED(op->GetErrorBuffer(&errors)) && errors != nullptr && errors->GetBufferPointer() != nullptr && errors->GetBufferSize() > 0) {
+        error_text.assign(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize());
+    }
+
+    if (FAILED(status)) {
+        error_out = !error_text.empty() ? error_text : ("DXC operation failed: " + hr_to_string(status));
+        return false;
+    }
+
+    ComPtr<IDxcBlob> result{};
+    const auto hr = op->GetResult(&result);
+    if (FAILED(hr) || result == nullptr || result->GetBufferPointer() == nullptr || result->GetBufferSize() == 0) {
+        error_out = "DXC operation returned no output blob: " + hr_to_string(hr);
+        return false;
+    }
+
+    const auto* first = static_cast<const uint8_t*>(result->GetBufferPointer());
+    out.assign(first, first + result->GetBufferSize());
+    return true;
+}
+
+bool validate_container_bytes(
+    DxcRuntime& runtime,
+    std::vector<uint8_t>& bytes,
+    std::string& error_out
+) {
+    if (bytes.empty()) {
+        error_out = "Cannot validate an empty shader container";
+        return false;
+    }
+
+    ComPtr<IDxcBlobEncoding> blob{};
+    if (!create_blob_from_bytes(runtime, bytes.data(), bytes.size(), DXC_CP_ACP, blob, error_out)) {
+        return false;
+    }
+
+    ComPtr<IDxcValidator> validator{};
+    auto hr = runtime.create(CLSID_DxcValidator, IID_PPV_ARGS(&validator));
+    if (FAILED(hr) || validator == nullptr) {
+        error_out = "Failed to create IDxcValidator: " + hr_to_string(hr);
+        return false;
+    }
+
+    ComPtr<IDxcOperationResult> validate_result{};
+    hr = validator->Validate(blob.Get(), DxcValidatorFlags_InPlaceEdit, &validate_result);
+    if (FAILED(hr) || validate_result == nullptr) {
+        error_out = "DXIL validator call failed: " + hr_to_string(hr);
+        return false;
+    }
+
+    std::vector<uint8_t> validated{};
+    if (!read_operation_result(validate_result.Get(), validated, error_out)) {
+        return false;
+    }
+
+    bytes = std::move(validated);
+    return true;
+}
+
+std::vector<render::ShaderRecoveredSourceInfo> recover_sources_from_pdb_or_dxil(
+    const void* bytecode,
+    size_t bytecode_size,
+    std::string& error_out
+) {
+    std::vector<render::ShaderRecoveredSourceInfo> out{};
+    auto& runtime = DxcRuntime::instance();
+    if (!runtime.ensure_loaded()) {
+        error_out = runtime.failure_reason;
+        return out;
+    }
+
+    ComPtr<IDxcBlobEncoding> blob{};
+    if (!create_blob_from_bytes(runtime, bytecode, bytecode_size, DXC_CP_ACP, blob, error_out)) {
+        return out;
+    }
+
+    ComPtr<IDxcPdbUtils> pdb{};
+    auto hr = runtime.create(CLSID_DxcPdbUtils, IID_PPV_ARGS(&pdb));
+    if (FAILED(hr) || pdb == nullptr) {
+        error_out = "Failed to create IDxcPdbUtils: " + hr_to_string(hr);
+        return out;
+    }
+
+    hr = pdb->Load(blob.Get());
+    if (FAILED(hr)) {
+        error_out = "IDxcPdbUtils::Load failed: " + hr_to_string(hr);
+        return out;
+    }
+
+    UINT32 source_count = 0;
+    hr = pdb->GetSourceCount(&source_count);
+    if (FAILED(hr)) {
+        error_out = "IDxcPdbUtils::GetSourceCount failed: " + hr_to_string(hr);
+        return out;
+    }
+
+    constexpr size_t MAX_RECOVERED_SOURCE_CHARS = 128 * 1024;
+    out.reserve(source_count);
+    for (UINT32 i = 0; i < source_count; ++i) {
+        render::ShaderRecoveredSourceInfo source{};
+
+        BSTR name = nullptr;
+        if (SUCCEEDED(pdb->GetSourceName(i, &name)) && name != nullptr) {
+            source.name = bstr_to_utf8(name);
+            SysFreeString(name);
+        }
+
+        ComPtr<IDxcBlobEncoding> source_blob{};
+        if (SUCCEEDED(pdb->GetSource(i, &source_blob)) && source_blob != nullptr &&
+            source_blob->GetBufferPointer() != nullptr && source_blob->GetBufferSize() > 0) {
+            const size_t take = std::min<size_t>(source_blob->GetBufferSize(), MAX_RECOVERED_SOURCE_CHARS);
+            source.text.assign(static_cast<const char*>(source_blob->GetBufferPointer()), take);
+            if (take < source_blob->GetBufferSize()) {
+                source.text += "\n/* recovered source truncated */\n";
+            }
+        }
+
+        out.emplace_back(std::move(source));
+    }
+
+    return out;
+}
 
 render::ShaderCompileResult compile_with_dxc(const render::ShaderCompileRequest& request) {
     render::ShaderCompileResult result{};
@@ -411,5 +654,278 @@ ShaderCompileResult compile_shader_file(const ShaderCompileRequest& request) {
     }
 
     return try_fxc();
+}
+
+ShaderBytecodeInspection inspect_shader_bytecode(
+    const void* bytecode,
+    size_t bytecode_size,
+    bool disassemble,
+    size_t max_disassembly_chars
+) {
+    ShaderBytecodeInspection result{};
+    result.bytecode_size = static_cast<uint32_t>(std::min<size_t>(bytecode_size, UINT32_MAX));
+
+    if (bytecode == nullptr || bytecode_size == 0) {
+        result.error = "Shader bytecode is empty";
+        return result;
+    }
+
+    const auto* bytes = static_cast<const uint8_t*>(bytecode);
+
+    if (bytecode_size >= 32 && std::memcmp(bytes, "DXBC", 4) == 0) {
+        result.container = true;
+        result.container_kind = "DXBC";
+        result.container_hash = bytes_to_hex(bytes + 4, 16);
+        result.container_version = read_u32_le(bytes + 20);
+        result.declared_size = read_u32_le(bytes + 24);
+        const auto chunk_count = read_u32_le(bytes + 28);
+
+        for (uint32_t i = 0; i < chunk_count; ++i) {
+            const size_t offset_table_pos = 32ull + static_cast<size_t>(i) * sizeof(uint32_t);
+            if (offset_table_pos + sizeof(uint32_t) > bytecode_size) {
+                result.error = "DXBC chunk offset table is truncated";
+                break;
+            }
+
+            const auto chunk_offset = read_u32_le(bytes + offset_table_pos);
+            if (static_cast<size_t>(chunk_offset) + 8 > bytecode_size) {
+                result.chunks.push_back({ "????", chunk_offset, 0 });
+                result.error = "DXBC chunk points outside the container";
+                continue;
+            }
+
+            ShaderContainerChunkInfo chunk{};
+            chunk.fourcc = fourcc_to_string(bytes + chunk_offset);
+            chunk.offset = chunk_offset;
+            chunk.size = read_u32_le(bytes + chunk_offset + 4);
+            result.chunks.push_back(std::move(chunk));
+        }
+
+        for (const auto& chunk : result.chunks) {
+            if (chunk.fourcc == "DXIL") {
+                result.container_kind = "DXIL";
+                break;
+            }
+        }
+    } else {
+        result.container_kind = "raw";
+    }
+
+    if (disassemble) {
+        auto& runtime = DxcRuntime::instance();
+        if (!runtime.ensure_loaded()) {
+            result.error = result.error.empty() ? runtime.failure_reason : (result.error + "; " + runtime.failure_reason);
+        } else {
+            const DxcBuffer buffer{
+                .Ptr = bytecode,
+                .Size = bytecode_size,
+                .Encoding = DXC_CP_ACP
+            };
+
+            ComPtr<IDxcResult> disasm_result{};
+            const auto hr = runtime.compiler->Disassemble(&buffer, IID_PPV_ARGS(&disasm_result));
+            if (FAILED(hr) || disasm_result == nullptr) {
+                const auto err = "DXC disassemble call failed: " + hr_to_string(hr);
+                result.error = result.error.empty() ? err : (result.error + "; " + err);
+            } else {
+                HRESULT status = E_FAIL;
+                disasm_result->GetStatus(&status);
+
+                ComPtr<IDxcBlobUtf8> errors{};
+                std::string error_text{};
+                if (SUCCEEDED(disasm_result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr)) &&
+                    errors != nullptr &&
+                    errors->GetStringLength() > 0) {
+                    error_text.assign(errors->GetStringPointer(), errors->GetStringLength());
+                }
+
+                ComPtr<IDxcBlobUtf8> disassembly{};
+                const auto out_hr = disasm_result->GetOutput(DXC_OUT_DISASSEMBLY, IID_PPV_ARGS(&disassembly), nullptr);
+                if (FAILED(status) || FAILED(out_hr) || disassembly == nullptr) {
+                    const auto err = !error_text.empty()
+                        ? error_text
+                        : ("DXC disassemble failed: " + hr_to_string(FAILED(status) ? status : out_hr));
+                    result.error = result.error.empty() ? err : (result.error + "; " + err);
+                } else {
+                    const size_t take = std::min<size_t>(disassembly->GetStringLength(), max_disassembly_chars);
+                    result.disassembly.assign(disassembly->GetStringPointer(), take);
+                    if (take < disassembly->GetStringLength()) {
+                        result.disassembly += "\n/* disassembly truncated */\n";
+                    }
+                    result.compiler = "dxc:" + runtime.loaded_from.string();
+                }
+            }
+        }
+    }
+
+    if (result.container && result.container_kind == "DXIL") {
+        std::string pdb_error{};
+        result.recovered_sources = recover_sources_from_pdb_or_dxil(bytecode, bytecode_size, pdb_error);
+        if (!pdb_error.empty() && !result.error.empty()) {
+            result.error += "; PDB/source recovery: " + pdb_error;
+        }
+    }
+
+    result.ok = result.error.empty() || !result.chunks.empty() || !result.disassembly.empty();
+    return result;
+}
+
+ShaderContainerEditResult edit_shader_container(const ShaderContainerEditRequest& request) {
+    ShaderContainerEditResult result{};
+    result.compiler = "dxc-container-builder";
+
+    auto& runtime = DxcRuntime::instance();
+    if (!runtime.ensure_loaded()) {
+        result.error = runtime.failure_reason;
+        return result;
+    }
+
+    ComPtr<IDxcBlobEncoding> input_blob{};
+    if (!create_blob_from_bytes(runtime, request.bytecode, request.bytecode_size, DXC_CP_ACP, input_blob, result.error)) {
+        return result;
+    }
+
+    ComPtr<IDxcContainerBuilder> builder{};
+    auto hr = runtime.create(CLSID_DxcContainerBuilder, IID_PPV_ARGS(&builder));
+    if (FAILED(hr) || builder == nullptr) {
+        result.error = "Failed to create IDxcContainerBuilder: " + hr_to_string(hr);
+        return result;
+    }
+
+    hr = builder->Load(input_blob.Get());
+    if (FAILED(hr)) {
+        result.error = "IDxcContainerBuilder::Load failed: " + hr_to_string(hr);
+        return result;
+    }
+
+    for (const auto& edit : request.edits) {
+        const auto fourcc = fourcc_value(edit.fourcc);
+        if (fourcc == 0) {
+            result.error = "Invalid container fourcc: " + edit.fourcc;
+            return result;
+        }
+
+        if (edit.remove) {
+            hr = builder->RemovePart(fourcc);
+            if (FAILED(hr) && HRESULT_CODE(hr) != ERROR_NOT_FOUND) {
+                result.error = "IDxcContainerBuilder::RemovePart(" + edit.fourcc + ") failed: " + hr_to_string(hr);
+                return result;
+            }
+            continue;
+        }
+
+        ComPtr<IDxcBlobEncoding> part_blob{};
+        if (!create_blob_from_bytes(runtime, edit.data.data(), edit.data.size(), DXC_CP_ACP, part_blob, result.error)) {
+            result.error = "Failed to create replacement part " + edit.fourcc + ": " + result.error;
+            return result;
+        }
+
+        hr = builder->RemovePart(fourcc);
+        if (FAILED(hr) && HRESULT_CODE(hr) != ERROR_NOT_FOUND) {
+            result.error = "IDxcContainerBuilder::RemovePart(" + edit.fourcc + ") failed before replacement: " + hr_to_string(hr);
+            return result;
+        }
+
+        hr = builder->AddPart(fourcc, part_blob.Get());
+        if (FAILED(hr)) {
+            result.error = "IDxcContainerBuilder::AddPart(" + edit.fourcc + ") failed: " + hr_to_string(hr);
+            return result;
+        }
+    }
+
+    ComPtr<IDxcOperationResult> serialize_result{};
+    hr = builder->SerializeContainer(&serialize_result);
+    if (FAILED(hr) || serialize_result == nullptr) {
+        result.error = "IDxcContainerBuilder::SerializeContainer failed: " + hr_to_string(hr);
+        return result;
+    }
+
+    if (!read_operation_result(serialize_result.Get(), result.bytecode, result.error)) {
+        return result;
+    }
+
+    if (request.validate_and_sign && !validate_container_bytes(runtime, result.bytecode, result.error)) {
+        return result;
+    }
+
+    result.succeeded = true;
+    return result;
+}
+
+ShaderContainerEditResult patch_dxil_text(const ShaderDxilTextPatchRequest& request) {
+    ShaderContainerEditResult result{};
+    result.compiler = "dxc-assembler";
+
+    if (request.patches.empty()) {
+        result.error = "DXIL text patch contains no replacements";
+        return result;
+    }
+
+    auto inspection = inspect_shader_bytecode(
+        request.bytecode,
+        request.bytecode_size,
+        true,
+        request.max_disassembly_chars);
+    if (inspection.disassembly.empty()) {
+        result.error = inspection.error.empty() ? "DXC produced no disassembly for text patching" : inspection.error;
+        return result;
+    }
+
+    std::string patched = std::move(inspection.disassembly);
+    for (const auto& patch : request.patches) {
+        if (patch.find.empty()) {
+            result.error = "DXIL text patch has an empty find string";
+            return result;
+        }
+
+        size_t replaced = 0;
+        size_t pos = 0;
+        while ((pos = patched.find(patch.find, pos)) != std::string::npos) {
+            patched.replace(pos, patch.find.size(), patch.replace);
+            pos += patch.replace.size();
+            ++replaced;
+        }
+
+        if (replaced == 0) {
+            result.error = "DXIL text patch did not match: " + patch.find.substr(0, 120);
+            return result;
+        }
+    }
+
+    auto& runtime = DxcRuntime::instance();
+    if (!runtime.ensure_loaded()) {
+        result.error = runtime.failure_reason;
+        return result;
+    }
+
+    ComPtr<IDxcBlobEncoding> text_blob{};
+    if (!create_blob_from_bytes(runtime, patched.data(), patched.size(), DXC_CP_UTF8, text_blob, result.error)) {
+        return result;
+    }
+
+    ComPtr<IDxcAssembler> assembler{};
+    auto hr = runtime.create(CLSID_DxcAssembler, IID_PPV_ARGS(&assembler));
+    if (FAILED(hr) || assembler == nullptr) {
+        result.error = "Failed to create IDxcAssembler: " + hr_to_string(hr);
+        return result;
+    }
+
+    ComPtr<IDxcOperationResult> assemble_result{};
+    hr = assembler->AssembleToContainer(text_blob.Get(), &assemble_result);
+    if (FAILED(hr) || assemble_result == nullptr) {
+        result.error = "IDxcAssembler::AssembleToContainer failed: " + hr_to_string(hr);
+        return result;
+    }
+
+    if (!read_operation_result(assemble_result.Get(), result.bytecode, result.error)) {
+        return result;
+    }
+
+    if (request.validate_and_sign && !validate_container_bytes(runtime, result.bytecode, result.error)) {
+        return result;
+    }
+
+    result.succeeded = true;
+    return result;
 }
 } // namespace render

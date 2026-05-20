@@ -276,6 +276,7 @@ protected:
     std::vector<std::unique_ptr<PointerHook>> m_create_command_list1_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_command_signature_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_pipeline_state_hooks{};
+    std::vector<std::unique_ptr<PointerHook>> m_create_root_signature_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_constant_buffer_view_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_render_target_view_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_depth_stencil_view_hooks{};
@@ -291,6 +292,7 @@ protected:
     std::unordered_map<uintptr_t, PointerHook*> m_create_command_list1_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_command_signature_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_pipeline_state_hook_lookup{};
+    std::unordered_map<uintptr_t, PointerHook*> m_create_root_signature_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_constant_buffer_view_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_render_target_view_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_depth_stencil_view_hook_lookup{};
@@ -322,6 +324,7 @@ protected:
     static HRESULT WINAPI create_command_list1(ID3D12Device4* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags, REFIID riid, void** command_list);
     static HRESULT WINAPI create_command_signature(ID3D12Device* device, const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* root_signature, REFIID riid, void** command_signature);
     static HRESULT WINAPI create_pipeline_state(ID3D12Device2* device, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid, void** pipeline_state);
+    static HRESULT WINAPI create_root_signature(ID3D12Device* device, UINT node_mask, const void* blob, SIZE_T blob_length_in_bytes, REFIID riid, void** root_signature);
     static void WINAPI create_constant_buffer_view(ID3D12Device* device, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
     static void WINAPI create_render_target_view(ID3D12Device* device, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
     static void WINAPI create_shader_resource_view(ID3D12Device* device, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
@@ -343,6 +346,15 @@ protected:
     static void WINAPI resource_barrier(ID3D12GraphicsCommandList* command_list, UINT num_barriers, const D3D12_RESOURCE_BARRIER* barriers);
     static void WINAPI set_graphics_root_descriptor_table(ID3D12GraphicsCommandList* command_list, UINT root_parameter_index, D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor);
     static void WINAPI set_compute_root_descriptor_table(ID3D12GraphicsCommandList* command_list, UINT root_parameter_index, D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor);
+    static void WINAPI set_compute_root_32bit_constant(ID3D12GraphicsCommandList* command_list, UINT root_parameter_index, UINT src_data, UINT dest_offset_in_32bit_values);
+    static void WINAPI set_graphics_root_32bit_constant(ID3D12GraphicsCommandList* command_list, UINT root_parameter_index, UINT src_data, UINT dest_offset_in_32bit_values);
+    static void WINAPI set_compute_root_32bit_constants(ID3D12GraphicsCommandList* command_list, UINT root_parameter_index, UINT num_32bit_values_to_set, const void* src_data, UINT dest_offset_in_32bit_values);
+    static void WINAPI set_graphics_root_32bit_constants(ID3D12GraphicsCommandList* command_list, UINT root_parameter_index, UINT num_32bit_values_to_set, const void* src_data, UINT dest_offset_in_32bit_values);
+    static void WINAPI set_compute_root_constant_buffer_view(ID3D12GraphicsCommandList* command_list, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS gpu_va);
+    static void WINAPI set_compute_root_shader_resource_view(ID3D12GraphicsCommandList* command_list, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS gpu_va);
+    static void WINAPI set_graphics_root_shader_resource_view(ID3D12GraphicsCommandList* command_list, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS gpu_va);
+    static void WINAPI set_compute_root_unordered_access_view(ID3D12GraphicsCommandList* command_list, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS gpu_va);
+    static void WINAPI set_graphics_root_unordered_access_view(ID3D12GraphicsCommandList* command_list, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS gpu_va);
     static void WINAPI set_descriptor_heaps(ID3D12GraphicsCommandList* command_list, UINT num_descriptor_heaps, ID3D12DescriptorHeap* const* descriptor_heaps);
     // 2026-05-17 SN2 fog Path A: redirect view 1's root_param 3 (FFogUniformParameters cbuffer)
     // to a UEVR-owned upload buffer so right-eye basepass can read view-1-correct content
@@ -360,6 +372,7 @@ protected:
     PointerHook* find_create_command_list1_hook(void* slot) const;
     PointerHook* find_create_command_signature_hook(void* slot) const;
     PointerHook* find_create_pipeline_state_hook(void* slot) const;
+    PointerHook* find_create_root_signature_hook(void* slot) const;
     PointerHook* find_create_constant_buffer_view_hook(void* slot) const;
     PointerHook* find_create_render_target_view_hook(void* slot) const;
     PointerHook* find_create_depth_stencil_view_hook(void* slot) const;

@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -30,12 +31,32 @@ public:
     enum class Stage : uint8_t {
         Vertex,
         Pixel,
+        Compute,
+        Amplification,
+        Mesh,
     };
 
     enum class OverrideSourceKind : uint8_t {
         Hlsl,
         Bytecode,
         DxilPatch,
+        DxilTextPatch,
+        ContainerPatch,
+        DxilTransform,
+    };
+
+    enum class EyeTarget : uint8_t {
+        Any,
+        Unknown,
+        Left,
+        Right,
+        Full,
+        Multi,
+    };
+
+    enum class BindOverrideKind : uint8_t {
+        Cbv,
+        RootConstants,
     };
 
     using CreateVertexShaderFn = HRESULT (WINAPI*)(ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11VertexShader**);
@@ -69,9 +90,28 @@ public:
         bool compiled{};
         bool apply_supported{};
         bool from_profile_dir{};
+        bool per_eye_variants{};
         uint64_t generation{};
         std::string status{};
         std::string compiler{};
+        std::string last_error{};
+    };
+
+    struct BindOverrideEntryInfo {
+        std::string key{};
+        std::string name{};
+        std::string target_hash{};
+        std::string stage{};
+        std::string pipeline{};
+        std::string eye{};
+        std::string kind{};
+        uint32_t root_parameter{};
+        uint32_t value_count{};
+        uint32_t dest_offset{};
+        bool enabled{};
+        bool from_profile_dir{};
+        std::string manifest_path{};
+        std::string status{};
         std::string last_error{};
     };
 
@@ -114,8 +154,37 @@ public:
         std::vector<PsoRenderUsageInfo> likely_targets{};
     };
 
+    struct D3D12PsoChurnFrameInfo {
+        uint64_t frame{};
+        uint64_t graphics_creations{};
+        uint64_t compute_creations{};
+        uint64_t stream_creations{};
+    };
+
+    struct D3D12PsoChurnInfo {
+        uint64_t tracked_pso_count{};
+        uint64_t current_frame_graphics_creations{};
+        uint64_t current_frame_compute_creations{};
+        uint64_t current_frame_stream_creations{};
+        uint64_t recent_window_frames{};
+        uint64_t recent_graphics_creations{};
+        uint64_t recent_compute_creations{};
+        uint64_t recent_stream_creations{};
+        std::vector<D3D12PsoChurnFrameInfo> recent_frames{};
+    };
+
+    struct D3D12ShaderBytecodeInspection {
+        bool found{};
+        std::string requested_stage{};
+        std::string requested_hash{};
+        std::string matched_stage{};
+        uintptr_t pipeline_state{};
+        ShaderBytecodeInspection bytecode{};
+    };
+
     struct Snapshot {
         bool auto_reload{true};
+        bool runtime_overrides_enabled{true};
         uint64_t frame{};
         std::string global_override_dir{};
         std::string profile_override_dir{};
@@ -127,9 +196,22 @@ public:
         uint64_t total_d3d12_pair_samples{};
         std::vector<D3D12PipelinePairInfo> distinct_d3d12_pairs{};
         uint64_t total_d3d12_pso_samples{};
+        D3D12PsoChurnInfo d3d12_pso_churn{};
         std::vector<D3D12PsoAggregateInfo> d3d12_pso_aggregates{};
         std::vector<OverrideEntryInfo> overrides{};
+        std::vector<BindOverrideEntryInfo> bind_overrides{};
         std::vector<std::string> recent_events{};
+    };
+
+    struct D3D12CbvBindOverride {
+        std::string name{};
+        std::vector<uint8_t> data{};
+    };
+
+    struct D3D12RootConstantsBindOverride {
+        std::string name{};
+        std::vector<uint32_t> values{};
+        uint32_t dest_offset{};
     };
 
     // === Shader Hunter (ShaderToggler-equivalent live hash hunting) ===
@@ -212,6 +294,12 @@ public:
     size_t hunter_trim_collected(bool scene_only, bool live_only);
     // Trim to top-N hits within the existing list.
     size_t hunter_trim_to_top_hits(size_t keep_count);
+    bool hunter_capture_active_as_override_stub(
+        HunterStage stage,
+        std::filesystem::path& manifest_path,
+        std::filesystem::path& source_path,
+        std::string& error_out
+    );
     // Highlight mode: instead of skipping the draw, substitute the PSO with
     // a variant whose PS outputs solid magenta — so the user can SEE where
     // the shader draws in the scene. Mutually exclusive with mark/skip per
@@ -277,10 +365,18 @@ public:
     bool should_track_d3d12_pipelines() const;
     bool should_record_d3d12_pipeline_creations() const;
     void request_reload();
+    void set_runtime_overrides_enabled(bool enabled);
+    bool runtime_overrides_enabled() const;
     void request_capture_next_d3d12_change();
     void clear_captured_d3d12_change();
     bool export_d3d12_pairs_json(std::filesystem::path& out_path, std::string& error_out);
     bool export_d3d12_pairs_csv(std::filesystem::path& out_path, std::string& error_out);
+    D3D12ShaderBytecodeInspection inspect_d3d12_shader_bytecode(
+        std::string_view stage,
+        std::string_view hash,
+        bool disassemble,
+        size_t max_disassembly_chars = 128 * 1024
+    ) const;
     Snapshot snapshot() const;
 
     void set_d3d11_create_callbacks(CreateVertexShaderFn create_vs, CreatePixelShaderFn create_ps);
@@ -292,7 +388,20 @@ public:
     void register_d3d12_compute_pipeline_state_creation(ID3D12Device* device, ID3D12PipelineState* pipeline_state, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc);
     void register_d3d12_pipeline_state_stream_creation(ID3D12Device* device, ID3D12PipelineState* pipeline_state, const D3D12_PIPELINE_STATE_STREAM_DESC* desc);
     ID3D12PipelineState* resolve_d3d12_pipeline_state(ID3D12PipelineState* pipeline_state);
+    ID3D12PipelineState* resolve_d3d12_pipeline_state_for_eye(ID3D12PipelineState* pipeline_state, int eye_bucket);
     void note_d3d12_pipeline_state_bound(ID3D12PipelineState* original_pipeline_state, ID3D12PipelineState* bound_pipeline_state);
+    std::optional<D3D12CbvBindOverride> resolve_d3d12_cbv_bind_override(
+        bool graphics,
+        uintptr_t pipeline_state,
+        int eye_bucket,
+        uint32_t root_parameter
+    ) const;
+    std::optional<D3D12RootConstantsBindOverride> resolve_d3d12_root_constants_bind_override(
+        bool graphics,
+        uintptr_t pipeline_state,
+        int eye_bucket,
+        uint32_t root_parameter
+    ) const;
 
 private:
     struct OverrideEntry {
@@ -309,11 +418,14 @@ private:
         std::filesystem::path patch_tool_path{};
         std::filesystem::path cached_bytecode_path{};
         std::string compiled_original_hash{};
+        std::vector<ShaderTextPatch> dxil_text_patches{};
+        std::vector<ShaderContainerEdit> container_edits{};
         std::string entry_point{};
         std::string profile{};
         ShaderCompilerBackend preferred_compiler{ShaderCompilerBackend::Auto};
         bool enabled{true};
         bool from_profile_dir{};
+        bool per_eye_variants{};
         bool compiled{};
         bool apply_supported{};
         uint64_t generation{};
@@ -416,13 +528,41 @@ private:
         bool override_active{};
         std::string vertex_override_name{};
         std::string pixel_override_name{};
+        std::string compute_override_name{};
+        std::string amplification_override_name{};
+        std::string mesh_override_name{};
         std::string tracking_note{};
         std::string last_error{};
         Microsoft::WRL::ComPtr<ID3D12Device> device{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> override_pipeline_state{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> override_pipeline_state_left{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> override_pipeline_state_right{};
         OwnedD3D12GraphicsPipelineStateDesc owned_desc{};
         OwnedD3D12PipelineStateStream owned_stream{};
+        D3D12_COMPUTE_PIPELINE_STATE_DESC compute_desc{};
         bool logged_substitution{};
+    };
+
+    struct BindOverrideEntry {
+        std::string key{};
+        std::string name{};
+        std::string target_hash{};
+        Stage stage{Stage::Pixel};
+        bool any_stage{true};
+        bool graphics{true};
+        bool compute{};
+        EyeTarget eye{EyeTarget::Any};
+        BindOverrideKind kind{BindOverrideKind::Cbv};
+        uint32_t root_parameter{};
+        uint32_t dest_offset{};
+        bool enabled{true};
+        bool from_profile_dir{};
+        std::filesystem::path manifest_path{};
+        std::filesystem::file_time_type manifest_write_time{};
+        std::string status{};
+        std::string last_error{};
+        std::vector<uint8_t> cbv_data{};
+        std::vector<uint32_t> constants{};
     };
 
     struct PsoRenderUsageRecord {
@@ -450,12 +590,18 @@ private:
     };
 
     void scan_override_directories();
-    void scan_single_directory(const std::filesystem::path& dir, bool from_profile_dir);
+    void scan_single_directory(
+        const std::filesystem::path& dir,
+        bool from_profile_dir,
+        std::unordered_map<std::string, std::filesystem::path>& discovered_bind_overrides);
     void remove_deleted_entries(const std::unordered_map<std::string, std::filesystem::path>& discovered_entries);
+    void remove_deleted_bind_overrides(const std::unordered_map<std::string, std::filesystem::path>& discovered_entries);
     void compile_or_refresh_entry(OverrideEntry& entry);
     std::optional<OverrideEntry> parse_manifest(const std::filesystem::path& manifest_path, bool from_profile_dir);
+    std::optional<BindOverrideEntry> parse_bind_override_manifest(const std::filesystem::path& manifest_path, bool from_profile_dir);
     bool compile_entry(OverrideEntry& entry, std::string& error_out);
     bool ensure_d3d12_patch_entry_compiled(OverrideEntry& entry, const void* original_bytecode, size_t original_bytecode_size, std::string_view original_hash, std::string& error_out);
+    bool record_matches_bind_override(const D3D12GraphicsPsoRecord& record, const BindOverrideEntry& entry) const;
     void push_event(std::string message);
     void refresh_active_override_flags_locked();
     void update_d3d11_override_shader(D3D11ShaderRecord& record, ID3D11Device* device);
@@ -473,6 +619,7 @@ private:
 
     mutable std::recursive_mutex m_mutex{};
     std::unordered_map<std::string, OverrideEntry> m_overrides{};
+    std::unordered_map<std::string, BindOverrideEntry> m_bind_overrides{};
     std::unordered_map<uintptr_t, D3D11ShaderRecord> m_d3d11_shader_records{};
     std::unordered_map<uintptr_t, D3D12GraphicsPsoRecord> m_d3d12_graphics_pso_records{};
     BoundShaderInfo m_bound_vertex_shader{};
@@ -485,6 +632,10 @@ private:
     std::unordered_map<std::string, size_t> m_distinct_d3d12_pair_indices{};
     uint64_t m_total_d3d12_pso_samples{};
     std::unordered_map<std::string, D3D12PsoAggregateRecord> m_d3d12_pso_aggregates{};
+    uint64_t m_d3d12_graphics_pso_creations_this_frame{};
+    uint64_t m_d3d12_compute_pso_creations_this_frame{};
+    uint64_t m_d3d12_stream_pso_creations_this_frame{};
+    std::vector<D3D12PsoChurnFrameInfo> m_recent_d3d12_pso_churn{};
     std::vector<std::string> m_recent_events{};
     std::chrono::steady_clock::time_point m_last_scan_time{};
     bool m_force_reload{};
@@ -494,6 +645,7 @@ private:
     CreatePixelShaderFn m_create_pixel_shader{};
     std::atomic_bool m_has_active_d3d11_overrides{false};
     std::atomic_bool m_has_active_d3d12_overrides{false};
+    std::atomic_bool m_runtime_overrides_enabled{true};
     std::atomic_bool m_inspector_tracking_enabled{false};
     std::atomic_bool m_capture_next_d3d12_change_hot_path{false};
 

@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <type_traits>
@@ -308,10 +309,21 @@ void draw_dx12_summary_row(const char* label, const std::string& value) {
     ImGui::TextWrapped("%s", value.c_str());
 }
 
+const char* shader_stage_label(render::ShaderOverrideRegistry::Stage stage) {
+    switch (stage) {
+    case render::ShaderOverrideRegistry::Stage::Vertex: return "VS";
+    case render::ShaderOverrideRegistry::Stage::Pixel: return "PS";
+    case render::ShaderOverrideRegistry::Stage::Compute: return "CS";
+    case render::ShaderOverrideRegistry::Stage::Amplification: return "AS";
+    case render::ShaderOverrideRegistry::Stage::Mesh: return "MS";
+    default: return "?";
+    }
+}
+
 void draw_bound_shader_table_row(const render::ShaderOverrideRegistry::BoundShaderInfo& shader) {
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
-    ImGui::TextUnformatted(shader.stage == render::ShaderOverrideRegistry::Stage::Vertex ? "VS" : "PS");
+    ImGui::TextUnformatted(shader_stage_label(shader.stage));
     ImGui::TableNextColumn();
     ImGui::TextUnformatted(shader.backend == render::ShaderOverrideRegistry::Backend::D3D11 ? "DX11" : "DX12");
     ImGui::TableNextColumn();
@@ -941,6 +953,9 @@ void RenderInspector::draw_dx12_diagnostics() {
             draw_dx12_summary_row("Heap switches / frame", std::to_string(snapshot.descriptor_heap_switches_this_frame));
             draw_dx12_summary_row("Barriers / frame", std::to_string(snapshot.resource_barriers_this_frame));
             draw_dx12_summary_row("RT binds / frame", std::to_string(snapshot.rtv_binds_this_frame));
+            draw_dx12_summary_row("Root binds / frame", std::to_string(snapshot.root_binds_this_frame));
+            draw_dx12_summary_row("Draw events / frame", std::to_string(snapshot.draw_events_this_frame));
+            draw_dx12_summary_row("Root signatures tracked", std::to_string(snapshot.root_signatures.size()));
             draw_dx12_summary_row("Transient heap creations / frame", std::to_string(snapshot.transient_heap_creations_this_frame));
             draw_dx12_summary_row("Transient resources / frame", std::to_string(snapshot.transient_resource_creations_this_frame));
             draw_dx12_summary_row("Transient bytes / frame", format_bytes(snapshot.transient_resource_bytes_this_frame));
@@ -1003,6 +1018,48 @@ void RenderInspector::draw_dx12_diagnostics() {
                 ImGui::TextWrapped("%s", flags.empty() ? "-" : flags.c_str());
                 ImGui::TableNextColumn();
                 ImGui::Text("%" PRIu64, heap.last_seen_frame);
+            }
+
+            ImGui::EndTable();
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Root Signatures")) {
+        constexpr auto root_sig_table_flags =
+            ImGuiTableFlags_Borders |
+            ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_Resizable |
+            ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_SizingStretchProp;
+
+        if (ImGui::BeginTable("DX12RootSignatureTable", 7, root_sig_table_flags, ImVec2(0.0f, 220.0f))) {
+            ImGui::TableSetupColumn("Root Signature");
+            ImGui::TableSetupColumn("Version");
+            ImGui::TableSetupColumn("Params");
+            ImGui::TableSetupColumn("Samplers");
+            ImGui::TableSetupColumn("Blob");
+            ImGui::TableSetupColumn("Flags");
+            ImGui::TableSetupColumn("Decode");
+            ImGui::TableHeadersRow();
+
+            const size_t take = std::min(snapshot.root_signatures.size(), static_cast<size_t>(m_dx12_event_limit));
+            for (size_t i = 0; i < take; ++i) {
+                const auto& root_signature = snapshot.root_signatures[i];
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(format_pointer_hex(root_signature.pointer).c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(root_signature.version.empty() ? "-" : root_signature.version.c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("%zu", root_signature.parameters.size());
+                ImGui::TableNextColumn();
+                ImGui::Text("%u", root_signature.static_sampler_count);
+                ImGui::TableNextColumn();
+                ImGui::Text("%u", root_signature.blob_size);
+                ImGui::TableNextColumn();
+                ImGui::TextWrapped("%s", root_signature.flags.empty() ? "-" : root_signature.flags.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextWrapped("%s", root_signature.decode_error.empty() ? "ok" : root_signature.decode_error.c_str());
             }
 
             ImGui::EndTable();
@@ -1084,6 +1141,61 @@ void RenderInspector::draw_dx12_diagnostics() {
                 ImGui::TextUnformatted(event.kind.c_str());
                 ImGui::TableNextColumn();
                 ImGui::TextWrapped("%s", event.detail.c_str());
+            }
+
+            ImGui::EndTable();
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Recent Draw Events")) {
+        constexpr auto draw_table_flags =
+            ImGuiTableFlags_Borders |
+            ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_Resizable |
+            ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_SizingStretchProp;
+
+        if (ImGui::BeginTable("DX12DrawEventTable", 9, draw_table_flags, ImVec2(0.0f, 220.0f))) {
+            ImGui::TableSetupColumn("Frame");
+            ImGui::TableSetupColumn("Draw");
+            ImGui::TableSetupColumn("Eye");
+            ImGui::TableSetupColumn("Kind");
+            ImGui::TableSetupColumn("PSO");
+            ImGui::TableSetupColumn("Root Sig");
+            ImGui::TableSetupColumn("RTV0");
+            ImGui::TableSetupColumn("Reads");
+            ImGui::TableSetupColumn("Producer");
+            ImGui::TableHeadersRow();
+
+            const auto start = snapshot.recent_draw_events.size() > static_cast<size_t>(m_dx12_event_limit)
+                ? snapshot.recent_draw_events.size() - static_cast<size_t>(m_dx12_event_limit)
+                : 0;
+
+            for (size_t i = snapshot.recent_draw_events.size(); i-- > start;) {
+                const auto& event = snapshot.recent_draw_events[i];
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::Text("%" PRIu64, event.frame);
+                ImGui::TableNextColumn();
+                ImGui::Text("%" PRIu64, event.draw_index);
+                ImGui::TableNextColumn();
+                ImGui::Text("%d", event.eye_bucket);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(event.kind.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(abbreviate_for_table(format_pointer_hex(event.pipeline_state)).c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(abbreviate_for_table(format_pointer_hex(event.root_signature)).c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(abbreviate_for_table(format_pointer_hex(event.rtv0_resource != 0 ? event.rtv0_resource : event.rtv0)).c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("%zu", event.descriptor_reads.size());
+                ImGui::TableNextColumn();
+                if (event.prior_rtv0_producer_draw != 0) {
+                    ImGui::Text("draw %" PRIu64, event.prior_rtv0_producer_draw);
+                } else {
+                    ImGui::TextUnformatted("-");
+                }
             }
 
             ImGui::EndTable();
@@ -1334,6 +1446,46 @@ void RenderInspector::draw_pso_profiler() {
 
 void RenderInspector::draw_shaders() {
     auto snapshot = render::ShaderOverrideRegistry::get().snapshot();
+    auto load_shader_editor = [&](const std::filesystem::path& path) {
+        constexpr size_t editor_capacity = 512 * 1024;
+        std::ifstream file{path, std::ios::binary};
+        if (!file) {
+            m_shader_editor_status = "Failed to open: " + path.string();
+            return;
+        }
+
+        file.seekg(0, std::ios::end);
+        const auto size = file.tellg();
+        file.seekg(0, std::ios::beg);
+        if (size < 0 || static_cast<size_t>(size) >= editor_capacity) {
+            m_shader_editor_status = "Shader source is too large for the built-in editor: " + path.string();
+            return;
+        }
+
+        m_shader_editor_buffer.assign(editor_capacity, '\0');
+        file.read(m_shader_editor_buffer.data(), size);
+        const auto path_string = path.string();
+        std::snprintf(m_shader_editor_path.data(), m_shader_editor_path.size(), "%s", path_string.c_str());
+        m_shader_editor_status = "Loaded: " + path_string;
+    };
+
+    auto save_shader_editor = [&]() {
+        if (m_shader_editor_path[0] == '\0' || m_shader_editor_buffer.empty()) {
+            m_shader_editor_status = "No shader source loaded.";
+            return;
+        }
+
+        std::ofstream file{m_shader_editor_path.data(), std::ios::binary | std::ios::trunc};
+        if (!file) {
+            m_shader_editor_status = std::string{"Failed to save: "} + m_shader_editor_path.data();
+            return;
+        }
+
+        file.write(m_shader_editor_buffer.data(), static_cast<std::streamsize>(std::strlen(m_shader_editor_buffer.data())));
+        render::ShaderOverrideRegistry::get().request_reload();
+        render::ShaderOverrideRegistry::get().on_present(*g_framework);
+        m_shader_editor_status = std::string{"Saved and reloaded: "} + m_shader_editor_path.data();
+    };
 
     ImGui::Text("Frame: %" PRIu64, snapshot.frame);
     ImGui::SameLine();
@@ -1347,6 +1499,12 @@ void RenderInspector::draw_shaders() {
     if (ImGui::Button("Reload Shader Overrides")) {
         render::ShaderOverrideRegistry::get().request_reload();
         render::ShaderOverrideRegistry::get().on_present(*g_framework);
+        snapshot = render::ShaderOverrideRegistry::get().snapshot();
+    }
+    ImGui::SameLine();
+    bool runtime_overrides = snapshot.runtime_overrides_enabled;
+    if (ImGui::Checkbox("Runtime overrides", &runtime_overrides)) {
+        render::ShaderOverrideRegistry::get().set_runtime_overrides_enabled(runtime_overrides);
         snapshot = render::ShaderOverrideRegistry::get().snapshot();
     }
 
@@ -1384,6 +1542,15 @@ void RenderInspector::draw_shaders() {
         ImGui::TextDisabled("|");
         ImGui::SameLine();
         ImGui::Text("Samples: %" PRIu64, snapshot.total_d3d12_pair_samples);
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        ImGui::Text(
+            "PSO churn: %" PRIu64 " recent / %" PRIu64 " tracked",
+            snapshot.d3d12_pso_churn.recent_graphics_creations +
+                snapshot.d3d12_pso_churn.recent_compute_creations +
+                snapshot.d3d12_pso_churn.recent_stream_creations,
+            snapshot.d3d12_pso_churn.tracked_pso_count);
         ImGui::SetNextItemWidth(180.0f);
         ImGui::DragInt("Distinct DX12 pair limit", &m_recent_dx12_shader_pair_limit, 1.0f, 4, 512);
         m_recent_dx12_shader_pair_limit = std::clamp(m_recent_dx12_shader_pair_limit, 4, 512);
@@ -1618,7 +1785,7 @@ void RenderInspector::draw_shaders() {
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(entry.backend == render::ShaderOverrideRegistry::Backend::D3D11 ? "DX11" : "DX12");
                 ImGui::TableNextColumn();
-                ImGui::TextUnformatted(entry.stage == render::ShaderOverrideRegistry::Stage::Vertex ? "VS" : "PS");
+                ImGui::TextUnformatted(shader_stage_label(entry.stage));
                 ImGui::TableNextColumn();
                 ImGui::TextWrapped("%s", entry.target_hash.c_str());
                 ImGui::TableNextColumn();
@@ -1631,6 +1798,12 @@ void RenderInspector::draw_shaders() {
                 ImGui::TextUnformatted(entry.source_kind.empty() ? "-" : entry.source_kind.c_str());
                 ImGui::TableNextColumn();
                 ImGui::TextWrapped("%s", entry.source_path.c_str());
+                if (entry.source_kind == "hlsl" && !entry.source_path.empty()) {
+                    const auto edit_label = std::string{"Edit##shader_editor_"} + entry.key;
+                    if (ImGui::SmallButton(edit_label.c_str())) {
+                        load_shader_editor(entry.source_path);
+                    }
+                }
                 ImGui::TableNextColumn();
                 std::string note{};
                 note += entry.from_profile_dir ? "Profile" : "Global";
@@ -1649,6 +1822,74 @@ void RenderInspector::draw_shaders() {
 
             ImGui::EndTable();
         }
+
+        if (!snapshot.bind_overrides.empty() &&
+            ImGui::BeginTable("ShaderBindOverrideTable", 9, table_flags, ImVec2(0.0f, 180.0f))) {
+            ImGui::TableSetupColumn("Name");
+            ImGui::TableSetupColumn("Hash");
+            ImGui::TableSetupColumn("Stage");
+            ImGui::TableSetupColumn("Pipeline");
+            ImGui::TableSetupColumn("Eye");
+            ImGui::TableSetupColumn("Kind");
+            ImGui::TableSetupColumn("Root");
+            ImGui::TableSetupColumn("Values");
+            ImGui::TableSetupColumn("Status");
+            ImGui::TableHeadersRow();
+
+            for (const auto& entry : snapshot.bind_overrides) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextWrapped("%s", entry.name.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextWrapped("%s", entry.target_hash.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(entry.stage.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(entry.pipeline.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(entry.eye.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(entry.kind.c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("%u", entry.root_parameter);
+                ImGui::TableNextColumn();
+                ImGui::Text("%u", entry.value_count);
+                ImGui::TableNextColumn();
+                ImGui::TextWrapped("%s%s%s",
+                    entry.status.c_str(),
+                    entry.enabled ? "" : " | Disabled",
+                    entry.last_error.empty() ? "" : (" | " + entry.last_error).c_str());
+            }
+
+            ImGui::EndTable();
+        }
+    }
+
+    if (ImGui::CollapsingHeader("HLSL Editor", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (m_shader_editor_buffer.empty()) {
+            m_shader_editor_buffer.assign(512 * 1024, '\0');
+        }
+
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##ShaderEditorPath", m_shader_editor_path.data(), m_shader_editor_path.size());
+        if (ImGui::Button("Load")) {
+            load_shader_editor(m_shader_editor_path.data());
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save + Recompile")) {
+            save_shader_editor();
+            snapshot = render::ShaderOverrideRegistry::get().snapshot();
+        }
+        if (!m_shader_editor_status.empty()) {
+            ImGui::TextWrapped("%s", m_shader_editor_status.c_str());
+        }
+
+        ImGui::InputTextMultiline(
+            "##ShaderEditorText",
+            m_shader_editor_buffer.data(),
+            m_shader_editor_buffer.size(),
+            ImVec2(-1.0f, 320.0f),
+            ImGuiInputTextFlags_AllowTabInput);
     }
 
     if (ImGui::CollapsingHeader("Recent Events", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1714,6 +1955,17 @@ void RenderInspector::draw_shader_hunter() {
         if (!ok) ImGui::OpenPopup("HunterSaveErr");
         else {
             m_shader_export_status = "Saved marked shaders as JSON manifests";
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Capture active PS stub")) {
+        std::filesystem::path manifest_path{};
+        std::filesystem::path source_path{};
+        std::string err{};
+        if (reg.hunter_capture_active_as_override_stub(render::ShaderOverrideRegistry::HunterStage::Pixel, manifest_path, source_path, err)) {
+            m_shader_export_status = "Captured override stub: " + manifest_path.string();
+        } else {
+            m_shader_export_status = err.empty() ? "No active PS hash to capture" : err;
         }
     }
     ImGui::SameLine();

@@ -34,6 +34,12 @@ UEVR_RENDER_CAPI const char* uevr_render_diag_snapshot_json(
 UEVR_RENDER_CAPI const char* uevr_render_diag_resources_json(int max_resources);
 UEVR_RENDER_CAPI const char* uevr_render_diag_d3d12_json(int max_heaps, int max_events);
 UEVR_RENDER_CAPI const char* uevr_render_diag_shaders_json(int max_distinct_pairs, int max_pso_aggregates);
+UEVR_RENDER_CAPI const char* uevr_render_diag_shader_bytecode_json(
+    const char* stage,
+    const char* hash,
+    int disassemble,
+    int max_disassembly_chars);
+UEVR_RENDER_CAPI const char* uevr_render_diag_hunter_capture_active_override_stub(int stage);
 UEVR_RENDER_CAPI const char* uevr_render_diag_preview_info_json();
 UEVR_RENDER_CAPI const char* uevr_render_diag_context_json();
 
@@ -51,6 +57,10 @@ UEVR_RENDER_CAPI void uevr_render_diag_set_force_d3d12_diagnostics(int enabled);
 // Re-scan shader override directories on the next on_present.
 UEVR_RENDER_CAPI void uevr_render_diag_request_shader_reload();
 
+// Runtime A/B switch for all shader overrides. Keeps manifests loaded but
+// resolves original shaders/PSOs while disabled.
+UEVR_RENDER_CAPI const char* uevr_render_diag_set_runtime_overrides_enabled(int enabled);
+
 // Arm/disarm the "capture next DX12 pipeline change" trigger.
 UEVR_RENDER_CAPI void uevr_render_diag_capture_next_d3d12_change();
 UEVR_RENDER_CAPI void uevr_render_diag_clear_captured_d3d12_change();
@@ -62,6 +72,10 @@ UEVR_RENDER_CAPI void uevr_render_diag_reset_d3d12();
 
 // Returns JSON {ok, path|error}. as_csv=0 → .json, !=0 → .csv.
 UEVR_RENDER_CAPI const char* uevr_render_diag_export_d3d12_pairs(int as_csv);
+
+// Writes the current D3D12 draw/bind snapshot, including symmetry oracle and
+// descriptor lineage, under <persistent>/render_inspector/frame_diffs.
+UEVR_RENDER_CAPI const char* uevr_render_diag_export_frame_pair_diff_json(int max_events);
 
 // Returns JSON {ok, bundle_dir, files[], error}. profile_name and backend
 // may be NULL (the FFI fills sensible defaults from Framework).

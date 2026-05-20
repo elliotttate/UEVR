@@ -48,6 +48,12 @@ const char* shader_stage_to_string(render::ShaderOverrideRegistry::Stage stage) 
         return "VS";
     case render::ShaderOverrideRegistry::Stage::Pixel:
         return "PS";
+    case render::ShaderOverrideRegistry::Stage::Compute:
+        return "CS";
+    case render::ShaderOverrideRegistry::Stage::Amplification:
+        return "AS";
+    case render::ShaderOverrideRegistry::Stage::Mesh:
+        return "MS";
     default:
         return "Unknown";
     }

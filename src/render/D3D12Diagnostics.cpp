@@ -9,8 +9,12 @@
 #include <string>
 #include <string_view>
 
+#include <wrl/client.h>
+
 namespace {
 constexpr size_t MAX_RECENT_BINDINGS = 96;
+constexpr size_t MAX_RECENT_ROOT_BINDS = 384;
+constexpr size_t MAX_RECENT_DRAW_EVENTS = 512;
 constexpr size_t MAX_RECENT_BARRIERS = 128;
 constexpr size_t MAX_RECENT_WARNINGS = 64;
 
@@ -72,6 +76,96 @@ std::string descriptor_heap_type_to_string(D3D12_DESCRIPTOR_HEAP_TYPE type) {
     default:
         return "Unknown";
     }
+}
+
+std::string root_parameter_type_to_string(D3D12_ROOT_PARAMETER_TYPE type) {
+    switch (type) {
+    case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
+        return "descriptor_table";
+    case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+        return "32bit_constants";
+    case D3D12_ROOT_PARAMETER_TYPE_CBV:
+        return "cbv";
+    case D3D12_ROOT_PARAMETER_TYPE_SRV:
+        return "srv";
+    case D3D12_ROOT_PARAMETER_TYPE_UAV:
+        return "uav";
+    default:
+        return "unknown";
+    }
+}
+
+std::string descriptor_range_type_to_string(D3D12_DESCRIPTOR_RANGE_TYPE type) {
+    switch (type) {
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
+        return "srv";
+    case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
+        return "uav";
+    case D3D12_DESCRIPTOR_RANGE_TYPE_CBV:
+        return "cbv";
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
+        return "sampler";
+    default:
+        return "unknown";
+    }
+}
+
+std::string shader_visibility_to_string(D3D12_SHADER_VISIBILITY visibility) {
+    switch (visibility) {
+    case D3D12_SHADER_VISIBILITY_ALL:
+        return "all";
+    case D3D12_SHADER_VISIBILITY_VERTEX:
+        return "vertex";
+    case D3D12_SHADER_VISIBILITY_HULL:
+        return "hull";
+    case D3D12_SHADER_VISIBILITY_DOMAIN:
+        return "domain";
+    case D3D12_SHADER_VISIBILITY_GEOMETRY:
+        return "geometry";
+    case D3D12_SHADER_VISIBILITY_PIXEL:
+        return "pixel";
+    case D3D12_SHADER_VISIBILITY_AMPLIFICATION:
+        return "amplification";
+    case D3D12_SHADER_VISIBILITY_MESH:
+        return "mesh";
+    default:
+        return "unknown";
+    }
+}
+
+std::string root_signature_flags_to_string(D3D12_ROOT_SIGNATURE_FLAGS flags) {
+    if (flags == D3D12_ROOT_SIGNATURE_FLAG_NONE) {
+        return "none";
+    }
+
+    std::string result{};
+    auto add = [&](D3D12_ROOT_SIGNATURE_FLAGS flag, const char* token) {
+        if ((flags & flag) != 0) {
+            if (!result.empty()) {
+                result += "|";
+            }
+            result += token;
+        }
+    };
+
+    add(D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, "allow_ia");
+    add(D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS, "deny_vs");
+    add(D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS, "deny_hs");
+    add(D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS, "deny_ds");
+    add(D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS, "deny_gs");
+    add(D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS, "deny_ps");
+    add(D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT, "allow_stream_output");
+    add(D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE, "local");
+    add(D3D12_ROOT_SIGNATURE_FLAG_DENY_AMPLIFICATION_SHADER_ROOT_ACCESS, "deny_as");
+    add(D3D12_ROOT_SIGNATURE_FLAG_DENY_MESH_SHADER_ROOT_ACCESS, "deny_ms");
+    add(D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED, "direct_cbv_srv_uav_heap");
+    add(D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED, "direct_sampler_heap");
+
+    if (result.empty()) {
+        result = format_pointer(static_cast<uintptr_t>(flags));
+    }
+
+    return result;
 }
 
 std::string barrier_type_to_string(D3D12_RESOURCE_BARRIER_TYPE type) {
@@ -259,6 +353,174 @@ std::string resource_name_or_pointer(ID3D12Object* object, uintptr_t pointer) {
 } // namespace
 
 namespace render {
+namespace {
+void append_root_descriptor_range(
+    D3D12Diagnostics::RootParameterInfo& out,
+    const D3D12_DESCRIPTOR_RANGE& range
+) {
+    D3D12Diagnostics::RootDescriptorRangeInfo info{};
+    info.type = descriptor_range_type_to_string(range.RangeType);
+    info.base_shader_register = range.BaseShaderRegister;
+    info.num_descriptors = range.NumDescriptors;
+    info.register_space = range.RegisterSpace;
+    info.offset_from_table_start = range.OffsetInDescriptorsFromTableStart;
+    out.ranges.emplace_back(std::move(info));
+}
+
+void append_root_descriptor_range(
+    D3D12Diagnostics::RootParameterInfo& out,
+    const D3D12_DESCRIPTOR_RANGE1& range
+) {
+    D3D12Diagnostics::RootDescriptorRangeInfo info{};
+    info.type = descriptor_range_type_to_string(range.RangeType);
+    info.base_shader_register = range.BaseShaderRegister;
+    info.num_descriptors = range.NumDescriptors;
+    info.register_space = range.RegisterSpace;
+    info.offset_from_table_start = range.OffsetInDescriptorsFromTableStart;
+    out.ranges.emplace_back(std::move(info));
+}
+
+void append_root_parameter(
+    D3D12Diagnostics::RootSignatureInfo& out,
+    uint32_t index,
+    const D3D12_ROOT_PARAMETER& param
+) {
+    D3D12Diagnostics::RootParameterInfo info{};
+    info.index = index;
+    info.parameter_type = root_parameter_type_to_string(param.ParameterType);
+    info.visibility = shader_visibility_to_string(param.ShaderVisibility);
+
+    switch (param.ParameterType) {
+    case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
+        if (param.DescriptorTable.pDescriptorRanges != nullptr) {
+            info.ranges.reserve(param.DescriptorTable.NumDescriptorRanges);
+            for (UINT i = 0; i < param.DescriptorTable.NumDescriptorRanges; ++i) {
+                append_root_descriptor_range(info, param.DescriptorTable.pDescriptorRanges[i]);
+            }
+        }
+        break;
+    case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+        info.shader_register = param.Constants.ShaderRegister;
+        info.register_space = param.Constants.RegisterSpace;
+        info.num_32bit_values = param.Constants.Num32BitValues;
+        break;
+    case D3D12_ROOT_PARAMETER_TYPE_CBV:
+    case D3D12_ROOT_PARAMETER_TYPE_SRV:
+    case D3D12_ROOT_PARAMETER_TYPE_UAV:
+        info.shader_register = param.Descriptor.ShaderRegister;
+        info.register_space = param.Descriptor.RegisterSpace;
+        break;
+    default:
+        break;
+    }
+
+    out.parameters.emplace_back(std::move(info));
+}
+
+void append_root_parameter(
+    D3D12Diagnostics::RootSignatureInfo& out,
+    uint32_t index,
+    const D3D12_ROOT_PARAMETER1& param
+) {
+    D3D12Diagnostics::RootParameterInfo info{};
+    info.index = index;
+    info.parameter_type = root_parameter_type_to_string(param.ParameterType);
+    info.visibility = shader_visibility_to_string(param.ShaderVisibility);
+
+    switch (param.ParameterType) {
+    case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
+        if (param.DescriptorTable.pDescriptorRanges != nullptr) {
+            info.ranges.reserve(param.DescriptorTable.NumDescriptorRanges);
+            for (UINT i = 0; i < param.DescriptorTable.NumDescriptorRanges; ++i) {
+                append_root_descriptor_range(info, param.DescriptorTable.pDescriptorRanges[i]);
+            }
+        }
+        break;
+    case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+        info.shader_register = param.Constants.ShaderRegister;
+        info.register_space = param.Constants.RegisterSpace;
+        info.num_32bit_values = param.Constants.Num32BitValues;
+        break;
+    case D3D12_ROOT_PARAMETER_TYPE_CBV:
+    case D3D12_ROOT_PARAMETER_TYPE_SRV:
+    case D3D12_ROOT_PARAMETER_TYPE_UAV:
+        info.shader_register = param.Descriptor.ShaderRegister;
+        info.register_space = param.Descriptor.RegisterSpace;
+        break;
+    default:
+        break;
+    }
+
+    out.parameters.emplace_back(std::move(info));
+}
+
+D3D12Diagnostics::RootSignatureInfo decode_root_signature_blob(const void* blob, size_t blob_size) {
+    D3D12Diagnostics::RootSignatureInfo info{};
+    info.blob_size = static_cast<uint32_t>(std::min<size_t>(blob_size, UINT32_MAX));
+
+    if (blob == nullptr || blob_size == 0) {
+        info.decode_error = "empty root signature blob";
+        return info;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> versioned{};
+    HRESULT hr = D3D12CreateVersionedRootSignatureDeserializer(
+        blob,
+        blob_size,
+        IID_PPV_ARGS(&versioned));
+
+    if (SUCCEEDED(hr) && versioned != nullptr) {
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
+        hr = versioned->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc);
+        if (FAILED(hr) || desc == nullptr) {
+            hr = versioned->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_0, &desc);
+        }
+
+        if (SUCCEEDED(hr) && desc != nullptr) {
+            if (desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+                info.version = "1.1";
+                info.flags = root_signature_flags_to_string(desc->Desc_1_1.Flags);
+                info.static_sampler_count = desc->Desc_1_1.NumStaticSamplers;
+                info.parameters.reserve(desc->Desc_1_1.NumParameters);
+                for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
+                    append_root_parameter(info, i, desc->Desc_1_1.pParameters[i]);
+                }
+            } else {
+                info.version = "1.0";
+                info.flags = root_signature_flags_to_string(desc->Desc_1_0.Flags);
+                info.static_sampler_count = desc->Desc_1_0.NumStaticSamplers;
+                info.parameters.reserve(desc->Desc_1_0.NumParameters);
+                for (UINT i = 0; i < desc->Desc_1_0.NumParameters; ++i) {
+                    append_root_parameter(info, i, desc->Desc_1_0.pParameters[i]);
+                }
+            }
+            return info;
+        }
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12RootSignatureDeserializer> legacy{};
+    hr = D3D12CreateRootSignatureDeserializer(blob, blob_size, IID_PPV_ARGS(&legacy));
+    if (SUCCEEDED(hr) && legacy != nullptr) {
+        const auto* desc = legacy->GetRootSignatureDesc();
+        if (desc != nullptr) {
+            info.version = "1.0";
+            info.flags = root_signature_flags_to_string(desc->Flags);
+            info.static_sampler_count = desc->NumStaticSamplers;
+            info.parameters.reserve(desc->NumParameters);
+            for (UINT i = 0; i < desc->NumParameters; ++i) {
+                append_root_parameter(info, i, desc->pParameters[i]);
+            }
+            return info;
+        }
+    }
+
+    std::ostringstream ss{};
+    ss << "D3D12 root signature deserialization failed hr=0x" << std::hex << std::uppercase << static_cast<uint32_t>(hr);
+    info.decode_error = ss.str();
+    return info;
+}
+} // namespace
+
 D3D12Diagnostics& D3D12Diagnostics::get() {
     static D3D12Diagnostics instance{};
     return instance;
@@ -309,6 +571,8 @@ void D3D12Diagnostics::begin_frame(
     m_descriptor_heap_switches_this_frame = 0;
     m_resource_barriers_this_frame = 0;
     m_rtv_binds_this_frame = 0;
+    m_root_binds_this_frame = 0;
+    m_draw_events_this_frame = 0;
     m_transient_heap_creations_this_frame = 0;
     m_transient_resource_creations_this_frame = 0;
     m_transient_resource_bytes_this_frame = 0;
@@ -537,6 +801,173 @@ void D3D12Diagnostics::register_dsv_descriptor(
     }
 }
 
+void D3D12Diagnostics::register_srv_descriptor(
+    std::string_view source,
+    ID3D12Resource* resource,
+    D3D12_CPU_DESCRIPTOR_HANDLE handle,
+    std::string_view name
+) {
+    if (!is_enabled()) {
+        return;
+    }
+
+    if (handle.ptr == 0) {
+        push_warning(source, "Attempted to register a null SRV descriptor");
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+
+    if (resource != nullptr) {
+        register_resource(source, resource, false, name);
+    }
+
+    const auto key = static_cast<uintptr_t>(handle.ptr);
+    auto& descriptor = m_srv_descriptors[key];
+    descriptor.handle = key;
+    descriptor.resource = reinterpret_cast<uintptr_t>(resource);
+    descriptor.source = std::string{source};
+    descriptor.descriptor_type = "SRV";
+    descriptor.last_seen_frame = m_frame;
+
+    if (descriptor.first_seen_frame == 0) {
+        descriptor.first_seen_frame = m_frame;
+    }
+
+    if (resource != nullptr) {
+        const auto resource_key = reinterpret_cast<uintptr_t>(resource);
+        if (const auto it = m_resources.find(resource_key); it != m_resources.end()) {
+            descriptor.name = it->second.name;
+        }
+    }
+
+    if (descriptor.name.empty()) {
+        descriptor.name = name.empty() ? format_pointer(key) : std::string{name};
+    }
+}
+
+void D3D12Diagnostics::register_uav_descriptor(
+    std::string_view source,
+    ID3D12Resource* resource,
+    D3D12_CPU_DESCRIPTOR_HANDLE handle,
+    std::string_view name
+) {
+    if (!is_enabled()) {
+        return;
+    }
+
+    if (handle.ptr == 0) {
+        push_warning(source, "Attempted to register a null UAV descriptor");
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+
+    if (resource != nullptr) {
+        register_resource(source, resource, false, name);
+    }
+
+    const auto key = static_cast<uintptr_t>(handle.ptr);
+    auto& descriptor = m_uav_descriptors[key];
+    descriptor.handle = key;
+    descriptor.resource = reinterpret_cast<uintptr_t>(resource);
+    descriptor.source = std::string{source};
+    descriptor.descriptor_type = "UAV";
+    descriptor.last_seen_frame = m_frame;
+
+    if (descriptor.first_seen_frame == 0) {
+        descriptor.first_seen_frame = m_frame;
+    }
+
+    if (resource != nullptr) {
+        const auto resource_key = reinterpret_cast<uintptr_t>(resource);
+        if (const auto it = m_resources.find(resource_key); it != m_resources.end()) {
+            descriptor.name = it->second.name;
+        }
+    }
+
+    if (descriptor.name.empty()) {
+        descriptor.name = name.empty() ? format_pointer(key) : std::string{name};
+    }
+}
+
+void D3D12Diagnostics::record_descriptor_copy(
+    std::string_view source,
+    D3D12_CPU_DESCRIPTOR_HANDLE dst,
+    D3D12_CPU_DESCRIPTOR_HANDLE src
+) {
+    if (!is_enabled() || dst.ptr == 0 || src.ptr == 0) {
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+
+    auto copy_descriptor = [&](auto& descriptors) {
+        const auto src_key = static_cast<uintptr_t>(src.ptr);
+        const auto it = descriptors.find(src_key);
+        if (it == descriptors.end()) {
+            return false;
+        }
+
+        auto copy = it->second;
+        copy.handle = static_cast<uintptr_t>(dst.ptr);
+        copy.source = std::string{source};
+        copy.last_seen_frame = m_frame;
+        descriptors[copy.handle] = std::move(copy);
+        return true;
+    };
+
+    if (copy_descriptor(m_srv_descriptors) || copy_descriptor(m_uav_descriptors)) {
+        return;
+    }
+
+    copy_descriptor(m_rtv_descriptors);
+}
+
+void D3D12Diagnostics::register_root_signature(
+    std::string_view source,
+    ID3D12RootSignature* root_signature,
+    const void* blob,
+    size_t blob_size
+) {
+    (void)source;
+    if (root_signature == nullptr || blob == nullptr || blob_size == 0) {
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+    const auto key = reinterpret_cast<uintptr_t>(root_signature);
+    auto decoded = decode_root_signature_blob(blob, blob_size);
+    decoded.pointer = key;
+    decoded.last_seen_frame = m_frame;
+
+    if (const auto it = m_root_signatures.find(key); it != m_root_signatures.end()) {
+        decoded.first_seen_frame = it->second.first_seen_frame;
+        if (decoded.first_seen_frame == 0) {
+            decoded.first_seen_frame = m_frame;
+        }
+    } else {
+        decoded.first_seen_frame = m_frame;
+    }
+
+    m_root_signatures[key] = std::move(decoded);
+}
+
+void D3D12Diagnostics::register_pipeline_root_signature(
+    std::string_view source,
+    ID3D12PipelineState* pipeline_state,
+    ID3D12RootSignature* root_signature
+) {
+    (void)source;
+    if (pipeline_state == nullptr || root_signature == nullptr) {
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+    m_pso_root_signatures[reinterpret_cast<uintptr_t>(pipeline_state)] =
+        reinterpret_cast<uintptr_t>(root_signature);
+}
+
 void D3D12Diagnostics::record_descriptor_heaps_set(
     std::string_view source,
     uint32_t count,
@@ -729,6 +1160,203 @@ void D3D12Diagnostics::record_rtv_bind(
     push_ring(m_recent_bindings, std::move(event), MAX_RECENT_BINDINGS);
 }
 
+void D3D12Diagnostics::record_root_bind(
+    std::string_view source,
+    uintptr_t command_list,
+    uintptr_t pipeline_state,
+    int32_t eye_bucket,
+    std::string_view pipeline,
+    std::string_view kind,
+    uint32_t root_parameter,
+    uintptr_t value,
+    uint32_t value_count,
+    uint64_t value_hash
+) {
+    if (!is_enabled()) {
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+    ++m_root_binds_this_frame;
+
+    RootBindEvent event{};
+    event.frame = m_frame;
+    event.sequence = ++m_root_bind_sequence;
+    event.source = std::string{source};
+    event.pipeline = std::string{pipeline};
+    event.kind = std::string{kind};
+    event.command_list = command_list;
+    event.pipeline_state = pipeline_state;
+    event.eye_bucket = eye_bucket;
+    event.root_parameter = root_parameter;
+    event.value = value;
+    event.value_count = value_count;
+    event.value_hash = value_hash;
+
+    push_ring(m_recent_root_binds, std::move(event), MAX_RECENT_ROOT_BINDS);
+}
+
+void D3D12Diagnostics::record_draw_event(
+    std::string_view source,
+    std::string_view kind,
+    uintptr_t command_list,
+    uintptr_t pipeline_state,
+    int32_t eye_bucket,
+    uint32_t arg0,
+    uint32_t arg1,
+    uint32_t arg2,
+    int32_t arg3,
+    uint32_t arg4,
+    uintptr_t rtv0,
+    const RootSlotArray& graphics_root_descriptor_tables,
+    const RootSlotArray& compute_root_descriptor_tables,
+    const RootSlotArray& graphics_root_cbvs,
+    const RootSlotArray& compute_root_cbvs,
+    const RootSlotArray& graphics_root_srvs,
+    const RootSlotArray& compute_root_srvs,
+    const RootSlotArray& graphics_root_uavs,
+    const RootSlotArray& compute_root_uavs,
+    const RootHashArray& graphics_root_cbv_hash,
+    const RootHashArray& compute_root_cbv_hash,
+    const RootHashArray& graphics_root_constants_hash,
+    const RootHashArray& compute_root_constants_hash,
+    const RootHashArray& graphics_root_descriptor_table_resource_hash,
+    const RootHashArray& compute_root_descriptor_table_resource_hash,
+    const std::vector<DescriptorReadInfo>& descriptor_reads
+) {
+    if (!is_enabled()) {
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+
+    DrawEvent event{};
+    event.frame = m_frame;
+    event.draw_index = ++m_draw_events_this_frame;
+    event.source = std::string{source};
+    event.kind = std::string{kind};
+    event.command_list = command_list;
+    event.pipeline_state = pipeline_state;
+    if (const auto root_signature = m_pso_root_signatures.find(pipeline_state); root_signature != m_pso_root_signatures.end()) {
+        event.root_signature = root_signature->second;
+    }
+    event.eye_bucket = eye_bucket;
+    event.arg0 = arg0;
+    event.arg1 = arg1;
+    event.arg2 = arg2;
+    event.arg3 = arg3;
+    event.arg4 = arg4;
+    event.rtv0 = rtv0;
+    if (rtv0 != 0) {
+        if (const auto descriptor = m_rtv_descriptors.find(rtv0); descriptor != m_rtv_descriptors.end()) {
+            event.rtv0_resource = descriptor->second.resource;
+        }
+
+        const auto lineage_key = event.rtv0_resource != 0 ? event.rtv0_resource : rtv0;
+        if (const auto producer = m_last_resource_writes.find(lineage_key); producer != m_last_resource_writes.end()) {
+            event.prior_rtv0_producer_frame = producer->second.frame;
+            event.prior_rtv0_producer_draw = producer->second.draw_index;
+            event.prior_rtv0_producer_pso = producer->second.pipeline_state;
+        }
+
+        m_last_resource_writes[lineage_key] = ResourceProducerInfo{
+            event.frame,
+            event.draw_index,
+            pipeline_state,
+            command_list
+        };
+    }
+    event.graphics_root_descriptor_tables = graphics_root_descriptor_tables;
+    event.compute_root_descriptor_tables = compute_root_descriptor_tables;
+    event.graphics_root_cbvs = graphics_root_cbvs;
+    event.compute_root_cbvs = compute_root_cbvs;
+    event.graphics_root_srvs = graphics_root_srvs;
+    event.compute_root_srvs = compute_root_srvs;
+    event.graphics_root_uavs = graphics_root_uavs;
+    event.compute_root_uavs = compute_root_uavs;
+    event.graphics_root_cbv_hash = graphics_root_cbv_hash;
+    event.compute_root_cbv_hash = compute_root_cbv_hash;
+    event.graphics_root_constants_hash = graphics_root_constants_hash;
+    event.compute_root_constants_hash = compute_root_constants_hash;
+    event.graphics_root_descriptor_table_resource_hash = graphics_root_descriptor_table_resource_hash;
+    event.compute_root_descriptor_table_resource_hash = compute_root_descriptor_table_resource_hash;
+    event.descriptor_reads = descriptor_reads;
+
+    for (auto& read : event.descriptor_reads) {
+        if (read.resource == 0) {
+            continue;
+        }
+
+        if (const auto producer = m_last_resource_writes.find(read.resource); producer != m_last_resource_writes.end()) {
+            read.producer_frame = producer->second.frame;
+            read.producer_draw = producer->second.draw_index;
+            read.producer_pso = producer->second.pipeline_state;
+        }
+    }
+
+    push_ring(m_recent_draw_events, std::move(event), MAX_RECENT_DRAW_EVENTS);
+}
+
+std::optional<D3D12Diagnostics::DescriptorReadInfo> D3D12Diagnostics::resolve_descriptor_read(
+    uint32_t root_parameter,
+    uint32_t descriptor_index,
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor
+) const {
+    if (!is_enabled() || descriptor.ptr == 0) {
+        return std::nullopt;
+    }
+
+    std::scoped_lock _{m_mutex};
+    const auto key = static_cast<uintptr_t>(descriptor.ptr);
+
+    auto make = [&](const DescriptorInfo& tracked) {
+        DescriptorReadInfo info{};
+        info.root_parameter = root_parameter;
+        info.descriptor_index = descriptor_index;
+        info.descriptor_cpu = key;
+        info.resource = tracked.resource;
+        info.descriptor_type = tracked.descriptor_type;
+        return info;
+    };
+
+    if (const auto it = m_srv_descriptors.find(key); it != m_srv_descriptors.end()) {
+        return make(it->second);
+    }
+
+    if (const auto it = m_uav_descriptors.find(key); it != m_uav_descriptors.end()) {
+        return make(it->second);
+    }
+
+    return std::nullopt;
+}
+
+void D3D12Diagnostics::record_gpu_timing_sample(
+    std::string_view source,
+    uintptr_t pipeline_state,
+    int32_t eye_bucket,
+    double milliseconds
+) {
+    if (!is_enabled() || pipeline_state == 0 || milliseconds < 0.0) {
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+    std::ostringstream key{};
+    key << pipeline_state << ':' << eye_bucket << ':' << source;
+
+    auto& aggregate = m_gpu_timings[key.str()];
+    if (aggregate.samples == 0) {
+        aggregate.pipeline_state = pipeline_state;
+        aggregate.kind = std::string{source};
+        aggregate.eye_bucket = eye_bucket;
+    }
+
+    ++aggregate.samples;
+    aggregate.total_ms += milliseconds;
+    aggregate.max_ms = (std::max)(aggregate.max_ms, milliseconds);
+    aggregate.last_frame = m_frame;
+}
+
 D3D12Diagnostics::Snapshot D3D12Diagnostics::snapshot() const {
     if (!is_enabled()) {
         return {};
@@ -754,6 +1382,8 @@ D3D12Diagnostics::Snapshot D3D12Diagnostics::snapshot() const {
     out.descriptor_heap_switches_this_frame = m_descriptor_heap_switches_this_frame;
     out.resource_barriers_this_frame = m_resource_barriers_this_frame;
     out.rtv_binds_this_frame = m_rtv_binds_this_frame;
+    out.root_binds_this_frame = m_root_binds_this_frame;
+    out.draw_events_this_frame = m_draw_events_this_frame;
     out.transient_heap_creations_this_frame = m_transient_heap_creations_this_frame;
     out.transient_resource_creations_this_frame = m_transient_resource_creations_this_frame;
     out.transient_resource_bytes_this_frame = m_transient_resource_bytes_this_frame;
@@ -774,7 +1404,45 @@ D3D12Diagnostics::Snapshot D3D12Diagnostics::snapshot() const {
         return lhs.name < rhs.name;
     });
 
+    out.root_signatures.reserve(m_root_signatures.size());
+    for (const auto& [_, root_signature] : m_root_signatures) {
+        out.root_signatures.emplace_back(root_signature);
+    }
+
+    std::sort(out.root_signatures.begin(), out.root_signatures.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.last_seen_frame != rhs.last_seen_frame) {
+            return lhs.last_seen_frame > rhs.last_seen_frame;
+        }
+        return lhs.pointer < rhs.pointer;
+    });
+
     out.recent_bindings = m_recent_bindings;
+    out.recent_root_binds = m_recent_root_binds;
+    out.recent_draw_events = m_recent_draw_events;
+    out.gpu_timings.reserve(m_gpu_timings.size());
+    for (const auto& [_, aggregate] : m_gpu_timings) {
+        GpuTimingInfo info{};
+        info.pipeline_state = aggregate.pipeline_state;
+        info.kind = aggregate.kind;
+        info.eye_bucket = aggregate.eye_bucket;
+        info.samples = aggregate.samples;
+        info.avg_ms = aggregate.samples > 0 ? aggregate.total_ms / static_cast<double>(aggregate.samples) : 0.0;
+        info.max_ms = aggregate.max_ms;
+        info.last_frame = aggregate.last_frame;
+        out.gpu_timings.emplace_back(std::move(info));
+    }
+    std::sort(out.gpu_timings.begin(), out.gpu_timings.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.last_frame != rhs.last_frame) {
+            return lhs.last_frame > rhs.last_frame;
+        }
+        if (lhs.max_ms != rhs.max_ms) {
+            return lhs.max_ms > rhs.max_ms;
+        }
+        return lhs.pipeline_state < rhs.pipeline_state;
+    });
+    if (out.gpu_timings.size() > 128) {
+        out.gpu_timings.resize(128);
+    }
     out.recent_barriers = m_recent_barriers;
     out.recent_warnings = m_recent_warnings;
 
@@ -807,7 +1475,13 @@ void D3D12Diagnostics::clear_state_locked() {
     m_resources.clear();
     m_rtv_descriptors.clear();
     m_dsv_descriptors.clear();
+    m_srv_descriptors.clear();
+    m_uav_descriptors.clear();
+    m_last_resource_writes.clear();
+    m_gpu_timings.clear();
     m_recent_bindings.clear();
+    m_recent_root_binds.clear();
+    m_recent_draw_events.clear();
     m_recent_barriers.clear();
     m_recent_warnings.clear();
     m_current_bind_context.reset();
@@ -827,6 +1501,9 @@ void D3D12Diagnostics::clear_state_locked() {
     m_descriptor_heap_switches_this_frame = 0;
     m_resource_barriers_this_frame = 0;
     m_rtv_binds_this_frame = 0;
+    m_root_binds_this_frame = 0;
+    m_draw_events_this_frame = 0;
+    m_root_bind_sequence = 0;
     m_transient_heap_creations_this_frame = 0;
     m_transient_resource_creations_this_frame = 0;
     m_transient_resource_bytes_this_frame = 0;

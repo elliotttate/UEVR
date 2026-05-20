@@ -1,4 +1,5 @@
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -50,6 +51,7 @@ namespace {
 constexpr size_t CREATE_GRAPHICS_PIPELINE_STATE_VTABLE_INDEX = 10;
 constexpr size_t CREATE_COMPUTE_PIPELINE_STATE_VTABLE_INDEX = 11;
 constexpr size_t CREATE_COMMAND_LIST_VTABLE_INDEX = 12;
+constexpr size_t CREATE_ROOT_SIGNATURE_VTABLE_INDEX = 16;
 constexpr size_t CREATE_COMMAND_SIGNATURE_VTABLE_INDEX = 41;
 constexpr size_t CREATE_PIPELINE_STATE_VTABLE_INDEX = 47;
 constexpr size_t CREATE_COMMAND_LIST1_VTABLE_INDEX = 51;
@@ -73,12 +75,21 @@ constexpr size_t EXECUTE_BUNDLE_VTABLE_INDEX = 27;
 constexpr size_t SET_DESCRIPTOR_HEAPS_VTABLE_INDEX = 28;
 constexpr size_t SET_COMPUTE_ROOT_DESCRIPTOR_TABLE_VTABLE_INDEX = 31;
 constexpr size_t SET_GRAPHICS_ROOT_DESCRIPTOR_TABLE_VTABLE_INDEX = 32;
+constexpr size_t SET_COMPUTE_ROOT_32BIT_CONSTANT_VTABLE_INDEX = 33;
+constexpr size_t SET_GRAPHICS_ROOT_32BIT_CONSTANT_VTABLE_INDEX = 34;
+constexpr size_t SET_COMPUTE_ROOT_32BIT_CONSTANTS_VTABLE_INDEX = 35;
+constexpr size_t SET_GRAPHICS_ROOT_32BIT_CONSTANTS_VTABLE_INDEX = 36;
+constexpr size_t SET_COMPUTE_ROOT_CONSTANT_BUFFER_VIEW_VTABLE_INDEX = 37;
 // 2026-05-17 BUG FIX: was 35, that's SetComputeRoot32BitConstants — wrong
 // signature, caused SN2 to crash and our diagnostic to show garbage
 // (root_param=10, gpu_va=0x4 == num_32bit_values=4). Correct index per
 // d3d12.h vtable order is 38 (3 IUnknown + 4 ID3D12Object + 1 ID3D12DeviceChild
 // + 1 ID3D12CommandList + 29th method of ID3D12GraphicsCommandList).
 constexpr size_t SET_GRAPHICS_ROOT_CONSTANT_BUFFER_VIEW_VTABLE_INDEX = 38;
+constexpr size_t SET_COMPUTE_ROOT_SHADER_RESOURCE_VIEW_VTABLE_INDEX = 39;
+constexpr size_t SET_GRAPHICS_ROOT_SHADER_RESOURCE_VIEW_VTABLE_INDEX = 40;
+constexpr size_t SET_COMPUTE_ROOT_UNORDERED_ACCESS_VIEW_VTABLE_INDEX = 41;
+constexpr size_t SET_GRAPHICS_ROOT_UNORDERED_ACCESS_VIEW_VTABLE_INDEX = 42;
 constexpr size_t OM_SET_RENDER_TARGETS_VTABLE_INDEX = 46;
 constexpr size_t CLEAR_RENDER_TARGET_VIEW_VTABLE_INDEX = 48;
 constexpr size_t EXECUTE_INDIRECT_VTABLE_INDEX = 59;
@@ -129,6 +140,9 @@ std::atomic<bool> g_stereo_trace_ffi_enabled{false};
 // fires on another for the SAME command list. thread_local missed the viewport
 // set (caused all `has_viewport=0` in earlier Path A test). Per-cmdlist map fixes this.
 struct CommandListCorrelationState {
+    using RootSlotArray = render::D3D12Diagnostics::RootSlotArray;
+    using RootHashArray = render::D3D12Diagnostics::RootHashArray;
+
     void*    current_pso = nullptr;
     float    viewport_top_left_x = 0.0f;
     float    viewport_top_left_y = 0.0f;
@@ -139,7 +153,22 @@ struct CommandListCorrelationState {
     StereoTraceBucket last_viewport_bucket = StereoTraceBucket::Unknown;
     uint64_t last_rtv0_handle = 0;                  // CPU descriptor handle of RTV slot 0
     uint64_t last_graphics_root_desc_table0 = 0;    // GPU descriptor handle of root parameter 0 (graphics)
-    std::array<uint64_t, 16> last_graphics_root_cbv{}; // Root CBVs by root parameter index.
+    RootSlotArray last_graphics_root_desc_tables{}; // Root descriptor-table GPU handles by root parameter index.
+    RootSlotArray last_compute_root_desc_tables{};
+    RootSlotArray last_graphics_root_cbv{};         // Root CBVs by root parameter index.
+    RootSlotArray last_compute_root_cbv{};
+    RootSlotArray last_graphics_root_srv{};
+    RootSlotArray last_compute_root_srv{};
+    RootSlotArray last_graphics_root_uav{};
+    RootSlotArray last_compute_root_uav{};
+    RootHashArray last_graphics_root_cbv_hash{};
+    RootHashArray last_compute_root_cbv_hash{};
+    RootHashArray last_graphics_root_constants_hash{};
+    RootHashArray last_compute_root_constants_hash{};
+    RootHashArray last_graphics_root_desc_table_resource_hash{};
+    RootHashArray last_compute_root_desc_table_resource_hash{};
+    std::vector<render::D3D12Diagnostics::DescriptorReadInfo> last_graphics_descriptor_reads{};
+    std::vector<render::D3D12Diagnostics::DescriptorReadInfo> last_compute_descriptor_reads{};
 };
 // Per-cmdlist state map. Keyed on raw ID3D12GraphicsCommandList* pointer.
 // Entries persist for the lifetime of the cmdlist. UE5 creates a bounded
@@ -148,6 +177,7 @@ static std::mutex g_cmdlist_state_mutex;
 static std::unordered_map<ID3D12GraphicsCommandList*, CommandListCorrelationState> g_cmdlist_state_map;
 // Empty sentinel for read_cmdlist_state() when no entry exists yet.
 static const CommandListCorrelationState g_cmdlist_state_empty{};
+thread_local int g_per_eye_pso_rebind_depth = 0;
 inline void update_cmdlist_pso(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* pso);
 inline void clear_cmdlist_state(ID3D12GraphicsCommandList* cl);
 
@@ -270,6 +300,45 @@ bool enable_d3d12_compute_root_table_hook() {
         char value[32]{};
         const auto len = GetEnvironmentVariableA(
             "UEVR_SUBNAUTICA2_ENABLE_FOG_COMPUTE_BIND_HOOK",
+            value,
+            static_cast<DWORD>(sizeof(value)));
+        if (len == 0) return false;
+        std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
+        return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+    }();
+    return enabled;
+}
+
+// Full root-bind capture is more expensive than the base draw/RTV diagnostics,
+// so keep it opt-in. The SN2-focused descriptor-table diagnostics also imply it
+// because those investigations depend on root-slot correlation.
+bool enable_d3d12_root_bind_capture_hook() {
+    static const bool enabled = []() {
+        if (enable_d3d12_descriptor_table_hook() || enable_d3d12_compute_root_table_hook()) {
+            return true;
+        }
+
+        char value[32]{};
+        const auto len = GetEnvironmentVariableA(
+            "UEVR_ENABLE_D3D12_ROOT_BIND_CAPTURE",
+            value,
+            static_cast<DWORD>(sizeof(value)));
+        if (len == 0) return false;
+        std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
+        return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+    }();
+    return enabled;
+}
+
+bool enable_d3d12_resource_lineage_hook() {
+    static const bool enabled = []() {
+        if (enable_d3d12_root_bind_capture_hook()) {
+            return true;
+        }
+
+        char value[32]{};
+        const auto len = GetEnvironmentVariableA(
+            "UEVR_ENABLE_D3D12_RESOURCE_LINEAGE",
             value,
             static_cast<DWORD>(sizeof(value)));
         if (len == 0) return false;
@@ -1080,10 +1149,14 @@ bool D3D12Hook::hook() {
         m_create_command_list1_hooks.clear();
         m_create_command_signature_hooks.clear();
         m_create_pipeline_state_hooks.clear();
+        m_create_root_signature_hooks.clear();
         m_create_constant_buffer_view_hooks.clear();
         m_create_render_target_view_hooks.clear();
         m_create_depth_stencil_view_hooks.clear();
         m_create_shader_resource_view_hooks.clear();
+        m_create_unordered_access_view_hooks.clear();
+        m_copy_descriptors_simple_hooks.clear();
+        m_copy_descriptors_hooks.clear();
         m_set_pipeline_state_hooks.clear();
         m_command_list_diagnostic_hooks.clear();
         m_create_graphics_pipeline_state_hook_lookup.clear();
@@ -1092,10 +1165,14 @@ bool D3D12Hook::hook() {
         m_create_command_list1_hook_lookup.clear();
         m_create_command_signature_hook_lookup.clear();
         m_create_pipeline_state_hook_lookup.clear();
+        m_create_root_signature_hook_lookup.clear();
         m_create_constant_buffer_view_hook_lookup.clear();
         m_create_render_target_view_hook_lookup.clear();
         m_create_depth_stencil_view_hook_lookup.clear();
         m_create_shader_resource_view_hook_lookup.clear();
+        m_create_unordered_access_view_hook_lookup.clear();
+        m_copy_descriptors_simple_hook_lookup.clear();
+        m_copy_descriptors_hook_lookup.clear();
         m_set_pipeline_state_hook_lookup.clear();
         m_command_list_diagnostic_hook_lookup.clear();
         m_set_pipeline_state_slots.clear();
@@ -1115,6 +1192,7 @@ bool D3D12Hook::hook() {
         std::unordered_set<uintptr_t> create_command_list1_slots{};
         std::unordered_set<uintptr_t> create_command_signature_slots{};
         std::unordered_set<uintptr_t> pipeline_state_stream_slots{};
+        std::unordered_set<uintptr_t> root_signature_slots{};
         std::unordered_set<uintptr_t> constant_buffer_view_slots{};
         std::unordered_set<uintptr_t> render_target_view_slots{};
         std::unordered_set<uintptr_t> depth_stencil_view_slots{};
@@ -1123,6 +1201,7 @@ bool D3D12Hook::hook() {
         std::unordered_set<uintptr_t> copy_descriptors_simple_slots{};
         std::unordered_set<uintptr_t> copy_descriptors_slots{};
         const bool sn2_hooks_enabled = is_subnautica2_process();
+        const bool resource_lineage_enabled = enable_d3d12_resource_lineage_hook();
 
         add_unique_pointer_hook(
             device,
@@ -1149,6 +1228,15 @@ bool D3D12Hook::hook() {
             m_create_command_list_hooks,
             m_create_command_list_hook_lookup,
             create_command_list_slots
+        );
+
+        add_unique_pointer_hook(
+            device,
+            CREATE_ROOT_SIGNATURE_VTABLE_INDEX,
+            reinterpret_cast<void*>(&D3D12Hook::create_root_signature),
+            m_create_root_signature_hooks,
+            m_create_root_signature_hook_lookup,
+            root_signature_slots
         );
 
         Microsoft::WRL::ComPtr<ID3D12Device1> device1{};
@@ -1216,6 +1304,15 @@ bool D3D12Hook::hook() {
 
             add_unique_pointer_hook(
                 iface,
+                CREATE_ROOT_SIGNATURE_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::create_root_signature),
+                m_create_root_signature_hooks,
+                m_create_root_signature_hook_lookup,
+                root_signature_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
                 CREATE_RENDER_TARGET_VIEW_VTABLE_INDEX,
                 reinterpret_cast<void*>(&D3D12Hook::create_render_target_view),
                 m_create_render_target_view_hooks,
@@ -1223,7 +1320,7 @@ bool D3D12Hook::hook() {
                 render_target_view_slots
             );
 
-            if (sn2_hooks_enabled) {
+            if (sn2_hooks_enabled || resource_lineage_enabled) {
                 add_unique_pointer_hook(
                     iface,
                     CREATE_CONSTANT_BUFFER_VIEW_VTABLE_INDEX,
@@ -1466,8 +1563,14 @@ bool D3D12Hook::unhook() {
     m_create_command_list1_hooks.clear();
     m_create_command_signature_hooks.clear();
     m_create_pipeline_state_hooks.clear();
+    m_create_root_signature_hooks.clear();
     m_create_render_target_view_hooks.clear();
     m_create_depth_stencil_view_hooks.clear();
+    m_create_constant_buffer_view_hooks.clear();
+    m_create_shader_resource_view_hooks.clear();
+    m_create_unordered_access_view_hooks.clear();
+    m_copy_descriptors_simple_hooks.clear();
+    m_copy_descriptors_hooks.clear();
     m_set_pipeline_state_hooks.clear();
     m_command_list_diagnostic_hooks.clear();
     m_create_graphics_pipeline_state_hook_lookup.clear();
@@ -1476,8 +1579,14 @@ bool D3D12Hook::unhook() {
     m_create_command_list1_hook_lookup.clear();
     m_create_command_signature_hook_lookup.clear();
     m_create_pipeline_state_hook_lookup.clear();
+    m_create_root_signature_hook_lookup.clear();
     m_create_render_target_view_hook_lookup.clear();
     m_create_depth_stencil_view_hook_lookup.clear();
+    m_create_constant_buffer_view_hook_lookup.clear();
+    m_create_shader_resource_view_hook_lookup.clear();
+    m_create_unordered_access_view_hook_lookup.clear();
+    m_copy_descriptors_simple_hook_lookup.clear();
+    m_copy_descriptors_hook_lookup.clear();
     m_set_pipeline_state_hook_lookup.clear();
     m_command_list_diagnostic_hook_lookup.clear();
     m_set_pipeline_state_slots.clear();
@@ -1634,7 +1743,9 @@ void D3D12Hook::install_command_list_hooks(ID3D12GraphicsCommandList* command_li
             m_command_list_diagnostic_slots
         );
 
-        if (enable_d3d12_descriptor_table_hook()) {
+        const bool root_bind_capture = enable_d3d12_root_bind_capture_hook();
+
+        if (enable_d3d12_descriptor_table_hook() || root_bind_capture) {
             add_unique_pointer_hook(
                 iface,
                 SET_GRAPHICS_ROOT_DESCRIPTOR_TABLE_VTABLE_INDEX,
@@ -1645,7 +1756,7 @@ void D3D12Hook::install_command_list_hooks(ID3D12GraphicsCommandList* command_li
             );
         }
 
-        if (is_subnautica2_process()) {
+        if (is_subnautica2_process() || root_bind_capture) {
             add_unique_pointer_hook(
                 iface,
                 SET_GRAPHICS_ROOT_CONSTANT_BUFFER_VIEW_VTABLE_INDEX,
@@ -1656,7 +1767,7 @@ void D3D12Hook::install_command_list_hooks(ID3D12GraphicsCommandList* command_li
             );
         }
 
-        if (enable_d3d12_compute_root_table_hook() || sn2_pso3069_diag_enabled()) {
+        if (enable_d3d12_compute_root_table_hook() || sn2_pso3069_diag_enabled() || root_bind_capture) {
             add_unique_pointer_hook(
                 iface,
                 SET_DESCRIPTOR_HEAPS_VTABLE_INDEX,
@@ -1667,11 +1778,94 @@ void D3D12Hook::install_command_list_hooks(ID3D12GraphicsCommandList* command_li
             );
         }
 
-        if (enable_d3d12_compute_root_table_hook()) {
+        if (enable_d3d12_compute_root_table_hook() || root_bind_capture) {
             add_unique_pointer_hook(
                 iface,
                 SET_COMPUTE_ROOT_DESCRIPTOR_TABLE_VTABLE_INDEX,
                 reinterpret_cast<void*>(&D3D12Hook::set_compute_root_descriptor_table),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+        }
+
+        if (root_bind_capture) {
+            add_unique_pointer_hook(
+                iface,
+                SET_COMPUTE_ROOT_32BIT_CONSTANT_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::set_compute_root_32bit_constant),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                SET_GRAPHICS_ROOT_32BIT_CONSTANT_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::set_graphics_root_32bit_constant),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                SET_COMPUTE_ROOT_32BIT_CONSTANTS_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::set_compute_root_32bit_constants),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                SET_GRAPHICS_ROOT_32BIT_CONSTANTS_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::set_graphics_root_32bit_constants),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                SET_COMPUTE_ROOT_CONSTANT_BUFFER_VIEW_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::set_compute_root_constant_buffer_view),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                SET_COMPUTE_ROOT_SHADER_RESOURCE_VIEW_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::set_compute_root_shader_resource_view),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                SET_GRAPHICS_ROOT_SHADER_RESOURCE_VIEW_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::set_graphics_root_shader_resource_view),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                SET_COMPUTE_ROOT_UNORDERED_ACCESS_VIEW_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::set_compute_root_unordered_access_view),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                SET_GRAPHICS_ROOT_UNORDERED_ACCESS_VIEW_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::set_graphics_root_unordered_access_view),
                 m_command_list_diagnostic_hooks,
                 m_command_list_diagnostic_hook_lookup,
                 m_command_list_diagnostic_slots
@@ -1776,6 +1970,14 @@ PointerHook* D3D12Hook::find_create_pipeline_state_hook(void* slot) const {
     }
 
     return m_create_pipeline_state_hooks.empty() ? nullptr : m_create_pipeline_state_hooks.front().get();
+}
+
+PointerHook* D3D12Hook::find_create_root_signature_hook(void* slot) const {
+    if (const auto it = m_create_root_signature_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_create_root_signature_hook_lookup.end()) {
+        return it->second;
+    }
+
+    return m_create_root_signature_hooks.empty() ? nullptr : m_create_root_signature_hooks.front().get();
 }
 
 PointerHook* D3D12Hook::find_create_constant_buffer_view_hook(void* slot) const {
@@ -2374,6 +2576,84 @@ namespace sn2_pso3069_subst {
     }
 }
 
+static size_t d3d12_pipeline_stream_subobject_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) {
+    switch (type) {
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
+        return sizeof(ID3D12RootSignature*);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+        return sizeof(D3D12_SHADER_BYTECODE);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT:
+        return sizeof(D3D12_STREAM_OUTPUT_DESC);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND:
+        return sizeof(D3D12_BLEND_DESC);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK:
+        return sizeof(UINT);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER:
+        return sizeof(D3D12_RASTERIZER_DESC);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL:
+        return sizeof(D3D12_DEPTH_STENCIL_DESC);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT:
+        return sizeof(D3D12_INPUT_LAYOUT_DESC);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE:
+        return sizeof(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY:
+        return sizeof(D3D12_PRIMITIVE_TOPOLOGY_TYPE);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS:
+        return sizeof(D3D12_RT_FORMAT_ARRAY);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT:
+        return sizeof(DXGI_FORMAT);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC:
+        return sizeof(DXGI_SAMPLE_DESC);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK:
+        return sizeof(UINT);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+        return sizeof(D3D12_CACHED_PIPELINE_STATE);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS:
+        return sizeof(D3D12_PIPELINE_STATE_FLAGS);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1:
+        return sizeof(D3D12_DEPTH_STENCIL_DESC1);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
+        return sizeof(D3D12_VIEW_INSTANCING_DESC);
+    default:
+        return 0;
+    }
+}
+
+static ID3D12RootSignature* d3d12_root_signature_from_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc) {
+    if (desc == nullptr || desc->pPipelineStateSubobjectStream == nullptr || desc->SizeInBytes == 0) {
+        return nullptr;
+    }
+
+    const auto* base = static_cast<const uint8_t*>(desc->pPipelineStateSubobjectStream);
+    size_t pos = 0;
+    while (pos + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= desc->SizeInBytes) {
+        const auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*>(base + pos);
+        pos += sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE);
+        const size_t align = alignof(void*);
+        pos = (pos + align - 1) & ~(align - 1);
+        const size_t value_size = d3d12_pipeline_stream_subobject_size(type);
+        if (value_size == 0 || pos + value_size > desc->SizeInBytes) {
+            break;
+        }
+
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+            return *reinterpret_cast<ID3D12RootSignature* const*>(base + pos);
+        }
+
+        pos += value_size;
+        pos = (pos + align - 1) & ~(align - 1);
+    }
+
+    return nullptr;
+}
+
 HRESULT WINAPI D3D12Hook::create_graphics_pipeline_state(
     ID3D12Device* device,
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
@@ -2418,6 +2698,18 @@ HRESULT WINAPI D3D12Hook::create_graphics_pipeline_state(
             static_cast<ID3D12PipelineState*>(*pipeline_state),
             desc
         );
+    }
+
+    if (SUCCEEDED(result) &&
+        pipeline_state != nullptr &&
+        *pipeline_state != nullptr &&
+        riid == __uuidof(ID3D12PipelineState) &&
+        desc != nullptr &&
+        desc->pRootSignature != nullptr) {
+        render::D3D12Diagnostics::get().register_pipeline_root_signature(
+            "D3D12Hook::CreateGraphicsPipelineState",
+            static_cast<ID3D12PipelineState*>(*pipeline_state),
+            desc->pRootSignature);
     }
 
     // 2026-05-17 night: SN2 sky-atmosphere PSO fingerprint by entry-name scan.
@@ -2480,6 +2772,18 @@ HRESULT WINAPI D3D12Hook::create_compute_pipeline_state(
             static_cast<ID3D12PipelineState*>(*pipeline_state),
             desc
         );
+    }
+
+    if (SUCCEEDED(result) &&
+        pipeline_state != nullptr &&
+        *pipeline_state != nullptr &&
+        riid == __uuidof(ID3D12PipelineState) &&
+        desc != nullptr &&
+        desc->pRootSignature != nullptr) {
+        render::D3D12Diagnostics::get().register_pipeline_root_signature(
+            "D3D12Hook::CreateComputePipelineState",
+            static_cast<ID3D12PipelineState*>(*pipeline_state),
+            desc->pRootSignature);
     }
 
     return result;
@@ -2686,6 +2990,19 @@ HRESULT WINAPI D3D12Hook::create_pipeline_state(
         );
     }
 
+    if (SUCCEEDED(result) &&
+        pipeline_state != nullptr &&
+        *pipeline_state != nullptr &&
+        riid == __uuidof(ID3D12PipelineState) &&
+        desc != nullptr) {
+        if (auto* root_signature = d3d12_root_signature_from_pipeline_stream(desc); root_signature != nullptr) {
+            render::D3D12Diagnostics::get().register_pipeline_root_signature(
+                "D3D12Hook::CreatePipelineState",
+                static_cast<ID3D12PipelineState*>(*pipeline_state),
+                root_signature);
+        }
+    }
+
     // 2026-05-17 night: SkyAtmosFix PSO fingerprint — also scan stream variant.
     // SN2 uses D3D12_PIPELINE_STATE_STREAM_DESC. Parse the stream to extract
     // PS bytecode, then memmem-scan for entry name "RenderSkyAtmosphereRayMarchingPS".
@@ -2759,6 +3076,39 @@ HRESULT WINAPI D3D12Hook::create_pipeline_state(
             pos += value_size;
             // Re-align to pointer.
             pos = (pos + align - 1) & ~(align - 1);
+        }
+    }
+
+    return result;
+}
+
+HRESULT WINAPI D3D12Hook::create_root_signature(
+    ID3D12Device* device,
+    UINT node_mask,
+    const void* blob,
+    SIZE_T blob_length_in_bytes,
+    REFIID riid,
+    void** root_signature
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = device != nullptr ? &(*(void***)device)[CREATE_ROOT_SIGNATURE_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_create_root_signature_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::create_root_signature)*>() : nullptr;
+
+    if (original == nullptr) {
+        return E_FAIL;
+    }
+
+    const auto result = original(device, node_mask, blob, blob_length_in_bytes, riid, root_signature);
+    if (SUCCEEDED(result) && root_signature != nullptr && *root_signature != nullptr && blob != nullptr && blob_length_in_bytes > 0) {
+        Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature_iface{};
+        auto* unknown = reinterpret_cast<IUnknown*>(*root_signature);
+        if (unknown != nullptr && SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&root_signature_iface)))) {
+            render::D3D12Diagnostics::get().register_root_signature(
+                "D3D12Hook::CreateRootSignature",
+                root_signature_iface.Get(),
+                blob,
+                static_cast<size_t>(blob_length_in_bytes));
         }
     }
 
@@ -4992,6 +5342,7 @@ void WINAPI D3D12Hook::create_shader_resource_view(
         original(device, resource, desc, descriptor);
     }
 
+    render::D3D12Diagnostics::get().register_srv_descriptor("D3D12Hook::CreateShaderResourceView", resource, descriptor);
     sn2_descriptor_registry::record_srv(resource, desc, descriptor);
 }
 
@@ -5044,6 +5395,7 @@ void WINAPI D3D12Hook::create_unordered_access_view(
         original(device, resource, counter_resource, desc, descriptor);
     }
 
+    render::D3D12Diagnostics::get().register_uav_descriptor("D3D12Hook::CreateUnorderedAccessView", resource, descriptor);
     sn2_descriptor_registry::record_uav(resource, desc, descriptor);
 }
 
@@ -5098,6 +5450,19 @@ void WINAPI D3D12Hook::copy_descriptors_simple(
 
     if (original != nullptr) {
         original(device, num_descriptors, dst_start, src_start, type);
+    }
+
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && device != nullptr && num_descriptors > 0) {
+        const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        const UINT n = (num_descriptors > 4096u) ? 4096u : num_descriptors;
+        for (UINT i = 0; i < n; ++i) {
+            D3D12_CPU_DESCRIPTOR_HANDLE dst{dst_start.ptr + (SIZE_T)i * stride};
+            D3D12_CPU_DESCRIPTOR_HANDLE src{src_start.ptr + (SIZE_T)i * stride};
+            render::D3D12Diagnostics::get().record_descriptor_copy(
+                "D3D12Hook::CopyDescriptorsSimple",
+                dst,
+                src);
+        }
     }
 
     if (sn2_pso3069_diag_enabled() && type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
@@ -5191,6 +5556,47 @@ void WINAPI D3D12Hook::copy_descriptors(
 
     if (original != nullptr) {
         original(device, num_dst_ranges, dst_starts, dst_sizes, num_src_ranges, src_starts, src_sizes, type);
+    }
+
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && device != nullptr
+        && dst_starts != nullptr && dst_sizes != nullptr
+        && src_starts != nullptr && src_sizes != nullptr
+        && num_dst_ranges > 0 && num_src_ranges > 0) {
+        const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        uint64_t total_dst = 0;
+        for (UINT i = 0; i < num_dst_ranges; ++i) total_dst += dst_sizes[i];
+        uint64_t total_src = 0;
+        for (UINT i = 0; i < num_src_ranges; ++i) total_src += src_sizes[i];
+        const uint64_t total = (total_dst < total_src) ? total_dst : total_src;
+        const uint64_t bounded = (total > 4096ull) ? 4096ull : total;
+
+        UINT dst_range_idx = 0;
+        UINT dst_within = 0;
+        UINT src_range_idx = 0;
+        UINT src_within = 0;
+        for (uint64_t i = 0; i < bounded; ++i) {
+            while (dst_range_idx < num_dst_ranges && dst_within >= dst_sizes[dst_range_idx]) {
+                ++dst_range_idx;
+                dst_within = 0;
+            }
+            if (dst_range_idx >= num_dst_ranges) break;
+
+            while (src_range_idx < num_src_ranges && src_within >= src_sizes[src_range_idx]) {
+                ++src_range_idx;
+                src_within = 0;
+            }
+            if (src_range_idx >= num_src_ranges) break;
+
+            D3D12_CPU_DESCRIPTOR_HANDLE dst{dst_starts[dst_range_idx].ptr + (SIZE_T)dst_within * stride};
+            D3D12_CPU_DESCRIPTOR_HANDLE src{src_starts[src_range_idx].ptr + (SIZE_T)src_within * stride};
+            render::D3D12Diagnostics::get().record_descriptor_copy(
+                "D3D12Hook::CopyDescriptors",
+                dst,
+                src);
+
+            ++dst_within;
+            ++src_within;
+        }
     }
 
     if (sn2_pso3069_diag_enabled() && type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && device != nullptr
@@ -5296,16 +5702,465 @@ inline void update_cmdlist_rtv0(ID3D12GraphicsCommandList* cl, const D3D12_CPU_D
     std::scoped_lock _{g_cmdlist_state_mutex};
     g_cmdlist_state_map[cl].last_rtv0_handle = static_cast<uint64_t>(rtv0->ptr);
 }
-inline void update_cmdlist_root_desc_table0(ID3D12GraphicsCommandList* cl, UINT root_param, D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle) {
-    if (cl == nullptr || root_param != 0) return; // root param 0 = "bindless heap" in UE5
-    std::scoped_lock _{g_cmdlist_state_mutex};
-    g_cmdlist_state_map[cl].last_graphics_root_desc_table0 = static_cast<uint64_t>(gpu_handle.ptr);
+
+inline uint64_t fnv1a64_bytes(const void* data, size_t size) {
+    if (data == nullptr || size == 0) {
+        return 0;
+    }
+
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= static_cast<uint64_t>(bytes[i]);
+        hash *= 1099511628211ull;
+    }
+    return hash;
 }
 
-inline void update_cmdlist_root_cbv(ID3D12GraphicsCommandList* cl, UINT root_param, D3D12_GPU_VIRTUAL_ADDRESS gpu_va) {
-    if (cl == nullptr || root_param >= g_cmdlist_state_empty.last_graphics_root_cbv.size()) return;
+inline bool root_param_in_range(UINT root_param) {
+    return root_param < render::D3D12Diagnostics::MAX_ROOT_BIND_SLOTS;
+}
+
+inline void update_cmdlist_root_desc_table(
+    ID3D12GraphicsCommandList* cl,
+    bool graphics,
+    UINT root_param,
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle
+) {
+    if (cl == nullptr || !root_param_in_range(root_param)) return;
     std::scoped_lock _{g_cmdlist_state_mutex};
-    g_cmdlist_state_map[cl].last_graphics_root_cbv[root_param] = static_cast<uint64_t>(gpu_va);
+    auto& s = g_cmdlist_state_map[cl];
+    if (graphics) {
+        s.last_graphics_root_desc_tables[root_param] = static_cast<uintptr_t>(gpu_handle.ptr);
+        if (root_param == 0) {
+            s.last_graphics_root_desc_table0 = static_cast<uint64_t>(gpu_handle.ptr);
+        }
+    } else {
+        s.last_compute_root_desc_tables[root_param] = static_cast<uintptr_t>(gpu_handle.ptr);
+    }
+}
+
+inline void update_cmdlist_root_va(
+    ID3D12GraphicsCommandList* cl,
+    bool graphics,
+    const char* kind,
+    UINT root_param,
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va
+) {
+    if (cl == nullptr || !root_param_in_range(root_param)) return;
+    std::scoped_lock _{g_cmdlist_state_mutex};
+    auto& s = g_cmdlist_state_map[cl];
+    auto& target =
+        std::strcmp(kind, "cbv") == 0 ? (graphics ? s.last_graphics_root_cbv : s.last_compute_root_cbv) :
+        std::strcmp(kind, "srv") == 0 ? (graphics ? s.last_graphics_root_srv : s.last_compute_root_srv) :
+                                        (graphics ? s.last_graphics_root_uav : s.last_compute_root_uav);
+    target[root_param] = static_cast<uintptr_t>(gpu_va);
+}
+
+inline void update_cmdlist_root_constants_hash(
+    ID3D12GraphicsCommandList* cl,
+    bool graphics,
+    UINT root_param,
+    uint64_t hash
+) {
+    if (cl == nullptr || !root_param_in_range(root_param)) return;
+    std::scoped_lock _{g_cmdlist_state_mutex};
+    auto& s = g_cmdlist_state_map[cl];
+    if (graphics) {
+        s.last_graphics_root_constants_hash[root_param] = hash;
+    } else {
+        s.last_compute_root_constants_hash[root_param] = hash;
+    }
+}
+
+inline void update_cmdlist_root_cbv_hash(
+    ID3D12GraphicsCommandList* cl,
+    bool graphics,
+    UINT root_param,
+    uint64_t hash
+) {
+    if (cl == nullptr || !root_param_in_range(root_param)) return;
+    std::scoped_lock _{g_cmdlist_state_mutex};
+    auto& s = g_cmdlist_state_map[cl];
+    if (graphics) {
+        s.last_graphics_root_cbv_hash[root_param] = hash;
+    } else {
+        s.last_compute_root_cbv_hash[root_param] = hash;
+    }
+}
+
+inline uint64_t hash_gpu_va_upload_prefix(D3D12_GPU_VIRTUAL_ADDRESS gpu_va, size_t size) {
+    if (gpu_va == 0 || size == 0) {
+        return 0;
+    }
+
+    auto* cpu = sn2_upload_buf_map::gpu_va_to_cpu(gpu_va, size);
+    if (cpu == nullptr) {
+        return 0;
+    }
+
+    return fnv1a64_bytes(cpu, size);
+}
+
+namespace bind_override_uploads {
+    struct UploadBuffer {
+        Microsoft::WRL::ComPtr<ID3D12Resource> resource{};
+        D3D12_GPU_VIRTUAL_ADDRESS gpu_va{};
+        void* cpu{};
+        size_t size{};
+    };
+
+    static std::mutex g_mutex{};
+    static std::unordered_map<std::string, UploadBuffer> g_buffers{};
+
+    D3D12_GPU_VIRTUAL_ADDRESS get_or_create(
+        ID3D12Device* device,
+        const std::string& name,
+        const std::vector<uint8_t>& data
+    ) {
+        if (device == nullptr || data.empty()) {
+            return 0;
+        }
+
+        const size_t aligned_size = (data.size() + 255u) & ~size_t{255u};
+        std::scoped_lock _{g_mutex};
+        auto& buffer = g_buffers[name];
+
+        if (buffer.resource == nullptr || buffer.size < aligned_size || buffer.cpu == nullptr) {
+            buffer = {};
+
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+            heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+            heap.CreationNodeMask = 1;
+            heap.VisibleNodeMask = 1;
+
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = aligned_size;
+            desc.Height = 1;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.Format = DXGI_FORMAT_UNKNOWN;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+            if (FAILED(device->CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    nullptr,
+                    IID_PPV_ARGS(&buffer.resource))) ||
+                buffer.resource == nullptr) {
+                buffer = {};
+                return 0;
+            }
+
+            sn2_upload_buf_map::install_map_hook(buffer.resource.Get());
+
+            D3D12_RANGE read_range{0, 0};
+            if (FAILED(buffer.resource->Map(0, &read_range, &buffer.cpu)) || buffer.cpu == nullptr) {
+                buffer = {};
+                return 0;
+            }
+
+            buffer.gpu_va = buffer.resource->GetGPUVirtualAddress();
+            buffer.size = aligned_size;
+        }
+
+        std::memcpy(buffer.cpu, data.data(), data.size());
+        if (data.size() < buffer.size) {
+            std::memset(static_cast<uint8_t*>(buffer.cpu) + data.size(), 0, buffer.size - data.size());
+        }
+
+        return buffer.gpu_va;
+    }
+} // namespace bind_override_uploads
+
+namespace gpu_timestamp_timing {
+    constexpr UINT QUERY_COUNT = 4096;
+
+    struct Pending {
+        UINT begin_index{};
+        uintptr_t pso{};
+        int32_t eye_bucket{-1};
+        const char* kind{};
+    };
+
+    struct Token {
+        bool valid{};
+        UINT begin_index{};
+        uintptr_t pso{};
+        int32_t eye_bucket{-1};
+        const char* kind{};
+    };
+
+    static std::mutex g_mutex{};
+    static Microsoft::WRL::ComPtr<ID3D12QueryHeap> g_query_heap{};
+    static Microsoft::WRL::ComPtr<ID3D12Resource> g_readback{};
+    static uint64_t* g_mapped{};
+    static UINT g_next_query{};
+    static uint64_t g_frequency{};
+    static std::vector<Pending> g_pending{};
+
+    bool enabled() {
+        static const bool value = []() {
+            const char* env = std::getenv("UEVR_ENABLE_D3D12_GPU_TIMESTAMPS");
+            return env != nullptr && env[0] != '\0' && env[0] != '0';
+        }();
+        return value;
+    }
+
+    bool init(ID3D12Device* device, ID3D12CommandQueue* queue) {
+        if (!enabled() || device == nullptr || queue == nullptr) {
+            return false;
+        }
+
+        std::scoped_lock _{g_mutex};
+        if (g_query_heap != nullptr && g_readback != nullptr && g_mapped != nullptr && g_frequency != 0) {
+            return true;
+        }
+
+        D3D12_QUERY_HEAP_DESC query_desc{};
+        query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        query_desc.Count = QUERY_COUNT;
+        if (FAILED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&g_query_heap))) || g_query_heap == nullptr) {
+            return false;
+        }
+
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        heap.CreationNodeMask = 1;
+        heap.VisibleNodeMask = 1;
+
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = QUERY_COUNT * sizeof(uint64_t);
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_UNKNOWN;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        if (FAILED(device->CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr,
+                IID_PPV_ARGS(&g_readback))) ||
+            g_readback == nullptr) {
+            g_query_heap.Reset();
+            return false;
+        }
+
+        if (FAILED(queue->GetTimestampFrequency(&g_frequency)) || g_frequency == 0) {
+            g_query_heap.Reset();
+            g_readback.Reset();
+            return false;
+        }
+
+        D3D12_RANGE read_range{0, 0};
+        if (FAILED(g_readback->Map(0, &read_range, reinterpret_cast<void**>(&g_mapped))) || g_mapped == nullptr) {
+            g_query_heap.Reset();
+            g_readback.Reset();
+            g_frequency = 0;
+            return false;
+        }
+
+        std::memset(g_mapped, 0, QUERY_COUNT * sizeof(uint64_t));
+        g_next_query = 0;
+        g_pending.clear();
+        SPDLOG_INFO("[D3D12GpuTiming] timestamp query heap initialized frequency={}", g_frequency);
+        return true;
+    }
+
+    void drain_locked() {
+        if (g_mapped == nullptr || g_frequency == 0) {
+            return;
+        }
+
+        auto& diagnostics = render::D3D12Diagnostics::get();
+        g_pending.erase(
+            std::remove_if(g_pending.begin(), g_pending.end(), [&](const Pending& pending) {
+                const auto start = g_mapped[pending.begin_index];
+                const auto end = g_mapped[pending.begin_index + 1];
+                if (start == 0 || end <= start) {
+                    return false;
+                }
+
+                const double ms = (static_cast<double>(end - start) * 1000.0) / static_cast<double>(g_frequency);
+                diagnostics.record_gpu_timing_sample(pending.kind, pending.pso, pending.eye_bucket, ms);
+                g_mapped[pending.begin_index] = 0;
+                g_mapped[pending.begin_index + 1] = 0;
+                return true;
+            }),
+            g_pending.end());
+    }
+
+    Token begin(ID3D12GraphicsCommandList* command_list, const char* kind, const CommandListCorrelationState& state) {
+        Token token{};
+        if (command_list == nullptr || state.current_pso == nullptr || !enabled()) {
+            return token;
+        }
+
+        auto* d3d12 = g_d3d12_hook;
+        if (d3d12 == nullptr || !init(d3d12->get_device(), d3d12->get_command_queue())) {
+            return token;
+        }
+
+        std::scoped_lock _{g_mutex};
+        drain_locked();
+
+        if (g_next_query + 1 >= QUERY_COUNT) {
+            g_next_query = 0;
+        }
+
+        const UINT begin_index = g_next_query;
+        g_next_query += 2;
+
+        command_list->EndQuery(g_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, begin_index);
+        token.valid = true;
+        token.begin_index = begin_index;
+        token.pso = reinterpret_cast<uintptr_t>(state.current_pso);
+        token.eye_bucket = static_cast<int32_t>(state.last_viewport_bucket);
+        token.kind = kind;
+        return token;
+    }
+
+    void end(ID3D12GraphicsCommandList* command_list, const Token& token) {
+        if (!token.valid || command_list == nullptr || g_query_heap == nullptr || g_readback == nullptr) {
+            return;
+        }
+
+        std::scoped_lock _{g_mutex};
+        command_list->EndQuery(g_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, token.begin_index + 1);
+        command_list->ResolveQueryData(
+            g_query_heap.Get(),
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            token.begin_index,
+            2,
+            g_readback.Get(),
+            static_cast<UINT64>(token.begin_index) * sizeof(uint64_t));
+        g_pending.push_back(Pending{token.begin_index, token.pso, token.eye_bucket, token.kind});
+    }
+} // namespace gpu_timestamp_timing
+
+inline void hash_descriptor_read(uint64_t& hash, const render::D3D12Diagnostics::DescriptorReadInfo& read) {
+    const uint64_t values[] = {
+        read.root_parameter,
+        read.descriptor_index,
+        read.descriptor_cpu,
+        read.resource
+    };
+    for (const auto value : values) {
+        for (int i = 0; i < 8; ++i) {
+            hash ^= (value >> (i * 8)) & 0xffu;
+            hash *= 1099511628211ull;
+        }
+    }
+}
+
+
+inline void record_root_bind_event(
+    const char* source,
+    ID3D12GraphicsCommandList* cl,
+    const CommandListCorrelationState& state,
+    bool graphics,
+    const char* kind,
+    UINT root_param,
+    uintptr_t value,
+    UINT value_count = 0,
+    uint64_t value_hash = 0
+) {
+    render::D3D12Diagnostics::get().record_root_bind(
+        source,
+        reinterpret_cast<uintptr_t>(cl),
+        reinterpret_cast<uintptr_t>(state.current_pso),
+        static_cast<int32_t>(state.last_viewport_bucket),
+        graphics ? "graphics" : "compute",
+        kind,
+        root_param,
+        value,
+        value_count,
+        value_hash);
+}
+
+inline void record_draw_event_from_state(
+    const char* source,
+    const char* kind,
+    ID3D12GraphicsCommandList* cl,
+    const CommandListCorrelationState& state,
+    UINT arg0,
+    UINT arg1,
+    UINT arg2,
+    INT arg3,
+    UINT arg4
+) {
+    std::vector<render::D3D12Diagnostics::DescriptorReadInfo> descriptor_reads{};
+    descriptor_reads.reserve(state.last_graphics_descriptor_reads.size() + state.last_compute_descriptor_reads.size());
+    descriptor_reads.insert(
+        descriptor_reads.end(),
+        state.last_graphics_descriptor_reads.begin(),
+        state.last_graphics_descriptor_reads.end());
+    descriptor_reads.insert(
+        descriptor_reads.end(),
+        state.last_compute_descriptor_reads.begin(),
+        state.last_compute_descriptor_reads.end());
+
+    render::D3D12Diagnostics::get().record_draw_event(
+        source,
+        kind,
+        reinterpret_cast<uintptr_t>(cl),
+        reinterpret_cast<uintptr_t>(state.current_pso),
+        static_cast<int32_t>(state.last_viewport_bucket),
+        arg0,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        static_cast<uintptr_t>(state.last_rtv0_handle),
+        state.last_graphics_root_desc_tables,
+        state.last_compute_root_desc_tables,
+        state.last_graphics_root_cbv,
+        state.last_compute_root_cbv,
+        state.last_graphics_root_srv,
+        state.last_compute_root_srv,
+        state.last_graphics_root_uav,
+        state.last_compute_root_uav,
+        state.last_graphics_root_cbv_hash,
+        state.last_compute_root_cbv_hash,
+        state.last_graphics_root_constants_hash,
+        state.last_compute_root_constants_hash,
+        state.last_graphics_root_desc_table_resource_hash,
+        state.last_compute_root_desc_table_resource_hash,
+        descriptor_reads);
+}
+
+inline void apply_per_eye_pso_variant(
+    ID3D12GraphicsCommandList* cl,
+    const CommandListCorrelationState& state
+) {
+    if (cl == nullptr || state.current_pso == nullptr) {
+        return;
+    }
+
+    auto* original_pso = reinterpret_cast<ID3D12PipelineState*>(state.current_pso);
+    auto* effective_pso = render::ShaderOverrideRegistry::get().resolve_d3d12_pipeline_state_for_eye(
+        original_pso,
+        static_cast<int>(state.last_viewport_bucket));
+    if (effective_pso == nullptr || effective_pso == original_pso) {
+        return;
+    }
+
+    ++g_per_eye_pso_rebind_depth;
+    cl->SetPipelineState(effective_pso);
+    --g_per_eye_pso_rebind_depth;
 }
 
 // Returns a copy (not a reference) since the map is mutex-protected.
@@ -5424,7 +6279,6 @@ void WINAPI D3D12Hook::clear_state(ID3D12GraphicsCommandList* command_list, ID3D
 }
 
 void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_list, ID3D12PipelineState* pipeline_state) {
-    update_cmdlist_pso(command_list, pipeline_state);
     auto d3d12 = g_d3d12_hook;
     const auto slot = &(*(void***)command_list)[SET_PIPELINE_STATE_VTABLE_INDEX];
     auto* hook = d3d12->find_set_pipeline_state_hook(slot);
@@ -5433,6 +6287,13 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
     if (original == nullptr) {
         return;
     }
+
+    if (g_per_eye_pso_rebind_depth > 0) {
+        original(command_list, pipeline_state);
+        return;
+    }
+
+    update_cmdlist_pso(command_list, pipeline_state);
 
     auto& shader_registry = render::ShaderOverrideRegistry::get();
     if (!shader_registry.should_track_d3d12_pipelines()) {
@@ -5548,6 +6409,16 @@ void WINAPI D3D12Hook::draw_instanced(
     // Read per-CL state once for both eye-diff and per-eye-skip decisions.
     const auto s = (command_list != nullptr) ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
     const int eye_bucket = static_cast<int>(s.last_viewport_bucket);
+    record_draw_event_from_state(
+        "D3D12Hook::DrawInstanced",
+        "draw",
+        command_list,
+        s,
+        vertex_count_per_instance,
+        instance_count,
+        start_vertex_location,
+        0,
+        start_instance_location);
     // Eye-Diff record: per-PSO per-eye fingerprint of the current draw.
     if (reg.eyediff_enabled() && command_list != nullptr) {
         auto [ps_hash, vs_hash] = reg.snapshot_pso_hashes_for(reinterpret_cast<uintptr_t>(s.current_pso));
@@ -5579,8 +6450,12 @@ void WINAPI D3D12Hook::draw_instanced(
         return;
     }
 
+    apply_per_eye_pso_variant(command_list, s);
+
     if (original != nullptr) {
+        const auto timing = gpu_timestamp_timing::begin(command_list, "draw", s);
         original(command_list, vertex_count_per_instance, instance_count, start_vertex_location, start_instance_location);
+        gpu_timestamp_timing::end(command_list, timing);
     }
 }
 
@@ -5611,6 +6486,16 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
     reg2.hunter_inc_draw_indexed_hit();
     const auto s2 = (command_list != nullptr) ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
     const int eye_bucket2 = static_cast<int>(s2.last_viewport_bucket);
+    record_draw_event_from_state(
+        "D3D12Hook::DrawIndexedInstanced",
+        "draw_indexed",
+        command_list,
+        s2,
+        index_count_per_instance,
+        instance_count,
+        start_index_location,
+        base_vertex_location,
+        start_instance_location);
     if (reg2.eyediff_enabled() && command_list != nullptr) {
         auto [ps_hash, vs_hash] = reg2.snapshot_pso_hashes_for(reinterpret_cast<uintptr_t>(s2.current_pso));
         reg2.eyediff_record_draw(ps_hash, vs_hash, eye_bucket2, s2.last_rtv0_handle, s2.last_graphics_root_desc_table0);
@@ -5639,8 +6524,12 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         return;
     }
 
+    apply_per_eye_pso_variant(command_list, s2);
+
     if (original != nullptr) {
+        const auto timing = gpu_timestamp_timing::begin(command_list, "draw_indexed", s2);
         original(command_list, index_count_per_instance, instance_count, start_index_location, base_vertex_location, start_instance_location);
+        gpu_timestamp_timing::end(command_list, timing);
     }
 }
 
@@ -5659,8 +6548,19 @@ void WINAPI D3D12Hook::dispatch(
     reg.hunter_inc_dispatch_hit();
     // Per-eye selective skip for compute. eye_bucket from CL viewport state
     // (compute usually inherits the graphics-pass viewport set just before).
+    const auto dispatch_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
+    record_draw_event_from_state(
+        "D3D12Hook::Dispatch",
+        "dispatch",
+        command_list,
+        dispatch_state,
+        thread_group_count_x,
+        thread_group_count_y,
+        thread_group_count_z,
+        0,
+        0);
     if (command_list != nullptr) {
-        const auto s = read_cmdlist_state(command_list);
+        const auto& s = dispatch_state;
         if (s.current_pso != nullptr &&
                 reg.hunter_should_skip_draw_per_eye(reinterpret_cast<uintptr_t>(s.current_pso),
                                                     static_cast<int>(s.last_viewport_bucket))) {
@@ -5672,6 +6572,8 @@ void WINAPI D3D12Hook::dispatch(
         reg.hunter_inc_dispatch_skipped();
         return;
     }
+
+    apply_per_eye_pso_variant(command_list, dispatch_state);
 
     // 2026-05-19 SN2 COMPUTE CAPTURE — capture LEFT-eye target dispatches
     if (sn2_compute_capture::enabled() && command_list != nullptr) {
@@ -5686,7 +6588,9 @@ void WINAPI D3D12Hook::dispatch(
     }
 
     if (original != nullptr) {
+        const auto timing = gpu_timestamp_timing::begin(command_list, "dispatch", dispatch_state);
         original(command_list, thread_group_count_x, thread_group_count_y, thread_group_count_z);
+        gpu_timestamp_timing::end(command_list, timing);
     }
 }
 
@@ -5864,8 +6768,15 @@ void WINAPI D3D12Hook::execute_indirect(
         }
     }
 
+    if (command_list != nullptr) {
+        apply_per_eye_pso_variant(command_list, read_cmdlist_state(command_list));
+    }
+
     if (original != nullptr) {
+        const auto indirect_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
+        const auto timing = gpu_timestamp_timing::begin(command_list, "execute_indirect", indirect_state);
         original(command_list, command_signature, max_command_count, effective_arg_buffer, effective_arg_offset, count_buffer, count_buffer_offset);
+        gpu_timestamp_timing::end(command_list, timing);
     }
 }
 
@@ -5883,13 +6794,28 @@ void WINAPI D3D12Hook::dispatch_mesh(
     auto& reg = render::ShaderOverrideRegistry::get();
     auto* base_command_list = reinterpret_cast<ID3D12GraphicsCommandList*>(command_list);
     reg.hunter_inc_dispatch_mesh_hit();
+    const auto state = base_command_list != nullptr ? read_cmdlist_state(base_command_list) : g_cmdlist_state_empty;
+    record_draw_event_from_state(
+        "D3D12Hook::DispatchMesh",
+        "dispatch_mesh",
+        base_command_list,
+        state,
+        thread_group_count_x,
+        thread_group_count_y,
+        thread_group_count_z,
+        0,
+        0);
     if (reg.hunter_should_skip_graphics(base_command_list)) {
         reg.hunter_inc_dispatch_mesh_skipped();
         return;
     }
 
+    apply_per_eye_pso_variant(base_command_list, state);
+
     if (original != nullptr) {
+        const auto timing = gpu_timestamp_timing::begin(base_command_list, "dispatch_mesh", state);
         original(command_list, thread_group_count_x, thread_group_count_y, thread_group_count_z);
+        gpu_timestamp_timing::end(base_command_list, timing);
     }
 }
 
@@ -6031,6 +6957,54 @@ inline bool gpu_handle_in_bindless_heap(UINT64 gpu) {
     const UINT64 max_off = (UINT64)tls_bindless_heap.num_descriptors * (UINT64)tls_bindless_heap.stride;
     if (max_off == 0) return false;
     return (gpu - tls_bindless_heap.gpu_base) < max_off;
+}
+
+inline void update_cmdlist_descriptor_reads(
+    ID3D12GraphicsCommandList* cl,
+    bool graphics,
+    UINT root_param,
+    D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor
+) {
+    if (cl == nullptr || !root_param_in_range(root_param)) return;
+
+    std::vector<render::D3D12Diagnostics::DescriptorReadInfo> reads{};
+    uint64_t resource_hash = 1469598103934665603ull;
+
+    if (gpu_handle_in_bindless_heap(base_descriptor.ptr)) {
+        constexpr UINT MAX_SCAN_DESCRIPTORS = 32;
+        const SIZE_T cpu_start = tls_bindless_heap.cpu_base + static_cast<SIZE_T>(base_descriptor.ptr - tls_bindless_heap.gpu_base);
+        const auto& diagnostics = render::D3D12Diagnostics::get();
+        for (UINT i = 0; i < MAX_SCAN_DESCRIPTORS; ++i) {
+            D3D12_CPU_DESCRIPTOR_HANDLE cpu{cpu_start + static_cast<SIZE_T>(i) * tls_bindless_heap.stride};
+            auto read = diagnostics.resolve_descriptor_read(root_param, i, cpu);
+            if (!read.has_value()) {
+                continue;
+            }
+
+            hash_descriptor_read(resource_hash, *read);
+            reads.emplace_back(std::move(*read));
+        }
+    }
+
+    if (reads.empty()) {
+        resource_hash = 0;
+    }
+
+    std::scoped_lock _{g_cmdlist_state_mutex};
+    auto& s = g_cmdlist_state_map[cl];
+    auto& target_reads = graphics ? s.last_graphics_descriptor_reads : s.last_compute_descriptor_reads;
+    target_reads.erase(
+        std::remove_if(target_reads.begin(), target_reads.end(), [root_param](const auto& read) {
+            return read.root_parameter == root_param;
+        }),
+        target_reads.end());
+    target_reads.insert(target_reads.end(), reads.begin(), reads.end());
+
+    if (graphics) {
+        s.last_graphics_root_desc_table_resource_hash[root_param] = resource_hash;
+    } else {
+        s.last_compute_root_desc_table_resource_hash[root_param] = resource_hash;
+    }
 }
 
 // Re-use the SRV-map TU-cross-link for the view atomic.
@@ -6470,8 +7444,20 @@ void WINAPI D3D12Hook::set_graphics_root_descriptor_table(
     const auto state = read_cmdlist_state(command_list);
     const int view_id = cmdlist_view_id(state);
 
-    // Eye-diff: capture root descriptor table 0 (UE5 bindless heap).
-    update_cmdlist_root_desc_table0(command_list, root_parameter_index, base_descriptor);
+    // Eye-diff and diagnostics: capture all graphics descriptor tables. Root
+    // param 0 is still mirrored to the legacy field used by older SN2 logic.
+    update_cmdlist_root_desc_table(command_list, true, root_parameter_index, base_descriptor);
+    update_cmdlist_descriptor_reads(command_list, true, root_parameter_index, base_descriptor);
+    record_root_bind_event(
+        "D3D12Hook::SetGraphicsRootDescriptorTable",
+        command_list,
+        state,
+        true,
+        "descriptor_table",
+        root_parameter_index,
+        static_cast<uintptr_t>(base_descriptor.ptr),
+        1,
+        0);
 
     // 2026-05-19 PSO3069 descriptor-table diag: log base_descriptor per eye when
     // the current PSO is the basepass-water shader (CRC 166DBA88). If both eyes
@@ -7090,6 +8076,11 @@ void WINAPI D3D12Hook::set_descriptor_heaps(
     if (original != nullptr) {
         original(command_list, num_descriptor_heaps, descriptor_heaps);
     }
+
+    render::D3D12Diagnostics::get().record_descriptor_heaps_set(
+        "D3D12Hook::SetDescriptorHeaps",
+        num_descriptor_heaps,
+        descriptor_heaps);
 }
 
 // 2026-05-17 SN2 FOG-FIX Task #45 — retroactive view tagging.
@@ -7108,6 +8099,20 @@ void WINAPI D3D12Hook::set_compute_root_descriptor_table(
     const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_COMPUTE_ROOT_DESCRIPTOR_TABLE_VTABLE_INDEX] : nullptr;
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_compute_root_descriptor_table)*>() : nullptr;
+
+    const auto state = read_cmdlist_state(command_list);
+    update_cmdlist_root_desc_table(command_list, false, root_parameter_index, base_descriptor);
+    update_cmdlist_descriptor_reads(command_list, false, root_parameter_index, base_descriptor);
+    record_root_bind_event(
+        "D3D12Hook::SetComputeRootDescriptorTable",
+        command_list,
+        state,
+        false,
+        "descriptor_table",
+        root_parameter_index,
+        static_cast<uintptr_t>(base_descriptor.ptr),
+        1,
+        0);
 
     const int view_id = sn2_get_current_fog_view();
     // Periodic logging — first 8 calls + every 4000th — so we can see
@@ -7168,6 +8173,345 @@ void WINAPI D3D12Hook::set_compute_root_descriptor_table(
 
     if (original != nullptr) {
         original(command_list, root_parameter_index, base_descriptor);
+    }
+}
+
+void WINAPI D3D12Hook::set_compute_root_32bit_constant(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    UINT src_data,
+    UINT dest_offset_in_32bit_values
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_COMPUTE_ROOT_32BIT_CONSTANT_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_compute_root_32bit_constant)*>() : nullptr;
+
+    const auto state = read_cmdlist_state(command_list);
+    auto effective_src_data = src_data;
+    auto effective_dest_offset = dest_offset_in_32bit_values;
+    if (auto override = render::ShaderOverrideRegistry::get().resolve_d3d12_root_constants_bind_override(
+            false,
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            static_cast<int>(state.last_viewport_bucket),
+            root_parameter_index);
+        override.has_value() && !override->values.empty()) {
+        effective_src_data = override->values.front();
+        effective_dest_offset = override->dest_offset;
+    }
+
+    const uint64_t payload[2]{effective_src_data, effective_dest_offset};
+    const auto hash = fnv1a64_bytes(payload, sizeof(payload));
+    update_cmdlist_root_constants_hash(command_list, false, root_parameter_index, hash);
+    record_root_bind_event(
+        "D3D12Hook::SetComputeRoot32BitConstant",
+        command_list,
+        state,
+        false,
+        "constants",
+        root_parameter_index,
+        static_cast<uintptr_t>(effective_src_data),
+        1,
+        hash);
+
+    if (original != nullptr) {
+        original(command_list, root_parameter_index, effective_src_data, effective_dest_offset);
+    }
+}
+
+void WINAPI D3D12Hook::set_graphics_root_32bit_constant(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    UINT src_data,
+    UINT dest_offset_in_32bit_values
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_GRAPHICS_ROOT_32BIT_CONSTANT_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_graphics_root_32bit_constant)*>() : nullptr;
+
+    const auto state = read_cmdlist_state(command_list);
+    auto effective_src_data = src_data;
+    auto effective_dest_offset = dest_offset_in_32bit_values;
+    if (auto override = render::ShaderOverrideRegistry::get().resolve_d3d12_root_constants_bind_override(
+            true,
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            static_cast<int>(state.last_viewport_bucket),
+            root_parameter_index);
+        override.has_value() && !override->values.empty()) {
+        effective_src_data = override->values.front();
+        effective_dest_offset = override->dest_offset;
+    }
+
+    const uint64_t payload[2]{effective_src_data, effective_dest_offset};
+    const auto hash = fnv1a64_bytes(payload, sizeof(payload));
+    update_cmdlist_root_constants_hash(command_list, true, root_parameter_index, hash);
+    record_root_bind_event(
+        "D3D12Hook::SetGraphicsRoot32BitConstant",
+        command_list,
+        state,
+        true,
+        "constants",
+        root_parameter_index,
+        static_cast<uintptr_t>(effective_src_data),
+        1,
+        hash);
+
+    if (original != nullptr) {
+        original(command_list, root_parameter_index, effective_src_data, effective_dest_offset);
+    }
+}
+
+void WINAPI D3D12Hook::set_compute_root_32bit_constants(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    UINT num_32bit_values_to_set,
+    const void* src_data,
+    UINT dest_offset_in_32bit_values
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_COMPUTE_ROOT_32BIT_CONSTANTS_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_compute_root_32bit_constants)*>() : nullptr;
+
+    const auto state = read_cmdlist_state(command_list);
+    std::vector<uint32_t> override_values{};
+    const void* effective_src_data = src_data;
+    UINT effective_count = num_32bit_values_to_set;
+    UINT effective_dest_offset = dest_offset_in_32bit_values;
+    if (auto override = render::ShaderOverrideRegistry::get().resolve_d3d12_root_constants_bind_override(
+            false,
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            static_cast<int>(state.last_viewport_bucket),
+            root_parameter_index);
+        override.has_value() && !override->values.empty()) {
+        override_values = override->values;
+        effective_src_data = override_values.data();
+        effective_count = static_cast<UINT>(override_values.size());
+        effective_dest_offset = override->dest_offset;
+    }
+
+    const auto hash = fnv1a64_bytes(effective_src_data, static_cast<size_t>(effective_count) * sizeof(uint32_t));
+    update_cmdlist_root_constants_hash(command_list, false, root_parameter_index, hash);
+    record_root_bind_event(
+        "D3D12Hook::SetComputeRoot32BitConstants",
+        command_list,
+        state,
+        false,
+        "constants",
+        root_parameter_index,
+        static_cast<uintptr_t>(effective_dest_offset),
+        effective_count,
+        hash);
+
+    if (original != nullptr) {
+        original(command_list, root_parameter_index, effective_count, effective_src_data, effective_dest_offset);
+    }
+}
+
+void WINAPI D3D12Hook::set_graphics_root_32bit_constants(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    UINT num_32bit_values_to_set,
+    const void* src_data,
+    UINT dest_offset_in_32bit_values
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_GRAPHICS_ROOT_32BIT_CONSTANTS_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_graphics_root_32bit_constants)*>() : nullptr;
+
+    const auto state = read_cmdlist_state(command_list);
+    std::vector<uint32_t> override_values{};
+    const void* effective_src_data = src_data;
+    UINT effective_count = num_32bit_values_to_set;
+    UINT effective_dest_offset = dest_offset_in_32bit_values;
+    if (auto override = render::ShaderOverrideRegistry::get().resolve_d3d12_root_constants_bind_override(
+            true,
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            static_cast<int>(state.last_viewport_bucket),
+            root_parameter_index);
+        override.has_value() && !override->values.empty()) {
+        override_values = override->values;
+        effective_src_data = override_values.data();
+        effective_count = static_cast<UINT>(override_values.size());
+        effective_dest_offset = override->dest_offset;
+    }
+
+    const auto hash = fnv1a64_bytes(effective_src_data, static_cast<size_t>(effective_count) * sizeof(uint32_t));
+    update_cmdlist_root_constants_hash(command_list, true, root_parameter_index, hash);
+    record_root_bind_event(
+        "D3D12Hook::SetGraphicsRoot32BitConstants",
+        command_list,
+        state,
+        true,
+        "constants",
+        root_parameter_index,
+        static_cast<uintptr_t>(effective_dest_offset),
+        effective_count,
+        hash);
+
+    if (original != nullptr) {
+        original(command_list, root_parameter_index, effective_count, effective_src_data, effective_dest_offset);
+    }
+}
+
+void WINAPI D3D12Hook::set_compute_root_constant_buffer_view(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_COMPUTE_ROOT_CONSTANT_BUFFER_VIEW_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_compute_root_constant_buffer_view)*>() : nullptr;
+
+    const auto state = read_cmdlist_state(command_list);
+    D3D12_GPU_VIRTUAL_ADDRESS effective_gpu_va = gpu_va;
+    if (auto override = render::ShaderOverrideRegistry::get().resolve_d3d12_cbv_bind_override(
+            false,
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            static_cast<int>(state.last_viewport_bucket),
+            root_parameter_index);
+        override.has_value()) {
+        const auto key = override->name + ":compute:" + std::to_string(reinterpret_cast<uintptr_t>(state.current_pso)) + ":" + std::to_string(root_parameter_index);
+        if (const auto replacement_va = bind_override_uploads::get_or_create(
+                d3d12 != nullptr ? d3d12->get_device() : nullptr,
+                key,
+                override->data);
+            replacement_va != 0) {
+            effective_gpu_va = replacement_va;
+        }
+    }
+
+    const auto cbv_hash = hash_gpu_va_upload_prefix(effective_gpu_va, 256);
+    update_cmdlist_root_va(command_list, false, "cbv", root_parameter_index, effective_gpu_va);
+    update_cmdlist_root_cbv_hash(command_list, false, root_parameter_index, cbv_hash);
+    record_root_bind_event(
+        "D3D12Hook::SetComputeRootConstantBufferView",
+        command_list,
+        state,
+        false,
+        "cbv",
+        root_parameter_index,
+        static_cast<uintptr_t>(effective_gpu_va),
+        cbv_hash != 0 ? 256 : 0,
+        cbv_hash);
+
+    if (original != nullptr) {
+        original(command_list, root_parameter_index, effective_gpu_va);
+    }
+}
+
+void WINAPI D3D12Hook::set_compute_root_shader_resource_view(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_COMPUTE_ROOT_SHADER_RESOURCE_VIEW_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_compute_root_shader_resource_view)*>() : nullptr;
+
+    const auto state = read_cmdlist_state(command_list);
+    update_cmdlist_root_va(command_list, false, "srv", root_parameter_index, gpu_va);
+    record_root_bind_event(
+        "D3D12Hook::SetComputeRootShaderResourceView",
+        command_list,
+        state,
+        false,
+        "srv",
+        root_parameter_index,
+        static_cast<uintptr_t>(gpu_va),
+        1,
+        0);
+
+    if (original != nullptr) {
+        original(command_list, root_parameter_index, gpu_va);
+    }
+}
+
+void WINAPI D3D12Hook::set_graphics_root_shader_resource_view(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_GRAPHICS_ROOT_SHADER_RESOURCE_VIEW_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_graphics_root_shader_resource_view)*>() : nullptr;
+
+    const auto state = read_cmdlist_state(command_list);
+    update_cmdlist_root_va(command_list, true, "srv", root_parameter_index, gpu_va);
+    record_root_bind_event(
+        "D3D12Hook::SetGraphicsRootShaderResourceView",
+        command_list,
+        state,
+        true,
+        "srv",
+        root_parameter_index,
+        static_cast<uintptr_t>(gpu_va),
+        1,
+        0);
+
+    if (original != nullptr) {
+        original(command_list, root_parameter_index, gpu_va);
+    }
+}
+
+void WINAPI D3D12Hook::set_compute_root_unordered_access_view(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_COMPUTE_ROOT_UNORDERED_ACCESS_VIEW_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_compute_root_unordered_access_view)*>() : nullptr;
+
+    const auto state = read_cmdlist_state(command_list);
+    update_cmdlist_root_va(command_list, false, "uav", root_parameter_index, gpu_va);
+    record_root_bind_event(
+        "D3D12Hook::SetComputeRootUnorderedAccessView",
+        command_list,
+        state,
+        false,
+        "uav",
+        root_parameter_index,
+        static_cast<uintptr_t>(gpu_va),
+        1,
+        0);
+
+    if (original != nullptr) {
+        original(command_list, root_parameter_index, gpu_va);
+    }
+}
+
+void WINAPI D3D12Hook::set_graphics_root_unordered_access_view(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_GRAPHICS_ROOT_UNORDERED_ACCESS_VIEW_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_graphics_root_unordered_access_view)*>() : nullptr;
+
+    const auto state = read_cmdlist_state(command_list);
+    update_cmdlist_root_va(command_list, true, "uav", root_parameter_index, gpu_va);
+    record_root_bind_event(
+        "D3D12Hook::SetGraphicsRootUnorderedAccessView",
+        command_list,
+        state,
+        true,
+        "uav",
+        root_parameter_index,
+        static_cast<uintptr_t>(gpu_va),
+        1,
+        0);
+
+    if (original != nullptr) {
+        original(command_list, root_parameter_index, gpu_va);
     }
 }
 
@@ -7580,7 +8924,36 @@ void WINAPI D3D12Hook::set_graphics_root_constant_buffer_view(
         }
     }
 
-    update_cmdlist_root_cbv(command_list, root_parameter_index, gpu_va);
+    const auto final_state = read_cmdlist_state(command_list);
+    if (auto override = render::ShaderOverrideRegistry::get().resolve_d3d12_cbv_bind_override(
+            true,
+            reinterpret_cast<uintptr_t>(final_state.current_pso),
+            static_cast<int>(final_state.last_viewport_bucket),
+            root_parameter_index);
+        override.has_value()) {
+        const auto key = override->name + ":graphics:" + std::to_string(reinterpret_cast<uintptr_t>(final_state.current_pso)) + ":" + std::to_string(root_parameter_index);
+        if (const auto replacement_va = bind_override_uploads::get_or_create(
+                d3d12 != nullptr ? d3d12->get_device() : nullptr,
+                key,
+                override->data);
+            replacement_va != 0) {
+            gpu_va = replacement_va;
+        }
+    }
+
+    const auto cbv_hash = hash_gpu_va_upload_prefix(gpu_va, 256);
+    update_cmdlist_root_va(command_list, true, "cbv", root_parameter_index, gpu_va);
+    update_cmdlist_root_cbv_hash(command_list, true, root_parameter_index, cbv_hash);
+    record_root_bind_event(
+        "D3D12Hook::SetGraphicsRootConstantBufferView",
+        command_list,
+        final_state,
+        true,
+        "cbv",
+        root_parameter_index,
+        static_cast<uintptr_t>(gpu_va),
+        cbv_hash != 0 ? 256 : 0,
+        cbv_hash);
 
     if (original != nullptr) {
         original(command_list, root_parameter_index, gpu_va);

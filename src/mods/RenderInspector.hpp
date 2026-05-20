@@ -1,8 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "Mod.hpp"
 #include "render/D3D12Diagnostics.hpp"
@@ -103,6 +105,9 @@ private:
     int m_pso_sort_mode{0};
     std::string m_selected_pso_key{};
     std::string m_render_bundle_export_status{};
+    std::array<char, 1024> m_shader_editor_path{};
+    std::vector<char> m_shader_editor_buffer{};
+    std::string m_shader_editor_status{};
 
     std::atomic<bool> m_force_resources_sampling{false};
     std::atomic<bool> m_force_shader_tracking{false};
