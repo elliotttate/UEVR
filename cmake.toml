@@ -153,6 +153,13 @@ type = "plugin"
 sources = ["examples/example_plugin/**.cpp", "examples/example_plugin/**.c"]
 headers = ["examples/example_plugin/**.hpp", "examples/example_plugin/**.h"]
 
+[target.subnautica2_thumbnail_fix]
+type = "shared"
+sources = ["examples/subnautica2_thumbnail_fix/**.cpp"]
+include-directories = ["include/"]
+compile-features = ["cxx_std_23"]
+link-libraries = ["Psapi"]
+
 [target.sdk-test]
 type = "shared"
 sources = ["side-projects/sdk-test/**.cpp", "side-projects/sdk-test/**.c"]
@@ -224,15 +231,28 @@ LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO = "${CMAKE_BINARY_DIR}/lib/${CMKR_TARGET
 ARCHIVE_OUTPUT_DIRECTORY_RELEASE = "${CMAKE_BINARY_DIR}/lib/${CMKR_TARGET}"
 ARCHIVE_OUTPUT_DIRECTORY_RELWITHDEBINFO = "${CMAKE_BINARY_DIR}/lib/${CMKR_TARGET}"
 
+[target.dxil-patch]
+type = "executable"
+sources = ["tools/dxil-patch/DxilPatch.cpp"]
+compile-features = ["cxx_std_23"]
+compile-options = ["/EHa", "/MP"]
+link-libraries = ["nlohmann_json"]
+
+[target.dxil-patch.properties]
+RUNTIME_OUTPUT_DIRECTORY_RELEASE = "${CMAKE_BINARY_DIR}/bin/uevr"
+RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO = "${CMAKE_BINARY_DIR}/bin/uevr"
+RUNTIME_OUTPUT_DIRECTORY_DEBUG = "${CMAKE_BINARY_DIR}/bin/uevr"
+
 [template.ue4template]
 type = "shared"
 sources = ["src/**.cpp", "src/**.c"]
 headers = ["src/**.hpp", "src/**.h"]
 include-directories = [
-    "shared/", 
-    "src/", 
-    "include/", 
-    "${OPENXR_SOURCE_DIR}/src"
+    "shared/",
+    "src/",
+    "include/",
+    "${OPENXR_SOURCE_DIR}/src",
+    "dependencies/vendor/renderdoc"
 ]
 compile-options = ["/GS-", "/bigobj", "/EHa", "/MP"]
 compile-features = ["cxx_std_23"]
@@ -242,6 +262,7 @@ link-libraries = [
     "d3d11",
     "d3d12",
     "d3dcompiler",
+    "windowscodecs",
     "dbghelp",
     "safetyhook",
     "glm",

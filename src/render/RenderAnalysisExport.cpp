@@ -261,6 +261,7 @@ json to_json(const render::ShaderOverrideRegistry::OverrideEntryInfo& entry) {
         {"target_hash", entry.target_hash},
         {"manifest_path", entry.manifest_path},
         {"source_path", entry.source_path},
+        {"source_kind", entry.source_kind},
         {"entry_point", entry.entry_point},
         {"profile", entry.profile},
         {"enabled", entry.enabled},

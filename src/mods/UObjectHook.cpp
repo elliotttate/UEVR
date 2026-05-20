@@ -8,6 +8,8 @@
 #include <utility/String.hpp>
 #include <utility/ScopeGuard.hpp>
 
+#include "DumperMode.hpp"
+
 #include <sdk/UObjectBase.hpp>
 #include <sdk/UObjectArray.hpp>
 #include <sdk/UClass.hpp>
@@ -422,6 +424,39 @@ void UObjectHook::hook() {
 
     m_hooked = true;
     m_wants_activate = false;
+
+    // Dumper mode: skip the inline safetyhook::create_inline() patches on
+    // UObjectBase::AddObject and UObjectBase::destructor. Those trampolines
+    // interfere with the game's atomic UObject hash-table operations on some
+    // UE4 forks (RoboQuest 4.26 confirmed — crashes ~65s after injection
+    // with `lock cmpxchg qword ptr [rcx+0x40], r14` on a null UObject).
+    //
+    // Live tracking of new / destroyed UObjects isn't needed for reflection
+    // dumping — the plugin walks sdk::FUObjectArray directly when it needs
+    // a snapshot. We still populate m_objects with the existing objects at
+    // init time so find_uobject / exists continue to work.
+    //
+    // See DumperMode.hpp.
+    if (uevr::is_dumper_mode()) {
+        SPDLOG_INFO("[UObjectHook] Dumper mode: skipping AddObject + destructor hooks "
+                    "(live tracking disabled; existing-object snapshot still populated)");
+
+        auto uobjectarray = sdk::FUObjectArray::get();
+        if (uobjectarray != nullptr) {
+            for (auto i = 0; i < uobjectarray->get_object_count(); ++i) {
+                auto item = uobjectarray->get_object(i);
+                if (item == nullptr) continue;
+                auto obj = item->get_object();
+                if (obj == nullptr) continue;
+                add_new_object(obj);
+            }
+            SPDLOG_INFO("[UObjectHook] Dumper mode: added {} existing objects", m_objects.size());
+        }
+
+        reload_persistent_states();
+        m_fully_hooked = true;
+        return;
+    }
 
     auto destructor_fn = sdk::UObjectBase::get_destructor();
 

@@ -1,15 +1,48 @@
 #include "render/D3D12Diagnostics.hpp"
 
+#include <Windows.h>
+
 #include <algorithm>
 #include <array>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <string_view>
 
 namespace {
 constexpr size_t MAX_RECENT_BINDINGS = 96;
 constexpr size_t MAX_RECENT_BARRIERS = 128;
 constexpr size_t MAX_RECENT_WARNINGS = 64;
+
+// Try to read an engine-supplied debug name off a resource. UE's RHI sets
+// WKPDID_D3DDebugObjectName / WKPDID_D3DDebugObjectNameW on render targets
+// ("SceneColor", "GBufferA", "MotionBlur_*", etc.), which are the most
+// human-readable hooks we have to tie a raw RTV back to engine intent.
+std::string try_resolve_d3d_debug_name(ID3D12Resource* resource) {
+    if (resource == nullptr) return {};
+    UINT size = 0;
+    if (SUCCEEDED(resource->GetPrivateData(WKPDID_D3DDebugObjectName, &size, nullptr)) && size > 0 && size < 1024) {
+        std::string buf(size, '\0');
+        if (SUCCEEDED(resource->GetPrivateData(WKPDID_D3DDebugObjectName, &size, buf.data()))) {
+            while (!buf.empty() && buf.back() == '\0') buf.pop_back();
+            if (!buf.empty()) return buf;
+        }
+    }
+    UINT wsize = 0;
+    if (SUCCEEDED(resource->GetPrivateData(WKPDID_D3DDebugObjectNameW, &wsize, nullptr)) && wsize > 0 && wsize < 2048) {
+        std::wstring wbuf(wsize / sizeof(wchar_t), L'\0');
+        if (SUCCEEDED(resource->GetPrivateData(WKPDID_D3DDebugObjectNameW, &wsize, wbuf.data()))) {
+            while (!wbuf.empty() && wbuf.back() == L'\0') wbuf.pop_back();
+            if (!wbuf.empty()) {
+                int n = WideCharToMultiByte(CP_UTF8, 0, wbuf.c_str(), (int)wbuf.size(), nullptr, 0, nullptr, nullptr);
+                std::string narrow(n, '\0');
+                WideCharToMultiByte(CP_UTF8, 0, wbuf.c_str(), (int)wbuf.size(), narrow.data(), n, nullptr, nullptr);
+                return narrow;
+            }
+        }
+    }
+    return {};
+}
 
 template <typename T>
 void push_ring(std::vector<T>& values, T value, size_t max_entries) {
@@ -437,6 +470,13 @@ void D3D12Diagnostics::register_rtv_descriptor(
         const auto resource_key = reinterpret_cast<uintptr_t>(resource);
         if (const auto it = m_resources.find(resource_key); it != m_resources.end()) {
             descriptor.name = it->second.name;
+            if (descriptor.name.empty()) {
+                auto dbg = try_resolve_d3d_debug_name(resource);
+                if (!dbg.empty()) {
+                    descriptor.name = dbg;
+                    it->second.name = dbg;
+                }
+            }
         }
     }
 
@@ -482,6 +522,13 @@ void D3D12Diagnostics::register_dsv_descriptor(
         const auto resource_key = reinterpret_cast<uintptr_t>(resource);
         if (const auto it = m_resources.find(resource_key); it != m_resources.end()) {
             descriptor.name = it->second.name;
+            if (descriptor.name.empty()) {
+                auto dbg = try_resolve_d3d_debug_name(resource);
+                if (!dbg.empty()) {
+                    descriptor.name = dbg;
+                    it->second.name = dbg;
+                }
+            }
         }
     }
 
@@ -624,6 +671,18 @@ void D3D12Diagnostics::record_rtv_bind(
             if (const auto it = m_rtv_descriptors.find(target.handle); it != m_rtv_descriptors.end()) {
                 target.resource = it->second.resource;
                 target.name = it->second.name;
+                // The engine may set the debug name after CreateRenderTargetView.
+                // Retry the lookup here so subsequent binds see a real name.
+                if (target.name.empty() && it->second.resource != 0) {
+                    auto dbg = try_resolve_d3d_debug_name(reinterpret_cast<ID3D12Resource*>(it->second.resource));
+                    if (!dbg.empty()) {
+                        it->second.name = dbg;
+                        target.name = dbg;
+                        if (auto rit = m_resources.find(it->second.resource); rit != m_resources.end()) {
+                            rit->second.name = dbg;
+                        }
+                    }
+                }
             }
 
             if (target.name.empty()) {
@@ -644,6 +703,16 @@ void D3D12Diagnostics::record_rtv_bind(
         if (const auto it = m_dsv_descriptors.find(target.handle); it != m_dsv_descriptors.end()) {
             target.resource = it->second.resource;
             target.name = it->second.name;
+            if (target.name.empty() && it->second.resource != 0) {
+                auto dbg = try_resolve_d3d_debug_name(reinterpret_cast<ID3D12Resource*>(it->second.resource));
+                if (!dbg.empty()) {
+                    it->second.name = dbg;
+                    target.name = dbg;
+                    if (auto rit = m_resources.find(it->second.resource); rit != m_resources.end()) {
+                        rit->second.name = dbg;
+                    }
+                }
+            }
         }
 
         if (target.name.empty()) {
@@ -653,8 +722,11 @@ void D3D12Diagnostics::record_rtv_bind(
         context.depth_target = std::move(target);
     }
 
+    BindingEvent event{m_frame, std::string{source}, "OMSetRenderTargets", detail.str()};
+    event.render_targets = context.render_targets;
+    event.depth_target = context.depth_target;
     m_current_bind_context = std::move(context);
-    push_ring(m_recent_bindings, BindingEvent{m_frame, std::string{source}, "OMSetRenderTargets", detail.str()}, MAX_RECENT_BINDINGS);
+    push_ring(m_recent_bindings, std::move(event), MAX_RECENT_BINDINGS);
 }
 
 D3D12Diagnostics::Snapshot D3D12Diagnostics::snapshot() const {

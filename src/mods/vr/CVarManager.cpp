@@ -413,6 +413,24 @@ CVarManager::ChangeSnapshot CVarManager::get_change_snapshot() const {
     return s_change_snapshot;
 }
 
+std::vector<CVarManager::CVarFfiSnapshot> CVarManager::ffi_snapshot() const {
+    std::vector<CVarFfiSnapshot> out{};
+    out.reserve(m_all_cvars.size());
+    for (const auto& cvar : m_all_cvars) {
+        if (cvar == nullptr) continue;
+        CVarFfiSnapshot s{};
+        s.module = utility::narrow(cvar->get_module());
+        s.name = utility::narrow(cvar->get_name());
+        s.key = cvar->get_key_name();
+        s.frozen = cvar->is_frozen();
+        s.ever_frozen = false; // CVar::m_ever_frozen is private; surface only is_frozen here.
+        s.frozen_int = cvar->is_frozen() ? cvar->get_frozen_int_value() : 0;
+        s.frozen_float = cvar->is_frozen() ? cvar->get_frozen_float_value() : 0.0f;
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
 uint64_t CVarManager::get_change_counter() const {
     return s_change_counter.load(std::memory_order_relaxed);
 }

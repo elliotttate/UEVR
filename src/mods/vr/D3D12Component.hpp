@@ -2,6 +2,7 @@
 
 #include <span>
 #include <chrono>
+#include <filesystem>
 
 #include <d3d12.h>
 #include <dxgi.h>
@@ -43,11 +44,50 @@ public:
 
     const auto& get_backbuffer_size() const { return m_backbuffer_size; }
 
-    auto is_initialized() const { return m_openvr.left_eye_tex[0].texture != nullptr; }
+    bool is_initialized() const;
     const auto& get_last_on_frame_time() const { return m_last_on_frame; }
 
     auto& openxr() { return m_openxr; }
     auto& get_openvr_ui_tex() { return m_openvr.ui_tex; }
+
+    // External-consumer hooks for the render-diagnostics FFI.
+    // Eye target descriptor: the texture that holds the requested eye's pixels,
+    // PLUS the region within it that corresponds to that eye. For native stereo
+    // (DOUBLE_WIDE swapchains), the region is the left or right half of a
+    // single underlying texture; for AFR / OpenVR mirror textures it covers
+    // the full extent.
+    struct EyeTarget {
+        Microsoft::WRL::ComPtr<ID3D12Resource> texture{};
+        UINT region_x{0};
+        UINT region_y{0};
+        UINT region_w{0};
+        UINT region_h{0};
+        UINT array_slice{0};
+        const char* path{"none"}; // OpenVR / OpenXR/AFR / OpenXR/DOUBLE_WIDE / OpenXR/NATIVE_STEREO_ARRAY / Framework/Swapchain
+        const char* note{""};
+    };
+
+    EyeTarget get_current_eye_target(int side) const;
+
+    // Back-compat shims.
+    Microsoft::WRL::ComPtr<ID3D12Resource> get_current_eye_resource(int side) const {
+        return get_current_eye_target(side).texture;
+    }
+    uint32_t get_current_eye_subresource(int side) const {
+        return get_current_eye_target(side).array_slice;
+    }
+
+    // Most-recently classified scene mode as a string (Unknown / Stereo3D / Mono2D).
+    const char* get_shf_scene_mode_str() const;
+
+    // Per-render-path timing stats as primitives (count, avg ms, max ms).
+    struct FfiTiming { uint64_t count{}; double avg_ms{}; double max_ms{}; };
+    FfiTiming get_timing_on_frame()         const;
+    FfiTiming get_timing_ui_copy()          const;
+    FfiTiming get_timing_swapchain_copy()   const;
+    FfiTiming get_timing_openxr_submit()    const;
+    FfiTiming get_timing_spectator_mirror() const;
+    FfiTiming get_timing_post_present()     const;
 
     struct HitchFrameSnapshot {
         bool initialized{};
@@ -102,6 +142,16 @@ private:
     void draw_spectator_view(ID3D12GraphicsCommandList* command_list, bool is_right_eye_frame, d3d12::TextureContext* game_tex_override = nullptr);
     void clear_backbuffer();
     bool ensure_2d_screen_textures(ID3D12Device* device, const D3D12_RESOURCE_DESC& base_desc);
+    void dump_native_stereo_backbuffer_once(
+        ID3D12Resource* backbuffer,
+        const D3D12_BOX& left_box,
+        const D3D12_BOX& right_box,
+        D3D12_RESOURCE_STATES source_state);
+    bool dump_texture_region_to_bmp(
+        ID3D12Resource* texture,
+        const D3D12_BOX& src_box,
+        D3D12_RESOURCE_STATES source_state,
+        const std::filesystem::path& path);
 
     enum class ShfSceneMode {
         Unknown,
@@ -169,6 +219,7 @@ private:
     d3d12::TextureContext m_shf_mono_scene_tex{};
     std::array<d3d12::CommandContext, 3> m_game_tex_commands{};
     d3d12::CommandContext m_shf_mono_scene_commands{};
+    d3d12::CommandContext m_native_debug_dump_commands{};
     uint64_t m_shf_mono_scene_width{};
     uint32_t m_shf_mono_scene_height{};
     DXGI_FORMAT m_shf_mono_scene_format{DXGI_FORMAT_UNKNOWN};
@@ -183,6 +234,8 @@ private:
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_ui_batch_alpha_invert{};
 
     ID3D12Resource* m_last_checked_native{nullptr};
+    bool m_native_debug_dumped_backbuffer{false};
+    uint32_t m_native_debug_submit_count{0};
 
     // Mimicking what OpenXR does.
     struct OpenVR {
@@ -276,12 +329,19 @@ private:
         void copy(uint32_t swapchain_idx, ID3D12Resource* src,
             std::optional<std::function<void(d3d12::CommandContext&, ID3D12Resource*)>> pre_commands = std::nullopt,
             std::optional<std::function<void(d3d12::CommandContext&)>> additional_commands = std::nullopt,
-            D3D12_RESOURCE_STATES src_state = D3D12_RESOURCE_STATE_PRESENT, D3D12_BOX* src_box = nullptr);
+            D3D12_RESOURCE_STATES src_state = D3D12_RESOURCE_STATE_PRESENT, D3D12_BOX* src_box = nullptr,
+            uint32_t dst_subresource = 0);
 
         void copy(uint32_t swapchain_idx, ID3D12Resource* src,
             D3D12_RESOURCE_STATES src_state = D3D12_RESOURCE_STATE_PRESENT, D3D12_BOX* src_box = nullptr)
         {
-            this->copy(swapchain_idx, src, std::nullopt, std::nullopt, src_state, src_box);
+            this->copy(swapchain_idx, src, std::nullopt, std::nullopt, src_state, src_box, 0);
+        }
+
+        void copy(uint32_t swapchain_idx, ID3D12Resource* src,
+            D3D12_RESOURCE_STATES src_state, D3D12_BOX* src_box, uint32_t dst_subresource)
+        {
+            this->copy(swapchain_idx, src, std::nullopt, std::nullopt, src_state, src_box, dst_subresource);
         }
         void wait_for_all_copies() {
             std::scoped_lock _{this->mtx};

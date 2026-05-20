@@ -417,6 +417,42 @@ target_link_libraries(example_plugin PUBLIC
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
 
+# Target subnautica2_thumbnail_fix
+set(CMKR_TARGET subnautica2_thumbnail_fix)
+set(subnautica2_thumbnail_fix_SOURCES "")
+
+list(APPEND subnautica2_thumbnail_fix_SOURCES
+	"examples/subnautica2_thumbnail_fix/Plugin.cpp"
+)
+
+list(APPEND subnautica2_thumbnail_fix_SOURCES
+	cmake.toml
+)
+
+set(CMKR_SOURCES ${subnautica2_thumbnail_fix_SOURCES})
+add_library(subnautica2_thumbnail_fix SHARED)
+
+if(subnautica2_thumbnail_fix_SOURCES)
+	target_sources(subnautica2_thumbnail_fix PRIVATE ${subnautica2_thumbnail_fix_SOURCES})
+endif()
+
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${subnautica2_thumbnail_fix_SOURCES})
+
+target_compile_features(subnautica2_thumbnail_fix PUBLIC
+	cxx_std_23
+)
+
+target_include_directories(subnautica2_thumbnail_fix PUBLIC
+	"include/"
+)
+
+target_link_libraries(subnautica2_thumbnail_fix PUBLIC
+	Psapi
+)
+
+unset(CMKR_TARGET)
+unset(CMKR_SOURCES)
+
 # Target sdk-test
 set(CMKR_TARGET sdk-test)
 set(sdk-test_SOURCES "")
@@ -708,6 +744,57 @@ set_target_properties(LuaVR PROPERTIES
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
 
+# Target dxil-patch
+set(CMKR_TARGET dxil-patch)
+set(dxil-patch_SOURCES "")
+
+list(APPEND dxil-patch_SOURCES
+	"tools/dxil-patch/DxilPatch.cpp"
+)
+
+list(APPEND dxil-patch_SOURCES
+	cmake.toml
+)
+
+set(CMKR_SOURCES ${dxil-patch_SOURCES})
+add_executable(dxil-patch)
+
+if(dxil-patch_SOURCES)
+	target_sources(dxil-patch PRIVATE ${dxil-patch_SOURCES})
+endif()
+
+get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+if(NOT CMKR_VS_STARTUP_PROJECT)
+	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT dxil-patch)
+endif()
+
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${dxil-patch_SOURCES})
+
+target_compile_features(dxil-patch PRIVATE
+	cxx_std_23
+)
+
+target_compile_options(dxil-patch PRIVATE
+	"/EHa"
+	"/MP"
+)
+
+target_link_libraries(dxil-patch PRIVATE
+	nlohmann_json
+)
+
+set_target_properties(dxil-patch PROPERTIES
+	RUNTIME_OUTPUT_DIRECTORY_RELEASE
+		"${CMAKE_BINARY_DIR}/bin/uevr"
+	RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO
+		"${CMAKE_BINARY_DIR}/bin/uevr"
+	RUNTIME_OUTPUT_DIRECTORY_DEBUG
+		"${CMAKE_BINARY_DIR}/bin/uevr"
+)
+
+unset(CMKR_TARGET)
+unset(CMKR_SOURCES)
+
 # Target uevr
 set(CMKR_TARGET uevr)
 set(uevr_SOURCES "")
@@ -757,17 +844,20 @@ list(APPEND uevr_SOURCES
 	"src/render/D3D12Diagnostics.cpp"
 	"src/render/FrameResourceInspector.cpp"
 	"src/render/RenderAnalysisExport.cpp"
+	"src/render/RenderDiagnosticsCAPI.cpp"
 	"src/render/ShaderCompiler.cpp"
 	"src/render/ShaderOverrideRegistry.cpp"
 	"src/uevr-imgui/imgui_impl_dx11.cpp"
 	"src/uevr-imgui/imgui_impl_dx12.cpp"
 	"src/uevr-imgui/imgui_impl_win32.cpp"
 	"src/utility/ImGui.cpp"
+	"src/DumperMode.hpp"
 	"src/ExceptionHandler.hpp"
 	"src/Framework.hpp"
 	"src/LicenseStrings.hpp"
 	"src/Mod.hpp"
 	"src/Mods.hpp"
+	"src/ProfilerMode.hpp"
 	"src/WindowFilter.hpp"
 	"src/hooks/D3D11Hook.hpp"
 	"src/hooks/D3D12Hook.hpp"
@@ -811,6 +901,7 @@ list(APPEND uevr_SOURCES
 	"src/render/D3D12Diagnostics.hpp"
 	"src/render/FrameResourceInspector.hpp"
 	"src/render/RenderAnalysisExport.hpp"
+	"src/render/RenderDiagnosticsCAPI.hpp"
 	"src/render/ShaderCompiler.hpp"
 	"src/render/ShaderOverrideRegistry.hpp"
 	"src/uevr-imgui/font_robotomedium.hpp"
@@ -850,6 +941,7 @@ target_include_directories(uevr PUBLIC
 	"src/"
 	"include/"
 	"${OPENXR_SOURCE_DIR}/src"
+	"dependencies/vendor/renderdoc"
 )
 
 target_link_libraries(uevr PUBLIC
@@ -857,6 +949,7 @@ target_link_libraries(uevr PUBLIC
 	d3d11
 	d3d12
 	d3dcompiler
+	windowscodecs
 	dbghelp
 	safetyhook
 	glm

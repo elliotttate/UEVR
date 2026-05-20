@@ -1,0 +1,63 @@
+MSBuild version 17.14.40+3e7442088 for .NET Framework
+
+  1>Checking Build System
+  Building Custom Rule E:/Github/UEVRJ/build/_deps/directxtk-src/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/build/_deps/sdkgenny-src/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/build/_deps/bddisasm-src/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/build/_deps/tracy-src/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/build/_deps/zydis-src/dependencies/zycore/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/build/_deps/asmjit-src/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/build/_deps/directxtk12-src/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/build/_deps/openxr-src/src/CMakeLists.txt
+  TracyClient.vcxproj -> E:\Github\UEVRJ\build\_deps\tracy-build\Release\TracyClient.lib
+  spdlog.vcxproj -> E:\Github\UEVRJ\build\Release\spdlog.lib
+  bddisasm.vcxproj -> E:\Github\UEVRJ\build\_deps\bddisasm-build\Release\bddisasm.lib
+  glm.vcxproj -> E:\Github\UEVRJ\build\Release\glm.lib
+  imgui.vcxproj -> E:\Github\UEVRJ\build\Release\imgui.lib
+  Zycore.vcxproj -> E:\Github\UEVRJ\build\_deps\zydis-build\zycore\Release\Zycore.lib
+  sdkgenny.vcxproj -> E:\Github\UEVRJ\build\_deps\sdkgenny-build\Release\sdkgenny.lib
+  lua.vcxproj -> E:\Github\UEVRJ\build\Release\lua.lib
+  DirectXTK.vcxproj -> E:\Github\UEVRJ\build\bin\CMake\Release\DirectXTK.lib
+  openvr.vcxproj -> E:\Github\UEVRJ\build\Release\openvr_api.dll
+  DirectXTK12.vcxproj -> E:\Github\UEVRJ\build\bin\CMake\Release\DirectXTK12.lib
+  Building Custom Rule E:/Github/UEVRJ/build/_deps/openxr-src/src/loader/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/build/_deps/kananlib-src/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/build/_deps/bddisasm-src/CMakeLists.txt
+  asmjit.vcxproj -> E:\Github\UEVRJ\build\_deps\asmjit-build\Release\asmjit.lib
+  Building Custom Rule E:/Github/UEVRJ/build/_deps/zydis-src/CMakeLists.txt
+  bdshemu.vcxproj -> E:\Github\UEVRJ\build\_deps\bddisasm-build\Release\bdshemu.lib
+  kananlib.vcxproj -> E:\Github\UEVRJ\build\_deps\kananlib-build\Release\kananlib.lib
+  openxr_loader.vcxproj -> E:\Github\UEVRJ\build\_deps\openxr-build\src\loader\Release\openxr_loader.lib
+  Zydis.vcxproj -> E:\Github\UEVRJ\build\_deps\zydis-build\Release\Zydis.lib
+  Building Custom Rule E:/Github/UEVRJ/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/dependencies/submodules/UESDK/CMakeLists.txt
+  Building Custom Rule E:/Github/UEVRJ/dependencies/vendor/safetyhook/CMakeLists.txt
+  luavrlib.vcxproj -> E:\Github\UEVRJ\build\Release\luavrlib.lib
+  safetyhook.vcxproj -> E:\Github\UEVRJ\build\dependencies\vendor\safetyhook\Release\safetyhook.lib
+  uesdk.vcxproj -> E:\Github\UEVRJ\build\lib\uesdk.lib
+  Compiling shaders for UEVR...
+  Using DXC: "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\dxc.exe"
+  
+  "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\dxc.exe" "alpha_luminance_sprite_ps.fx" -nologo -WX -Ges -Zi -Zpc -Qstrip_reflect -Qstrip_debug -HV 2021 -T ps_6_0 -E SpritePixelShader -Fh"Compiled\alpha_luminance_sprite_ps_SpritePixelShader.inc" -Fd"Compiled\alpha_luminance_sprite_ps_SpritePixelShader.pdb" -Vnalpha_luminance_sprite_ps_SpritePixelShader
+  
+  "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\dxc.exe" "alpha_luminance_sprite_ps.fx" -nologo -WX -Ges -Zi -Zpc -Qstrip_reflect -Qstrip_debug -HV 2021 -T vs_6_0 -E SpriteVertexShader -Fh"Compiled\alpha_luminance_sprite_ps_SpriteVertexShader.inc" -Fd"Compiled\alpha_luminance_sprite_ps_SpriteVertexShader.pdb" -Vnalpha_luminance_sprite_ps_SpriteVertexShader
+  Shaders compiled ok
+  Generating commit hash...
+  Building Custom Rule E:/Github/UEVRJ/CMakeLists.txt
+  Framework.cpp
+  D3D12Hook.cpp
+  PluginLoader.cpp
+  D3D12Component.cpp
+     Creating library E:/Github/UEVRJ/build/lib/uevr/UEVRBackend.lib and object E:/Github/UEVRJ/build/lib/uevr/UEVRBackend.exp
+  uevr.vcxproj -> E:\Github\UEVRJ\build\bin\uevr\UEVRBackend.dll
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:13.62

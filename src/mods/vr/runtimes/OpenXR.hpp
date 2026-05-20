@@ -449,6 +449,7 @@ public:
         DOUBLE_WIDE = STANDARD_START,
         DEPTH,
         DUMMY_VIRTUAL_DESKTOP,
+        NATIVE_STEREO_ARRAY,
 
         STANDARD_END,
 
@@ -499,6 +500,14 @@ public:
         case SwapchainIndex::DOUBLE_WIDE:
             cached_eye_swapchain_width.store(w, std::memory_order_relaxed);
             cached_eye_swapchain_height.store(h, std::memory_order_relaxed);
+            break;
+        case SwapchainIndex::NATIVE_STEREO_ARRAY:
+            if (cached_eye_swapchain_width.load(std::memory_order_relaxed) == 0 ||
+                cached_eye_swapchain_height.load(std::memory_order_relaxed) == 0)
+            {
+                cached_eye_swapchain_width.store(w, std::memory_order_relaxed);
+                cached_eye_swapchain_height.store(h, std::memory_order_relaxed);
+            }
             break;
         case SwapchainIndex::AFR_LEFT_EYE:
             if (cached_eye_swapchain_width.load(std::memory_order_relaxed) == 0 ||

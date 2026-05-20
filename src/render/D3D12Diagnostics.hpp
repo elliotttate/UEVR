@@ -40,24 +40,28 @@ public:
         std::string note{};
     };
 
+    struct BoundTargetInfo {
+        uintptr_t handle{};
+        uintptr_t resource{};
+        std::string name{};
+        std::string descriptor_type{};
+    };
+
     struct BindingEvent {
         uint64_t frame{};
         std::string source{};
         std::string kind{};
         std::string detail{};
+        // Structured per-bind info. Populated for OMSetRenderTargets events;
+        // empty for SetDescriptorHeaps / other event kinds.
+        std::vector<BoundTargetInfo> render_targets{};
+        std::optional<BoundTargetInfo> depth_target{};
     };
 
     struct WarningEvent {
         uint64_t frame{};
         std::string source{};
         std::string message{};
-    };
-
-    struct BoundTargetInfo {
-        uintptr_t handle{};
-        uintptr_t resource{};
-        std::string name{};
-        std::string descriptor_type{};
     };
 
     struct CurrentBindContext {

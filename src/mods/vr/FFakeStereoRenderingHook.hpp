@@ -368,7 +368,41 @@ public:
     void attempt_hook_ue55_slate_output_texture_register();
     void attempt_hook_update_viewport_rhi(uintptr_t return_address);
     void attempt_hook_fsceneview_constructor();
-    
+    void attempt_hook_subnautica2_compute_volumetric_fog();
+    void attempt_hook_subnautica2_init_volumetric_render_target();
+    void attempt_hook_subnautica2_reconstruct_volumetric_render_target();
+    void attempt_hook_subnautica2_compose_volumetric_render_target();
+    void attempt_hook_subnautica2_render_fog_wrapper();
+    void attempt_hook_subnautica2_render_fog_pass();
+    void attempt_hook_subnautica2_render_underwater_fog();
+    void attempt_hook_subnautica2_setup_volumetric_fog_ub();
+    void attempt_hook_subnautica2_lightscat_store_midhook();
+    void attempt_hook_subnautica2_try_add_mesh_batch_probe();
+    void attempt_hook_subnautica2_setup_fog_uniform_params();
+    void attempt_hook_subnautica2_basepass_pso_select();
+    void attempt_hook_subnautica2_basepass_mp_ctor();
+    void attempt_hook_subnautica2_basepass_cull_threshold();
+    void attempt_hook_subnautica2_basepass_ps_force_nolm();
+    void attempt_hook_subnautica2_single_layer_water();
+    void attempt_hook_subnautica2_single_layer_water_scene_without_water();
+    void attempt_hook_subnautica2_single_layer_water_inner();
+    void attempt_hook_subnautica2_slw_per_view();
+    static void __cdecl subnautica2_slw_per_view_hook(
+        void* scene_renderer,
+        void* arg2,
+        void* view_info,
+        void* arg4,
+        void* stack0,
+        void* stack1,
+        void* stack2,
+        void* stack3);
+    void attempt_hook_subnautica2_volumetric_fog_per_view();
+    static void __cdecl subnautica2_volumetric_fog_per_view_hook(
+        void* arg1,
+        void* view_info,
+        void* arg3,
+        void* arg4);
+
 
     bool has_double_precision() const {
         return m_has_double_precision;
@@ -549,6 +583,7 @@ private:
     // IStereoRendering
     static bool is_stereo_enabled(FFakeStereoRendering* stereo);
     static void adjust_view_rect(FFakeStereoRendering* stereo, int32_t index, int* x, int* y, uint32_t* w, uint32_t* h);
+    static void set_final_view_rect(FFakeStereoRendering* stereo, sdk::FRHICommandListBase* cmd_list, int32_t view_index, const FIntRect* final_view_rect);
     static void calculate_stereo_view_offset(FFakeStereoRendering* stereo, const int32_t view_index, Rotator<float>* view_rotation,
         const float world_to_meters, Vector3f* view_location);
     static Matrix4x4f* calculate_stereo_projection_matrix(FFakeStereoRendering* stereo, Matrix4x4f* out, const int32_t view_index);
@@ -571,6 +606,58 @@ private:
                                                  void* elements, void* params, void* unk1, void* unk2);
     static void ue57_add_slate_draw_elements_pass_hook(safetyhook::Context& ctx);
     static void ue55_slate_output_texture_register_hook(safetyhook::Context& ctx);
+    static void subnautica2_compute_volumetric_fog_hook(void* scene_renderer, FRDGBuilder* graph_builder, void* scene_textures);
+    static void subnautica2_init_volumetric_render_target_hook(FRDGBuilder* graph_builder, void* views, void* scene_textures);
+    static void subnautica2_reconstruct_volumetric_render_target_hook(FRDGBuilder* graph_builder, void* views, FRDGTexture* scene_depth, FRDGTexture* half_resolution_depth_checkerboard_minmax, bool wait_finish_fence);
+    static void subnautica2_compose_volumetric_render_target_hook(FRDGBuilder* graph_builder, void* views, FRDGTexture* scene_color, FRDGTexture* scene_depth, bool compose_with_water, void* water_pass_data, void* scene_textures);
+    static void subnautica2_compute_volumetric_fog_force_view_index_hook(safetyhook::Context& ctx);
+    static bool subnautica2_render_fog_wrapper_hook(void* scene_renderer, FRDGBuilder* graph_builder, void* scene_textures, void* scene_color_or_data, bool should_render_volumetric);
+    static bool subnautica2_render_fog_pass_hook(void* scene_renderer, FRDGBuilder* graph_builder, void* scene_textures, void* scene_color_or_data, bool should_render_volumetric);
+    static void subnautica2_render_underwater_fog_hook(void* scene_renderer, FRDGBuilder* graph_builder, void* scene_without_water_textures, void* scene_textures);
+    static void subnautica2_setup_volumetric_fog_ub_hook(void* view_info, void* view_uniform_shader_parameters);
+    static void subnautica2_lightscat_store_midhook(safetyhook::Context& ctx);
+    static void subnautica2_try_add_mesh_batch_probe_midhook(safetyhook::Context& ctx);
+    static void subnautica2_setup_fog_uniform_params_hook(void* graph_builder, void* view_info, void* fog_uniform_params, bool a4);
+    static void subnautica2_uwe_trace_hook_45F890(safetyhook::Context& ctx);
+    static void subnautica2_uwe_trace_hook_4B2A10(safetyhook::Context& ctx);
+    static void subnautica2_uwe_trace_hook_5665F0(safetyhook::Context& ctx);
+    static void subnautica2_uwe_trace_hook_576140(safetyhook::Context& ctx);
+    static void subnautica2_uwe_trace_hook_FD6170(safetyhook::Context& ctx);
+    static void subnautica2_uwe_trace_hook_FD0A50(safetyhook::Context& ctx);
+    static void subnautica2_uwelit_hook_506DC20(safetyhook::Context& ctx);
+    static void subnautica2_uwelit_hook_5BF08A6(safetyhook::Context& ctx);
+    static void subnautica2_uwelit_hook_5D638D1(safetyhook::Context& ctx);
+    static void subnautica2_uwelit_hook_644EDEC(safetyhook::Context& ctx);
+    static void subnautica2_uwelit_hook_644FA04(safetyhook::Context& ctx);
+    static void subnautica2_uwelit_hook_6452806(safetyhook::Context& ctx);
+    static void subnautica2_uwelit_hook_69D828D(safetyhook::Context& ctx);
+    static void subnautica2_uwelit_hook_7FA6BB5(safetyhook::Context& ctx);
+    static void subnautica2_uwelit_hook_9131F2A(safetyhook::Context& ctx);
+    void attempt_hook_subnautica2_uwe_trace();
+    // sub_142631130: SN2-customized BasePass PSO-selection dispatcher. The 3rd
+    // register arg (r8d) is *(uint32_t*)<SN2-added-15th-arg-pointer>. A 7-way
+    // switch on this value picks one of 7 case branches, each calling a
+    // different FMaterial::TryGetShaders permutation. Per-view divergence of
+    // this value is suspected to cause the "fog only in left eye" symptom.
+    // MidHook so we can rewrite r8d without needing to know the function's
+    // full 11-arg signature (the original takes 4 reg + 7 stack args).
+    static void subnautica2_basepass_pso_select_hook(safetyhook::Context& ctx);
+    // sub_14263A3A0: FBasePassMeshProcessor::FBasePassMeshProcessor. Reads
+    // View+0x24CC (per-view cull threshold float, conditional on View+0x11D9)
+    // and caches it at this+0x8C. RenderDoc proves primary=1.0f, secondary
+    // =6e7 -> different LOD culls -> different shader variants per view.
+    // We hook the ctor and force secondary view's +0x8C to match primary's
+    // so both views select the same shader.
+    static __int64 subnautica2_basepass_mp_ctor_hook(
+        __int64 a1, __int64 a2, __int64 a3, unsigned int a4,
+        __int64 a5, void* a6, __int64 a7, char a8, int a9);
+    // MidHook AFTER movss xmm3,[rsi+8Ch] in TryAddMeshBatch. Overrides xmm3
+    // for secondary view to use primary's cached cull threshold so both
+    // views select the same shader-type-getter variant.
+    static void subnautica2_basepass_cull_threshold_hook(safetyhook::Context& ctx);
+    static void subnautica2_single_layer_water_hook(void* scene_renderer, FRDGBuilder* graph_builder, void* views, void* scene_textures, void* single_layer_water_prepass_result, bool should_render_volumetric_cloud, void* scene_without_water_textures, void* lumen_frame_temporaries, bool camera_underwater);
+    static void subnautica2_single_layer_water_inner_hook(void* scene_renderer, FRDGBuilder* graph_builder, void* views, void* scene_textures, void* scene_without_water_textures, void* single_layer_water_prepass_result);
+    static void subnautica2_single_layer_water_scene_without_water_hook(safetyhook::Context& ctx);
 
     // FViewport
     static void* viewport_destructor_hook(void* viewport, void* a2, void* a3, void* a4);
@@ -593,6 +680,8 @@ private:
 
         uint32_t last_frame_count{};
         uint32_t last_index{};
+        uint32_t native_stereo_primary_scene_state_frame{};
+        sdk::FSceneViewStateInterface* native_stereo_primary_scene_state{};
 
         // For keeping track of what the states were before our modifications.
         std::unordered_map<sdk::FSceneViewStateInterface*, sdk::FSceneViewInitOptionsUE4> view_init_options_ue4{};
@@ -603,12 +692,48 @@ private:
     safetyhook::InlineHook m_localplayer_get_viewpoint_hook{};
     safetyhook::InlineHook m_tick_hook{};
     safetyhook::InlineHook m_adjust_view_rect_hook{};
+    safetyhook::InlineHook m_set_final_view_rect_hook{};
     safetyhook::InlineHook m_calculate_stereo_view_offset_hook_inline{};
     std::unique_ptr<PointerHook> m_calculate_stereo_view_offset_hook_ptr{}; // some games have a short jmp which isnt supported by safetyhook right now so we use pointerhook
     safetyhook::InlineHook m_calculate_stereo_projection_matrix_hook{};
     safetyhook::InlineHook m_render_texture_render_thread_hook{};
     safetyhook::InlineHook m_ue418_oculus_pixel_density_hook{};
     safetyhook::InlineHook m_slate_thread_hook{};
+    safetyhook::InlineHook m_subnautica2_compute_volumetric_fog_hook{};
+    safetyhook::InlineHook m_subnautica2_init_volumetric_render_target_hook{};
+    safetyhook::InlineHook m_subnautica2_reconstruct_volumetric_render_target_hook{};
+    safetyhook::InlineHook m_subnautica2_compose_volumetric_render_target_hook{};
+    safetyhook::InlineHook m_subnautica2_render_fog_wrapper_hook{};
+    safetyhook::InlineHook m_subnautica2_render_fog_pass_hook{};
+    safetyhook::InlineHook m_subnautica2_render_underwater_fog_hook{};
+    safetyhook::InlineHook m_subnautica2_setup_volumetric_fog_ub_hook{};
+    safetyhook::MidHook m_subnautica2_lightscat_store_midhook{};
+    safetyhook::MidHook m_subnautica2_try_add_mesh_batch_probe{};
+    safetyhook::InlineHook m_subnautica2_setup_fog_uniform_params_hook{};
+    safetyhook::MidHook m_subnautica2_uwe_trace_hook_45F890{};
+    safetyhook::MidHook m_subnautica2_uwe_trace_hook_4B2A10{};
+    safetyhook::MidHook m_subnautica2_uwe_trace_hook_5665F0{};
+    safetyhook::MidHook m_subnautica2_uwe_trace_hook_576140{};
+    safetyhook::MidHook m_subnautica2_uwe_trace_hook_FD6170{};
+    safetyhook::MidHook m_subnautica2_uwe_trace_hook_FD0A50{};
+    safetyhook::MidHook m_subnautica2_uwelit_hook_506DC20{};
+    safetyhook::MidHook m_subnautica2_uwelit_hook_5BF08A6{};
+    safetyhook::MidHook m_subnautica2_uwelit_hook_5D638D1{};
+    safetyhook::MidHook m_subnautica2_uwelit_hook_644EDEC{};
+    safetyhook::MidHook m_subnautica2_uwelit_hook_644FA04{};
+    safetyhook::MidHook m_subnautica2_uwelit_hook_6452806{};
+    safetyhook::MidHook m_subnautica2_uwelit_hook_69D828D{};
+    safetyhook::MidHook m_subnautica2_uwelit_hook_7FA6BB5{};
+    safetyhook::MidHook m_subnautica2_uwelit_hook_9131F2A{};
+    safetyhook::MidHook m_subnautica2_basepass_pso_select_hook{};
+    safetyhook::InlineHook m_subnautica2_basepass_mp_ctor_hook{};
+    safetyhook::MidHook m_subnautica2_basepass_cull_threshold_hook{};
+    safetyhook::InlineHook m_subnautica2_single_layer_water_hook{};
+    safetyhook::InlineHook m_subnautica2_single_layer_water_inner_hook{};
+    safetyhook::InlineHook m_subnautica2_slw_per_view_hook{};
+    safetyhook::InlineHook m_subnautica2_volumetric_fog_per_view_hook{};
+    safetyhook::MidHook m_subnautica2_compute_volumetric_fog_view_index_hook{};
+    safetyhook::MidHook m_subnautica2_single_layer_water_scene_without_water_hook{};
     std::vector<safetyhook::MidHook> m_ue57_slate_elements_hooks{};
     safetyhook::MidHook m_ue55_slate_output_texture_register_hook{};
     safetyhook::InlineHook m_gameviewportclient_draw_hook{};
@@ -680,6 +805,27 @@ private:
     bool m_attempted_hook_ue55_slate_output_texture_register{false};
     bool m_attempted_hook_update_viewport_rhi{false};
     bool m_attempted_hook_fsceneview_constructor{false};
+    bool m_attempted_hook_subnautica2_compute_volumetric_fog{false};
+    bool m_attempted_hook_subnautica2_init_volumetric_render_target{false};
+    bool m_attempted_hook_subnautica2_reconstruct_volumetric_render_target{false};
+    bool m_attempted_hook_subnautica2_compose_volumetric_render_target{false};
+    bool m_attempted_hook_subnautica2_render_fog_wrapper{false};
+    bool m_attempted_hook_subnautica2_render_fog_pass{false};
+    bool m_attempted_hook_subnautica2_render_underwater_fog{false};
+    bool m_attempted_hook_subnautica2_setup_volumetric_fog_ub{false};
+    bool m_attempted_hook_subnautica2_lightscat_store_midhook{false};
+    bool m_attempted_hook_subnautica2_try_add_mesh_batch_probe{false};
+    bool m_attempted_hook_subnautica2_setup_fog_uniform_params{false};
+    bool m_attempted_hook_subnautica2_uwe_trace{false};
+    bool m_attempted_hook_subnautica2_basepass_pso_select{false};
+    bool m_attempted_hook_subnautica2_basepass_mp_ctor{false};
+    bool m_attempted_hook_subnautica2_basepass_cull_threshold{false};
+    bool m_attempted_hook_subnautica2_basepass_ps_force_nolm{false};
+    bool m_attempted_hook_subnautica2_single_layer_water{false};
+    bool m_attempted_hook_subnautica2_single_layer_water_inner{false};
+    bool m_attempted_hook_subnautica2_slw_per_view{false};
+    bool m_attempted_hook_subnautica2_volumetric_fog_per_view{false};
+    bool m_attempted_hook_subnautica2_single_layer_water_scene_without_water{false};
     bool m_uses_old_rendertarget_manager{false};
     bool m_rendertarget_manager_embedded_in_stereo_device{false}; // 4.17 and below...?
     bool m_special_detected{false};

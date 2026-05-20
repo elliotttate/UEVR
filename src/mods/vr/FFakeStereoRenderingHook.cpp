@@ -8,8 +8,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <future>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -51,8 +53,10 @@
 
 #include "Framework.hpp"
 #include "Mods.hpp"
+#include "DumperMode.hpp"
 #include "mods/UObjectHook.hpp"
 #include "mods/GameSpecific.hpp"
+#include "hooks/D3D12Hook.hpp"  // for sn2_fog_srv_map::lookup_by_gpu_va
 
 #include <bdshemu.h>
 #include <bddisasm.h>
@@ -73,9 +77,123 @@
 FFakeStereoRenderingHook* g_hook = nullptr;
 uint32_t g_frame_count{};
 
+// 2026-05-17 evening: file-external linkage so D3D12Hook.cpp can read the
+// most recent view-0 fog texture pointer (published by the lightscat
+// midhook). Used by the fog descriptor swap to pick which pool entry to
+// copy into view 1's basepass binding.
+std::atomic<uintptr_t> g_subnautica2_view0_lightscat{0};
+
 namespace {
 bool is_readable_process_range(uintptr_t address, size_t size);
 bool is_executable_process_range(uintptr_t address, size_t size);
+bool is_writable_process_range(uintptr_t address, size_t size);
+
+void disable_native_instanced_stereo_cvars() {
+    auto& vr = VR::get();
+
+    if (!vr->is_native_stereo_fix_enabled() || vr->is_native_stereo_fix_same_pass_enabled()) {
+        return;
+    }
+
+    static bool attempted = false;
+    if (attempted) {
+        return;
+    }
+
+    attempted = true;
+
+    auto set_cvar_to_zero = [](const wchar_t* name) {
+        bool set_via_console_manager = false;
+
+        try {
+            if (auto console_manager = sdk::FConsoleManager::get(); console_manager != nullptr) {
+                if (auto object = console_manager->find(name); object != nullptr) {
+                    ((sdk::IConsoleVariable*)object)->Set(L"0");
+                    set_via_console_manager = true;
+                }
+            }
+        } catch(...) {
+        }
+
+        const bool set_via_data =
+            sdk::set_cvar_data_int(L"Engine", name, 0) ||
+            sdk::set_cvar_data_int(L"RenderCore", name, 0);
+
+        SPDLOG_INFO("[NativeStereoDebug] Disabled {} for explicit native stereo console_manager={} data={}",
+            utility::narrow(name), set_via_console_manager, set_via_data);
+    };
+
+    // 2026-05-20: allow keeping vr.InstancedStereo ENABLED on SN2 (gated by
+    // UEVR_SN2_KEEP_INSTANCED_STEREO=1). Per the diagnostic chain in
+    // sn2_ue5_per_view_root_cause memory note, keeping ISR on is required
+    // for View.bIsMultiViewportEnabled to be true, which is required for
+    // ShouldDrawSceneViewsInOneNanitePass to enable Nanite per-view rendering.
+    // Without this, Nanite + VSM compute passes only fire for the LEFT eye.
+    static const bool keep_instanced_stereo_sn2 = []() {
+        char buf[8]{};
+        return GetEnvironmentVariableA("UEVR_SN2_KEEP_INSTANCED_STEREO", buf, sizeof(buf)) > 0
+            && buf[0] == '1';
+    }();
+    if (!keep_instanced_stereo_sn2) {
+        set_cvar_to_zero(L"vr.InstancedStereo");
+    } else {
+        SPDLOG_WARN("[NativeStereoDebug] SKIPPING vr.InstancedStereo disable (UEVR_SN2_KEEP_INSTANCED_STEREO=1 to enable per-view Nanite)");
+        // Also ENABLE the InstancedStereo cvar (in case it defaulted off)
+        // and the Nanite multi-view cvar (required for per-view Nanite).
+        auto set_cvar_to_one = [](const wchar_t* name) {
+            bool ok = false;
+            try {
+                if (auto console_manager = sdk::FConsoleManager::get(); console_manager != nullptr) {
+                    if (auto object = console_manager->find(name); object != nullptr) {
+                        ((sdk::IConsoleVariable*)object)->Set(L"1");
+                        ok = true;
+                    }
+                }
+            } catch(...) {}
+            const bool via_data = sdk::set_cvar_data_int(L"Engine", name, 1) ||
+                                  sdk::set_cvar_data_int(L"RenderCore", name, 1) ||
+                                  sdk::set_cvar_data_int(L"Renderer", name, 1);
+            SPDLOG_WARN("[NativeStereoDebug] Set {} = 1 console={} data={}",
+                utility::narrow(name), ok, via_data);
+        };
+        set_cvar_to_one(L"vr.InstancedStereo");
+        set_cvar_to_one(L"r.Nanite.MultipleSceneViewsInOnePass");
+    }
+    set_cvar_to_zero(L"vr.MobileMultiView");
+    set_cvar_to_zero(L"vr.HiddenAreaMask");
+}
+
+void force_native_stereo_view_family_show_flag(sdk::FSceneViewFamily& view_family, std::string_view source) {
+    auto& vr = VR::get();
+
+    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled() || vr->is_native_stereo_fix_same_pass_enabled()) {
+        return;
+    }
+
+    // Subnautica 2's UE 5.6.1 renderer gates SetFinalViewRect on this show flag.
+    constexpr auto engine_show_flags_stereo_rendering_dword_offset = 0x58;
+    constexpr auto engine_show_flags_stereo_rendering_mask = 0x01000000u;
+
+    auto* stereo_rendering_flags = (uint32_t*)((uintptr_t)&view_family + engine_show_flags_stereo_rendering_dword_offset);
+
+    if (IsBadReadPtr(stereo_rendering_flags, sizeof(uint32_t))) {
+        SPDLOG_WARN_ONCE("[NativeStereoDebug] Failed to force ViewFamily StereoRendering flag from {}; bad pointer {:x}",
+            source, (uintptr_t)stereo_rendering_flags);
+        return;
+    }
+
+    const auto before = *stereo_rendering_flags;
+    const auto after = before | engine_show_flags_stereo_rendering_mask;
+    *stereo_rendering_flags = after;
+
+    if (before != after) {
+        SPDLOG_INFO("[NativeStereoDebug] Forced ViewFamily.EngineShowFlags.StereoRendering from {} offset=0x{:x} before=0x{:08x} after=0x{:08x}",
+            source, engine_show_flags_stereo_rendering_dword_offset, before, after);
+    } else {
+        SPDLOG_INFO_ONCE("[NativeStereoDebug] ViewFamily.EngineShowFlags.StereoRendering already set from {} offset=0x{:x} value=0x{:08x}",
+            source, engine_show_flags_stereo_rendering_dword_offset, after);
+    }
+}
 
 std::mutex g_shf_texture_probe_mutex{};
 std::unordered_set<uintptr_t> g_shf_logged_texture_probe_keys{};
@@ -185,6 +303,1871 @@ bool shf_is_current_game() {
     }();
 
     return result;
+}
+
+bool subnautica2_is_current_game() {
+    static const bool result = []() {
+        // UEVR_DISABLE_SN2_HOOKS=1 turns off ALL SN2-specific stereo patches
+        // and log spam so we can iterate on generic UEVR features without
+        // interference. This is the master switch for the SN2-specific code
+        // baked into FFakeStereoRenderingHook for SingleLayerWater / volumetric
+        // fog / lightscat fixes.
+        char disable[8]{};
+        if (GetEnvironmentVariableA("UEVR_DISABLE_SN2_HOOKS", disable, sizeof(disable)) > 0
+                && disable[0] == '1') {
+            return false;
+        }
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && exe_path->find(L"Subnautica2-Win64-Shipping") != std::wstring::npos;
+    }();
+
+    return result;
+}
+
+bool subnautica2_diag_clean_mode() {
+    static const bool result = []() {
+        auto enabled = [](const char* name) {
+            char value[32]{};
+            const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+            if (len == 0 || len >= sizeof(value)) {
+                return false;
+            }
+
+            std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
+            return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+        };
+        return enabled("UEVR_SN2_DIAG_CLEAN") || enabled("UEVR_SN2_DIAG_STRICT");
+    }();
+
+    return result;
+}
+
+bool subnautica2_force_primary_primary_views() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FORCE_PRIMARY_PRIMARY", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+bool subnautica2_disable_water_state_sync() {
+    if (subnautica2_diag_clean_mode()) return true;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_DISABLE_WATER_STATE_SYNC", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+bool subnautica2_disable_compose_volumetric_view_rect_fix() {
+    if (subnautica2_diag_clean_mode()) return true;
+    // Default ENABLED. SN2's ComposeVolumetricRenderTargetOverScene reads
+    // both views' init_options.view_rect and runtime view_rect; under stereo
+    // it leaves view 1's rect mirroring view 0's (both starting at x=0),
+    // causing the volumetric-fog overlay to write only to the left half of
+    // the backbuffer. This produces the "fog only in left eye" symptom.
+    // Set UEVR_SUBNAUTICA2_DISABLE_COMPOSE_VOLUMETRIC_VIEW_RECT_FIX=1 to
+    // disable the patch and confirm the bug returns.
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_DISABLE_COMPOSE_VOLUMETRIC_VIEW_RECT_FIX", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+// 2026-05-16: New env var to allow ONLY rect-widening (FIX-V3) without enabling
+// state-copy or double-dispatch. Default OFF — caused left-eye flicker;
+// matrix-swap path is now the preferred experiment.
+bool subnautica2_enable_fog_rect_widen() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_ENABLE_FOG_RECT_WIDEN", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return false;  // default DISABLED
+        return value[0] == L'1';
+    }();
+    return result;
+}
+
+// 2026-05-16: NEW strategy — copy view 0's matrix block to view 1 during the
+// compute_volumetric_fog dispatch, then restore view 1 immediately after the
+// call returns. This makes view 1's compute iteration build its fog volume
+// using view 0's projection/view matrices (so the resulting volume is filled
+// with view 0's perspective for both eyes' UAVs), then view 1's basepass uses
+// its ORIGINAL matrices to sample. Avoids the runtime_view_rect mutation that
+// caused left-eye flicker. Range covers FViewMatrices block at offset 0x3B0
+// (verified read by sub_142FD6170 starting at *((_OWORD*)a2 + 59)).
+bool subnautica2_enable_fog_view1_matrix_swap() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_ENABLE_FOG_VIEW1_MATRIX_SWAP", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return false;  // default DISABLED
+        return value[0] == L'1';
+    }();
+    return result;
+}
+
+uint32_t subnautica2_fog_view1_matrix_swap_offset() {
+    static const uint32_t result = []() {
+        wchar_t value[32]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_MATRIX_SWAP_OFFSET", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return (uint32_t)0x3B0;
+        return (uint32_t)wcstoul(value, nullptr, 0);
+    }();
+    return result;
+}
+
+uint32_t subnautica2_fog_view1_matrix_swap_size() {
+    static const uint32_t result = []() {
+        wchar_t value[32]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_MATRIX_SWAP_SIZE", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return (uint32_t)0x200;  // 512 bytes = ~8 4x4 matrices
+        return (uint32_t)wcstoul(value, nullptr, 0);
+    }();
+    return result;
+}
+
+// 2026-05-17 Plan Phase A.1: per-view volumetric fog dispatcher (sub_142FD6170)
+// hook for view-tagging fog SRVs created during compute_volumetric_fog. Sets a
+// GLOBAL ATOMIC g_sn2_current_fog_view (was thread_local but RHI thread != render
+// thread broke that) that D3D12Hook::create_shader_resource_view reads to tag
+// captured fog SRVs. Single-writer (compute_volumetric_fog runs sequentially
+// per view) so simple atomic is enough.
+std::atomic<int> g_sn2_current_fog_view{-1};
+extern "C" int sn2_get_current_fog_view() {
+    return g_sn2_current_fog_view.load(std::memory_order_relaxed);
+}
+
+// 2026-05-17 Plan Phase B: descriptor swap via explicit CPU handles. User reads
+// FogSRV log to find view 1's SRV cpu_handle (source) and view 0's slot
+// cpu_handle (destination). Both gated to be non-zero, else no swap.
+uint64_t subnautica2_fog_swap_src_handle() {
+    static const uint64_t result = []() {
+        wchar_t value[32]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_SWAP_SRC_HANDLE", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return (uint64_t)0;
+        return (uint64_t)wcstoull(value, nullptr, 0);
+    }();
+    return result;
+}
+
+uint64_t subnautica2_fog_swap_dst_handle() {
+    static const uint64_t result = []() {
+        wchar_t value[32]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_SWAP_DST_HANDLE", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return (uint64_t)0;
+        return (uint64_t)wcstoull(value, nullptr, 0);
+    }();
+    return result;
+}
+
+uint32_t subnautica2_fog_swap_count() {
+    static const uint32_t result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_SWAP_COUNT", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return (uint32_t)2;
+        return (uint32_t)wcstoul(value, nullptr, 0);
+    }();
+    return result;
+}
+
+// 2026-05-17 Plan Phase B (index-based variant): more convenient than raw cpu
+// handles — user reads FogSRV log, picks SRV creation indices for source (view
+// 1) and destination (view 0's slot bound to right-eye SLW PS).
+// Read EVERY call (not cached) so user can change via SetEnvironmentVariable
+// in a tool that injects into the process — supports faster iteration.
+int32_t subnautica2_fog_swap_src_index() {
+    wchar_t value[16]{};
+    const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_SWAP_SRC_INDEX", value, (DWORD)std::size(value));
+    if (len == 0 || len >= std::size(value)) return -1;
+    return (int32_t)wcstol(value, nullptr, 0);
+}
+
+int32_t subnautica2_fog_swap_dst_index() {
+    wchar_t value[16]{};
+    const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_SWAP_DST_INDEX", value, (DWORD)std::size(value));
+    if (len == 0 || len >= std::size(value)) return -1;
+    return (int32_t)wcstol(value, nullptr, 0);
+}
+
+// 2026-05-17: sweep mode. If enabled, automatically cycle src_idx through 0..15
+// every SWAP_SWEEP_INTERVAL_MS milliseconds. dst_idx stays fixed.
+// User watches right eye; when fixed, reads log for the active src_idx.
+bool subnautica2_fog_swap_sweep_enabled() {
+    wchar_t value[16]{};
+    const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_SWAP_SWEEP", value, (DWORD)std::size(value));
+    if (len == 0 || len >= std::size(value)) return false;
+    return value[0] == L'1';
+}
+
+uint32_t subnautica2_fog_swap_sweep_interval_ms() {
+    static const uint32_t result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_SWAP_SWEEP_INTERVAL_MS", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return (uint32_t)3000;
+        return (uint32_t)wcstoul(value, nullptr, 0);
+    }();
+    return result;
+}
+
+uint32_t subnautica2_fog_swap_sweep_max_index() {
+    static const uint32_t result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_SWAP_SWEEP_MAX_INDEX", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return (uint32_t)16;
+        return (uint32_t)wcstoul(value, nullptr, 0);
+    }();
+    return result;
+}
+
+uint32_t subnautica2_fog_swap_sweep_min_index() {
+    static const uint32_t result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_SWAP_SWEEP_MIN_INDEX", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return (uint32_t)0;
+        return (uint32_t)wcstoul(value, nullptr, 0);
+    }();
+    return result;
+}
+
+// Sweep target: 0=src, 1=dst. Default 0 (src).
+uint32_t subnautica2_fog_swap_sweep_target() {
+    wchar_t value[16]{};
+    const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_SWAP_SWEEP_TARGET", value, (DWORD)std::size(value));
+    if (len == 0 || len >= std::size(value)) return 0;
+    return (uint32_t)wcstoul(value, nullptr, 0);
+}
+
+// 2026-05-17 Task #43: if enabled, override the src descriptor by looking up
+// view 1's compute-output UAV-tagged ID3D12Resource (from sn2_fog_uav_map),
+// then resolving the matching SRV cpu_handle from sn2_fog_srv_map. This is
+// the principled path to find view 1's correct fog volume without manual
+// src_idx tuning.
+bool subnautica2_fog_swap_use_uav_tag() {
+    wchar_t value[16]{};
+    const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FOG_SWAP_USE_UAV_TAG", value, (DWORD)std::size(value));
+    if (len == 0 || len >= std::size(value)) return false;
+    return value[0] == L'1';
+}
+
+
+bool subnautica2_enable_volumetric_fog_per_view_hook() {
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_PER_VIEW_HOOK", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return false;
+        return value[0] == L'1';
+    }();
+    return result;
+}
+
+// 2026-05-16 Phase 3: enable per-view SLW hook (sub_142EB72E0) for the bindless
+// descriptor swap fix. Default OFF until the hook + heap rewrite is validated.
+bool subnautica2_enable_slw_per_view_hook() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_ENABLE_SLW_PER_VIEW_HOOK", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return false;
+        return value[0] == L'1';
+    }();
+    return result;
+}
+
+// 2026-05-16 Phase 3 EXPERIMENT: copy view 0's FViewInfo+0x2630..+0x2648 region
+// into view 1 just before view 1's SLW per-view dispatcher runs. The wide-scan
+// diagnostic showed these 4 pointers differ between view 0 and view 1 with
+// identical stride 0x1D20 — strong signature of RDG resource wrappers. If they
+// are the SLW pass's fog volume wrapper refs, copying view 0's into view 1
+// makes view 1's SLW use view 0's filled volumes (stereo-collapse on water but
+// no black sky).
+bool subnautica2_enable_slw_per_view_field_copy() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_ENABLE_SLW_PER_VIEW_FIELD_COPY", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return false;
+        return value[0] == L'1';
+    }();
+    return result;
+}
+
+uint32_t subnautica2_slw_field_copy_start() {
+    static const uint32_t result = []() {
+        wchar_t value[32]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_SLW_FIELD_COPY_START", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return (uint32_t)0x2630;
+        return (uint32_t)wcstoul(value, nullptr, 0);
+    }();
+    return result;
+}
+
+uint32_t subnautica2_slw_field_copy_size() {
+    static const uint32_t result = []() {
+        wchar_t value[32]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_SLW_FIELD_COPY_SIZE", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return (uint32_t)0x20;  // 4 ptrs * 8 = 32 bytes
+        return (uint32_t)wcstoul(value, nullptr, 0);
+    }();
+    return result;
+}
+
+// 2026-05-16 EXPERIMENT MODE 2: skip the post-call restore. Field copy stays
+// in view 1's FViewInfo for the rest of this frame; UE5's next-frame setup
+// overwrites it. Theory: avoids double-ownership crash because view 1 fully
+// commits to view 0's wrappers (no race between two consumers of the same
+// wrapper later in the frame).
+bool subnautica2_slw_field_copy_no_restore() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_SLW_FIELD_COPY_NO_RESTORE", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return false;
+        return value[0] == L'1';
+    }();
+    return result;
+}
+
+bool subnautica2_enable_uwe_trace() {
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_ENABLE_UWE_TRACE", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return false;
+        return value[0] == L'1';
+    }();
+    return result;
+}
+
+// Bitmask gate for the 9 UWELit hooks. Bits 0..8 correspond to the 9 hooks in
+// declaration order. UEVR_SUBNAUTICA2_UWELIT_HOOK_MASK env var (decimal). e.g.:
+//   "1"   = bit 0  = hook sub_14506DC20 only
+//   "3"   = bits 0,1 = hooks 506DC20 + 5BF08A6
+//   "511" = bits 0..8 = all 9 hooks (DANGER: 9-hooks-at-once caused hang)
+// Default 1 = just the material permutation builder.
+uint32_t subnautica2_uwelit_hook_mask() {
+    static const uint32_t result = []() -> uint32_t {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_UWELIT_HOOK_MASK", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) return 1u;
+        try { return (uint32_t)std::stoi(std::wstring(value)); } catch (...) { return 1u; }
+    }();
+    return result;
+}
+
+bool subnautica2_disable_volumetric_fog_view_loop_fix() {
+    if (subnautica2_diag_clean_mode()) return true;
+    // Default DISABLED: decompile of sub_142FBED20 confirms the per-view fog
+    // loop iterates BOTH views unconditionally (Hex-Rays just hides the loop;
+    // see ASM at loc_142FBF280..0x142FC1E67). The "second fog build" hook
+    // double-dispatches ComputeVolumetricFog with a mutated Views.Num()=1,
+    // which poisons view 1's compute pass and produces the "fog only in
+    // left eye" symptom. Set the env var to 0 to re-enable the hook.
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_DISABLE_VOLUMETRIC_FOG_VIEW_LOOP_FIX", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return true;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+bool subnautica2_enable_volumetric_fog_view_index_force() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_VIEW_INDEX_FORCE", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+// 2026-05-15: post-compute state-copy fix. After compute_volumetric_fog runs
+// for view 0, copy state+0x1E00 (the IntegratedLightScattering texture handle
+// per user's offline trace) from view 0's FSceneViewState to view 1's
+// FSceneViewState. View 1's basepass walker then reads view 0's valid UB at
+// params+0x2C lookup, instead of garbage. Both views render with view 0's fog.
+bool subnautica2_enable_volumetric_fog_state_copy() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_STATE_COPY", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+uint32_t subnautica2_volumetric_fog_state_copy_size() {
+    static const uint32_t result = []() -> uint32_t {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_VOLUMETRIC_FOG_STATE_COPY_SIZE", value, (DWORD)std::size(value));
+        if (len == 0 || len >= std::size(value)) {
+            return 8;  // default: 8 bytes (single pointer)
+        }
+        try {
+            return (uint32_t)std::wcstoul(value, nullptr, 0);
+        } catch (...) {
+            return 8;
+        }
+    }();
+    return result;
+}
+
+bool subnautica2_force_secondary_primary_view_index() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FORCE_SECONDARY_PRIMARY_VIEW_INDEX", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+bool subnautica2_clear_stereo_aspects() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_CLEAR_STEREO_ASPECTS", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+bool subnautica2_disable_underwater_fog_view_data_fix() {
+    if (subnautica2_diag_clean_mode()) return true;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_DISABLE_UNDERWATER_FOG_VIEW_DATA_FIX", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+bool subnautica2_disable_render_fog_view_rect_fix() {
+    if (subnautica2_diag_clean_mode()) return true;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_DISABLE_RENDER_FOG_VIEW_RECT_FIX", value, (DWORD)std::size(value));
+        return len > 0 && value[0] != L'\0' && value[0] != L'0';
+    }();
+
+    return result;
+}
+
+bool subnautica2_persist_render_fog_view_rect_fix() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_PERSIST_RENDER_FOG_VIEW_RECT_FIX", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+bool subnautica2_disable_single_layer_water_pass_fix() {
+    if (subnautica2_diag_clean_mode()) return true;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_DISABLE_SINGLE_LAYER_WATER_PASS_FIX", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+bool subnautica2_disable_single_layer_water_view_rect_fix() {
+    if (subnautica2_diag_clean_mode()) return true;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_DISABLE_SINGLE_LAYER_WATER_VIEW_RECT_FIX", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return true;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+bool subnautica2_enable_single_layer_water_secondary_replay() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_WATER_SECONDARY_REPLAY", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+// 2026-05-16: UWE-trace mid-hooks. Four functions identified by IDA scan of
+// .text byte-reads at FEngineShowFlags offset 0xE0 (UWEWaterExtinctionView):
+//   sub_14045F890 / sub_1404B2A10 / sub_1405665F0 / sub_140576140
+// Each fires ~ once per view per frame for various UWE water passes. Logging
+// rcx/rdx/r8/r9 + first 4 stack args + dereference of pointer-shaped args
+// reveals which view data each is handed. Gated by UEVR_SUBNAUTICA2_ENABLE_UWE_TRACE.
+constexpr uintptr_t SUBNAUTICA2_UWE_TRACE_45F890_RVA = 0x45F890;
+constexpr uintptr_t SUBNAUTICA2_UWE_TRACE_4B2A10_RVA = 0x4B2A10;
+constexpr uintptr_t SUBNAUTICA2_UWE_TRACE_5665F0_RVA = 0x5665F0;
+constexpr uintptr_t SUBNAUTICA2_UWE_TRACE_576140_RVA = 0x576140;
+// FVolumetricFogIntegrationParameters setup — per-view integration param
+// builder. Takes (params_out, FViewInfo*, integration_data). Called 3x per
+// frame from compute_volumetric_fog's per-view loop. Critical for finding
+// the per-view-broken site: if both views' calls receive distinct FViewInfo
+// pointers, the pre-Execute setup is correct and the bug is in RDG resolution.
+constexpr uintptr_t SUBNAUTICA2_UWE_TRACE_FD6170_RVA = 0x2FD6170;
+// sub_142FD0A50 = UWE Ray-Traced Volumetric Fog Pass dispatcher. Builds an
+// FRayTraceDirectionalLightVolumeShadowMapRGS::FParameters, allocates a per-view
+// FRDGTexture (3D fog volume), and registers the pass. Args:
+//   a1 = FRDGBuilder*, a2 = FViewInfo*, a3 = FScene*,
+//   a4 = FVolumetricFogIntegrationParameterData*, a5 = OUT FRDGTextureRef**
+// The OUTPUT FRDGTextureRef written through a5 is the per-view fog volume —
+// the one that should differ between view 0 and view 1 but ends up bound to
+// the same physical resource at FRDGBuilder::Execute time. Tracing this is
+// the definitive per-view path.
+constexpr uintptr_t SUBNAUTICA2_UWE_TRACE_FD0A50_RVA = 0x2FD0A50;
+// UWEWaterLighting (FEngineShowFlags 0xDF) is the SOLE flag that toggles the
+// visible-teal-in-left-eye effect. The 11 functions below all read offset 0xDF;
+// hooking them shows which is the per-view-broken render pass.
+// (User-confirmed 2026-05-16: ShowFlag.UWEWaterLighting 0 → both eyes match;
+//  r.fog 0 → both match; r.UWEFog 0 → NO effect; bug NOT in UWE plugin path.)
+constexpr uintptr_t SUBNAUTICA2_UWELIT_TRACE_RVAS[] = {
+    0x506DC20,  // 1916 bytes — material permutation builder (writes bit 3 of param +520)
+    0x5BF08A6,  // 1100 bytes
+    0x5D638D1,  // 1285 bytes
+    0x644EDEC,  // 876 bytes
+    0x644FA04,  // 804 bytes
+    0x6452806,  // 672 bytes
+    0x69D828D,  // 749 bytes
+    0x7FA6BB5,  // 737 bytes
+    0x9131F2A,  // 1715 bytes
+};
+
+constexpr uintptr_t SUBNAUTICA2_COMPUTE_VOLUMETRIC_FOG_RVA = 0x2FBED20;
+constexpr uintptr_t SUBNAUTICA2_COMPUTE_VOLUMETRIC_FOG_VIEW_INDEX_STORE_RVA = 0x2FBF1AF;
+constexpr uintptr_t SUBNAUTICA2_INIT_VOLUMETRIC_RENDER_TARGET_RVA = 0x300F8B0;
+constexpr uintptr_t SUBNAUTICA2_RECONSTRUCT_VOLUMETRIC_RENDER_TARGET_RVA = 0x3013530;
+constexpr uintptr_t SUBNAUTICA2_COMPOSE_VOLUMETRIC_OVER_SCENE_RVA = 0x2FFB190;
+constexpr uintptr_t SUBNAUTICA2_RENDER_FOG_WRAPPER_RVA = 0x26F7F90;
+constexpr uintptr_t SUBNAUTICA2_RENDER_FOG_PASS_RVA = 0x26EF210;
+constexpr uintptr_t SUBNAUTICA2_RENDER_UNDERWATER_FOG_RVA = 0x26F9B40;
+// FViewInfo::SetupVolumetricFogUniformBufferParameters — per-view function that
+// populates FViewUniformShaderParameters' volumetric fog section at offset 0xFC0
+// (~116 bytes through 0x1034). The function checks family-level r.VolumetricFog
+// cvar but the OUTPUT depends on per-view inputs (view+0x1170 distance, etc).
+// SN2 only fills the 3D fog volume for view 0 via compute_volumetric_fog, so
+// view 1's UB has fog parameters pointing to empty/zero regions. Hook to copy
+// view 0's UB output over view 1's UB output, forcing both views' basepass to
+// sample identical fog regions → visible teal in BOTH eyes.
+constexpr uintptr_t SUBNAUTICA2_SETUP_VOLUMETRIC_FOG_UB_RVA = 0x2FD6620;
+// 2026-05-17 evening REVISION v2 — naive mirror direction was wrong:
+//   compute_volumetric_fog runs PER-VIEW. Call 1 (r14=view0) writes view 0's
+//   real texture; mirror to view 1's slot works. THEN call 2 (r14=view1)
+//   OVERWRITES view 1's slot with view 1's OWN empty texture. Net result:
+//   view 1 ends up with empty texture again.
+// Fix: midhook fires BEFORE the store at 0x2FC179D. On view 0's call (detected
+// via v1_vtable!=0), SAVE ctx.rax/ctx.r13 into globals. On view 1's call
+// (v1_vtable==0 means we ARE view 1), OVERWRITE ctx.rax/ctx.r13 with the
+// saved view-0 values. The store then writes view 0's texture into view 1's
+// slot, and stays there because view 1 has no later call to overwrite it.
+constexpr uintptr_t SUBNAUTICA2_LIGHTSCAT_STORE_RVA = 0x2FC179D;
+// SetupFogUniformParameters at RVA 0x26FD010 — populates FFogUniformParameters
+// from FViewInfo. Reads view+0x2658 to fill the IntegratedLightScattering
+// pointer at a3+0x120 (and the +0x2660 companion to a3+0x130). For view 1,
+// if my post-compute copy ran in time, view+0x2658 has view 0's value here.
+// If not, fall-back default black texture is used and view 1 has no fog.
+constexpr uintptr_t SUBNAUTICA2_SETUP_FOG_UNIFORM_PARAMS_RVA = 0x26FD010;
+// 2026-05-15 final probe: TryAddMeshBatch fog-skip divergence point. At
+// 0x1426870E8 the function checks r15 (some pointer), r14b (a flag), and a
+// virtual call result. If ALL non-null/non-zero/return-zero, bl=1 and fog
+// is applied to this mesh. Otherwise bl=0 and fog is skipped at 0x142687131
+// jz. Per disproven_patches: view 0 has bl=1 (fog), view 1 has bl=0 (no fog).
+// Probe which specific condition fails for view 1 so we can patch the
+// minimum necessary scope without crashing on downstream null derefs.
+constexpr uintptr_t SUBNAUTICA2_TRY_ADD_MESH_BATCH_PROBE_RVA = 0x26870E8;
+// sub_142631130 — SN2-customized BasePass PSO selection dispatcher. 7-way
+// switch on the 3rd register arg (loaded as *(uint32_t*) of an SN2-added
+// pointer arg to FBasePassMeshProcessor::Process<FUniformLightMapPolicy>).
+constexpr uintptr_t SUBNAUTICA2_BASEPASS_PSO_SELECT_RVA = 0x2631130;
+// sub_14263A3A0 — FBasePassMeshProcessor::FBasePassMeshProcessor. The ctor
+// is the convergence point for per-view BasePass setup; its 8th arg (EFlags)
+// and 9th arg (ETranslucencyPass) are the only inputs that can vary per
+// call. We log them to find if they diverge per view.
+constexpr uintptr_t SUBNAUTICA2_BASEPASS_MP_CTOR_RVA = 0x263A3A0;
+// In TryAddMeshBatch, immediately AFTER `movss xmm3,[rsi+8Ch]` (8-byte instr
+// at 0x142687108). At 0x142687110 xmm3 has just been loaded with the
+// per-view cull threshold from FBasePassMeshProcessor+0x8C. A MidHook here
+// can override xmm3 to force secondary view to use primary's threshold so
+// both views select the same shader-type-getter -> same shader binary ->
+// symmetric fog rendering.
+constexpr uintptr_t SUBNAUTICA2_BASEPASS_CULL_THRESHOLD_RVA = 0x2687110;
+constexpr uintptr_t SUBNAUTICA2_SINGLE_LAYER_WATER_RVA = 0x2EC70C0;
+constexpr uintptr_t SUBNAUTICA2_SINGLE_LAYER_WATER_INNER_RVA = 0x2EC8C40;
+constexpr uintptr_t SUBNAUTICA2_SINGLE_LAYER_WATER_SCENE_WITHOUT_WATER_READY_RVA = 0x2EC71D7;
+// 2026-05-16: per-view SLW dispatcher discovered by disasm of sub_142EC8C40.
+// Called once per FViewInfo* inside the SLW inner loop at 0x142EC8F00.
+// R8 = FViewInfo* (per-view arg), RCX = scene renderer / builder, RDX = scene
+// textures-ish, R9 = extra ctx. Sibling smaller helper sub_142DC1F10 also gets
+// the per-view FViewInfo (in RCX) — kept as alternate hook candidate.
+constexpr uintptr_t SUBNAUTICA2_SLW_PER_VIEW_RVA = 0x2EB72E0;
+constexpr uintptr_t SUBNAUTICA2_SLW_PER_VIEW_HELPER_RVA = 0x2DC1F10;
+// 2026-05-17 Plan A.1: per-view volumetric fog integration setup. Called twice
+// per frame from compute_volumetric_fog (sub_142FBED20), once per FViewInfo.
+// Sets thread_local view tag used by CreateShaderResourceView to identify
+// which view a fog SRV belongs to.
+constexpr uintptr_t SUBNAUTICA2_VOLUMETRIC_FOG_PER_VIEW_RVA = 0x2FD6170;
+constexpr auto SUBNAUTICA2_SCENERENDERER_VIEWS_DATA_OFFSET = 0x10;
+constexpr auto SUBNAUTICA2_SCENERENDERER_VIEWS_COUNT_OFFSET = 0x18;
+constexpr auto SUBNAUTICA2_SCENERENDERER_VIEWS_MAX_OFFSET = 0x1C;
+constexpr auto SUBNAUTICA2_SCENEVIEW_STRIDE = 0x29D0;
+constexpr auto SUBNAUTICA2_SCENEVIEW_FAMILY_OFFSET = 0x08;
+constexpr auto SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET = 0x50;
+constexpr auto SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET = 0xDD0;
+constexpr auto SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET = 0xDD4;
+constexpr auto SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET = 0xDD8;
+constexpr auto SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAG_OFFSET = 0x11EC;
+// SN2-added per-view byte at +0x11D9 that the FBasePassMeshProcessor ctor
+// reads to decide a gating condition. If this byte differs primary vs
+// secondary, the mesh-pass processor's internal state diverges per view and
+// downstream shader-map lookup returns different PSO permutations.
+constexpr auto SUBNAUTICA2_SCENEVIEW_BASEPASS_GATE_BYTE_OFFSET = 0x11D9;
+// SN2-added per-view dword at +0x24CC (right after VISIBILITY_FLAGS=0x24C8)
+// that the FBasePassMeshProcessor ctor copies into FBasePassMeshProcessor+0x140.
+// Per-view divergence of this dword propagates into per-view PSO selection.
+constexpr auto SUBNAUTICA2_SCENEVIEW_BASEPASS_KEY_DWORD_OFFSET = 0x24CC;
+// Per-view fog-render bool block. SN2's FSceneView ctor copies these from
+// FSceneViewInitOptions+0x2E0..0x2E5. The block covers FOG_RENDER_FLAG (0x11EC)
+// plus 4 adjacent bools at 0x11E8..0x11EB that gate which fog code path the
+// material shader-map selects (e.g. NEEDS_BASEPASS_PIXEL_VOLUMETRIC_FOGGING).
+// View 0 and view 1 are constructed with independent values and end up
+// selecting different PS permutations for the same material, producing the
+// "fog only in left eye" symptom. We sync these primary->secondary at
+// BeginRenderViewFamily so both views pick the same PSO.
+constexpr auto SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_START_OFFSET = 0x11E8;
+constexpr auto SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE = 0x6; // 0x11E8..0x11ED inclusive
+constexpr auto SUBNAUTICA2_SCENEVIEW_INSTANCED_STEREO_ENABLED_OFFSET = 0x11F3;
+constexpr auto SUBNAUTICA2_SCENEVIEW_MULTI_VIEWPORT_ENABLED_OFFSET = 0x11F4;
+constexpr auto SUBNAUTICA2_SCENEVIEW_MOBILE_MULTI_VIEW_ENABLED_OFFSET = 0x11F5;
+constexpr auto SUBNAUTICA2_SCENEVIEW_SHOULD_BIND_INSTANCED_VIEW_UB_OFFSET = 0x11F6;
+constexpr auto SUBNAUTICA2_SCENEVIEW_SINGLE_PASS_STEREO_OFFSET = 0x11F7;
+constexpr auto SUBNAUTICA2_SCENEVIEW_UNDERWATER_DEPTH_OFFSET = 0x1200;
+constexpr auto SUBNAUTICA2_SCENEVIEW_WATER_INTERSECTION_OFFSET = 0x1204;
+constexpr auto SUBNAUTICA2_SCENEVIEW_STEREO_ASPECTS_FLAGS_OFFSET = 0x1BD2;
+constexpr auto SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET = 0x1C00;
+constexpr auto SUBNAUTICA2_SCENEVIEW_VIEWSTATE_OFFSET = 0x1C10;
+constexpr auto SUBNAUTICA2_SCENEVIEW_CACHED_VIEW_UNIFORM_OFFSET = 0x1C18;
+constexpr auto SUBNAUTICA2_SCENEVIEW_SINGLE_LAYER_WATER_PASS_OFFSET = 0x2098;
+constexpr auto SUBNAUTICA2_SCENEVIEW_LOCAL_FOG_VOLUME_VIEW_DATA_OFFSET = 0x2348;
+constexpr auto SUBNAUTICA2_SCENEVIEW_VISIBILITY_FLAGS_OFFSET = 0x24C8;
+constexpr auto SUBNAUTICA2_SCENEVIEW_SHADER_MAP_OFFSET = 0x26D8;
+constexpr uint8_t SUBNAUTICA2_SCENEVIEW_HAS_NO_VISIBLE_PRIMITIVE_MASK = 0x02;
+constexpr auto SUBNAUTICA2_CACHED_VIEW_UNIFORM_REFLECTION_MASK_OFFSET = 0x0CCC;
+constexpr auto SUBNAUTICA2_CACHED_VIEW_UNIFORM_ENV_COMPONENT_FLAGS_OFFSET = 0x1410;
+constexpr auto SUBNAUTICA2_VIEWSTATE_VOLCLOUD_OFFSET = 0x1EA0;
+constexpr auto SUBNAUTICA2_VOLCLOUD_HISTORY_AVAILABLE_OFFSET = 0x0D;
+constexpr auto SUBNAUTICA2_VOLCLOUD_VALID_OFFSET = 0x0F;
+constexpr auto SUBNAUTICA2_VOLCLOUD_PREV_EXPOSURE_OFFSET = 0x10;
+constexpr auto SUBNAUTICA2_VOLCLOUD_CURRENT_PIXEL_OFFSET_OFFSET = 0x24;
+constexpr auto SUBNAUTICA2_VOLCLOUD_TRACING_RESOLUTION_OFFSET = 0x3C;
+constexpr auto SUBNAUTICA2_VOLCLOUD_RECONSTRUCT_VIEW_RECT_OFFSET = 0x44;
+constexpr auto SUBNAUTICA2_VOLCLOUD_TRACING_VIEW_RECT_BASE_OFFSET = 0x80;
+constexpr auto SUBNAUTICA2_VOLCLOUD_TEXTURE_INDEX_OFFSET = 0x08;
+constexpr auto SUBNAUTICA2_VOLCLOUD_MODE_OFFSET = 0xB0;
+constexpr auto SUBNAUTICA2_VOLCLOUD_UPSAMPLING_MODE_OFFSET = 0xB4;
+constexpr auto SUBNAUTICA2_SCENE_WITHOUT_WATER_COLOR_OFFSET = 0x08;
+constexpr auto SUBNAUTICA2_SCENE_WITHOUT_WATER_DEPTH_OFFSET = 0x10;
+constexpr auto SUBNAUTICA2_SCENE_WITHOUT_WATER_VIEWS_DATA_OFFSET = 0x18;
+constexpr auto SUBNAUTICA2_SCENE_WITHOUT_WATER_VIEWS_COUNT_OFFSET = 0x20;
+constexpr auto SUBNAUTICA2_SCENE_WITHOUT_WATER_VIEWS_MAX_OFFSET = 0x24;
+constexpr auto SUBNAUTICA2_SCENE_WITHOUT_WATER_REFRACTION_FACTOR_OFFSET = 0x28;
+
+struct Subnautica2SceneWithoutWaterView {
+    int32_t rect[4]{};
+    float minmax_uv[4]{};
+};
+
+bool subnautica2_rect_valid(const int32_t* rect) {
+    return rect != nullptr && rect[2] > rect[0] && rect[3] > rect[1];
+}
+
+bool subnautica2_rect_equal(const int32_t* a, const int32_t* b) {
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+float subnautica2_absf(float value) {
+    return value < 0.0f ? -value : value;
+}
+
+bool subnautica2_uv_close(const float* a, const float* b) {
+    constexpr float tolerance = 0.0025f;
+    return subnautica2_absf(a[0] - b[0]) <= tolerance &&
+           subnautica2_absf(a[1] - b[1]) <= tolerance &&
+           subnautica2_absf(a[2] - b[2]) <= tolerance &&
+           subnautica2_absf(a[3] - b[3]) <= tolerance;
+}
+
+int32_t subnautica2_divide_rect_coord(int32_t value, int32_t factor) {
+    if (factor <= 1 || value == 0) {
+        return value;
+    }
+
+    return value / factor;
+}
+
+bool subnautica2_get_effective_scene_view_rect(uint8_t* view, int32_t (&out)[4]) {
+    if (view == nullptr) {
+        return false;
+    }
+
+    if (is_readable_process_range(
+            (uintptr_t)view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET,
+            sizeof(out)))
+    {
+        const auto* runtime_rect = (const int32_t*)(view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+
+        if (subnautica2_rect_valid(runtime_rect)) {
+            memcpy(out, runtime_rect, sizeof(out));
+            return true;
+        }
+    }
+
+    if (!is_readable_process_range(
+            (uintptr_t)view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET,
+            sizeof(sdk::FSceneViewInitOptionsUE5)))
+    {
+        return false;
+    }
+
+    const auto* init_options = (const sdk::FSceneViewInitOptionsUE5*)(view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET);
+    const auto* init_rect = init_options->view_rect;
+
+    if (!subnautica2_rect_valid(init_rect)) {
+        return false;
+    }
+
+    memcpy(out, init_rect, sizeof(out));
+    return true;
+}
+
+bool subnautica2_expected_scene_without_water_view(
+    uint8_t* view,
+    const int32_t* full_rect,
+    int32_t downsample_factor,
+    Subnautica2SceneWithoutWaterView& out)
+{
+    if (view == nullptr ||
+        full_rect == nullptr ||
+        downsample_factor <= 0 ||
+        !subnautica2_rect_valid(full_rect))
+    {
+        return false;
+    }
+
+    int32_t view_rect[4]{};
+
+    if (!subnautica2_get_effective_scene_view_rect(view, view_rect)) {
+        return false;
+    }
+
+    out.rect[0] = subnautica2_divide_rect_coord(view_rect[0], downsample_factor);
+    out.rect[1] = subnautica2_divide_rect_coord(view_rect[1], downsample_factor);
+    out.rect[2] = subnautica2_divide_rect_coord(view_rect[2], downsample_factor);
+    out.rect[3] = subnautica2_divide_rect_coord(view_rect[3], downsample_factor);
+
+    const int32_t extent_x = std::max(1, subnautica2_divide_rect_coord(full_rect[2], downsample_factor));
+    const int32_t extent_y = std::max(1, subnautica2_divide_rect_coord(full_rect[3], downsample_factor));
+    constexpr float pixel_safe_guard_band = 0.55f;
+
+    out.minmax_uv[0] = ((float)out.rect[0] + pixel_safe_guard_band) / (float)extent_x;
+    out.minmax_uv[1] = ((float)out.rect[1] + pixel_safe_guard_band) / (float)extent_y;
+    out.minmax_uv[2] = ((float)out.rect[2] - pixel_safe_guard_band) / (float)extent_x;
+    out.minmax_uv[3] = ((float)out.rect[3] - pixel_safe_guard_band) / (float)extent_y;
+    return true;
+}
+
+struct Subnautica2RuntimeViewRectPatch {
+    uint8_t* view{};
+    int32_t original[4]{};
+    int32_t desired[4]{};
+    bool valid{};
+    bool patched{};
+};
+
+struct Subnautica2PrimaryViewIndexPatch {
+    uint8_t* view{};
+    int32_t original{};
+    int32_t desired{};
+    bool valid{};
+    bool patched{};
+};
+
+struct Subnautica2ArrayViewPatch {
+    void* view{};
+    uintptr_t original_data{};
+    int32_t original_count{};
+    uintptr_t replay_data{};
+    bool valid{};
+    bool patched{};
+};
+
+bool subnautica2_patch_array_view_to_secondary(void* views, Subnautica2ArrayViewPatch& patch) {
+    if (views == nullptr ||
+        !is_writable_process_range((uintptr_t)views, sizeof(uintptr_t) + sizeof(int32_t)))
+    {
+        return false;
+    }
+
+    auto* const data_ptr = (uintptr_t*)views;
+    auto* const count_ptr = (int32_t*)((uintptr_t)views + sizeof(uintptr_t));
+    const auto original_data = *data_ptr;
+    const auto original_count = *count_ptr;
+
+    if (original_data == 0 ||
+        original_count < 2 ||
+        original_count > 8 ||
+        !is_readable_process_range(original_data, SUBNAUTICA2_SCENEVIEW_STRIDE * 2))
+    {
+        return false;
+    }
+
+    patch.view = views;
+    patch.original_data = original_data;
+    patch.original_count = original_count;
+    patch.replay_data = original_data + SUBNAUTICA2_SCENEVIEW_STRIDE;
+    patch.valid = true;
+
+    *data_ptr = patch.replay_data;
+    *count_ptr = 1;
+    patch.patched = true;
+    return true;
+}
+
+void subnautica2_restore_array_view_patch(const Subnautica2ArrayViewPatch& patch) {
+    if (!patch.valid || !patch.patched || patch.view == nullptr ||
+        !is_writable_process_range((uintptr_t)patch.view, sizeof(uintptr_t) + sizeof(int32_t)))
+    {
+        return;
+    }
+
+    *(uintptr_t*)patch.view = patch.original_data;
+    *(int32_t*)((uintptr_t)patch.view + sizeof(uintptr_t)) = patch.original_count;
+}
+
+bool subnautica2_patch_runtime_view_rects(
+    const char* source,
+    void* views,
+    std::array<Subnautica2RuntimeViewRectPatch, 2>& patches)
+{
+    auto& vr = VR::get();
+
+    if (!subnautica2_is_current_game() ||
+        subnautica2_disable_single_layer_water_view_rect_fix() ||
+        vr == nullptr ||
+        !vr->is_hmd_active() ||
+        !vr->is_native_stereo_fix_enabled() ||
+        vr->is_native_stereo_fix_same_pass_enabled() ||
+        vr->is_using_afr() ||
+        views == nullptr)
+    {
+        return false;
+    }
+
+    const auto views_addr = (uintptr_t)views;
+
+    if (!is_readable_process_range(views_addr, sizeof(uintptr_t) + sizeof(int32_t))) {
+        return false;
+    }
+
+    auto* const views_data = *(uint8_t**)views_addr;
+    const auto views_count = *(int32_t*)(views_addr + sizeof(uintptr_t));
+
+    if (views_data == nullptr ||
+        views_count < 2 ||
+        views_count > 8 ||
+        !is_writable_process_range((uintptr_t)views_data, SUBNAUTICA2_SCENEVIEW_STRIDE * 2))
+    {
+        return false;
+    }
+
+    bool patched_any = false;
+    bool mismatch_any = false;
+
+    for (int32_t eye = 0; eye < 2; ++eye) {
+        auto& patch = patches[eye];
+        patch.view = views_data + (SUBNAUTICA2_SCENEVIEW_STRIDE * eye);
+
+        if (!is_readable_process_range(
+                (uintptr_t)patch.view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET,
+                sizeof(sdk::FSceneViewInitOptionsUE5)) ||
+            !is_writable_process_range(
+                (uintptr_t)patch.view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET,
+                sizeof(patch.original)))
+        {
+            continue;
+        }
+
+        const auto* init_options = (const sdk::FSceneViewInitOptionsUE5*)(patch.view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET);
+        const auto* init_rect = init_options->view_rect;
+        auto* const runtime_rect = (int32_t*)(patch.view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+
+        if (!subnautica2_rect_valid(init_rect)) {
+            continue;
+        }
+
+        memcpy(patch.original, runtime_rect, sizeof(patch.original));
+        memcpy(patch.desired, init_rect, sizeof(patch.desired));
+        patch.valid = true;
+
+        const bool rect_mismatch = !subnautica2_rect_equal(patch.original, patch.desired);
+        mismatch_any = mismatch_any || rect_mismatch;
+
+        if (rect_mismatch) {
+            memcpy(runtime_rect, patch.desired, sizeof(patch.desired));
+            patch.patched = true;
+            patched_any = true;
+        }
+    }
+
+    static std::atomic<uint64_t> logged_calls{0};
+    const auto count = logged_calls.fetch_add(1, std::memory_order_relaxed);
+
+    if (count < 48 || patched_any || ((count % 600) == 0 && mismatch_any)) {
+        SPDLOG_INFO(
+            "[Subnautica2][ViewRect] {} call={} count={} patched={} mismatch={} disabled={} eye0(valid={}, view={:x}, init={} {} {} {}, runtime={} {} {} {}, after={} {} {} {}) eye1(valid={}, view={:x}, init={} {} {} {}, runtime={} {} {} {}, after={} {} {} {})",
+            source,
+            count + 1,
+            views_count,
+            patched_any,
+            mismatch_any,
+            subnautica2_disable_single_layer_water_view_rect_fix(),
+            patches[0].valid,
+            (uintptr_t)patches[0].view,
+            patches[0].desired[0],
+            patches[0].desired[1],
+            patches[0].desired[2],
+            patches[0].desired[3],
+            patches[0].original[0],
+            patches[0].original[1],
+            patches[0].original[2],
+            patches[0].original[3],
+            patches[0].patched ? patches[0].desired[0] : patches[0].original[0],
+            patches[0].patched ? patches[0].desired[1] : patches[0].original[1],
+            patches[0].patched ? patches[0].desired[2] : patches[0].original[2],
+            patches[0].patched ? patches[0].desired[3] : patches[0].original[3],
+            patches[1].valid,
+            (uintptr_t)patches[1].view,
+            patches[1].desired[0],
+            patches[1].desired[1],
+            patches[1].desired[2],
+            patches[1].desired[3],
+            patches[1].original[0],
+            patches[1].original[1],
+            patches[1].original[2],
+            patches[1].original[3],
+            patches[1].patched ? patches[1].desired[0] : patches[1].original[0],
+            patches[1].patched ? patches[1].desired[1] : patches[1].original[1],
+            patches[1].patched ? patches[1].desired[2] : patches[1].original[2],
+            patches[1].patched ? patches[1].desired[3] : patches[1].original[3]);
+    }
+
+    return patched_any;
+}
+
+void subnautica2_restore_runtime_view_rects(const std::array<Subnautica2RuntimeViewRectPatch, 2>& patches) {
+    for (const auto& patch : patches) {
+        if (!patch.valid || !patch.patched || patch.view == nullptr) {
+            continue;
+        }
+
+        auto* const runtime_rect = (int32_t*)(patch.view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+        if (is_writable_process_range((uintptr_t)runtime_rect, sizeof(patch.original))) {
+            memcpy(runtime_rect, patch.original, sizeof(patch.original));
+        }
+    }
+}
+
+bool subnautica2_patch_renderer_runtime_view_rects_for_fog(
+    const char* source,
+    void* scene_renderer,
+    std::array<Subnautica2RuntimeViewRectPatch, 2>& patches)
+{
+    auto& vr = VR::get();
+
+    if (!subnautica2_is_current_game() ||
+        subnautica2_disable_render_fog_view_rect_fix() ||
+        vr == nullptr ||
+        !vr->is_hmd_active() ||
+        !vr->is_native_stereo_fix_enabled() ||
+        vr->is_native_stereo_fix_same_pass_enabled() ||
+        vr->is_using_afr() ||
+        scene_renderer == nullptr)
+    {
+        return false;
+    }
+
+    const auto renderer = (uintptr_t)scene_renderer;
+    if (!is_readable_process_range(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_DATA_OFFSET, sizeof(uintptr_t) + sizeof(int32_t) * 2)) {
+        return false;
+    }
+
+    auto* const views_data = *(uint8_t**)(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_DATA_OFFSET);
+    const auto views_count = *(int32_t*)(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_COUNT_OFFSET);
+    const auto views_max = *(int32_t*)(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_MAX_OFFSET);
+
+    if (views_data == nullptr ||
+        views_count < 2 ||
+        views_count > 8 ||
+        views_max < views_count ||
+        !is_writable_process_range((uintptr_t)views_data, SUBNAUTICA2_SCENEVIEW_STRIDE * 2))
+    {
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[Subnautica2][RenderFogViewRect] {} skipping patch; views={} count={}/{} disabled={}",
+            source,
+            (uintptr_t)views_data,
+            views_count,
+            views_max,
+            subnautica2_disable_render_fog_view_rect_fix());
+        return false;
+    }
+
+    bool patched_any = false;
+    bool mismatch_any = false;
+
+    for (int32_t eye = 0; eye < 2; ++eye) {
+        auto& patch = patches[eye];
+        patch.view = views_data + (SUBNAUTICA2_SCENEVIEW_STRIDE * eye);
+
+        if (!is_readable_process_range(
+                (uintptr_t)patch.view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET,
+                sizeof(sdk::FSceneViewInitOptionsUE5)) ||
+            !is_writable_process_range(
+                (uintptr_t)patch.view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET,
+                sizeof(patch.original)))
+        {
+            continue;
+        }
+
+        const auto* init_options = (const sdk::FSceneViewInitOptionsUE5*)(patch.view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET);
+        const auto* init_rect = init_options->view_rect;
+        auto* const runtime_rect = (int32_t*)(patch.view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+
+        if (!subnautica2_rect_valid(init_rect) || !subnautica2_rect_valid(runtime_rect)) {
+            continue;
+        }
+
+        memcpy(patch.original, runtime_rect, sizeof(patch.original));
+        memcpy(patch.desired, init_rect, sizeof(patch.desired));
+        patch.valid = true;
+
+        const bool rect_mismatch = !subnautica2_rect_equal(patch.original, patch.desired);
+        mismatch_any = mismatch_any || rect_mismatch;
+
+        if (rect_mismatch) {
+            memcpy(runtime_rect, patch.desired, sizeof(patch.desired));
+            patch.patched = true;
+            patched_any = true;
+        }
+    }
+
+    static std::atomic<uint64_t> logged_calls{0};
+    const auto count = logged_calls.fetch_add(1, std::memory_order_relaxed);
+
+    if (count < 96 || patched_any || ((count % 600) == 0 && mismatch_any)) {
+        SPDLOG_INFO(
+            "[Subnautica2][RenderFogViewRect] {} call={} views={} count={}/{} patched={} mismatch={} eye0(valid={}, view={:x}, pass={}, stereo_index={}, primary_index={}, fog_flag={}, init={} {} {} {}, runtime_before={} {} {} {}, runtime_used={} {} {} {}) eye1(valid={}, view={:x}, pass={}, stereo_index={}, primary_index={}, fog_flag={}, init={} {} {} {}, runtime_before={} {} {} {}, runtime_used={} {} {} {})",
+            source,
+            count + 1,
+            (uintptr_t)views_data,
+            views_count,
+            views_max,
+            patched_any,
+            mismatch_any,
+            patches[0].valid,
+            (uintptr_t)patches[0].view,
+            patches[0].valid ? *(uint32_t*)(patches[0].view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET) : 0,
+            patches[0].valid ? *(int32_t*)(patches[0].view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET) : 0,
+            patches[0].valid ? *(int32_t*)(patches[0].view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET) : 0,
+            patches[0].valid ? patches[0].view[SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAG_OFFSET] : 0,
+            patches[0].desired[0],
+            patches[0].desired[1],
+            patches[0].desired[2],
+            patches[0].desired[3],
+            patches[0].original[0],
+            patches[0].original[1],
+            patches[0].original[2],
+            patches[0].original[3],
+            patches[0].patched ? patches[0].desired[0] : patches[0].original[0],
+            patches[0].patched ? patches[0].desired[1] : patches[0].original[1],
+            patches[0].patched ? patches[0].desired[2] : patches[0].original[2],
+            patches[0].patched ? patches[0].desired[3] : patches[0].original[3],
+            patches[1].valid,
+            (uintptr_t)patches[1].view,
+            patches[1].valid ? *(uint32_t*)(patches[1].view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET) : 0,
+            patches[1].valid ? *(int32_t*)(patches[1].view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET) : 0,
+            patches[1].valid ? *(int32_t*)(patches[1].view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET) : 0,
+            patches[1].valid ? patches[1].view[SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAG_OFFSET] : 0,
+            patches[1].desired[0],
+            patches[1].desired[1],
+            patches[1].desired[2],
+            patches[1].desired[3],
+            patches[1].original[0],
+            patches[1].original[1],
+            patches[1].original[2],
+            patches[1].original[3],
+            patches[1].patched ? patches[1].desired[0] : patches[1].original[0],
+            patches[1].patched ? patches[1].desired[1] : patches[1].original[1],
+            patches[1].patched ? patches[1].desired[2] : patches[1].original[2],
+            patches[1].patched ? patches[1].desired[3] : patches[1].original[3]);
+    }
+
+    return patched_any;
+}
+
+bool subnautica2_patch_secondary_primary_view_index(
+    const char* source,
+    void* views,
+    Subnautica2PrimaryViewIndexPatch& patch)
+{
+    auto& vr = VR::get();
+
+    if (!subnautica2_is_current_game() ||
+        !subnautica2_force_secondary_primary_view_index() ||
+        vr == nullptr ||
+        !vr->is_hmd_active() ||
+        !vr->is_native_stereo_fix_enabled() ||
+        vr->is_native_stereo_fix_same_pass_enabled() ||
+        vr->is_using_afr() ||
+        views == nullptr)
+    {
+        return false;
+    }
+
+    const auto views_addr = (uintptr_t)views;
+
+    if (!is_readable_process_range(views_addr, sizeof(uintptr_t) + sizeof(int32_t))) {
+        return false;
+    }
+
+    auto* const views_data = *(uint8_t**)views_addr;
+    const auto views_count = *(int32_t*)(views_addr + sizeof(uintptr_t));
+
+    if (views_data == nullptr ||
+        views_count < 2 ||
+        views_count > 8 ||
+        !is_writable_process_range(
+            (uintptr_t)views_data + SUBNAUTICA2_SCENEVIEW_STRIDE + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET,
+            sizeof(int32_t)))
+    {
+        return false;
+    }
+
+    auto* const secondary_view = views_data + SUBNAUTICA2_SCENEVIEW_STRIDE;
+    const auto secondary_pass = *(uint32_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+    const auto secondary_stereo_index = *(int32_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET);
+    auto& primary_view_index = *(int32_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET);
+
+    if (secondary_pass != EStereoscopicPass::eSSP_SECONDARY ||
+        secondary_stereo_index < 0 ||
+        primary_view_index == secondary_stereo_index)
+    {
+        return false;
+    }
+
+    patch.view = secondary_view;
+    patch.original = primary_view_index;
+    patch.desired = secondary_stereo_index;
+    patch.valid = true;
+
+    primary_view_index = secondary_stereo_index;
+    patch.patched = true;
+
+    static std::atomic<uint64_t> logged_calls{0};
+    const auto count = logged_calls.fetch_add(1, std::memory_order_relaxed);
+    if (count < 32 || (count % 600) == 0) {
+        SPDLOG_WARN(
+            "[Subnautica2][SingleLayerWater] {} patching secondary PrimaryViewIndex {} -> {} during water pass",
+            source,
+            patch.original,
+            patch.desired);
+    }
+
+    return true;
+}
+
+void subnautica2_restore_primary_view_index(const Subnautica2PrimaryViewIndexPatch& patch) {
+    if (!patch.valid || !patch.patched || patch.view == nullptr ||
+        !is_writable_process_range(
+            (uintptr_t)patch.view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET,
+            sizeof(int32_t)))
+    {
+        return;
+    }
+
+    *(int32_t*)(patch.view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET) = patch.original;
+}
+
+bool subnautica2_patch_scene_without_water_views(
+    const char* source,
+    void* scene_renderer,
+    void* scene_without_water_textures)
+{
+    auto& vr = VR::get();
+
+    if (!subnautica2_is_current_game() ||
+        vr == nullptr ||
+        !vr->is_hmd_active() ||
+        !vr->is_native_stereo_fix_enabled() ||
+        vr->is_native_stereo_fix_same_pass_enabled() ||
+        vr->is_using_afr() ||
+        scene_renderer == nullptr ||
+        scene_without_water_textures == nullptr)
+    {
+        return false;
+    }
+
+    const auto renderer = (uintptr_t)scene_renderer;
+
+    if (!is_readable_process_range(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_DATA_OFFSET, sizeof(uintptr_t) + sizeof(int32_t) * 2)) {
+        return false;
+    }
+
+    auto* const views_data = *(uint8_t**)(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_DATA_OFFSET);
+    const auto views_count = *(int32_t*)(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_COUNT_OFFSET);
+    const auto views_max = *(int32_t*)(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_MAX_OFFSET);
+
+    const auto water = (uintptr_t)scene_without_water_textures;
+
+    if (!is_readable_process_range(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_COLOR_OFFSET, 0x30)) {
+        return false;
+    }
+
+    auto* const water_views = *(Subnautica2SceneWithoutWaterView**)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_VIEWS_DATA_OFFSET);
+    const auto water_views_count = *(int32_t*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_VIEWS_COUNT_OFFSET);
+    const auto water_views_max = *(int32_t*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_VIEWS_MAX_OFFSET);
+    const auto color_texture = *(uintptr_t*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_COLOR_OFFSET);
+    const auto depth_texture = *(uintptr_t*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_DEPTH_OFFSET);
+    const auto refraction_factor_raw = *(float*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_REFRACTION_FACTOR_OFFSET);
+
+    if (views_data == nullptr ||
+        views_count < 2 ||
+        views_count > 8 ||
+        views_max < views_count ||
+        water_views == nullptr ||
+        water_views_count < 2 ||
+        water_views_count > 8 ||
+        water_views_max < water_views_count ||
+        !is_readable_process_range((uintptr_t)views_data, SUBNAUTICA2_SCENEVIEW_STRIDE * 2) ||
+        !is_writable_process_range((uintptr_t)water_views, sizeof(Subnautica2SceneWithoutWaterView) * 2))
+    {
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[Subnautica2][SceneWithoutWater] {} skipping probe; renderer_views={} count={}/{} water_views={} count={}/{}",
+            source,
+            (uintptr_t)views_data,
+            views_count,
+            views_max,
+            (uintptr_t)water_views,
+            water_views_count,
+            water_views_max);
+        return false;
+    }
+
+    int32_t full_rect[4]{0, 0, 0, 0};
+    int32_t downsample_factor = 1;
+    if (refraction_factor_raw >= 1.5f && refraction_factor_raw <= 8.5f) {
+        downsample_factor = (int32_t)(refraction_factor_raw + 0.5f);
+    }
+
+    std::array<Subnautica2SceneWithoutWaterView, 2> expected{};
+    bool expected_valid[2]{};
+
+    for (int32_t eye = 0; eye < 2; ++eye) {
+        auto* const view = views_data + (SUBNAUTICA2_SCENEVIEW_STRIDE * eye);
+
+        if (!is_readable_process_range(
+                (uintptr_t)view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET,
+                sizeof(sdk::FSceneViewInitOptionsUE5)))
+        {
+            continue;
+        }
+
+        int32_t rect[4]{};
+
+        if (!subnautica2_get_effective_scene_view_rect(view, rect)) {
+            continue;
+        }
+
+        full_rect[0] = std::min(full_rect[0], rect[0]);
+        full_rect[1] = std::min(full_rect[1], rect[1]);
+        full_rect[2] = std::max(full_rect[2], rect[2]);
+        full_rect[3] = std::max(full_rect[3], rect[3]);
+    }
+
+    for (int32_t eye = 0; eye < 2; ++eye) {
+        expected_valid[eye] = subnautica2_expected_scene_without_water_view(
+            views_data + (SUBNAUTICA2_SCENEVIEW_STRIDE * eye),
+            full_rect,
+            downsample_factor,
+            expected[eye]);
+    }
+
+    bool patched_any = false;
+    bool mismatch_any = false;
+
+    if (!subnautica2_disable_underwater_fog_view_data_fix()) {
+        for (int32_t eye = 0; eye < 2; ++eye) {
+            if (!expected_valid[eye]) {
+                continue;
+            }
+
+            auto& current = water_views[eye];
+            const bool rect_mismatch = !subnautica2_rect_equal(current.rect, expected[eye].rect);
+            const bool uv_mismatch = !subnautica2_uv_close(current.minmax_uv, expected[eye].minmax_uv);
+
+            mismatch_any = mismatch_any || rect_mismatch || uv_mismatch;
+
+            if (rect_mismatch || uv_mismatch) {
+                current = expected[eye];
+                patched_any = true;
+            }
+        }
+    } else {
+        for (int32_t eye = 0; eye < 2; ++eye) {
+            if (!expected_valid[eye]) {
+                continue;
+            }
+
+            mismatch_any = mismatch_any ||
+                !subnautica2_rect_equal(water_views[eye].rect, expected[eye].rect) ||
+                !subnautica2_uv_close(water_views[eye].minmax_uv, expected[eye].minmax_uv);
+        }
+    }
+
+    static std::atomic<uint64_t> logged_calls{0};
+    const auto count = logged_calls.fetch_add(1, std::memory_order_relaxed);
+    if (count < 24 || ((count % 600) == 0 && (patched_any || mismatch_any))) {
+        SPDLOG_INFO(
+            "[Subnautica2][SceneWithoutWater] {} call={} renderer_views={} count={}/{} water_views={} count={}/{} color={:x} depth={:x} refraction={} downsample={} full_rect={} {} {} {} patched={} mismatch={}",
+            source,
+            count + 1,
+            (uintptr_t)views_data,
+            views_count,
+            views_max,
+            (uintptr_t)water_views,
+            water_views_count,
+            water_views_max,
+            color_texture,
+            depth_texture,
+            refraction_factor_raw,
+            downsample_factor,
+            full_rect[0],
+            full_rect[1],
+            full_rect[2],
+            full_rect[3],
+            patched_any,
+            mismatch_any);
+
+        for (int32_t eye = 0; eye < 2; ++eye) {
+            auto* const view = views_data + (SUBNAUTICA2_SCENEVIEW_STRIDE * eye);
+            const auto* init_options = (const sdk::FSceneViewInitOptionsUE5*)(view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET);
+            const auto* runtime_view_rect = (const int32_t*)(view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+            const auto& current = water_views[eye];
+
+            SPDLOG_INFO(
+                "[Subnautica2][SceneWithoutWater] {} eye={} view={:x} pass={} stereo_index={} primary_index={} fog_flag={} instanced={} singlepass={} multiviewport={} mobile_multiview={} bind_instanced_ub={} underwater_depth={} water_intersection={} init_rect={} {} {} {} runtime_rect={} {} {} {} current_rect={} {} {} {} current_uv={:.6f} {:.6f} {:.6f} {:.6f} expected_valid={} expected_rect={} {} {} {} expected_uv={:.6f} {:.6f} {:.6f} {:.6f}",
+                source,
+                eye,
+                (uintptr_t)view,
+                *(uint32_t*)(view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET),
+                *(int32_t*)(view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET),
+                *(int32_t*)(view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET),
+                view[SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAG_OFFSET],
+                view[SUBNAUTICA2_SCENEVIEW_INSTANCED_STEREO_ENABLED_OFFSET],
+                view[SUBNAUTICA2_SCENEVIEW_SINGLE_PASS_STEREO_OFFSET],
+                view[SUBNAUTICA2_SCENEVIEW_MULTI_VIEWPORT_ENABLED_OFFSET],
+                view[SUBNAUTICA2_SCENEVIEW_MOBILE_MULTI_VIEW_ENABLED_OFFSET],
+                view[SUBNAUTICA2_SCENEVIEW_SHOULD_BIND_INSTANCED_VIEW_UB_OFFSET],
+                *(float*)(view + SUBNAUTICA2_SCENEVIEW_UNDERWATER_DEPTH_OFFSET),
+                view[SUBNAUTICA2_SCENEVIEW_WATER_INTERSECTION_OFFSET],
+                init_options->view_rect[0],
+                init_options->view_rect[1],
+                init_options->view_rect[2],
+                init_options->view_rect[3],
+                runtime_view_rect[0],
+                runtime_view_rect[1],
+                runtime_view_rect[2],
+                runtime_view_rect[3],
+                current.rect[0],
+                current.rect[1],
+                current.rect[2],
+                current.rect[3],
+                current.minmax_uv[0],
+                current.minmax_uv[1],
+                current.minmax_uv[2],
+                current.minmax_uv[3],
+                expected_valid[eye],
+                expected[eye].rect[0],
+                expected[eye].rect[1],
+                expected[eye].rect[2],
+                expected[eye].rect[3],
+                expected[eye].minmax_uv[0],
+                expected[eye].minmax_uv[1],
+                expected[eye].minmax_uv[2],
+                expected[eye].minmax_uv[3]);
+        }
+    }
+
+    return patched_any;
+}
+
+void subnautica2_log_compose_volumetric_render_target(
+    const char* source,
+    void* views,
+    bool compose_with_water,
+    void* water_pass_data)
+{
+    if (!subnautica2_is_current_game() || views == nullptr) {
+        return;
+    }
+
+    const auto views_addr = (uintptr_t)views;
+    if (!is_readable_process_range(views_addr, sizeof(uintptr_t) + sizeof(int32_t))) {
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[Subnautica2][ComposeVolumetric] {} skipping probe; bad views header {:x}",
+            source,
+            views_addr);
+        return;
+    }
+
+    auto* const views_data = *(uint8_t**)views_addr;
+    const auto views_count = *(int32_t*)(views_addr + sizeof(uintptr_t));
+
+    Subnautica2SceneWithoutWaterView* water_views = nullptr;
+    int32_t water_views_count = 0;
+    uintptr_t water_color = 0;
+    uintptr_t water_depth = 0;
+    float refraction_factor = 0.0f;
+
+    if (compose_with_water && water_pass_data != nullptr) {
+        const auto water = (uintptr_t)water_pass_data;
+        if (is_readable_process_range(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_COLOR_OFFSET, 0x30)) {
+            water_color = *(uintptr_t*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_COLOR_OFFSET);
+            water_depth = *(uintptr_t*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_DEPTH_OFFSET);
+            water_views = *(Subnautica2SceneWithoutWaterView**)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_VIEWS_DATA_OFFSET);
+            water_views_count = *(int32_t*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_VIEWS_COUNT_OFFSET);
+            refraction_factor = *(float*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_REFRACTION_FACTOR_OFFSET);
+        }
+    }
+
+    if (views_data == nullptr ||
+        views_count <= 0 ||
+        views_count > 8 ||
+        !is_readable_process_range((uintptr_t)views_data, SUBNAUTICA2_SCENEVIEW_STRIDE * std::min(views_count, 2)))
+    {
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[Subnautica2][ComposeVolumetric] {} skipping probe; views_data={} count={} water_views={} water_count={} compose_with_water={}",
+            source,
+            (uintptr_t)views_data,
+            views_count,
+            (uintptr_t)water_views,
+            water_views_count,
+            compose_with_water);
+        return;
+    }
+
+    uintptr_t viewstate[2]{};
+    uintptr_t cached_uniform[2]{};
+    uintptr_t volc_state[2]{};
+    bool volc_valid[2]{};
+    uint32_t volc_mode[2]{};
+    uint32_t volc_upsampling[2]{};
+    uint32_t local_fog_count[2]{};
+    uint32_t volc_texture_index[2]{};
+    bool volc_history_available[2]{};
+    float volc_prev_exposure[2]{};
+    int32_t volc_pixel_offset[2][2]{};
+    int32_t volc_trace_resolution[2][2]{};
+    int32_t volc_reconstruct_rect[2][2]{};
+    int32_t volc_tracing_rect[2][2]{};
+
+    for (int32_t eye = 0; eye < std::min(views_count, 2); ++eye) {
+        auto* const view = views_data + (SUBNAUTICA2_SCENEVIEW_STRIDE * eye);
+
+        if (!is_readable_process_range((uintptr_t)view + SUBNAUTICA2_SCENEVIEW_VIEWSTATE_OFFSET, sizeof(uintptr_t) * 2)) {
+            continue;
+        }
+
+        viewstate[eye] = *(uintptr_t*)(view + SUBNAUTICA2_SCENEVIEW_VIEWSTATE_OFFSET);
+        cached_uniform[eye] = *(uintptr_t*)(view + SUBNAUTICA2_SCENEVIEW_CACHED_VIEW_UNIFORM_OFFSET);
+
+        if (viewstate[eye] != 0 &&
+            is_readable_process_range(viewstate[eye] + SUBNAUTICA2_VIEWSTATE_VOLCLOUD_OFFSET, SUBNAUTICA2_VOLCLOUD_UPSAMPLING_MODE_OFFSET + sizeof(uint32_t)))
+        {
+            volc_state[eye] = viewstate[eye] + SUBNAUTICA2_VIEWSTATE_VOLCLOUD_OFFSET;
+            volc_valid[eye] = *(uint8_t*)(volc_state[eye] + SUBNAUTICA2_VOLCLOUD_VALID_OFFSET) != 0;
+            volc_history_available[eye] = *(uint8_t*)(volc_state[eye] + SUBNAUTICA2_VOLCLOUD_HISTORY_AVAILABLE_OFFSET) != 0;
+            volc_texture_index[eye] = *(uint32_t*)(volc_state[eye] + SUBNAUTICA2_VOLCLOUD_TEXTURE_INDEX_OFFSET);
+            volc_prev_exposure[eye] = *(float*)(volc_state[eye] + SUBNAUTICA2_VOLCLOUD_PREV_EXPOSURE_OFFSET);
+            memcpy(volc_pixel_offset[eye], (void*)(volc_state[eye] + SUBNAUTICA2_VOLCLOUD_CURRENT_PIXEL_OFFSET_OFFSET), sizeof(volc_pixel_offset[eye]));
+            memcpy(volc_trace_resolution[eye], (void*)(volc_state[eye] + SUBNAUTICA2_VOLCLOUD_TRACING_RESOLUTION_OFFSET), sizeof(volc_trace_resolution[eye]));
+            memcpy(volc_reconstruct_rect[eye], (void*)(volc_state[eye] + SUBNAUTICA2_VOLCLOUD_RECONSTRUCT_VIEW_RECT_OFFSET), sizeof(volc_reconstruct_rect[eye]));
+            memcpy(
+                volc_tracing_rect[eye],
+                (void*)(volc_state[eye] + SUBNAUTICA2_VOLCLOUD_TRACING_VIEW_RECT_BASE_OFFSET + (8 * volc_texture_index[eye])),
+                sizeof(volc_tracing_rect[eye]));
+            volc_mode[eye] = *(uint32_t*)(volc_state[eye] + SUBNAUTICA2_VOLCLOUD_MODE_OFFSET);
+            volc_upsampling[eye] = *(uint32_t*)(volc_state[eye] + SUBNAUTICA2_VOLCLOUD_UPSAMPLING_MODE_OFFSET);
+        }
+
+        const auto local_fog_ptr = *(uintptr_t*)(view + SUBNAUTICA2_SCENEVIEW_LOCAL_FOG_VOLUME_VIEW_DATA_OFFSET);
+        if (local_fog_ptr != 0 && is_readable_process_range(local_fog_ptr, sizeof(uint32_t))) {
+            local_fog_count[eye] = *(uint32_t*)local_fog_ptr;
+        }
+    }
+
+    const bool shared_viewstate = views_count >= 2 && viewstate[0] != 0 && viewstate[0] == viewstate[1];
+    const bool shared_volc_state = views_count >= 2 && volc_state[0] != 0 && volc_state[0] == volc_state[1];
+    const bool asymmetric_volc =
+        views_count >= 2 &&
+        (volc_valid[0] != volc_valid[1] ||
+         volc_mode[0] != volc_mode[1] ||
+         volc_upsampling[0] != volc_upsampling[1] ||
+         volc_texture_index[0] != volc_texture_index[1] ||
+         volc_history_available[0] != volc_history_available[1] ||
+         volc_pixel_offset[0][0] != volc_pixel_offset[1][0] ||
+         volc_pixel_offset[0][1] != volc_pixel_offset[1][1] ||
+         volc_trace_resolution[0][0] != volc_trace_resolution[1][0] ||
+         volc_trace_resolution[0][1] != volc_trace_resolution[1][1] ||
+         volc_reconstruct_rect[0][0] != volc_reconstruct_rect[1][0] ||
+         volc_reconstruct_rect[0][1] != volc_reconstruct_rect[1][1] ||
+         volc_tracing_rect[0][0] != volc_tracing_rect[1][0] ||
+         volc_tracing_rect[0][1] != volc_tracing_rect[1][1] ||
+         local_fog_count[0] != local_fog_count[1]);
+
+    static std::atomic<uint64_t> logged_calls{0};
+    const auto count = logged_calls.fetch_add(1, std::memory_order_relaxed);
+    if (count >= 120 && !shared_viewstate && !shared_volc_state && !asymmetric_volc && (count % 900) != 0) {
+        return;
+    }
+
+    SPDLOG_INFO(
+        "[Subnautica2][ComposeVolumetric] {} call={} views={} count={} compose_with_water={} water_views={} water_count={} water_color={:x} water_depth={:x} refraction={} shared_viewstate={} shared_volc={} asymmetric_volc={}",
+        source,
+        count + 1,
+        (uintptr_t)views_data,
+        views_count,
+        compose_with_water,
+        (uintptr_t)water_views,
+        water_views_count,
+        water_color,
+        water_depth,
+        refraction_factor,
+        shared_viewstate,
+        shared_volc_state,
+        asymmetric_volc);
+
+    for (int32_t eye = 0; eye < std::min(views_count, 2); ++eye) {
+        auto* const view = views_data + (SUBNAUTICA2_SCENEVIEW_STRIDE * eye);
+        const auto* init_options = (const sdk::FSceneViewInitOptionsUE5*)(view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET);
+        const auto* runtime_view_rect = (const int32_t*)(view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+        const auto* water_view = (compose_with_water &&
+                                  water_views != nullptr &&
+                                  water_views_count > eye &&
+                                  is_readable_process_range((uintptr_t)&water_views[eye], sizeof(Subnautica2SceneWithoutWaterView)))
+            ? &water_views[eye]
+            : nullptr;
+
+        float reflection_mask = 0.0f;
+        uint32_t env_flags = 0;
+        if (cached_uniform[eye] != 0 &&
+            is_readable_process_range(cached_uniform[eye] + SUBNAUTICA2_CACHED_VIEW_UNIFORM_ENV_COMPONENT_FLAGS_OFFSET, sizeof(uint32_t)))
+        {
+            reflection_mask = *(float*)(cached_uniform[eye] + SUBNAUTICA2_CACHED_VIEW_UNIFORM_REFLECTION_MASK_OFFSET);
+            env_flags = *(uint32_t*)(cached_uniform[eye] + SUBNAUTICA2_CACHED_VIEW_UNIFORM_ENV_COMPONENT_FLAGS_OFFSET);
+        }
+
+        SPDLOG_INFO(
+            "[Subnautica2][ComposeVolumetric] {} eye={} view={:x} pass={} stereo_index={} primary_index={} family={:x} viewstate={:x} cached_ub={:x} shader_map={:x} fog_flag={} underwater_depth={} water_intersection={} local_fog_count={} reflection_mask={} env_flags=0x{:08x} volc_state={:x} valid={} hist={} tex_index={} prev_exp={} mode={} upsample={} pixel_offset={} {} trace_res={} {} recon_rect={} {} tracing_rect={} {} init_rect={} {} {} {} runtime_rect={} {} {} {} water_rect={} {} {} {} water_uv={:.6f} {:.6f} {:.6f} {:.6f}",
+            source,
+            eye,
+            (uintptr_t)view,
+            *(uint32_t*)(view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET),
+            *(int32_t*)(view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET),
+            *(int32_t*)(view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET),
+            *(uintptr_t*)(view + SUBNAUTICA2_SCENEVIEW_FAMILY_OFFSET),
+            viewstate[eye],
+            cached_uniform[eye],
+            *(uintptr_t*)(view + SUBNAUTICA2_SCENEVIEW_SHADER_MAP_OFFSET),
+            view[SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAG_OFFSET],
+            *(float*)(view + SUBNAUTICA2_SCENEVIEW_UNDERWATER_DEPTH_OFFSET),
+            view[SUBNAUTICA2_SCENEVIEW_WATER_INTERSECTION_OFFSET],
+            local_fog_count[eye],
+            reflection_mask,
+            env_flags,
+            volc_state[eye],
+            volc_valid[eye],
+            volc_history_available[eye],
+            volc_texture_index[eye],
+            volc_prev_exposure[eye],
+            volc_mode[eye],
+            volc_upsampling[eye],
+            volc_pixel_offset[eye][0],
+            volc_pixel_offset[eye][1],
+            volc_trace_resolution[eye][0],
+            volc_trace_resolution[eye][1],
+            volc_reconstruct_rect[eye][0],
+            volc_reconstruct_rect[eye][1],
+            volc_tracing_rect[eye][0],
+            volc_tracing_rect[eye][1],
+            init_options->view_rect[0],
+            init_options->view_rect[1],
+            init_options->view_rect[2],
+            init_options->view_rect[3],
+            runtime_view_rect[0],
+            runtime_view_rect[1],
+            runtime_view_rect[2],
+            runtime_view_rect[3],
+            water_view != nullptr ? water_view->rect[0] : 0,
+            water_view != nullptr ? water_view->rect[1] : 0,
+            water_view != nullptr ? water_view->rect[2] : 0,
+            water_view != nullptr ? water_view->rect[3] : 0,
+            water_view != nullptr ? water_view->minmax_uv[0] : 0.0f,
+            water_view != nullptr ? water_view->minmax_uv[1] : 0.0f,
+            water_view != nullptr ? water_view->minmax_uv[2] : 0.0f,
+            water_view != nullptr ? water_view->minmax_uv[3] : 0.0f);
+    }
+}
+
+thread_local bool g_subnautica2_force_volumetric_fog_view_index_one = false;
+
+// 2026-05-16 FIX-V2: capture view 1's NATURAL +0x2658 value (the right-eye
+// fog texture pointer) before any propagation overwrites it. Used by the
+// setup_volumetric_fog_ub_hook to rewrite view 1's UB at the correct offset
+// so the basepass material's fog volume binding picks view 1's filtered
+// fog (e.g. RD ID 30162) instead of view 0's (RD ID 28166).
+static std::atomic<uintptr_t> g_subnautica2_view1_natural_lightscat{0};
+// g_subnautica2_view0_lightscat defined outside the anonymous namespace
+// near the top of this file (file-external linkage for D3D12Hook to use).
+// Empirically discovered offset within the UB fog section where the texture
+// handle (8 bytes) lives. Found by scanning view 0's UB+0xFC0..0x1040 for
+// the 8-byte sequence matching view 0's +0x2658 value. Captured once per
+// session, used to rewrite view 1's UB at the same offset.
+static std::atomic<int32_t> g_subnautica2_fog_ub_handle_offset{-1};
+
+void subnautica2_sync_native_stereo_water_state(sdk::FSceneViewFamily& view_family, uint32_t frame_count) {
+    auto& vr = VR::get();
+
+    if (!subnautica2_is_current_game() ||
+        subnautica2_disable_water_state_sync() ||
+        !vr->is_hmd_active() ||
+        !vr->is_native_stereo_fix_enabled() ||
+        vr->is_native_stereo_fix_same_pass_enabled())
+    {
+        return;
+    }
+
+    auto views = view_family.get_views();
+
+    if (views == nullptr || views->count < 2 || views->data == nullptr || views->data[0] == nullptr) {
+        return;
+    }
+
+    auto primary_view = (uint8_t*)views->data[0];
+
+    constexpr size_t REQUIRED_READ_RANGE =
+        SUBNAUTICA2_SCENEVIEW_BASEPASS_KEY_DWORD_OFFSET + sizeof(uint32_t);
+    static_assert(
+        SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_START_OFFSET + SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE
+            <= REQUIRED_READ_RANGE,
+        "fog-render flag block must be covered by sync read range");
+
+    if (IsBadReadPtr(primary_view, REQUIRED_READ_RANGE)) {
+        return;
+    }
+
+    const auto primary_pass = *(uint32_t*)(primary_view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+
+    if (primary_pass != EStereoscopicPass::eSSP_PRIMARY) {
+        return;
+    }
+
+    const auto primary_depth = *(float*)(primary_view + SUBNAUTICA2_SCENEVIEW_UNDERWATER_DEPTH_OFFSET);
+    const auto primary_intersection = *(uint8_t*)(primary_view + SUBNAUTICA2_SCENEVIEW_WATER_INTERSECTION_OFFSET);
+    const auto primary_basepass_gate = *(uint8_t*)(primary_view + SUBNAUTICA2_SCENEVIEW_BASEPASS_GATE_BYTE_OFFSET);
+    const auto primary_basepass_key = *(uint32_t*)(primary_view + SUBNAUTICA2_SCENEVIEW_BASEPASS_KEY_DWORD_OFFSET);
+
+    uint8_t primary_fog_flags[SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE];
+    memcpy(primary_fog_flags,
+        primary_view + SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_START_OFFSET,
+        SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE);
+
+    static uint32_t log_count = 0;
+    static uint32_t fog_log_count = 0;
+    static uint32_t basepass_log_count = 0;
+
+    for (uint32_t i = 1; i < (uint32_t)views->count; ++i) {
+        auto secondary_view = (uint8_t*)views->data[i];
+
+        if (secondary_view == nullptr ||
+            IsBadReadPtr(secondary_view, REQUIRED_READ_RANGE))
+        {
+            continue;
+        }
+
+        const auto secondary_pass = *(uint32_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+
+        if (secondary_pass != EStereoscopicPass::eSSP_SECONDARY) {
+            continue;
+        }
+
+        auto& secondary_depth = *(float*)(secondary_view + SUBNAUTICA2_SCENEVIEW_UNDERWATER_DEPTH_OFFSET);
+        auto& secondary_intersection = *(uint8_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_WATER_INTERSECTION_OFFSET);
+        const auto before_depth = secondary_depth;
+        const auto before_intersection = secondary_intersection;
+
+        secondary_depth = primary_depth;
+        secondary_intersection = primary_intersection;
+
+        if (log_count < 32 && (before_depth != primary_depth || before_intersection != primary_intersection)) {
+            SPDLOG_INFO("[Subnautica2][NativeStereoFix] Synced water state frame={} view={} primary(depth={}, intersection={}) secondary_before(depth={}, intersection={})",
+                frame_count, i, primary_depth, primary_intersection, before_depth, before_intersection);
+            ++log_count;
+        }
+
+        // Sync the per-view fog-render bool block (0x11E8..0x11ED). These
+        // gate which BasePass PSO permutation the material shader-map picks
+        // (LEFT lacked the Texture3D5 volumetric-fog binding while RIGHT had
+        // it -- different shader compile keys for identical geometry). The
+        // existing post-ctor zeroing only touches 0x11F3..0x11F7, so this
+        // block was diverging between eyes and selecting different shaders.
+        uint8_t* secondary_fog_flags_ptr = secondary_view + SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_START_OFFSET;
+        uint8_t before_fog_flags[SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE];
+        memcpy(before_fog_flags, secondary_fog_flags_ptr, SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE);
+
+        const bool fog_flags_differ =
+            memcmp(before_fog_flags, primary_fog_flags, SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE) != 0;
+
+        memcpy(secondary_fog_flags_ptr, primary_fog_flags, SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE);
+
+        if (fog_log_count < 32 && fog_flags_differ) {
+            SPDLOG_INFO("[Subnautica2][NativeStereoFix] Synced fog-render flags frame={} view={} primary=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] secondary_before=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                frame_count, i,
+                primary_fog_flags[0], primary_fog_flags[1], primary_fog_flags[2],
+                primary_fog_flags[3], primary_fog_flags[4], primary_fog_flags[5],
+                before_fog_flags[0], before_fog_flags[1], before_fog_flags[2],
+                before_fog_flags[3], before_fog_flags[4], before_fog_flags[5]);
+            ++fog_log_count;
+        }
+
+        // Sync the FBasePassMeshProcessor-feeding per-view fields. The
+        // FBasePassMeshProcessor ctor (called per-view) reads View+0x11D9
+        // (byte gate) and View+0x24CC (dword copied into +0x8C of the mesh
+        // pass processor). The mesh processor also caches per-view bool
+        // flags at +0x78, +0x81, +0x88 which feed into the case-branch
+        // shader-type selection inside sub_142631130's case-0 path. To find
+        // out which view fields drive those, we widen the sync to cover the
+        // entire range around 0x11D9..0x11FF (catches any byte gate adjacent
+        // to FOG_RENDER_FLAGS) AND 0x24C8..0x24CF (catches VISIBILITY_FLAGS
+        // and BASEPASS_KEY_DWORD).
+        auto& secondary_basepass_gate = *(uint8_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_BASEPASS_GATE_BYTE_OFFSET);
+        auto& secondary_basepass_key = *(uint32_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_BASEPASS_KEY_DWORD_OFFSET);
+        const auto before_basepass_gate = secondary_basepass_gate;
+        const auto before_basepass_key = secondary_basepass_key;
+
+        const bool basepass_state_differs =
+            before_basepass_gate != primary_basepass_gate ||
+            before_basepass_key != primary_basepass_key;
+
+        secondary_basepass_gate = primary_basepass_gate;
+        secondary_basepass_key = primary_basepass_key;
+
+        if (basepass_log_count < 32 && basepass_state_differs) {
+            SPDLOG_INFO("[Subnautica2][NativeStereoFix] Synced BasePass state frame={} view={} primary(gate=0x{:02x} key=0x{:08x}) secondary_before(gate=0x{:02x} key=0x{:08x})",
+                frame_count, i,
+                primary_basepass_gate, primary_basepass_key,
+                before_basepass_gate, before_basepass_key);
+            ++basepass_log_count;
+        }
+
+    }
 }
 
 bool aphelion_is_current_game() {
@@ -863,6 +2846,7 @@ bool is_probable_d3d_native_resource(void* native) {
     return module_path_lower.ends_with("d3d12.dll") ||
         module_path_lower.ends_with("d3d12core.dll") ||
         module_path_lower.ends_with("dxgi.dll") ||
+        module_path_lower.ends_with("renderdoc.dll") ||
         module_path_lower.ends_with("d3d12sdklayers.dll");
 }
 
@@ -1930,7 +3914,19 @@ FFakeStereoRenderingHook::FFakeStereoRenderingHook() {
 }
 
 void FFakeStereoRenderingHook::on_frame() {
+    // Engine tick hook is always installed — plugins (including dumper-mode
+    // clients) need on_pre_engine_tick callbacks to submit game-thread work.
     attempt_hook_game_engine_tick();
+
+    // Render-pipeline hooks are the crash vector on some UE4.26.x forks
+    // (RoboQuest, Stellar Blade). Dumper mode skips them entirely so
+    // reflection-only plugins can run without triggering the
+    // FViewport::GetRenderTargetTexture PointerHook that tears down the
+    // render thread. See DumperMode.hpp.
+    if (uevr::is_dumper_mode()) {
+        return;
+    }
+
     attempt_hook_slate_thread();
     attempt_hook_fsceneview_constructor();
 
@@ -2281,7 +4277,11 @@ void* FFakeStereoRenderingHook::engine_tick_hook(sdk::UGameEngine* engine, float
         return result;
     }
 
-    hook->attempt_hooking();
+    // Dumper mode: skip render-pipeline hooks (see DumperMode.hpp). Engine
+    // tick dispatch below still runs, so plugins receive on_pre_engine_tick.
+    if (!uevr::is_dumper_mode()) {
+        hook->attempt_hooking();
+    }
 
     // Best place to run game thread jobs.
     GameThreadWorker::get().execute();
@@ -2291,9 +4291,15 @@ void* FFakeStereoRenderingHook::engine_tick_hook(sdk::UGameEngine* engine, float
         hook->m_ignore_next_engine_tick = false;
         return nullptr;
     }
-    
-    g_framework->enable_engine_thread();
-    g_framework->run_imgui_frame(false);
+
+    // Dumper mode: skip the imgui-frame + engine-thread-enable logic. ImGui
+    // needs a D3D device + swapchain that we never installed, and
+    // enable_engine_thread is a VR-only optimization. The mod fan-out below
+    // still runs, so plugins still get on_pre_engine_tick callbacks.
+    if (!uevr::is_dumper_mode()) {
+        g_framework->enable_engine_thread();
+        g_framework->run_imgui_frame(false);
+    }
 
     delta += hook->m_ignored_engine_delta;
     hook->m_ignored_engine_delta = 0.0f;
@@ -2765,6 +4771,4128 @@ void FFakeStereoRenderingHook::attempt_hook_fsceneview_constructor() {
     SPDLOG_INFO("Hooked FSceneView::FSceneView constructor!");
 }
 
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_compute_volumetric_fog() {
+    if (m_attempted_hook_subnautica2_compute_volumetric_fog) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_compute_volumetric_fog = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    if (subnautica2_disable_volumetric_fog_view_loop_fix() &&
+        !subnautica2_enable_volumetric_fog_state_copy() &&
+        !subnautica2_enable_fog_rect_widen() &&
+        !subnautica2_enable_fog_view1_matrix_swap()) {
+        SPDLOG_WARN("[Subnautica2][VolumetricFog] Hook disabled (view-loop-fix=disabled AND state-copy=disabled AND rect-widen=disabled AND matrix-swap=disabled)");
+        return;
+    }
+    if (subnautica2_enable_volumetric_fog_state_copy()) {
+        SPDLOG_WARN("[Subnautica2][VolumetricFog] State-copy mode enabled (post-compute view0->view1 state copy)");
+    }
+    if (subnautica2_enable_fog_rect_widen()) {
+        SPDLOG_WARN("[Subnautica2][VolumetricFog] Rect-widen mode enabled (FIX-V3: widen view 0 rect to full SBS X range)");
+    }
+    if (subnautica2_enable_fog_view1_matrix_swap()) {
+        SPDLOG_WARN(
+            "[Subnautica2][VolumetricFog] View1 matrix-swap mode enabled (copy view 0 matrices to view 1 at offset 0x{:x} size {} bytes for fog compute, then restore)",
+            subnautica2_fog_view1_matrix_swap_offset(),
+            subnautica2_fog_view1_matrix_swap_size());
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_COMPUTE_VOLUMETRIC_FOG_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][VolumetricFog] Cannot hook ComputeVolumetricFog; bad target {:x}", target);
+        return;
+    }
+
+    constexpr uint8_t expected_prologue[] = {
+        0x40, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x57,
+        0x48, 0x8D, 0xAC, 0x24, 0xA8, 0xF3, 0xFF, 0xFF,
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][VolumetricFog] ComputeVolumetricFog prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    m_subnautica2_compute_volumetric_fog_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_compute_volumetric_fog_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_compute_volumetric_fog_hook) {
+        SPDLOG_WARN("[Subnautica2][VolumetricFog] Failed to create ComputeVolumetricFog hook at {:x}", target);
+        return;
+    }
+
+    if (auto enable_result = m_subnautica2_compute_volumetric_fog_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][VolumetricFog] Failed to enable ComputeVolumetricFog hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+
+    if (subnautica2_enable_volumetric_fog_view_index_force()) {
+        const auto view_index_store = exe_base + SUBNAUTICA2_COMPUTE_VOLUMETRIC_FOG_VIEW_INDEX_STORE_RVA;
+        constexpr uint8_t expected_view_index_store[] = {
+            0x44, 0x89, 0x65, 0xE4, // mov [rbp-1Ch], r12d
+        };
+
+        if (!is_executable_process_range(view_index_store, sizeof(expected_view_index_store)) ||
+            std::memcmp((void*)view_index_store, expected_view_index_store, sizeof(expected_view_index_store)) != 0)
+        {
+            SPDLOG_WARN(
+                "[Subnautica2][VolumetricFog] ViewIndex store mismatch at {:x}; falling back to shifted single-view second fog build",
+                view_index_store);
+        } else {
+            auto view_index_hook = safetyhook::create_mid(
+                (void*)view_index_store,
+                &FFakeStereoRenderingHook::subnautica2_compute_volumetric_fog_force_view_index_hook);
+
+            if (view_index_hook) {
+                m_subnautica2_compute_volumetric_fog_view_index_hook = std::move(view_index_hook);
+                SPDLOG_WARN(
+                    "[Subnautica2][VolumetricFog] Hooked ComputeVolumetricFog ViewIndex store at {:x}; second fog build will run as ViewIndex=1",
+                    view_index_store);
+            } else {
+                SPDLOG_WARN(
+                    "[Subnautica2][VolumetricFog] Failed to hook ViewIndex store at {:x}; falling back to shifted single-view second fog build",
+                    view_index_store);
+            }
+        }
+    } else {
+        SPDLOG_WARN(
+            "[Subnautica2][VolumetricFog] ViewIndex force is disabled; using shifted single-view second fog build only. Set UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_VIEW_INDEX_FORCE=1 to test the experimental mid-hook.");
+    }
+
+    SPDLOG_WARN("[Subnautica2][VolumetricFog] Hooked ComputeVolumetricFog at {:x}; right eye will get a second fog build", target);
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_init_volumetric_render_target() {
+    if (m_attempted_hook_subnautica2_init_volumetric_render_target) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_init_volumetric_render_target = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_INIT_VOLUMETRIC_RENDER_TARGET_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][VRTInit] Cannot hook InitVolumetricRenderTargetForViews; bad target {:x}", target);
+        return;
+    }
+
+    constexpr uint8_t expected_prologue[] = {
+        0x40, 0x55,                   // push rbp
+        0x41, 0x56,                   // push r14
+        0x48, 0x8D, 0xAC, 0x24, 0x08, 0xCF, 0xFF, 0xFF, // lea rbp, [rsp-30F8h]
+        0xB8, 0xF8, 0x31, 0x00, 0x00, // mov eax, 31F8h
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][VRTInit] InitVolumetricRenderTargetForViews prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    m_subnautica2_init_volumetric_render_target_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_init_volumetric_render_target_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_init_volumetric_render_target_hook) {
+        SPDLOG_WARN("[Subnautica2][VRTInit] Failed to create InitVolumetricRenderTargetForViews hook at {:x}", target);
+        return;
+    }
+
+    if (auto enable_result = m_subnautica2_init_volumetric_render_target_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][VRTInit] Failed to enable InitVolumetricRenderTargetForViews hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+
+    SPDLOG_WARN("[Subnautica2][VRTInit] Hooked InitVolumetricRenderTargetForViews at {:x}; logging per-eye cloud VRT state before/after init", target);
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_reconstruct_volumetric_render_target() {
+    if (m_attempted_hook_subnautica2_reconstruct_volumetric_render_target) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_reconstruct_volumetric_render_target = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_RECONSTRUCT_VOLUMETRIC_RENDER_TARGET_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][VRTReconstruct] Cannot hook ReconstructVolumetricRenderTarget; bad target {:x}", target);
+        return;
+    }
+
+    constexpr uint8_t expected_prologue[] = {
+        0x4C, 0x8B, 0xDC,             // mov r11, rsp
+        0x55,                         // push rbp
+        0x57,                         // push rdi
+        0x41, 0x56,                   // push r14
+        0x41, 0x57,                   // push r15
+        0x49, 0x8D, 0xAB, 0xC8, 0xFE, 0xFF, 0xFF, // lea rbp, [r11-138h]
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][VRTReconstruct] ReconstructVolumetricRenderTarget prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    m_subnautica2_reconstruct_volumetric_render_target_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_reconstruct_volumetric_render_target_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_reconstruct_volumetric_render_target_hook) {
+        SPDLOG_WARN("[Subnautica2][VRTReconstruct] Failed to create ReconstructVolumetricRenderTarget hook at {:x}", target);
+        return;
+    }
+
+    if (auto enable_result = m_subnautica2_reconstruct_volumetric_render_target_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][VRTReconstruct] Failed to enable ReconstructVolumetricRenderTarget hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+
+    SPDLOG_WARN("[Subnautica2][VRTReconstruct] Hooked ReconstructVolumetricRenderTarget at {:x}; logging per-eye cloud VRT state before/after reconstruct", target);
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_compose_volumetric_render_target() {
+    if (m_attempted_hook_subnautica2_compose_volumetric_render_target) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_compose_volumetric_render_target = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_COMPOSE_VOLUMETRIC_OVER_SCENE_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][ComposeVolumetric] Cannot hook ComposeVolumetricRenderTargetOverScene; bad target {:x}", target);
+        return;
+    }
+
+    constexpr uint8_t expected_prologue[] = {
+        0x4C, 0x8B, 0xDC,             // mov r11, rsp
+        0x55,                         // push rbp
+        0x57,                         // push rdi
+        0x41, 0x54,                   // push r12
+        0x41, 0x56,                   // push r14
+        0x49, 0x8D, 0xAB, 0x78, 0xFE, 0xFF, 0xFF, // lea rbp, [r11-188h]
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][ComposeVolumetric] ComposeVolumetricRenderTargetOverScene prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    m_subnautica2_compose_volumetric_render_target_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_compose_volumetric_render_target_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_compose_volumetric_render_target_hook) {
+        SPDLOG_WARN("[Subnautica2][ComposeVolumetric] Failed to create ComposeVolumetricRenderTargetOverScene hook at {:x}", target);
+        return;
+    }
+
+    if (auto enable_result = m_subnautica2_compose_volumetric_render_target_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][ComposeVolumetric] Failed to enable ComposeVolumetricRenderTargetOverScene hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+
+    SPDLOG_WARN("[Subnautica2][ComposeVolumetric] Hooked ComposeVolumetricRenderTargetOverScene at {:x}; logging per-eye volumetric/cloud/water state", target);
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_basepass_pso_select() {
+    if (m_attempted_hook_subnautica2_basepass_pso_select) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_basepass_pso_select = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    // Default DISABLED: the MidHook fires ~96 times in 17ms on entering the
+    // main menu and was correlated with downstream instability. The data it
+    // already produced (every call goes through case-0 / a3=0, never the
+    // other 6 cases) is sufficient to know the case branch isn't where the
+    // per-view divergence lives. Set UEVR_SUBNAUTICA2_ENABLE_BASEPASS_PSO_HOOK=1
+    // to re-enable for further diagnostics.
+    {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_ENABLE_BASEPASS_PSO_HOOK", value, (DWORD)std::size(value));
+        const bool enabled = len > 0 && len < std::size(value) &&
+            value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+        if (!enabled) {
+            SPDLOG_INFO("[Subnautica2][BasePassPSO] Hook skipped (set UEVR_SUBNAUTICA2_ENABLE_BASEPASS_PSO_HOOK=1 to enable)");
+            return;
+        }
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_BASEPASS_PSO_SELECT_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][BasePassPSO] Cannot hook sub_142631130; bad target {:x}", target);
+        return;
+    }
+
+    constexpr uint8_t expected_prologue[] = {
+        0x48, 0x83, 0xEC, 0x58,             // sub rsp, 58h
+        0x45, 0x8B, 0xD1,                   // mov r10d, r9d
+        0x41, 0x83, 0xF8, 0x06,             // cmp r8d, 6
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][BasePassPSO] sub_142631130 prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    // MidHook at function entry. We patch IN PLACE before the original
+    // executes, so the original's stack args remain undisturbed. The callback
+    // can read/modify r8d (the 7-way switch input) via the Context and the
+    // original function continues normally.
+    auto hook_result = safetyhook::create_mid(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_basepass_pso_select_hook);
+
+    if (!hook_result) {
+        SPDLOG_WARN("[Subnautica2][BasePassPSO] Failed to create sub_142631130 mid hook at {:x}", target);
+        return;
+    }
+
+    m_subnautica2_basepass_pso_select_hook = std::move(hook_result);
+
+    SPDLOG_WARN("[Subnautica2][BasePassPSO] Hooked sub_142631130 at {:x}; logging permutation key per call and forcing via env var UEVR_SUBNAUTICA2_BASEPASS_PSO_FORCE_A3 (0..6) if set", target);
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_basepass_mp_ctor() {
+    if (m_attempted_hook_subnautica2_basepass_mp_ctor) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_basepass_mp_ctor = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+    if (subnautica2_diag_clean_mode()) {
+        SPDLOG_INFO("[Subnautica2][DiagClean] Skipping BasePassMPCtor hook");
+        return;
+    }
+
+    // Default DISABLED. The InlineHook with 9 forwarded args appears to
+    // hang the game (MetaXR preview goes black, no frames submitted). The
+    // calling-convention/arg-forwarding for the 9-arg signature needs more
+    // investigation. Set UEVR_SUBNAUTICA2_ENABLE_BASEPASS_MP_CTOR_FIX=1 to
+    // re-enable for diagnostics. The fix theory is sound: force secondary
+    // view's FBasePassMeshProcessor+0x8C cull threshold to match primary's
+    // so both views select the same shader-type-getter -> same shader.
+    {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_ENABLE_BASEPASS_MP_CTOR_FIX", value, (DWORD)std::size(value));
+        const bool enabled = len > 0 && len < std::size(value) &&
+            value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+        if (!enabled) {
+            SPDLOG_INFO("[Subnautica2][BasePassMPCtor] Hook skipped (set UEVR_SUBNAUTICA2_ENABLE_BASEPASS_MP_CTOR_FIX=1 to enable)");
+            return;
+        }
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_BASEPASS_MP_CTOR_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][BasePassMPCtor] Cannot hook sub_14263A3A0; bad target {:x}", target);
+        return;
+    }
+
+    constexpr uint8_t expected_prologue[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08,       // mov [rsp+arg_0], rbx
+        0x48, 0x89, 0x6C, 0x24, 0x10,       // mov [rsp+arg_8], rbp
+        0x48, 0x89, 0x74, 0x24, 0x18,       // mov [rsp+arg_10], rsi
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][BasePassMPCtor] sub_14263A3A0 prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    m_subnautica2_basepass_mp_ctor_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_basepass_mp_ctor_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_basepass_mp_ctor_hook) {
+        SPDLOG_WARN("[Subnautica2][BasePassMPCtor] Failed to create sub_14263A3A0 hook at {:x}", target);
+        return;
+    }
+
+    if (auto enable_result = m_subnautica2_basepass_mp_ctor_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][BasePassMPCtor] Failed to enable sub_14263A3A0 hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+
+    SPDLOG_WARN("[Subnautica2][BasePassMPCtor] Hooked FBasePassMeshProcessor ctor at {:x}; forcing per-view cull threshold (+0x8C) to match primary view's value so both eyes select the same shader", target);
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_basepass_cull_threshold() {
+    if (m_attempted_hook_subnautica2_basepass_cull_threshold) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_basepass_cull_threshold = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+    if (subnautica2_diag_clean_mode()) {
+        SPDLOG_INFO("[Subnautica2][DiagClean] Skipping BasePassR12bPatch");
+        return;
+    }
+
+    // Default DISABLED to isolate crash diagnostics. Enable with
+    // UEVR_SUBNAUTICA2_ENABLE_BASEPASS_R12B_PATCH=1.
+    {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_ENABLE_BASEPASS_R12B_PATCH", value, (DWORD)std::size(value));
+        const bool enabled = len > 0 && len < std::size(value) &&
+            value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+        if (!enabled) {
+            SPDLOG_INFO("[Subnautica2][BasePassR12bPatch] Patch skipped (set UEVR_SUBNAUTICA2_ENABLE_BASEPASS_R12B_PATCH=1 to enable)");
+            return;
+        }
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    constexpr uintptr_t SETNBE_R12B_RVA = 0x268719B;
+    const auto target = exe_base + SETNBE_R12B_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x10)) {
+        SPDLOG_WARN("[Subnautica2][BasePassR12bPatch] Cannot patch 0x{:x}; bad target", target);
+        return;
+    }
+
+    // Expected: `setnbe r12b` = REX.B(0x41) + 0F 97 C4
+    constexpr uint8_t expected_bytes[] = {0x41, 0x0F, 0x97, 0xC4};
+    if (std::memcmp((void*)target, expected_bytes, sizeof(expected_bytes)) != 0) {
+        const auto* p = (const uint8_t*)target;
+        SPDLOG_WARN("[Subnautica2][BasePassR12bPatch] Byte mismatch at {:x}; got {:02x} {:02x} {:02x} {:02x}, expected 41 0F 97 C4. Skipping patch for this build.",
+            target, p[0], p[1], p[2], p[3]);
+        return;
+    }
+
+    // Patch: `mov r12b, 1; nop` = REX.B(0x41) + B4 01 + NOP(90)
+    constexpr uint8_t patch_bytes[] = {0x41, 0xB4, 0x01, 0x90};
+
+    DWORD old_protect = 0;
+    if (!VirtualProtect((void*)target, sizeof(patch_bytes), PAGE_EXECUTE_READWRITE, &old_protect)) {
+        SPDLOG_WARN("[Subnautica2][BasePassR12bPatch] VirtualProtect failed at {:x}: err {}", target, GetLastError());
+        return;
+    }
+
+    std::memcpy((void*)target, patch_bytes, sizeof(patch_bytes));
+    FlushInstructionCache(GetCurrentProcess(), (void*)target, sizeof(patch_bytes));
+
+    DWORD restore_protect = 0;
+    VirtualProtect((void*)target, sizeof(patch_bytes), old_protect, &restore_protect);
+
+    SPDLOG_WARN("[Subnautica2][BasePassR12bPatch] Patched setnbe r12b -> mov r12b,1;nop at {:x}. r12b is now always 1; both stereo views will select the same BasePass shader-type variant -> symmetric fog rendering.", target);
+}
+
+// ============================================================================
+// Patch E: jz->jmp branch force at sub_142631130 case-0 PS-selector sites.
+//
+// Discovery (parallel investigation): case 0 of sub_142631130 selects between
+//   sub_14265A370 (TBasePassPSFNoLightMapPolicy, 64-bit RT, 11 textures)
+//     -- matches LEFT eye PS 27914 with visible fog
+//   sub_14265BEC0 (F128BitRTBasePassPS, 128-bit RT, 17 textures + Texture3D5)
+//     -- matches RIGHT eye PS 27923 with missing fog (HDR RT not populated per-view)
+//   sub_14265A110 (Lumen/HQ variant)
+//
+// The selection is via two `jz` branches at 0x142631EC8 and 0x142631ED8.
+// Forcing both jz->jmp routes ALL case-0 invocations to sub_14265A370 so
+// both eyes use the LEFT eye's working shader. Symmetric fog rendering.
+//
+// Patch is a 4-byte total static byte rewrite (2 bytes at each site),
+// gated by env var UEVR_SUBNAUTICA2_ENABLE_BASEPASS_PS_FORCE_NOLM=1.
+// ============================================================================
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_basepass_ps_force_nolm() {
+    if (m_attempted_hook_subnautica2_basepass_ps_force_nolm) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_basepass_ps_force_nolm = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+    if (subnautica2_diag_clean_mode()) {
+        SPDLOG_INFO("[Subnautica2][DiagClean] Skipping BasePassPSForceNoLM patch");
+        return;
+    }
+
+    // Default DISABLED; enable with UEVR_SUBNAUTICA2_ENABLE_BASEPASS_PS_FORCE_NOLM=1.
+    {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_ENABLE_BASEPASS_PS_FORCE_NOLM", value, (DWORD)std::size(value));
+        const bool enabled = len > 0 && len < std::size(value) &&
+            value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+        if (!enabled) {
+            SPDLOG_INFO("[Subnautica2][BasePassPSForceNoLM] Patch skipped (set UEVR_SUBNAUTICA2_ENABLE_BASEPASS_PS_FORCE_NOLM=1 to enable)");
+            return;
+        }
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    if (exe_base == 0) {
+        SPDLOG_WARN("[Subnautica2][BasePassPSForceNoLM] exe_base is null; skipping");
+        return;
+    }
+
+    struct PatchSite {
+        uintptr_t rva;
+        uint8_t original[2];
+        uint8_t patched[2];
+        const char* label;
+    };
+
+    constexpr PatchSite patches[] = {
+        { 0x2631EC8, {0x74, 0x07}, {0xEB, 0x07}, "force-sil-zero-branch" },
+        { 0x2631ED8, {0x74, 0x07}, {0xEB, 0x07}, "force-no-skylight-branch" },
+    };
+
+    for (const auto& p : patches) {
+        const auto target = exe_base + p.rva;
+
+        if (!is_executable_process_range(target, sizeof(p.original))) {
+            SPDLOG_WARN("[Subnautica2][BasePassPSForceNoLM] {} target {:x} not executable; skipping", p.label, target);
+            continue;
+        }
+
+        if (std::memcmp((void*)target, p.original, sizeof(p.original)) != 0) {
+            const auto* observed = (const uint8_t*)target;
+            SPDLOG_WARN(
+                "[Subnautica2][BasePassPSForceNoLM] {} byte mismatch at {:x}; got {:02x} {:02x}, expected {:02x} {:02x}. Skipping for this build.",
+                p.label, target, observed[0], observed[1], p.original[0], p.original[1]);
+            continue;
+        }
+
+        DWORD old_protect = 0;
+        if (!VirtualProtect((void*)target, sizeof(p.patched), PAGE_EXECUTE_READWRITE, &old_protect)) {
+            SPDLOG_WARN("[Subnautica2][BasePassPSForceNoLM] {} VirtualProtect failed at {:x}: err {}", p.label, target, GetLastError());
+            continue;
+        }
+
+        std::memcpy((void*)target, p.patched, sizeof(p.patched));
+        FlushInstructionCache(GetCurrentProcess(), (void*)target, sizeof(p.patched));
+
+        DWORD restore_protect = 0;
+        VirtualProtect((void*)target, sizeof(p.patched), old_protect, &restore_protect);
+
+        SPDLOG_WARN("[Subnautica2][BasePassPSForceNoLM] {} applied at {:x} (jz -> jmp, force branch taken)", p.label, target);
+    }
+
+    SPDLOG_WARN("[Subnautica2][BasePassPSForceNoLM] Patch E complete. Case-0 PS selector routes both eyes to TBasePassPSFNoLightMapPolicy (sub_14265A370).");
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_render_fog_wrapper() {
+    if (m_attempted_hook_subnautica2_render_fog_wrapper) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_render_fog_wrapper = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_RENDER_FOG_WRAPPER_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][RenderFog] Cannot hook RenderFog wrapper; bad target {:x}", target);
+        return;
+    }
+
+    constexpr uint8_t expected_prologue[] = {
+        0x4C, 0x89, 0x4C, 0x24, 0x20, // mov [rsp+20h], r9
+        0x4C, 0x89, 0x44, 0x24, 0x18, // mov [rsp+18h], r8
+        0x53,                         // push rbx
+        0x56,                         // push rsi
+        0x41, 0x55,                   // push r13
+        0x41, 0x56,                   // push r14
+        0x48, 0x83, 0xEC, 0x58,       // sub rsp, 58h
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][RenderFog] RenderFog wrapper prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    m_subnautica2_render_fog_wrapper_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_render_fog_wrapper_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_render_fog_wrapper_hook) {
+        SPDLOG_WARN("[Subnautica2][RenderFog] Failed to create RenderFog wrapper hook at {:x}", target);
+        return;
+    }
+
+    if (auto enable_result = m_subnautica2_render_fog_wrapper_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][RenderFog] Failed to enable RenderFog wrapper hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+
+    SPDLOG_WARN(
+        "[Subnautica2][RenderFog] Hooked RenderFog wrapper at {:x}; fog ViewRect patch {}",
+        target,
+        subnautica2_disable_render_fog_view_rect_fix() ? "disabled" : "enabled");
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_render_fog_pass() {
+    if (m_attempted_hook_subnautica2_render_fog_pass) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_render_fog_pass = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_RENDER_FOG_PASS_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][HeightFogPass] Cannot hook height fog pass; bad target {:x}", target);
+        return;
+    }
+
+    constexpr uint8_t expected_prologue[] = {
+        0x4C, 0x89, 0x4C, 0x24, 0x20, // mov [rsp+20h], r9
+        0x4C, 0x89, 0x44, 0x24, 0x18, // mov [rsp+18h], r8
+        0x48, 0x89, 0x4C, 0x24, 0x08, // mov [rsp+8h], rcx
+        0x55,                         // push rbp
+        0x53,                         // push rbx
+        0x56,                         // push rsi
+        0x41, 0x54,                   // push r12
+        0x41, 0x57,                   // push r15
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][HeightFogPass] Height fog pass prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    m_subnautica2_render_fog_pass_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_render_fog_pass_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_render_fog_pass_hook) {
+        SPDLOG_WARN("[Subnautica2][HeightFogPass] Failed to create height fog pass hook at {:x}", target);
+        return;
+    }
+
+    if (auto enable_result = m_subnautica2_render_fog_pass_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][HeightFogPass] Failed to enable height fog pass hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+
+    SPDLOG_WARN(
+        "[Subnautica2][HeightFogPass] Hooked height fog pass at {:x}; fog ViewRect patch {}",
+        target,
+        subnautica2_disable_render_fog_view_rect_fix() ? "disabled" : "enabled");
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_render_underwater_fog() {
+    if (m_attempted_hook_subnautica2_render_underwater_fog) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_render_underwater_fog = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_RENDER_UNDERWATER_FOG_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][UnderwaterFog] Cannot hook RenderUnderWaterFog; bad target {:x}", target);
+        return;
+    }
+
+    constexpr uint8_t expected_prologue[] = {
+        0x4C, 0x89, 0x4C, 0x24, 0x20, // mov [rsp+20h], r9
+        0x4C, 0x89, 0x44, 0x24, 0x18, // mov [rsp+18h], r8
+        0x48, 0x89, 0x54, 0x24, 0x10, // mov [rsp+10h], rdx
+        0x55,                         // push rbp
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][UnderwaterFog] RenderUnderWaterFog prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    m_subnautica2_render_underwater_fog_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_render_underwater_fog_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_render_underwater_fog_hook) {
+        SPDLOG_WARN("[Subnautica2][UnderwaterFog] Failed to create RenderUnderWaterFog hook at {:x}", target);
+        return;
+    }
+
+    if (auto enable_result = m_subnautica2_render_underwater_fog_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][UnderwaterFog] Failed to enable RenderUnderWaterFog hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+
+    SPDLOG_WARN(
+        "[Subnautica2][UnderwaterFog] Hooked RenderUnderWaterFog at {:x}; scene-without-water per-eye rect/UV fix {}",
+        target,
+        subnautica2_disable_underwater_fog_view_data_fix() ? "disabled" : "enabled");
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_try_add_mesh_batch_probe() {
+    if (m_attempted_hook_subnautica2_try_add_mesh_batch_probe) return;
+    m_attempted_hook_subnautica2_try_add_mesh_batch_probe = true;
+    if (!subnautica2_is_current_game()) return;
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_TRY_ADD_MESH_BATCH_PROBE_RVA;
+    if (exe_base == 0 || !is_executable_process_range(target, 0x10)) return;
+
+    // Verify the prologue: test r15, r15 = 4D 85 FF
+    constexpr uint8_t expected[] = { 0x4D, 0x85, 0xFF };
+    if (std::memcmp((void*)target, expected, sizeof(expected)) != 0) {
+        SPDLOG_WARN("[Subnautica2][TryAddMeshBatchProbe] Bytes mismatch at {:x}; skipping", target);
+        return;
+    }
+
+    m_subnautica2_try_add_mesh_batch_probe = safetyhook::create_mid(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_try_add_mesh_batch_probe_midhook);
+
+    if (!m_subnautica2_try_add_mesh_batch_probe) {
+        SPDLOG_WARN("[Subnautica2][TryAddMeshBatchProbe] Failed to create mid-hook at {:x}", target);
+        return;
+    }
+    SPDLOG_WARN("[Subnautica2][TryAddMeshBatchProbe] Probe installed at {:x}", target);
+}
+
+// MidHook fires AT `test r15, r15` in TryAddMeshBatch. Probe r15 and r14
+// values for the first N calls to determine which condition causes bl=0 for
+// view 1 (the per-view fog-skip divergence).
+void FFakeStereoRenderingHook::subnautica2_try_add_mesh_batch_probe_midhook(safetyhook::Context& ctx) {
+    static std::atomic<uint64_t> n_total{0};
+    static std::atomic<uint64_t> n_r15_null{0};
+    static std::atomic<uint64_t> n_r14b_zero{0};
+
+    const uint64_t total = n_total.fetch_add(1, std::memory_order_relaxed);
+    if (ctx.r15 == 0) {
+        n_r15_null.fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((ctx.r14 & 0xFF) == 0) {
+        n_r14b_zero.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Log first N for sampling, then a summary every 6000 calls.
+    if (total < 16) {
+        SPDLOG_WARN(
+            "[Subnautica2][TryAddMeshBatchProbe] N={} r15=0x{:x} r14b=0x{:02x} (r15_null_total={} r14b_zero_total={})",
+            total + 1, ctx.r15, ctx.r14 & 0xFF,
+            n_r15_null.load(), n_r14b_zero.load());
+    } else if ((total % 6000) == 0) {
+        SPDLOG_WARN(
+            "[Subnautica2][TryAddMeshBatchProbe] SUMMARY total={} r15_null={} r14b_zero={}",
+            total, n_r15_null.load(), n_r14b_zero.load());
+    }
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_setup_fog_uniform_params() {
+    if (m_attempted_hook_subnautica2_setup_fog_uniform_params) return;
+    m_attempted_hook_subnautica2_setup_fog_uniform_params = true;
+    if (!subnautica2_is_current_game()) return;
+    if (subnautica2_diag_clean_mode()) {
+        SPDLOG_INFO("[Subnautica2][DiagClean] Skipping SetupFogUniformParameters hook");
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_SETUP_FOG_UNIFORM_PARAMS_RVA;
+    if (exe_base == 0 || !is_executable_process_range(target, 0x10)) {
+        SPDLOG_WARN("[Subnautica2][SetupFogUniformParams] Bad target {:x}", target);
+        return;
+    }
+
+    m_subnautica2_setup_fog_uniform_params_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_setup_fog_uniform_params_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_setup_fog_uniform_params_hook) {
+        SPDLOG_WARN("[Subnautica2][SetupFogUniformParams] Failed to create hook at {:x}", target);
+        return;
+    }
+    if (auto enable_result = m_subnautica2_setup_fog_uniform_params_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][SetupFogUniformParams] Failed to enable hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+    SPDLOG_WARN("[Subnautica2][SetupFogUniformParams] Hooked SetupFogUniformParameters at {:x}", target);
+}
+
+// 2026-05-16 FIX-V4 REWRITE: Diagnose + fix the per-view FFogUniformParameters.
+// This is the function that fills cbuffer3 (FFogUniformParameters, ~108 bytes)
+// with the IntegratedLightScattering bindless index. The basepass material's
+// PS reads cbuffer3 at this slot to bind the fog 3D texture.
+// Per UE5 source FogRendering.cpp line 100:
+//   OutParameters.IntegratedLightScattering = View.VolumetricFogResources.IntegratedLightScatteringTexture;
+// In SN2: View+0x2658 = VolumetricFogResources.IntegratedLightScatteringTexture
+//         fog_uniform_params (a3) = OutParameters
+// If view 1 reads its OWN +0x2658, the bindless index in cbuffer3 should
+// differ between view 0 and view 1 (pointing to per-eye textures). If both
+// cbuffer3 end up with the same bytes → SN2 has a bug here.
+void FFakeStereoRenderingHook::subnautica2_setup_fog_uniform_params_hook(
+    void* graph_builder, void* view_info, void* fog_uniform_params, bool a4)
+{
+    auto* hook = g_hook;
+    if (hook == nullptr || !hook->m_subnautica2_setup_fog_uniform_params_hook) {
+        return;
+    }
+
+    // FIX-V4: pair detection state for cbuffer3 dump comparison.
+    static thread_local uintptr_t fix_v4_prev_view = 0;
+    static thread_local uint8_t fix_v4_view0_cbuf[0x200]{};
+    static thread_local bool fix_v4_has_view0 = false;
+    constexpr size_t FOG_PARAMS_SIZE = 0x180;  // covers FFogUniformParameters incl. tex@0x120
+    // IDA decode of sub_1426FD010 at 0x1426fd286:
+    //   mov [rbx+0x120], rax   ; IntegratedLightScattering handle (8 bytes)
+    //   mov [rbx+0x130], rax   ; paired RDG resource (8 bytes)
+    //   movss [rbx+0x90], xmm6 ; ApplyVolumetricFog (4 bytes, 0.0 in fallback)
+    constexpr size_t FOG_TEX_OFFSET   = 0x120;
+    constexpr size_t FOG_PAIRED_OFFSET = 0x130;
+    constexpr size_t FOG_APPLY_OFFSET  = 0x90;
+
+    // Pre-call diagnostic + fix: if this view's +0x2658 is null but a sibling
+    // view (view-stride away) has a valid value, copy it in BEFORE the function
+    // reads.
+    auto& vr = VR::get();
+    const bool stereo_active = vr != nullptr && vr->is_hmd_active() &&
+                                vr->is_native_stereo_fix_enabled() &&
+                                !vr->is_native_stereo_fix_same_pass_enabled() &&
+                                !vr->is_using_afr();
+
+    static thread_local uintptr_t cached_view0_2658 = 0;
+    static thread_local uintptr_t cached_view0_2660 = 0;
+    static std::atomic<uint64_t> fire_count{0};
+
+    // PAIR-DETECT: only inject when current view is exactly view0+stride.
+    // Random non-stereo views (reflections, shadow captures) should NOT get
+    // their +0x2658 overwritten — that crashed SN2 last attempt.
+    static thread_local uintptr_t pair_view0_ptr = 0;
+
+    if (view_info != nullptr && stereo_active) {
+        const uintptr_t view = (uintptr_t)view_info;
+        if (is_readable_process_range(view + 0x2658, 16) && is_writable_process_range(view + 0x2658, 16)) {
+            const uintptr_t v_2658 = *(uintptr_t*)(view + 0x2658);
+            const uintptr_t v_2660 = *(uintptr_t*)(view + 0x2660);
+
+            static std::atomic<uint64_t> nonnull_count{0};
+            static std::atomic<uint64_t> inject_count{0};
+
+            // Did we just see a valid view 0 last call, and is this view 0+stride?
+            const bool is_view1_of_pair = (pair_view0_ptr != 0) &&
+                                          (view == pair_view0_ptr + SUBNAUTICA2_SCENEVIEW_STRIDE);
+
+            if (v_2658 != 0) {
+                // This view has valid LightScattering. Cache and treat as view 0
+                // candidate for the next call (if next call is +stride, that's view 1).
+                cached_view0_2658 = v_2658;
+                cached_view0_2660 = v_2660;
+                pair_view0_ptr = view;
+                const auto nn = nonnull_count.fetch_add(1, std::memory_order_relaxed);
+                if (nn < 8 || (nn % 600) == 0) {
+                    SPDLOG_WARN(
+                        "[Subnautica2][SetupFogUniformParams] NONNULL nn={} view=0x{:x} 2658=0x{:x} (potential view0)",
+                        nn + 1, view, v_2658);
+                }
+            } else if (is_view1_of_pair && cached_view0_2658 != 0) {
+                // This IS view 1 of the stereo pair AND its +0x2658 is null.
+                // Inject view 0's value so SetupFogUniformParameters reads non-null.
+                *(uintptr_t*)(view + 0x2658) = cached_view0_2658;
+                *(uintptr_t*)(view + 0x2660) = cached_view0_2660;
+                const auto ic = inject_count.fetch_add(1, std::memory_order_relaxed);
+                if (ic < 8 || (ic % 600) == 0) {
+                    SPDLOG_WARN(
+                        "[Subnautica2][SetupFogUniformParams] INJECTED ic={} view1=0x{:x} (view0=0x{:x}) 2658: 0x0 -> 0x{:x}",
+                        ic + 1, view, pair_view0_ptr, cached_view0_2658);
+                }
+                pair_view0_ptr = 0;  // Consume the pair marker
+            } else {
+                // Non-stereo view OR view 1 that already had valid data.
+                // Reset pair tracking — only consecutive view0→view1+stride counts.
+                pair_view0_ptr = 0;
+            }
+
+            const auto n = fire_count.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4) {
+                SPDLOG_WARN(
+                    "[Subnautica2][SetupFogUniformParams] FIRED n={} view=0x{:x} 2658_was=0x{:x} is_view1_pair={}",
+                    n + 1, view, v_2658, is_view1_of_pair);
+            }
+
+            // 2026-05-17 NEW (env-gated): for view 1, override +0x2658 with
+            // the per-view-distinct wrapper at +0x2650. Our POST hook showed
+            // +0x2650 differs per view (view 0 vs view 1 have different
+            // wrapper pointers there), so this gives SetupFog a per-view-
+            // specific FRDGTextureRef to write into cbuf+0x120. RDG will
+            // resolve it to a view-1-specific bindless slot index → view 1's
+            // basepass binds DIFFERENT content than view 0.
+            //
+            // The user is responsible for confirming visually whether this
+            // produces a different (hopefully correct teal) right-eye fog.
+            // Worst case: right eye shows DIFFERENT garbage (different wrong
+            // texture) which still confirms the binding mechanism works and
+            // narrows further investigation.
+            static const bool use_view1_2650 = []() {
+                char v[8]{};
+                const auto n = GetEnvironmentVariableA("UEVR_SUBNAUTICA2_FOG_USE_VIEW1_2650", v, sizeof(v));
+                return n != 0 && v[0] == '1';
+            }();
+            if (use_view1_2650 && is_view1_of_pair) {
+                if (is_readable_process_range(view + 0x2650, 8)) {
+                    const uintptr_t v_2650 = *(uintptr_t*)(view + 0x2650);
+                    if (v_2650 != 0 && is_writable_process_range(view + 0x2658, 16)) {
+                        const uintptr_t orig_2658 = *(uintptr_t*)(view + 0x2658);
+                        *(uintptr_t*)(view + 0x2658) = v_2650;
+                        static std::atomic<uint64_t> override_n{0};
+                        const auto on = override_n.fetch_add(1, std::memory_order_relaxed);
+                        if (on < 8 || (on % 600) == 0) {
+                            SPDLOG_WARN(
+                                "[Subnautica2][SetupFogUniformParams][View1-2650-Override] on={} view1=0x{:x} 2658 was=0x{:x} now=0x{:x} (from +0x2650)",
+                                on + 1, view, orig_2658, v_2650);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Call original.
+    hook->m_subnautica2_setup_fog_uniform_params_hook.unsafe_call<void>(
+        graph_builder, view_info, fog_uniform_params, a4);
+
+    // FIX-V4: post-call diagnostic — dump cbuffer3 bytes and pair-compare.
+    if (fog_uniform_params != nullptr && view_info != nullptr &&
+        is_readable_process_range((uintptr_t)fog_uniform_params, FOG_PARAMS_SIZE))
+    {
+        const uintptr_t this_view = (uintptr_t)view_info;
+        uint8_t* cbuf = (uint8_t*)fog_uniform_params;
+
+        const bool is_view1_pair = (fix_v4_prev_view != 0) &&
+                                   (this_view == fix_v4_prev_view + SUBNAUTICA2_SCENEVIEW_STRIDE) &&
+                                   fix_v4_has_view0;
+
+        if (is_view1_pair) {
+            // FIX-V5: view 1 of stereo pair. The IDA-decoded offsets for the
+            // fog texture binding in FFogUniformParameters are:
+            //   0x120 (8 bytes) = IntegratedLightScattering FRHITexture* (RDG ref)
+            //   0x130 (8 bytes) = paired (sampler or RDG resource state)
+            //   0x90  (4 bytes) = ApplyVolumetricFog (float 1.0 means enabled)
+            //
+            // SN2's native call read view1+0x2658 which was either null
+            // (fallback to BlackAlphaOne and ApplyVolumetricFog=0) OR pointed
+            // to view 1's own UNFILLED fog texture. Either way, view 1's
+            // basepass doesn't get visible teal.
+            //
+            // Fix: read VIEW 1's own +0x2658 (which loop_fix populated with
+            // view 1's filled texture pointer). If non-null, write it into
+            // view 1's cbuf at 0x120 and force ApplyVolumetricFog=1.0.
+            const uintptr_t v1_tex   = is_readable_process_range(this_view + 0x2658, 8)
+                                       ? *(uintptr_t*)(this_view + 0x2658) : 0;
+            const uintptr_t v1_pair  = is_readable_process_range(this_view + 0x2660, 8)
+                                       ? *(uintptr_t*)(this_view + 0x2660) : 0;
+            const uintptr_t v0_tex   = *(uintptr_t*)(fix_v4_view0_cbuf + FOG_TEX_OFFSET);
+            const uintptr_t v0_pair  = *(uintptr_t*)(fix_v4_view0_cbuf + FOG_PAIRED_OFFSET);
+
+            const uintptr_t cur_v1_tex  = *(uintptr_t*)(cbuf + FOG_TEX_OFFSET);
+            const uintptr_t cur_v1_pair = *(uintptr_t*)(cbuf + FOG_PAIRED_OFFSET);
+
+            int patched = 0;
+            // If view 1 has its own valid +0x2658 (loop_fix scenario), use it.
+            // Otherwise fall back to copying view 0's texture handle so
+            // view 1 at least gets fog visible (even if at wrong coords).
+            uintptr_t target_tex  = v1_tex  ? v1_tex  : v0_tex;
+            uintptr_t target_pair = v1_pair ? v1_pair : v0_pair;
+            if (target_tex != 0 && target_tex != cur_v1_tex) {
+                *(uintptr_t*)(cbuf + FOG_TEX_OFFSET) = target_tex;
+                patched++;
+            }
+            if (target_pair != 0 && target_pair != cur_v1_pair) {
+                *(uintptr_t*)(cbuf + FOG_PAIRED_OFFSET) = target_pair;
+                patched++;
+            }
+            // Force ApplyVolumetricFog = 1.0 if we have a valid texture.
+            if (target_tex != 0) {
+                float* apply = (float*)(cbuf + FOG_APPLY_OFFSET);
+                if (*apply < 0.5f) { *apply = 1.0f; patched++; }
+            }
+
+            static std::atomic<uint64_t> diag_count{0};
+            const auto dc = diag_count.fetch_add(1, std::memory_order_relaxed);
+            if (dc < 8 || (dc % 600) == 0) {
+                SPDLOG_WARN(
+                    "[Subnautica2][FixV5] call={} view0=0x{:x} view1=0x{:x} v1_2658=0x{:x} cur_v1_tex=0x{:x} v0_tex=0x{:x} target=0x{:x} patched={}",
+                    dc + 1, fix_v4_prev_view, this_view, v1_tex, cur_v1_tex, v0_tex, target_tex, patched);
+            }
+
+            // (FRDG-RHI tracker removed 2026-05-16: FRDGTexture wrappers are
+            // reallocated each frame by FRDGBuilder, so reading +0x10 at hook
+            // entry is always NULL. To inspect post-execute, would need to
+            // hook FRDGBuilder::Execute or FRDGTexture::SetRHI — out of scope
+            // for this session.)
+
+            // 2026-05-17 Path A (Step 2/3): mirror view 1's post-FixV5 cbuf
+            // bytes into UEVR's per-view-1 upload buffer. The basepass
+            // redirect (D3D12Hook::set_graphics_root_constant_buffer_view)
+            // makes view 1's PS read this buffer instead of SN2's shared
+            // FFogUniformParameters cbuffer, which otherwise gets overwritten
+            // when SN2 uploads view 0's content over it.
+            //
+            // What we write here = cbuf AFTER FixV5's patch =
+            //   - bytes 0x000..0x180: view 1's native SetupFogUniformParameters
+            //     output, except:
+            //     - +0x120: target_tex (v1_2658 if non-null, else v0_2658)
+            //     - +0x130: target_pair
+            //     - +0x90 : 1.0f (ApplyVolumetricFog) if target_tex != 0
+            //
+            // When v1_2658 IS valid (loop_fix scenario or future Step 3 fix),
+            // this gives view 1 its OWN per-view-correct fog volume pointer.
+            // When v1_2658 is null (current state), it falls back to v0_tex,
+            // matching the current bug behavior but via the redirect path —
+            // useful as a control to confirm the write/redirect plumbing.
+            if (sn2_fog_path_a::enabled_env()) {
+                if (sn2_fog_path_a::buffer_ready()) {
+                    sn2_fog_path_a::write_buffer(cbuf, FOG_PARAMS_SIZE);
+                }
+                // Arm the next 2 matching cbuffer bindings for redirect.
+                // Count=2 covers both opaque and translucent basepass binds
+                // of the same shared fog cbuffer within view 1's pass.
+                // Done EVERY view 1 setup call (not just when buffer_ready)
+                // so the arm fires even on the very first frame where the
+                // buffer might not yet exist (the redirect hook will lazily
+                // create the buffer on first armed binding).
+                sn2_fog_path_a::arm_redirect(2);
+                static std::atomic<uint64_t> wb_count{0};
+                const auto wc = wb_count.fetch_add(1, std::memory_order_relaxed);
+                if (wc < 4 || (wc % 600) == 0) {
+                    SPDLOG_WARN(
+                        "[Subnautica2][FixV5][PathA] wrote view1 cbuf + armed redirect call={} target_tex=0x{:x} apply={:.2f} buffer_ready={}",
+                        wc + 1, target_tex, *(float*)(cbuf + FOG_APPLY_OFFSET),
+                        sn2_fog_path_a::buffer_ready() ? 1 : 0);
+                }
+            }
+
+            fix_v4_prev_view = 0;
+            fix_v4_has_view0 = false;
+        } else {
+            // VIEW 0 (or non-stereo) — save cbuf for upcoming view 1 compare.
+            memcpy(fix_v4_view0_cbuf, cbuf, FOG_PARAMS_SIZE);
+            fix_v4_has_view0 = true;
+            fix_v4_prev_view = this_view;
+        }
+    }
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_lightscat_store_midhook() {
+    if (m_attempted_hook_subnautica2_lightscat_store_midhook) {
+        return;
+    }
+    m_attempted_hook_subnautica2_lightscat_store_midhook = true;
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+    if (subnautica2_diag_clean_mode()) {
+        SPDLOG_INFO("[Subnautica2][DiagClean] Skipping LightScatStore midhook");
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_LIGHTSCAT_STORE_RVA;
+    if (exe_base == 0 || !is_executable_process_range(target, 0x10)) {
+        SPDLOG_WARN("[Subnautica2][LightScatStore] Bad target {:x}", target);
+        return;
+    }
+
+    // Verify the bytes at the target site (0x142FC179D):
+    //   49 89 86 58 26 00 00  =  mov [r14+0x2658], rax (the REAL tex write)
+    // Midhook fires BEFORE this instruction so we can read or replace ctx.rax.
+    constexpr uint8_t expected_bytes[] = { 0x49, 0x89, 0x86, 0x58, 0x26, 0x00, 0x00 };
+    if (std::memcmp((void*)target, expected_bytes, sizeof(expected_bytes)) != 0) {
+        SPDLOG_WARN("[Subnautica2][LightScatStore] Byte mismatch at {:x}; skipping hook", target);
+        return;
+    }
+
+    m_subnautica2_lightscat_store_midhook = safetyhook::create_mid(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_lightscat_store_midhook);
+
+    if (!m_subnautica2_lightscat_store_midhook) {
+        SPDLOG_WARN("[Subnautica2][LightScatStore] Failed to create mid-hook at {:x}", target);
+        return;
+    }
+    SPDLOG_WARN("[Subnautica2][LightScatStore] MidHook installed at {:x} (writes view 1's +0x2658 too)", target);
+}
+
+// 2026-05-17 evening REVISION v2: midhook fires BEFORE the store at
+// 0x142FC179D ("mov [r14+0x2658], rax"). On view 0's call we SAVE the
+// register values; on view 1's call we REPLACE them with the saved view-0
+// values so the store writes view 0's good texture into view 1's slot.
+//
+// View identity detection (no per-view tag from the engine):
+//   - "view 0 call" = (memory at r14 + 0x29D0 looks like another FViewInfo,
+//     i.e. its vtable is non-null and readable). In stereo, view 0 is
+//     followed by view 1 in memory, so v1_vtable!=0 means r14 IS view 0.
+//   - "view 1 call" = (memory at r14 + 0x29D0 has null/unreadable vtable),
+//     because there's no view 2 after view 1 in a stereo pair.
+//   - Non-stereo (mono main-menu pass): same as view 1, treat as skip.
+//
+// Globals persist across the per-frame call pair. We use thread_local because
+// compute_volumetric_fog runs on the render thread; no cross-thread access.
+void FFakeStereoRenderingHook::subnautica2_lightscat_store_midhook(safetyhook::Context& ctx) {
+    thread_local uintptr_t tl_saved_view0_tex  = 0;
+    thread_local uintptr_t tl_saved_view0_comp = 0;
+    thread_local uint64_t  tl_saved_frame_n    = 0;
+
+    const uintptr_t view_ptr      = ctx.r14;
+    const uintptr_t orig_tex      = ctx.rax;
+    const uintptr_t orig_comp     = ctx.r13;
+    const uintptr_t next_view_ptr = view_ptr + 0x29D0;
+
+    static std::atomic<uint64_t> log_n{0};
+    const auto n = log_n.fetch_add(1, std::memory_order_relaxed);
+
+    if (view_ptr == 0 || orig_tex == 0) {
+        return;
+    }
+
+    bool is_view0 = false;
+    if (is_readable_process_range(next_view_ptr, 8)) {
+        const uintptr_t next_view_vtable = *(uintptr_t*)next_view_ptr;
+        if (next_view_vtable != 0) {
+            is_view0 = true;
+        }
+    }
+
+    if (is_view0) {
+        // Save view 0's texture pointers for the upcoming view 1 call.
+        tl_saved_view0_tex  = orig_tex;
+        tl_saved_view0_comp = orig_comp;
+        tl_saved_frame_n    = n;
+        // ALSO publish to global atomic so D3D12Hook::set_graphics_root_descriptor_table
+        // can find the matching pool entry for view-1-eye descriptor swap.
+        g_subnautica2_view0_lightscat.store(orig_tex, std::memory_order_relaxed);
+        if (n < 16 || (n % 600) == 0) {
+            SPDLOG_WARN(
+                "[Subnautica2][LightScatStore] call={} VIEW0 saved tex=0x{:x} comp=0x{:x} (published to global)",
+                n + 1, orig_tex, orig_comp);
+        }
+        // Let original instruction run unchanged: writes view 0's tex to view0+0x2658.
+        return;
+    }
+
+    // is_view0 == false: either view 1 (stereo) or mono (non-stereo pass).
+    // Distinguish by checking if we saved a view-0 value in this same "session"
+    // (i.e. the save call was very recent — within a frame).
+    if (tl_saved_view0_tex == 0 || (n - tl_saved_frame_n) > 4) {
+        // No recent view-0 save: this is a mono pass or stale state. Leave
+        // registers untouched, original instruction writes whatever was there.
+        if (n < 16 || (n % 600) == 0) {
+            SPDLOG_WARN(
+                "[Subnautica2][LightScatStore] call={} MONO or stale (no recent view0 save) tex_was=0x{:x}",
+                n + 1, orig_tex);
+        }
+        return;
+    }
+
+    // Stereo view 1 call: overwrite ctx.rax/ctx.r13 with view 0's saved values
+    // so the upcoming store at 0x142FC179D writes view 0's texture into view 1.
+    ctx.rax = tl_saved_view0_tex;
+    ctx.r13 = tl_saved_view0_comp;
+
+    if (n < 16 || (n % 600) == 0) {
+        SPDLOG_WARN(
+            "[Subnautica2][LightScatStore] call={} VIEW1 REWRITE rax 0x{:x} -> 0x{:x} ; r13 0x{:x} -> 0x{:x}",
+            n + 1, orig_tex, tl_saved_view0_tex, orig_comp, tl_saved_view0_comp);
+    }
+
+    // Clear so the next mono pass doesn't accidentally use stale values.
+    tl_saved_view0_tex = 0;
+    tl_saved_view0_comp = 0;
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_setup_volumetric_fog_ub() {
+    if (m_attempted_hook_subnautica2_setup_volumetric_fog_ub) {
+        return;
+    }
+    m_attempted_hook_subnautica2_setup_volumetric_fog_ub = true;
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+    if (subnautica2_diag_clean_mode()) {
+        SPDLOG_INFO("[Subnautica2][DiagClean] Skipping SetupVolumetricFogUniformBufferParameters hook");
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_SETUP_VOLUMETRIC_FOG_UB_RVA;
+    if (exe_base == 0 || !is_executable_process_range(target, 0x10)) {
+        SPDLOG_WARN("[Subnautica2][SetupFogUB] Bad target {:x}", target);
+        return;
+    }
+
+    // Prologue: mov [rsp+18h], rbx; push rbp; push rsi; push rdi; sub rsp, 70h
+    constexpr uint8_t expected_prologue[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57, 0x48, 0x83, 0xEC, 0x70,
+    };
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][SetupFogUB] Prologue mismatch at {:x}; skipping", target);
+        return;
+    }
+
+    m_subnautica2_setup_volumetric_fog_ub_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_setup_volumetric_fog_ub_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_setup_volumetric_fog_ub_hook) {
+        SPDLOG_WARN("[Subnautica2][SetupFogUB] Failed to create hook at {:x}", target);
+        return;
+    }
+    if (auto enable_result = m_subnautica2_setup_volumetric_fog_ub_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][SetupFogUB] Failed to enable hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+    SPDLOG_WARN("[Subnautica2][SetupFogUB] Hooked SetupVolumetricFogUniformBufferParameters at {:x}", target);
+}
+
+// REAL FIX: pair-detect view 0 / view 1 using view stride 0x29D0. For view 0
+// of a stereo pair, save the UB's volumetric fog section (~128 bytes at
+// offset 0xFC0) AFTER original returns. For view 1 of that pair, overwrite
+// view 1's UB fog section with view 0's saved bytes. Basepass for view 1
+// then reads view 0's IntegratedLightScattering binding -> visible teal in
+// BOTH eyes.
+void FFakeStereoRenderingHook::subnautica2_setup_volumetric_fog_ub_hook(
+    void* view_info,
+    void* view_uniform_shader_parameters)
+{
+    auto* hook = g_hook;
+    if (hook == nullptr || !hook->m_subnautica2_setup_volumetric_fog_ub_hook) {
+        return;
+    }
+
+    // Always call original first so the game continues to function normally.
+    hook->m_subnautica2_setup_volumetric_fog_ub_hook.unsafe_call<void>(
+        view_info, view_uniform_shader_parameters);
+
+    if (view_info == nullptr || view_uniform_shader_parameters == nullptr) {
+        return;
+    }
+
+    constexpr size_t FOG_UB_OFFSET = 0x0;       // FIX-V2: scan FULL UB
+    constexpr size_t FOG_UB_SIZE = 10076;       // FViewUniformShaderParameters total size
+
+    const uintptr_t this_view = (uintptr_t)view_info;
+    const uintptr_t this_ub = (uintptr_t)view_uniform_shader_parameters;
+
+    if (!is_writable_process_range(this_ub + FOG_UB_OFFSET, FOG_UB_SIZE)) {
+        return;
+    }
+
+    // 2026-05-16 FIX-V2: pair-detect view 0/1 and SURGICALLY rewrite ONLY the
+    // fog texture handle bytes (not the entire section) for view 1. This is
+    // the real binding fix: replace the 8-byte handle in view 1's UB that
+    // points to view 0's filtered fog texture with view 1's natural pointer
+    // (captured in compute_volumetric_fog_hook before propagation).
+    static thread_local uintptr_t prev_view = 0;
+
+    static std::atomic<uint64_t> log_n{0};
+
+    if (prev_view != 0 && this_view == prev_view + SUBNAUTICA2_SCENEVIEW_STRIDE) {
+        // VIEW 1 of pair.
+        const uintptr_t v1_natural = g_subnautica2_view1_natural_lightscat.load(std::memory_order_relaxed);
+        const uintptr_t v0_handle = g_subnautica2_view0_lightscat.load(std::memory_order_relaxed);
+        int32_t handle_offset = g_subnautica2_fog_ub_handle_offset.load(std::memory_order_relaxed);
+
+        if (v1_natural != 0 && v0_handle != 0 && handle_offset >= 0 &&
+            (size_t)handle_offset + 8 <= FOG_UB_SIZE) {
+            // Scan view 1's UB at the discovered offset and replace.
+            uintptr_t* slot = (uintptr_t*)(this_ub + FOG_UB_OFFSET + handle_offset);
+            const uintptr_t before = *slot;
+            *slot = v1_natural;
+            static std::atomic<uint64_t> fixed_calls{0};
+            const auto fc = fixed_calls.fetch_add(1, std::memory_order_relaxed);
+            if (fc < 8 || (fc % 600) == 0) {
+                SPDLOG_WARN(
+                    "[Subnautica2][FixV2] view1 ub=0x{:x} fog[+0x{:x}+0x{:x}]: 0x{:x} -> 0x{:x} (write v1_natural)",
+                    this_ub, FOG_UB_OFFSET, handle_offset, before, v1_natural);
+            }
+        } else {
+            static std::atomic<uint64_t> skip_calls{0};
+            const auto sc = skip_calls.fetch_add(1, std::memory_order_relaxed);
+            if (sc < 4 || (sc % 600) == 0) {
+                SPDLOG_WARN(
+                    "[Subnautica2][FixV2] view1 SKIP: v1_natural=0x{:x} v0_handle=0x{:x} handle_offset={}",
+                    v1_natural, v0_handle, handle_offset);
+            }
+        }
+        prev_view = 0;
+    } else {
+        // VIEW 0 (or non-stereo). Discover the byte offset of the fog texture
+        // handle within UB+FOG_UB_OFFSET by scanning for the 8-byte sequence
+        // matching view 0's +0x2658 value (which IS the handle).
+        prev_view = this_view;
+
+        const uintptr_t v0_handle = g_subnautica2_view0_lightscat.load(std::memory_order_relaxed);
+        if (v0_handle != 0 && g_subnautica2_fog_ub_handle_offset.load(std::memory_order_relaxed) < 0) {
+            for (size_t off = 0; off + 8 <= FOG_UB_SIZE; off += 8) {
+                const uintptr_t candidate = *(uintptr_t*)(this_ub + FOG_UB_OFFSET + off);
+                if (candidate == v0_handle) {
+                    g_subnautica2_fog_ub_handle_offset.store((int32_t)off, std::memory_order_relaxed);
+                    SPDLOG_WARN(
+                        "[Subnautica2][FixV2] DISCOVERED handle_offset=0x{:x} (UB+0x{:x}+0x{:x}=0x{:x} matches view0+0x2658)",
+                        off, FOG_UB_OFFSET, off, v0_handle);
+                    break;
+                }
+            }
+            if (g_subnautica2_fog_ub_handle_offset.load(std::memory_order_relaxed) < 0) {
+                // Not found — log dump for diagnostics
+                static std::atomic<uint64_t> nf_calls{0};
+                const auto nfc = nf_calls.fetch_add(1, std::memory_order_relaxed);
+                if (nfc < 4) {
+                    std::string hex;
+                    for (size_t off = 0; off + 8 <= FOG_UB_SIZE; off += 8) {
+                        const uintptr_t v = *(uintptr_t*)(this_ub + FOG_UB_OFFSET + off);
+                        hex += fmt::format(" [0x{:x}]=0x{:x}", off, v);
+                    }
+                    SPDLOG_WARN(
+                        "[Subnautica2][FixV2] handle NOT FOUND in UB scan (looking for 0x{:x}); UB dump:{}",
+                        v0_handle, hex);
+                }
+            }
+        }
+
+        const auto cnt = log_n.fetch_add(1, std::memory_order_relaxed);
+        if (cnt < 4) {
+            uint64_t first = *(uint64_t*)(this_ub + FOG_UB_OFFSET);
+            SPDLOG_WARN(
+                "[Subnautica2][SetupFogUB] view0 view=0x{:x} ub=0x{:x} fog[0x{:x}] first=0x{:x}",
+                this_view, this_ub, FOG_UB_OFFSET, first);
+        }
+    }
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_single_layer_water_scene_without_water() {
+    if (m_attempted_hook_subnautica2_single_layer_water_scene_without_water) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_single_layer_water_scene_without_water = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_SINGLE_LAYER_WATER_SCENE_WITHOUT_WATER_READY_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x10)) {
+        SPDLOG_WARN("[Subnautica2][SceneWithoutWater] Cannot hook RenderSingleLayerWater handoff; bad target {:x}", target);
+        return;
+    }
+
+    constexpr uint8_t expected_bytes[] = {
+        0x48, 0x85, 0xC9,             // test rcx, rcx
+        0x74, 0x05,                   // jz short
+        0xE8, 0xFF, 0xCB, 0x45, 0xFE, // call FMemory::Free
+    };
+
+    if (std::memcmp((void*)target, expected_bytes, sizeof(expected_bytes)) != 0) {
+        SPDLOG_WARN("[Subnautica2][SceneWithoutWater] RenderSingleLayerWater handoff bytes mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    auto hook_result = safetyhook::create_mid(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_single_layer_water_scene_without_water_hook);
+
+    if (!hook_result) {
+        SPDLOG_WARN("[Subnautica2][SceneWithoutWater] Failed to hook RenderSingleLayerWater handoff at {:x}", target);
+        return;
+    }
+
+    m_subnautica2_single_layer_water_scene_without_water_hook = std::move(hook_result);
+
+    SPDLOG_WARN(
+        "[Subnautica2][SceneWithoutWater] Hooked RenderSingleLayerWater handoff at {:x}; per-eye rect/UV fix {}",
+        target,
+        subnautica2_disable_underwater_fog_view_data_fix() ? "disabled" : "enabled");
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_single_layer_water() {
+    if (m_attempted_hook_subnautica2_single_layer_water) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_single_layer_water = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_SINGLE_LAYER_WATER_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][SingleLayerWater] Cannot hook RenderSingleLayerWater; bad target {:x}", target);
+        return;
+    }
+
+    constexpr uint8_t expected_prologue[] = {
+        0x40, 0x55,                         // push rbp
+        0x53,                               // push rbx
+        0x56,                               // push rsi
+        0x57,                               // push rdi
+        0x41, 0x54,                         // push r12
+        0x41, 0x55,                         // push r13
+        0x41, 0x56,                         // push r14
+        0x41, 0x57,                         // push r15
+        0x48, 0x8D, 0xAC, 0x24, 0x98, 0xFD, 0xFF, 0xFF, // lea rbp, [rsp-268h]
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][SingleLayerWater] RenderSingleLayerWater prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    m_subnautica2_single_layer_water_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_single_layer_water_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_single_layer_water_hook) {
+        SPDLOG_WARN("[Subnautica2][SingleLayerWater] Failed to create RenderSingleLayerWater hook at {:x}", target);
+        return;
+    }
+
+    if (auto enable_result = m_subnautica2_single_layer_water_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][SingleLayerWater] Failed to enable RenderSingleLayerWater hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+
+    SPDLOG_WARN(
+        "[Subnautica2][SingleLayerWater] Hooked RenderSingleLayerWater at {:x}; runtime ViewRect fix {}",
+        target,
+        subnautica2_disable_single_layer_water_view_rect_fix() ? "disabled" : "enabled");
+}
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_single_layer_water_inner() {
+    if (m_attempted_hook_subnautica2_single_layer_water_inner) {
+        return;
+    }
+
+    m_attempted_hook_subnautica2_single_layer_water_inner = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_SINGLE_LAYER_WATER_INNER_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][SingleLayerWaterInner] Cannot hook RenderSingleLayerWaterInner; bad target {:x}", target);
+        return;
+    }
+
+    constexpr uint8_t expected_prologue[] = {
+        0x4C, 0x8B, 0xDC,             // mov r11, rsp
+        0x55,                         // push rbp
+        0x41, 0x57,                   // push r15
+        0x49, 0x8D, 0xAB, 0xD8, 0xFC, 0xFF, 0xFF, // lea rbp, [r11-328h]
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][SingleLayerWaterInner] RenderSingleLayerWaterInner prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    m_subnautica2_single_layer_water_inner_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_single_layer_water_inner_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_single_layer_water_inner_hook) {
+        SPDLOG_WARN("[Subnautica2][SingleLayerWaterInner] Failed to create RenderSingleLayerWaterInner hook at {:x}", target);
+        return;
+    }
+
+    if (auto enable_result = m_subnautica2_single_layer_water_inner_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][SingleLayerWaterInner] Failed to enable RenderSingleLayerWaterInner hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+
+    SPDLOG_WARN(
+        "[Subnautica2][SingleLayerWaterInner] Hooked RenderSingleLayerWaterInner at {:x}; secondary water pass fix {}",
+        target,
+        subnautica2_disable_single_layer_water_pass_fix() ? "disabled" : "enabled");
+}
+
+// 2026-05-16 Phase 3: hook the per-view SLW dispatcher (sub_142EB72E0) located
+// inside the SLW inner loop. Fires once per FViewInfo* (passed as R8). This is
+// the per-view boundary where we can rewrite bindless descriptor heap slots
+// (currently slots like 363073/363074 — heap-state-dependent) BETWEEN view 0's
+// and view 1's SLW pixel-shader draws.
+//
+// Initial role: pure diagnostic — log r8/rcx/rdx/r9 + first 4 stack args + the
+// FViewInfo*'s stereo_pass field (+0xDD0) to confirm per-view firing and
+// distinguish view 0 from view 1. Future revision will add the descriptor swap.
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_slw_per_view() {
+    if (m_attempted_hook_subnautica2_slw_per_view) {
+        return;
+    }
+    m_attempted_hook_subnautica2_slw_per_view = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    if (!subnautica2_enable_slw_per_view_hook()) {
+        SPDLOG_WARN("[Subnautica2][SLWPerView] Hook disabled (UEVR_SUBNAUTICA2_ENABLE_SLW_PER_VIEW_HOOK!=1)");
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_SLW_PER_VIEW_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][SLWPerView] Cannot hook sub_142EB72E0; bad target {:x}", target);
+        return;
+    }
+
+    // Verified from binary dump 2026-05-16: standard MSVC x64 prologue.
+    constexpr uint8_t expected_prologue[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x20,             // mov [rsp+20], rbx
+        0x48, 0x89, 0x54, 0x24, 0x10,             // mov [rsp+10], rdx
+        0x48, 0x89, 0x4C, 0x24, 0x08,             // mov [rsp+08], rcx
+        0x55,                                       // push rbp
+        0x56,                                       // push rsi
+        0x57,                                       // push rdi
+        0x41, 0x54,                                 // push r12
+        0x41, 0x55,                                 // push r13
+        0x41, 0x56,                                 // push r14
+        0x41, 0x57,                                 // push r15
+        0x48, 0x83, 0xEC, 0x70,                     // sub rsp, 70
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][SLWPerView] prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    m_subnautica2_slw_per_view_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_slw_per_view_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_slw_per_view_hook) {
+        SPDLOG_WARN("[Subnautica2][SLWPerView] Failed to create hook at {:x}", target);
+        return;
+    }
+
+    if (auto enable_result = m_subnautica2_slw_per_view_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][SLWPerView] Failed to enable hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+
+    SPDLOG_WARN(
+        "[Subnautica2][SLWPerView] Hooked sub_142EB72E0 at {:x}; diagnostic mode (log per-view firing, no behavior change)",
+        target);
+}
+
+void __cdecl FFakeStereoRenderingHook::subnautica2_slw_per_view_hook(
+    void* scene_renderer,
+    void* arg2,
+    void* view_info,
+    void* arg4,
+    void* stack0,
+    void* stack1,
+    void* stack2,
+    void* stack3)
+{
+    auto* hook = g_hook;
+
+    auto call_original = [&]() {
+        if (hook != nullptr && hook->m_subnautica2_slw_per_view_hook) {
+            hook->m_subnautica2_slw_per_view_hook.unsafe_call<void>(
+                scene_renderer, arg2, view_info, arg4, stack0, stack1, stack2, stack3);
+        }
+    };
+
+    // Read stereo_pass from FViewInfo+0xDD0 (constant SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET).
+    uint32_t stereo_pass = 0xFFFFFFFF;
+    uint32_t stereo_index = 0xFFFFFFFF;
+    if (view_info != nullptr) {
+        if (is_readable_process_range((uintptr_t)view_info + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET, 4)) {
+            stereo_pass = *(uint32_t*)((uintptr_t)view_info + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+        }
+        if (is_readable_process_range((uintptr_t)view_info + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET, 4)) {
+            stereo_index = *(uint32_t*)((uintptr_t)view_info + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET);
+        }
+    }
+
+    static std::atomic<uint64_t> call_count{0};
+    const auto cn = call_count.fetch_add(1, std::memory_order_relaxed);
+
+    // 2026-05-17 WHOLE-VIEWINFO DIFF: scan entire FViewInfo struct in 256-byte
+    // chunks. For each chunk, count bytes that differ between view 0 and view 1.
+    // Chunks with most diffs are the view-specific regions (where stereo matrices
+    // should live).
+    if (view_info != nullptr) {
+        static thread_local uintptr_t tl_seen_view0 = 0;
+        static thread_local uint8_t tl_v0_full[0x2A00]{};
+        constexpr uintptr_t SCAN_SIZE = 0x2A00; // ~ FViewInfo size 0x29D0
+        if (is_readable_process_range((uintptr_t)view_info, SCAN_SIZE)) {
+            if (stereo_pass == 1) {
+                memcpy(tl_v0_full, (const void*)view_info, SCAN_SIZE);
+                tl_seen_view0 = (uintptr_t)view_info;
+            } else if (stereo_pass == 2 && tl_seen_view0 != 0) {
+                static std::atomic<uint64_t> mc_count{0};
+                const auto mc = mc_count.fetch_add(1, std::memory_order_relaxed);
+                if (mc < 4 || (mc % 600) == 0) {
+                    // For each 256-byte chunk, count diff bytes
+                    char buf[2048] = {0};
+                    int written = 0;
+                    constexpr int CHUNK_SIZE = 256;
+                    int total_diff = 0;
+                    for (int chunk_off = 0; chunk_off < (int)SCAN_SIZE; chunk_off += CHUNK_SIZE) {
+                        int chunk_diff = 0;
+                        for (int i = 0; i < CHUNK_SIZE && chunk_off + i < (int)SCAN_SIZE; ++i) {
+                            if (((uint8_t*)view_info)[chunk_off + i] != tl_v0_full[chunk_off + i]) {
+                                ++chunk_diff;
+                            }
+                        }
+                        if (chunk_diff > 0) {
+                            int n = snprintf(buf + written, sizeof(buf) - written,
+                                "[0x%x:%d]", chunk_off, chunk_diff);
+                            if (n > 0) written += n;
+                            total_diff += chunk_diff;
+                        }
+                    }
+                    SPDLOG_WARN(
+                        "[Subnautica2][ViewInfoDiff] mc={} v0@0x{:x} v1@0x{:x} total_diff={}/{} chunks: {}",
+                        mc + 1, tl_seen_view0, (uintptr_t)view_info,
+                        total_diff, SCAN_SIZE, buf);
+                }
+            }
+        }
+    }
+
+    // 2026-05-17 Plan A.3: log SRV-map view-tag counts to validate Phase A.1
+    // tagging is working. Runs only at log-gate ticks to avoid overhead.
+    {
+        static std::atomic<uint64_t> log_count{0};
+        const auto lc = log_count.fetch_add(1, std::memory_order_relaxed);
+        if (lc < 16 || (lc % 600) == 0) {
+            SPDLOG_WARN(
+                "[Subnautica2][SLWPerView][SRVMapStatus] call={} pass={} idx={} | total={} v0_count={} v1_count={}",
+                lc + 1, stereo_pass, stereo_index,
+                sn2_fog_srv_map::size(),
+                sn2_fog_srv_map::count_by_view(0),
+                sn2_fog_srv_map::count_by_view(1));
+        }
+    }
+
+    // 2026-05-16 EXPERIMENT: per-view field copy. Save view 0's pointer on its
+    // call (stereo_pass==1), then on view 1's call (stereo_pass==2), copy a
+    // configurable byte range from view 0 to view 1 in place. After the original
+    // function runs, restore view 1's original bytes.
+    static thread_local void* tl_saved_view0 = nullptr;
+    static thread_local std::array<uint8_t, 0x100> tl_view1_backup{};  // up to 256 bytes
+    static thread_local uint32_t tl_view1_backup_size = 0;
+    static thread_local uintptr_t tl_view1_backup_off = 0;
+    bool field_copy_fired = false;
+
+    if (subnautica2_enable_slw_per_view_field_copy() && view_info != nullptr && stereo_pass != 0xFFFFFFFF) {
+        const uint32_t copy_off = subnautica2_slw_field_copy_start();
+        const uint32_t copy_sz = subnautica2_slw_field_copy_size();
+        if (stereo_pass == 1) {
+            tl_saved_view0 = view_info;
+        } else if (stereo_pass == 2 && tl_saved_view0 != nullptr && copy_sz > 0 && copy_sz <= tl_view1_backup.size()) {
+            if (is_readable_process_range((uintptr_t)tl_saved_view0 + copy_off, copy_sz) &&
+                is_writable_process_range((uintptr_t)view_info + copy_off, copy_sz))
+            {
+                memcpy(tl_view1_backup.data(), (const void*)((uintptr_t)view_info + copy_off), copy_sz);
+                tl_view1_backup_size = copy_sz;
+                tl_view1_backup_off = copy_off;
+                memcpy((void*)((uintptr_t)view_info + copy_off),
+                       (const void*)((uintptr_t)tl_saved_view0 + copy_off),
+                       copy_sz);
+                field_copy_fired = true;
+
+                static std::atomic<uint64_t> fc_count{0};
+                const auto fn = fc_count.fetch_add(1, std::memory_order_relaxed);
+                if (fn < 8 || (fn % 600) == 0) {
+                    const uintptr_t* v0p = (const uintptr_t*)((uintptr_t)tl_saved_view0 + copy_off);
+                    const uintptr_t* v1p = (const uintptr_t*)tl_view1_backup.data();
+                    SPDLOG_WARN(
+                        "[Subnautica2][SLWPerView][FieldCopy] fc={} off=0x{:x} size={} v0=[0x{:x} 0x{:x} 0x{:x} 0x{:x}] v1_was=[0x{:x} 0x{:x} 0x{:x} 0x{:x}]",
+                        fn + 1, copy_off, copy_sz,
+                        v0p[0], v0p[1], v0p[2], v0p[3],
+                        v1p[0], v1p[1], v1p[2], v1p[3]);
+                }
+            }
+        }
+    }
+
+    // Log gate: catch BOTH parities — log calls 1..32 AND every 601st OR every 600th (pairs).
+    const bool log_now = (cn < 32) || ((cn % 600) == 0) || ((cn % 600) == 1);
+
+    // 2026-05-17 NEW DIAGNOSTIC: dump the contents at view+0x2618..+0x2648.
+    // These pointers were confirmed per-view-distinct. Reading their target
+    // memory is SAFE (we don't modify). The vtable at offset +0 tells us the
+    // object type; if it's a known FRDGTexture3D vtable, we're golden.
+    if (log_now && view_info != nullptr && stereo_pass != 0xFFFFFFFF) {
+        constexpr uintptr_t wrapper_offsets[] = { 0x2630, 0x2638, 0x2640, 0x2648 };
+        for (auto off : wrapper_offsets) {
+            if (!is_readable_process_range((uintptr_t)view_info + off, 8)) continue;
+            const uintptr_t wrapper_ptr = *(uintptr_t*)((uintptr_t)view_info + off);
+            if (wrapper_ptr < 0x10000 || (wrapper_ptr & 0x7) != 0) continue;
+            if (!is_readable_process_range(wrapper_ptr, 128)) continue;
+
+            // Dump 16 uint64 (128 bytes) of the FRDGTexture-like object.
+            uintptr_t qw[16]{};
+            for (int i = 0; i < 16; ++i) {
+                qw[i] = *(uintptr_t*)(wrapper_ptr + i * 8);
+            }
+            SPDLOG_WARN(
+                "[Subnautica2][SLWPerView][DeepDump] call={} pass={} off=0x{:x} wrapper=0x{:x} [0..7]=0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x}",
+                cn + 1, stereo_pass, (unsigned long long)off, wrapper_ptr,
+                qw[0], qw[1], qw[2], qw[3], qw[4], qw[5], qw[6], qw[7]);
+            SPDLOG_WARN(
+                "[Subnautica2][SLWPerView][DeepDump] call={} pass={} off=0x{:x} [8..15]=0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x}",
+                cn + 1, stereo_pass, (unsigned long long)off,
+                qw[8], qw[9], qw[10], qw[11], qw[12], qw[13], qw[14], qw[15]);
+
+            // 2026-05-17 PHASE 3 ACTIVE: try to look up this wrapper's fog volume
+            // SRV in the global D3D12-side map. The shared object at +64 has a
+            // GPU VA at its +0x70 (qw[14]). If the SRV for that resource was
+            // captured by D3D12Hook::create_shader_resource_view, we can look it
+            // up here.
+            if (qw[8] >= 0x10000 && is_readable_process_range(qw[8], 128)) {
+                const UINT64 candidate_gpu_va = *(UINT64*)(qw[8] + 0x70);
+                if (candidate_gpu_va != 0) {
+                    sn2_fog_srv_map::Entry srv{};
+                    const bool found = sn2_fog_srv_map::lookup_by_gpu_va(candidate_gpu_va, srv);
+                    if (found) {
+                        SPDLOG_WARN(
+                            "[Subnautica2][SLWPerView][SRVLookup] call={} pass={} off=0x{:x} gpuVA=0x{:x} -> resource={:p} cpuHandle=0x{:x} (map size={})",
+                            cn + 1, stereo_pass, (unsigned long long)off,
+                            candidate_gpu_va, (void*)srv.resource, srv.cpu_handle.ptr,
+                            sn2_fog_srv_map::size());
+                    } else if (cn < 32 || (cn % 600) == 0) {
+                        SPDLOG_WARN(
+                            "[Subnautica2][SLWPerView][SRVLookup] call={} pass={} off=0x{:x} gpuVA=0x{:x} NOT FOUND in map (size={})",
+                            cn + 1, stereo_pass, (unsigned long long)off,
+                            candidate_gpu_va, sn2_fog_srv_map::size());
+                    }
+                }
+            }
+
+            // qw[8] is the SHARED pointer-at-+64 within wrapper. Pair A wrappers
+            // share one value, pair B wrappers share another. Likely FRHITexture*
+            // or pooled-RT*. Read 128 bytes to find the ID3D12Resource* nested
+            // deeper. (Read-only — safe.)
+            const uintptr_t shared_ptr = qw[8];
+            if (shared_ptr >= 0x10000 && (shared_ptr & 0x7) == 0 &&
+                is_readable_process_range(shared_ptr, 128))
+            {
+                uintptr_t sub[16];
+                for (int i = 0; i < 16; ++i) {
+                    sub[i] = *(uintptr_t*)(shared_ptr + i * 8);
+                }
+                // Only log for pair A (off=0x2630) to keep log volume manageable.
+                if (off == 0x2630) {
+                    SPDLOG_WARN(
+                        "[Subnautica2][SLWPerView][SharedDeref128] call={} pass={} qw[8]=0x{:x} [0..7]=0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x}",
+                        cn + 1, stereo_pass, shared_ptr,
+                        sub[0], sub[1], sub[2], sub[3], sub[4], sub[5], sub[6], sub[7]);
+                    SPDLOG_WARN(
+                        "[Subnautica2][SLWPerView][SharedDeref128] call={} pass={} qw[8]=0x{:x} [8..15]=0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x}",
+                        cn + 1, stereo_pass, shared_ptr,
+                        sub[8], sub[9], sub[10], sub[11], sub[12], sub[13], sub[14], sub[15]);
+                }
+            }
+        }
+    }
+
+    if (log_now && view_info != nullptr) {
+        // Scan a wide range of FViewInfo offsets to find ANY pointer-like value
+        // that differs between view 0 and view 1. Target range 0x2400..0x2900
+        // covers known fog-related fields. Log only non-null + non-zero entries.
+        constexpr uintptr_t scan_start = 0x2400;
+        constexpr uintptr_t scan_end = 0x2900;
+        char buf[2048] = {0};
+        int written = 0;
+        for (uintptr_t off = scan_start; off < scan_end && written < (int)sizeof(buf) - 64; off += 8) {
+            if (!is_readable_process_range((uintptr_t)view_info + off, 8)) break;
+            const uintptr_t v = *(uintptr_t*)((uintptr_t)view_info + off);
+            // Only log heap-ish pointers (>0x10000, looks like address)
+            if (v >= 0x10000 && v < 0xFFFFFFFFFFFFFFFFull && (v & 0x7) == 0) {
+                int n = snprintf(buf + written, sizeof(buf) - written,
+                    "[+0x%llx=0x%llx]", (unsigned long long)off, (unsigned long long)v);
+                if (n > 0) written += n;
+            }
+        }
+
+        SPDLOG_WARN(
+            "[Subnautica2][SLWPerView] call={} view_info={:p} pass={} idx={} non-zero-ptr-fields-in-0x2400..0x2900: {}",
+            cn + 1, view_info, stereo_pass, stereo_index, buf);
+    }
+
+    // 2026-05-17 Plan Phase B: descriptor swap. On view 1's call, if user has
+    // specified valid source + destination CPU descriptor handles via env vars,
+    // CopyDescriptorsSimple from source (view 1's SRV) to destination (view 0's
+    // slot the SLW PS reads). Performed BEFORE the original call so the swap
+    // is in place when the actual draws happen.
+    static thread_local std::array<uint64_t, 8> tl_dst_backup{};
+    static thread_local bool tl_descriptor_swap_active = false;
+    if (stereo_pass == 2) {
+        // Phase B: support BOTH raw cpu_handle env vars AND index-based env vars.
+        // Index variant is friendlier: user reads FogSRV log, picks N as source
+        // (= view 1 candidate) and M as destination (= view 0 slot bound to
+        // right-eye SLW PS).
+        uint64_t src_h = subnautica2_fog_swap_src_handle();
+        uint64_t dst_h = subnautica2_fog_swap_dst_handle();
+        int32_t src_idx = subnautica2_fog_swap_src_index();
+        const int32_t dst_idx = subnautica2_fog_swap_dst_index();
+
+        // 2026-05-17 sweep mode: target either SRC or DST (env var controlled).
+        // Target 0 = sweep src (find content). Target 1 = sweep dst (find slot).
+        int32_t effective_dst_idx = dst_idx;
+        if (subnautica2_fog_swap_sweep_enabled()) {
+            static const uint64_t start_tick = GetTickCount64();
+            const uint64_t now = GetTickCount64();
+            const uint32_t interval = subnautica2_fog_swap_sweep_interval_ms();
+            const uint32_t min_idx = subnautica2_fog_swap_sweep_min_index();
+            const uint32_t max_idx = subnautica2_fog_swap_sweep_max_index();
+            const uint32_t target = subnautica2_fog_swap_sweep_target();
+            const uint32_t range = (max_idx > min_idx) ? (max_idx - min_idx) : 0;
+            if (interval > 0 && range > 0) {
+                const int32_t swept = (int32_t)(min_idx + (((now - start_tick) / interval) % range));
+                if (target == 1) {
+                    effective_dst_idx = swept;
+                } else {
+                    src_idx = swept;
+                }
+                static std::atomic<int32_t> last_logged_swept{-2};
+                if (last_logged_swept.exchange(swept, std::memory_order_relaxed) != swept) {
+                    SPDLOG_WARN(
+                        "[Subnautica2][FogDescSwap][Sweep] target={} now src_idx={} dst_idx={} (range={}..{} interval_ms={}) at tick={} -- WATCH RIGHT EYE",
+                        target == 1 ? "DST" : "SRC",
+                        src_idx, effective_dst_idx, min_idx, max_idx, interval, now - start_tick);
+                }
+            }
+        }
+
+        if (src_idx >= 0 || effective_dst_idx >= 0) {
+            sn2_fog_srv_map::Entry e;
+            if (src_idx >= 0 && sn2_fog_srv_map::lookup_by_creation_index((uint64_t)src_idx, e)) {
+                src_h = (uint64_t)e.cpu_handle.ptr;
+            }
+            if (effective_dst_idx >= 0 && sn2_fog_srv_map::lookup_by_creation_index((uint64_t)effective_dst_idx, e)) {
+                dst_h = (uint64_t)e.cpu_handle.ptr;
+            }
+        }
+
+        // 2026-05-17 Task #43+#46: principled-source-and-dest override using
+        // the bindless slot map. View 0's bindless slot (the one view 1's
+        // basepass mistakenly also reads from, per the bug) is found by
+        // searching for a bindless slot whose tagged source is view 0's
+        // fog UAV. The src is view 1's compute UAV's staging cpu_handle —
+        // CopyDescriptorsSimple is cross-heap-safe (staging→bindless).
+        if (subnautica2_fog_swap_use_uav_tag()) {
+            D3D12_CPU_DESCRIPTOR_HANDLE v0_bindless{};
+            ID3D12Resource* v0_res = nullptr;
+            const bool dst_ok = sn2_bindless_slot_map::find_slot_for_view(0, v0_bindless, &v0_res);
+
+            sn2_fog_uav_map::Entry v1_uav{};
+            sn2_fog_srv_map::Entry v1_srv{};
+            uint64_t resolved_src = 0;
+            const bool v1_uav_ok = sn2_fog_uav_map::lookup_last_by_view_id(1, v1_uav);
+            if (v1_uav_ok && v1_uav.resource != nullptr) {
+                // Prefer SRV for the source descriptor — basepass reads view
+                // 1's volume as an SRV. If the same resource was tagged as
+                // both UAV (compute target) and SRV (basepass input), pick
+                // the SRV entry.
+                if (sn2_fog_srv_map::lookup_by_resource(v1_uav.resource, v1_srv)) {
+                    resolved_src = (uint64_t)v1_srv.cpu_handle.ptr;
+                } else {
+                    resolved_src = (uint64_t)v1_uav.cpu_handle.ptr;
+                }
+            }
+
+            if (dst_ok && resolved_src != 0) {
+                dst_h = (uint64_t)v0_bindless.ptr;
+                src_h = resolved_src;
+                static std::atomic<uint64_t> log_count{0};
+                const auto lc = log_count.fetch_add(1, std::memory_order_relaxed);
+                if (lc < 8 || (lc % 600) == 0) {
+                    SPDLOG_WARN(
+                        "[Subnautica2][FogDescSwap][UAVTag] bindless_dst=0x{:x} v0_res={:p} staging_src=0x{:x} v1_res={:p} (uav_v1={} srv_v1={} bindless_v0={} bindless_v1={})",
+                        dst_h, (void*)v0_res, src_h, (void*)v1_uav.resource,
+                        sn2_fog_uav_map::count_by_view(1),
+                        sn2_fog_srv_map::count_by_view(1),
+                        sn2_bindless_slot_map::count_by_view(0),
+                        sn2_bindless_slot_map::count_by_view(1));
+                }
+            } else {
+                static std::atomic<uint64_t> miss_count{0};
+                const auto mc = miss_count.fetch_add(1, std::memory_order_relaxed);
+                if (mc < 8 || (mc % 600) == 0) {
+                    SPDLOG_WARN(
+                        "[Subnautica2][FogDescSwap][UAVTag] missing data: dst_ok={} v1_uav_ok={} (uav_v1={} srv_v1={} bindless_v0={} bindless_v1={})",
+                        dst_ok, v1_uav_ok,
+                        sn2_fog_uav_map::count_by_view(1),
+                        sn2_fog_srv_map::count_by_view(1),
+                        sn2_bindless_slot_map::count_by_view(0),
+                        sn2_bindless_slot_map::count_by_view(1));
+                }
+            }
+        }
+        const uint32_t count = subnautica2_fog_swap_count();
+        if (src_h != 0 && dst_h != 0 && count > 0 && count <= 4) {
+            auto& d3d12 = g_framework->get_d3d12_hook();
+            if (d3d12 != nullptr) {
+                ID3D12Device* device = d3d12->get_device();
+                if (device != nullptr) {
+                    D3D12_CPU_DESCRIPTOR_HANDLE dst{(SIZE_T)dst_h};
+                    D3D12_CPU_DESCRIPTOR_HANDLE src{(SIZE_T)src_h};
+                    device->CopyDescriptorsSimple(count, dst, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    tl_descriptor_swap_active = true;
+
+                    static std::atomic<uint64_t> swap_count{0};
+                    const auto sc = swap_count.fetch_add(1, std::memory_order_relaxed);
+                    if (sc < 8 || (sc % 600) == 0) {
+                        SPDLOG_WARN(
+                            "[Subnautica2][FogDescSwap] call={} stereo_pass={} CopyDescriptorsSimple({}, dst=0x{:x}, src=0x{:x}, CBV_SRV_UAV) src_idx={} dst_idx={}",
+                            sc + 1, stereo_pass, count, dst_h, src_h, src_idx, dst_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    call_original();
+
+    // Restore view 1's original bytes so its other downstream passes still see
+    // its native per-view state. SKIPPED in NO_RESTORE mode — see experiment
+    // notes; theory is that not restoring avoids the double-ownership crash by
+    // committing view 1 to view 0's wrappers for the rest of the frame.
+    if (field_copy_fired && view_info != nullptr && tl_view1_backup_size > 0) {
+        if (!subnautica2_slw_field_copy_no_restore() &&
+            is_writable_process_range((uintptr_t)view_info + tl_view1_backup_off, tl_view1_backup_size))
+        {
+            memcpy((void*)((uintptr_t)view_info + tl_view1_backup_off),
+                   tl_view1_backup.data(),
+                   tl_view1_backup_size);
+        }
+        tl_view1_backup_size = 0;
+    }
+}
+
+// 2026-05-17 Plan Phase A.1: per-view volumetric fog dispatcher hook.
+// sub_142FD6170 is called twice per frame from compute_volumetric_fog, once per
+// FViewInfo*. We set thread_local g_sn2_current_fog_view based on the view's
+// stereo_pass. CreateShaderResourceView (in D3D12Hook.cpp) reads this to tag
+// captured fog SRVs with their owning view.
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_volumetric_fog_per_view() {
+    if (m_attempted_hook_subnautica2_volumetric_fog_per_view) {
+        return;
+    }
+    m_attempted_hook_subnautica2_volumetric_fog_per_view = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    if (!subnautica2_enable_volumetric_fog_per_view_hook()) {
+        SPDLOG_WARN("[Subnautica2][VolumetricFogPerView] Hook disabled (UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_PER_VIEW_HOOK!=1)");
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    const auto target = exe_base + SUBNAUTICA2_VOLUMETRIC_FOG_PER_VIEW_RVA;
+
+    if (exe_base == 0 || !is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[Subnautica2][VolumetricFogPerView] Cannot hook sub_142FD6170; bad target {:x}", target);
+        return;
+    }
+
+    // Verified prologue 2026-05-17:
+    // 48 89 5C 24 18  mov [rsp+18], rbx
+    // 55             push rbp
+    // 56             push rsi
+    // 57             push rdi
+    // 48 8D AC 24 30 FE FF FF  lea rbp, [rsp-1d0h]
+    // 48 81 EC D0 02 00 00     sub rsp, 2D0h
+    constexpr uint8_t expected_prologue[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x18,
+        0x55, 0x56, 0x57,
+        0x48, 0x8D, 0xAC, 0x24, 0x30, 0xFE, 0xFF, 0xFF,
+        0x48, 0x81, 0xEC, 0xD0, 0x02, 0x00, 0x00,
+    };
+
+    if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        SPDLOG_WARN("[Subnautica2][VolumetricFogPerView] prologue mismatch at {:x}; skipping hook for this build", target);
+        return;
+    }
+
+    m_subnautica2_volumetric_fog_per_view_hook = safetyhook::create_inline(
+        (void*)target,
+        &FFakeStereoRenderingHook::subnautica2_volumetric_fog_per_view_hook,
+        safetyhook::InlineHook::StartDisabled);
+
+    if (!m_subnautica2_volumetric_fog_per_view_hook) {
+        SPDLOG_WARN("[Subnautica2][VolumetricFogPerView] Failed to create hook at {:x}", target);
+        return;
+    }
+
+    if (auto enable_result = m_subnautica2_volumetric_fog_per_view_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_WARN("[Subnautica2][VolumetricFogPerView] Failed to enable hook at {:x}: {}", target, (int)enable_result.error().type);
+        return;
+    }
+
+    SPDLOG_WARN(
+        "[Subnautica2][VolumetricFogPerView] Hooked sub_142FD6170 at {:x}; per-view view-tagging active",
+        target);
+}
+
+void __cdecl FFakeStereoRenderingHook::subnautica2_volumetric_fog_per_view_hook(
+    void* arg1,
+    void* view_info,
+    void* arg3,
+    void* arg4)
+{
+    auto* hook = g_hook;
+
+    auto call_original = [&]() {
+        if (hook != nullptr && hook->m_subnautica2_volumetric_fog_per_view_hook) {
+            hook->m_subnautica2_volumetric_fog_per_view_hook.unsafe_call<void>(
+                arg1, view_info, arg3, arg4);
+        }
+    };
+
+    // FViewInfo* is in RDX (arg2 in x64 calling convention) per prior IDA work.
+    // Determine view 0 vs view 1 via stereo_pass at offset 0xDD0.
+    int view_id = -1;
+    if (view_info != nullptr &&
+        is_readable_process_range((uintptr_t)view_info + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET, 4))
+    {
+        const uint32_t pass = *(uint32_t*)((uintptr_t)view_info + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+        if (pass == EStereoscopicPass::eSSP_PRIMARY) view_id = 0;
+        else if (pass == EStereoscopicPass::eSSP_SECONDARY) view_id = 1;
+    }
+
+    // Set the atomic view tag globally. We do NOT restore it: UE5's RDG
+    // recording happens on the calling (render) thread, but actual D3D12
+    // command-list binding/dispatch is deferred to an RHI worker thread.
+    // Restoring atomic=-1 immediately after call_original means the worker
+    // thread sees -1 by the time it runs SetComputeRootDescriptorTable.
+    // Leaving the atomic at view_id makes the worker thread see the
+    // most-recently-recorded view tag, which is correct as long as setups
+    // for view 0 and view 1 are not interleaved with executes (UE5's
+    // sequential per-view fog loop guarantees this within a frame).
+    g_sn2_current_fog_view.store(view_id, std::memory_order_relaxed);
+
+    static std::atomic<uint64_t> call_count{0};
+    const auto cn = call_count.fetch_add(1, std::memory_order_relaxed);
+    if (cn < 16 || (cn % 600) == 0) {
+        SPDLOG_WARN(
+            "[Subnautica2][VolumetricFogPerView] call={} view_info={:p} view_id_set={} tid={}",
+            cn + 1, view_info, view_id, (uint32_t)GetCurrentThreadId());
+    }
+
+    call_original();
+
+    // 2026-05-17 Path A diagnostic: post-compute, dump view+0x2658 (and +0x2650
+    // as a cross-check, since prior memory was split on which offset holds
+    // IntegratedLightScattering's FRDGTexture pointer). Goal: confirm whether
+    // view 1's wrapper pointer is populated by the time FixV5 runs for view 1.
+    // If view 1's +0x2658 is non-null here AND FixV5 still reads null, then
+    // the call order is reversed (SetupFog before compute) and we need to
+    // stash this pointer for FixV5 to pick up.
+    if (view_info != nullptr && view_id != -1) {
+        const uintptr_t v = (uintptr_t)view_info;
+        const uintptr_t p_2650 = is_readable_process_range(v + 0x2650, 8) ? *(uintptr_t*)(v + 0x2650) : 0;
+        const uintptr_t p_2658 = is_readable_process_range(v + 0x2658, 8) ? *(uintptr_t*)(v + 0x2658) : 0;
+        const uintptr_t p_2660 = is_readable_process_range(v + 0x2660, 8) ? *(uintptr_t*)(v + 0x2660) : 0;
+        static std::atomic<uint64_t> post_n{0};
+        const auto pn = post_n.fetch_add(1, std::memory_order_relaxed);
+        if (pn < 16 || (pn % 600) == 0) {
+            SPDLOG_WARN(
+                "[Subnautica2][VolumetricFogPerView][POST] call={} view_id={} view=0x{:x} +2650=0x{:x} +2658=0x{:x} +2660=0x{:x}",
+                pn + 1, view_id, v, p_2650, p_2658, p_2660);
+        }
+
+        // 2026-05-17 Path A Step 3: if this is view 1 and +0x2658 is now
+        // populated (per-view compute has wired up view 1's RDG wrapper),
+        // overwrite UEVR's buffer at offset 0x120 with view 1's pointer.
+        // This fixes the case where FixV5 ran with view 1's +0x2658 == null
+        // (because compute hadn't recorded yet) and fell back to v0_tex.
+        if (view_id == 1 && p_2658 != 0 &&
+            sn2_fog_path_a::enabled_env() && sn2_fog_path_a::buffer_ready())
+        {
+            // We can't write at an offset with the current API; emit a
+            // diagnostic so we can decide whether to add an offset-write
+            // helper. For Step 3 v1, the FixV5 path already writes the whole
+            // buffer post-FixV5 — its target_tex falls back to v0_tex when
+            // FixV5 sees v1_tex=null. If POST hook sees v1_2658!=0 but FixV5
+            // saw v1_2658==0, that's evidence of call-ordering mismatch.
+            static std::atomic<uint64_t> post_v1_hits{0};
+            const auto h = post_v1_hits.fetch_add(1, std::memory_order_relaxed);
+            if (h < 8 || (h % 600) == 0) {
+                SPDLOG_WARN(
+                    "[Subnautica2][VolumetricFogPerView][POST][PathA] view1 v1_2658 NOW=0x{:x} hits={} (compare FixV5 v1_2658 in earlier log)",
+                    p_2658, h + 1);
+            }
+        }
+    }
+
+    // 2026-05-17 Task #47/#48 — wrapper walk via FViewInfo+0x2650 (the
+    // IntegratedLightScattering FRDGTexture pointer, identified via IDA +
+    // runtime FViewPtrDeref probe; the prior +0x2658 in memory was off by
+    // 8). FRDGTexture object at this pointer is ~200 bytes and stores
+    // FRHITexture* somewhere inside; that FRHITexture eventually owns the
+    // underlying ID3D12Resource* that's also in our staging-heap maps.
+    //
+    // Strategy: from view+0x2650 we have FRDGTexture*. Walk every 8-byte
+    // slot inside the first 512 bytes of that object (and one level of
+    // indirection) and for each pointer, probe sn2_fog_uav_map/
+    // sn2_fog_srv_map for a matching ID3D12Resource. When found, tag with
+    // this view's view_id.
+    // 2026-05-17 — wrapper-walk DISABLED. The 3-level pointer scan (512 * 256
+    // * 128 / 8 = ~524k pointer lookups per fog hook call, × ~7 calls/sec)
+    // stalled the render thread enough to break the OpenXR frame loop
+    // ("Recovering focused stale frame loop"), causing the Meta XR Simulator
+    // to show a black screen. Removing the walk because it found zero
+    // matches anyway — the FRDGTexture → ID3D12Resource chain is deeper or
+    // encoded; see project_sn2_wrapper_culled_light_grid_correction_2026-05-17
+    // memory for next-step plan (decompile vfunc at IDA 0x143112100).
+}
+
+void FFakeStereoRenderingHook::subnautica2_single_layer_water_hook(
+    void* scene_renderer,
+    FRDGBuilder* graph_builder,
+    void* views,
+    void* scene_textures,
+    void* single_layer_water_prepass_result,
+    bool should_render_volumetric_cloud,
+    void* scene_without_water_textures,
+    void* lumen_frame_temporaries,
+    bool camera_underwater)
+{
+    auto* hook = g_hook;
+
+    if (hook == nullptr || !hook->m_subnautica2_single_layer_water_hook) {
+        return;
+    }
+
+    std::array<Subnautica2RuntimeViewRectPatch, 2> view_rect_patches{};
+    subnautica2_patch_runtime_view_rects("RenderSingleLayerWater", views, view_rect_patches);
+
+    utility::ScopeGuard restore_view_rects{[&]() {
+        subnautica2_restore_runtime_view_rects(view_rect_patches);
+    }};
+
+    Subnautica2PrimaryViewIndexPatch primary_index_patch{};
+    subnautica2_patch_secondary_primary_view_index("RenderSingleLayerWater", views, primary_index_patch);
+
+    utility::ScopeGuard restore_primary_index{[&]() {
+        subnautica2_restore_primary_view_index(primary_index_patch);
+    }};
+
+    hook->m_subnautica2_single_layer_water_hook.unsafe_call<void>(
+        scene_renderer,
+        graph_builder,
+        views,
+        scene_textures,
+        single_layer_water_prepass_result,
+        should_render_volumetric_cloud,
+        scene_without_water_textures,
+        lumen_frame_temporaries,
+        camera_underwater);
+
+    auto& vr = VR::get();
+    if (!subnautica2_is_current_game() ||
+        !subnautica2_enable_single_layer_water_secondary_replay() ||
+        vr == nullptr ||
+        !vr->is_hmd_active() ||
+        !vr->is_native_stereo_fix_enabled() ||
+        vr->is_native_stereo_fix_same_pass_enabled() ||
+        vr->is_using_afr())
+    {
+        return;
+    }
+
+    Subnautica2ArrayViewPatch secondary_view_patch{};
+    if (!subnautica2_patch_array_view_to_secondary(views, secondary_view_patch)) {
+        return;
+    }
+
+    utility::ScopeGuard restore_secondary_view{[&]() {
+        subnautica2_restore_array_view_patch(secondary_view_patch);
+    }};
+
+    static std::atomic<uint64_t> replay_logged_calls{0};
+    const auto replay_count = replay_logged_calls.fetch_add(1, std::memory_order_relaxed);
+    if (replay_count < 32 || (replay_count % 600) == 0) {
+        SPDLOG_INFO(
+            "[Subnautica2][SingleLayerWater] Replaying water pass for secondary view only call={} original_count={} secondary_view={:x}",
+            replay_count + 1,
+            secondary_view_patch.original_count,
+            secondary_view_patch.replay_data);
+    }
+
+    hook->m_subnautica2_single_layer_water_hook.unsafe_call<void>(
+        scene_renderer,
+        graph_builder,
+        views,
+        scene_textures,
+        single_layer_water_prepass_result,
+        should_render_volumetric_cloud,
+        scene_without_water_textures,
+        lumen_frame_temporaries,
+        camera_underwater);
+}
+
+void FFakeStereoRenderingHook::subnautica2_single_layer_water_inner_hook(
+    void* scene_renderer,
+    FRDGBuilder* graph_builder,
+    void* views,
+    void* scene_textures,
+    void* scene_without_water_textures,
+    void* single_layer_water_prepass_result)
+{
+    auto* hook = g_hook;
+
+    if (hook == nullptr || !hook->m_subnautica2_single_layer_water_inner_hook) {
+        return;
+    }
+
+    auto call_original = [&]() {
+        hook->m_subnautica2_single_layer_water_inner_hook.unsafe_call<void>(
+            scene_renderer,
+            graph_builder,
+            views,
+            scene_textures,
+            scene_without_water_textures,
+            single_layer_water_prepass_result);
+    };
+
+    auto& vr = VR::get();
+
+    if (!subnautica2_is_current_game() ||
+        subnautica2_disable_single_layer_water_pass_fix() ||
+        vr == nullptr ||
+        !vr->is_hmd_active() ||
+        !vr->is_native_stereo_fix_enabled() ||
+        vr->is_native_stereo_fix_same_pass_enabled() ||
+        vr->is_using_afr() ||
+        views == nullptr)
+    {
+        call_original();
+        return;
+    }
+
+    const auto views_addr = (uintptr_t)views;
+
+    if (!is_readable_process_range(views_addr, sizeof(uintptr_t) + sizeof(int32_t))) {
+        call_original();
+        return;
+    }
+
+    auto* const views_data = *(uint8_t**)views_addr;
+    const auto views_count = *(int32_t*)(views_addr + sizeof(uintptr_t));
+
+    if (views_data == nullptr ||
+        views_count < 2 ||
+        views_count > 8 ||
+        !is_writable_process_range(
+            (uintptr_t)views_data,
+            SUBNAUTICA2_SCENEVIEW_STRIDE * 2))
+    {
+        call_original();
+        return;
+    }
+
+    auto* const primary_view = views_data;
+    auto* const secondary_view = views_data + SUBNAUTICA2_SCENEVIEW_STRIDE;
+
+    auto& primary_pass = *(uintptr_t*)(primary_view + SUBNAUTICA2_SCENEVIEW_SINGLE_LAYER_WATER_PASS_OFFSET);
+    auto& secondary_pass = *(uintptr_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_SINGLE_LAYER_WATER_PASS_OFFSET);
+    auto& primary_flags = *(uint8_t*)(primary_view + SUBNAUTICA2_SCENEVIEW_VISIBILITY_FLAGS_OFFSET);
+    auto& secondary_flags = *(uint8_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_VISIBILITY_FLAGS_OFFSET);
+
+    const auto original_secondary_pass = secondary_pass;
+    const auto original_primary_flags = primary_flags;
+    const auto original_secondary_flags = secondary_flags;
+    const auto primary_stereo_pass = *(uint32_t*)(primary_view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+    const auto secondary_stereo_pass = *(uint32_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+
+    bool patched = false;
+
+    if (primary_stereo_pass == EStereoscopicPass::eSSP_PRIMARY &&
+        secondary_stereo_pass == EStereoscopicPass::eSSP_SECONDARY)
+    {
+        primary_flags &= (uint8_t)~SUBNAUTICA2_SCENEVIEW_HAS_NO_VISIBLE_PRIMITIVE_MASK;
+        secondary_flags &= (uint8_t)~SUBNAUTICA2_SCENEVIEW_HAS_NO_VISIBLE_PRIMITIVE_MASK;
+
+        // 2026-05-16: AGGRESSIVE FIX — empirical observation: secondary_pass IS
+        // populated (different pointer from primary), but its CONTENTS produce
+        // the wrong per-view binding (bug confirmed via RenderDoc Thread A:
+        // right-eye basepass binds view 0's fog volume).
+        // The user-confirmed working workaround is `ShowFlag.UWEWaterLighting 0`
+        // (disables this pass entirely for both eyes). As a code fix we instead
+        // FORCE secondary to use primary's FSingleLayerWaterPass — both eyes
+        // will then sample the SAME pass data (view 0's correct setup) rather
+        // than two different setups where view 1's is wrong.
+        if (primary_pass != 0) {
+            secondary_pass = primary_pass;
+        }
+
+        patched =
+            primary_flags != original_primary_flags ||
+            secondary_flags != original_secondary_flags ||
+            secondary_pass != original_secondary_pass;
+    }
+
+    static std::atomic<uint64_t> logged_calls{0};
+    const auto count = logged_calls.fetch_add(1, std::memory_order_relaxed);
+
+    if (count < 120 || patched || ((count % 600) == 0)) {
+        // Use SPDLOG_WARN so spdlog::flush_on(err) doesn't apply — but warn is
+        // flushed more aggressively than info per the default sink behavior.
+        // (Also matches the [warning] level we see firing on other diagnostic logs.)
+        SPDLOG_WARN(
+            "[Subnautica2][SingleLayerWaterInner] call={} count={} patched={} primary(pass={}, water_pass={:x}, flags=0x{:02x}->0x{:02x}, singlepass={}, rect={} {} {} {}) secondary(pass={}, water_pass={:x}->{:x}, flags=0x{:02x}->0x{:02x}, singlepass={}, rect={} {} {} {})",
+            count + 1,
+            views_count,
+            patched,
+            primary_stereo_pass,
+            primary_pass,
+            original_primary_flags,
+            primary_flags,
+            primary_view[SUBNAUTICA2_SCENEVIEW_SINGLE_PASS_STEREO_OFFSET],
+            ((sdk::FSceneViewInitOptionsUE5*)(primary_view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET))->view_rect[0],
+            ((sdk::FSceneViewInitOptionsUE5*)(primary_view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET))->view_rect[1],
+            ((sdk::FSceneViewInitOptionsUE5*)(primary_view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET))->view_rect[2],
+            ((sdk::FSceneViewInitOptionsUE5*)(primary_view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET))->view_rect[3],
+            secondary_stereo_pass,
+            original_secondary_pass,
+            secondary_pass,
+            original_secondary_flags,
+            secondary_flags,
+            secondary_view[SUBNAUTICA2_SCENEVIEW_SINGLE_PASS_STEREO_OFFSET],
+            ((sdk::FSceneViewInitOptionsUE5*)(secondary_view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET))->view_rect[0],
+            ((sdk::FSceneViewInitOptionsUE5*)(secondary_view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET))->view_rect[1],
+            ((sdk::FSceneViewInitOptionsUE5*)(secondary_view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET))->view_rect[2],
+            ((sdk::FSceneViewInitOptionsUE5*)(secondary_view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET))->view_rect[3]);
+        if (patched && count < 24) {
+            spdlog::default_logger()->flush();  // see patches in log immediately during early debugging
+        }
+    }
+
+    utility::ScopeGuard restore_view_fields{[&]() {
+        secondary_pass = original_secondary_pass;
+        primary_flags = original_primary_flags;
+        secondary_flags = original_secondary_flags;
+    }};
+
+    call_original();
+}
+
+void FFakeStereoRenderingHook::subnautica2_compute_volumetric_fog_hook(
+    void* scene_renderer,
+    FRDGBuilder* graph_builder,
+    void* scene_textures)
+{
+    auto* hook = g_hook;
+
+    if (hook == nullptr || !hook->m_subnautica2_compute_volumetric_fog_hook) {
+        return;
+    }
+
+    // (RetAddr walk removed — caused render-thread timeout)
+
+    auto call_original = [&]() {
+        hook->m_subnautica2_compute_volumetric_fog_hook.unsafe_call<void>(scene_renderer, graph_builder, scene_textures);
+    };
+
+    thread_local bool inside_hook = false;
+    if (inside_hook) {
+        call_original();
+        return;
+    }
+
+    inside_hook = true;
+    utility::ScopeGuard inside_guard{[]() {
+        inside_hook = false;
+    }};
+
+    bool called_original = false;
+
+    auto fallback_original = [&]() {
+        called_original = true;
+        call_original();
+    };
+
+    auto& vr = VR::get();
+
+    const bool state_copy_enabled = subnautica2_enable_volumetric_fog_state_copy();
+    const bool double_dispatch_disabled = subnautica2_disable_volumetric_fog_view_loop_fix();
+    const bool rect_widen_enabled = subnautica2_enable_fog_rect_widen();
+    const bool matrix_swap_enabled_gate = subnautica2_enable_fog_view1_matrix_swap();
+
+    if (!subnautica2_is_current_game() ||
+        vr == nullptr ||
+        !vr->is_hmd_active() ||
+        !vr->is_native_stereo_fix_enabled() ||
+        vr->is_native_stereo_fix_same_pass_enabled() ||
+        vr->is_using_afr() ||
+        (double_dispatch_disabled && !state_copy_enabled && !rect_widen_enabled && !matrix_swap_enabled_gate))
+    {
+        fallback_original();
+        return;
+    }
+
+    const auto renderer = (uintptr_t)scene_renderer;
+    const auto header_addr = renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_DATA_OFFSET;
+
+    if (scene_renderer == nullptr ||
+        graph_builder == nullptr ||
+        !is_writable_process_range(header_addr, sizeof(uintptr_t) + sizeof(int32_t) * 2))
+    {
+        fallback_original();
+        return;
+    }
+
+    auto* views_data_ptr = (uint8_t**)(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_DATA_OFFSET);
+    auto* views_count_ptr = (int32_t*)(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_COUNT_OFFSET);
+    auto* views_max_ptr = (int32_t*)(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_MAX_OFFSET);
+
+    auto* const original_views_data = *views_data_ptr;
+    const auto original_views_count = *views_count_ptr;
+    const auto original_views_max = *views_max_ptr;
+
+    if (original_views_data == nullptr ||
+        original_views_count < 2 ||
+        original_views_count > 8 ||
+        original_views_max < original_views_count ||
+        !is_readable_process_range(
+            (uintptr_t)original_views_data,
+            SUBNAUTICA2_SCENEVIEW_STRIDE + SUBNAUTICA2_SCENEVIEW_STEREO_ASPECTS_FLAGS_OFFSET + sizeof(uint16_t)))
+    {
+        fallback_original();
+        return;
+    }
+
+    auto* const primary_view = original_views_data;
+    auto* const secondary_view = original_views_data + SUBNAUTICA2_SCENEVIEW_STRIDE;
+    const auto primary_pass = *(uint32_t*)(primary_view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+    const auto secondary_pass = *(uint32_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+    const auto primary_index = *(uint32_t*)(primary_view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET);
+    const auto secondary_index = *(uint32_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET);
+
+    if (primary_pass != EStereoscopicPass::eSSP_PRIMARY ||
+        secondary_pass != EStereoscopicPass::eSSP_SECONDARY)
+    {
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[Subnautica2][VolumetricFog] Skipping second fog build; unexpected stereo passes primary={} secondary={} indices={}/{} count={}",
+            primary_pass,
+            secondary_pass,
+            primary_index,
+            secondary_index,
+            original_views_count);
+        fallback_original();
+        return;
+    }
+
+    // 2026-05-15 23:38 FIX-V3 (DEPRECATED, default-off as of 2026-05-16):
+    // widening view 0's runtime_view_rect to cover view 1's screen-X range
+    // before compute. Empirically caused left-eye flicker (view 0 cbuffer
+    // pollution). Kept behind UEVR_SUBNAUTICA2_ENABLE_FOG_RECT_WIDEN=1 only.
+    int32_t saved_v0_runtime_rect[4]{};
+    bool widened_v0_rect = false;
+
+    if (rect_widen_enabled) {
+        auto* const v0_rt = (int32_t*)(primary_view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+        auto* const v1_rt = (int32_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+
+        if (is_writable_process_range((uintptr_t)v0_rt, 16) &&
+            is_readable_process_range((uintptr_t)v1_rt, 16))
+        {
+            const int32_t v0_x0 = v0_rt[0], v0_y0 = v0_rt[1], v0_x1 = v0_rt[2], v0_y1 = v0_rt[3];
+            const int32_t v1_x0 = v1_rt[0], v1_y0 = v1_rt[1], v1_x1 = v1_rt[2], v1_y1 = v1_rt[3];
+
+            if (v1_x0 > v0_x1 && v1_x1 > v0_x1) {
+                memcpy(saved_v0_runtime_rect, v0_rt, sizeof(saved_v0_runtime_rect));
+                v0_rt[2] = v1_x1;
+                widened_v0_rect = true;
+
+                static std::atomic<uint64_t> widen_count{0};
+                const auto wn = widen_count.fetch_add(1, std::memory_order_relaxed);
+                if (wn < 4 || (wn % 600) == 0) {
+                    SPDLOG_WARN(
+                        "[Subnautica2][VolumetricFog][RectWiden] call={} v0_rt=({},{},{},{}) -> ({},{},{},{}) | v1_rt=({},{},{},{}) (unchanged)",
+                        wn + 1, v0_x0, v0_y0, v0_x1, v0_y1,
+                        v0_rt[0], v0_rt[1], v0_rt[2], v0_rt[3],
+                        v1_x0, v1_y0, v1_x1, v1_y1);
+                }
+            }
+        }
+    }
+
+    // 2026-05-16 NEW STRATEGY: view-1 matrix swap.
+    // Copy view 0's FViewMatrices block to view 1 BEFORE compute_volumetric_fog
+    // executes. View 1's compute iteration then builds its fog volume using
+    // view 0's projection/view matrices — so the volume is filled with view 0's
+    // perspective for BOTH eyes' UAV writes. Restore view 1's original matrices
+    // immediately after fallback_original so view 1's basepass uses its own
+    // matrices to SAMPLE the volume.
+    //
+    // Offset / size are env-var-tunable; defaults (0x3B0 / 0x200) come from
+    // the memory note that sub_142FD6170 reads `*((_OWORD*)a2 + 59)` and walks
+    // forward through ~8 matrices.
+    const bool matrix_swap_enabled = subnautica2_enable_fog_view1_matrix_swap();
+    const uint32_t matrix_swap_offset = subnautica2_fog_view1_matrix_swap_offset();
+    const uint32_t matrix_swap_size = subnautica2_fog_view1_matrix_swap_size();
+    std::vector<uint8_t> saved_v1_matrix_block;
+    bool swapped_v1_matrices = false;
+
+    if (matrix_swap_enabled &&
+        matrix_swap_size > 0 &&
+        matrix_swap_size <= 0x1000 &&
+        is_readable_process_range((uintptr_t)primary_view + matrix_swap_offset, matrix_swap_size) &&
+        is_writable_process_range((uintptr_t)secondary_view + matrix_swap_offset, matrix_swap_size))
+    {
+        saved_v1_matrix_block.resize(matrix_swap_size);
+        memcpy(saved_v1_matrix_block.data(),
+               (const void*)(secondary_view + matrix_swap_offset),
+               matrix_swap_size);
+        memcpy((void*)(secondary_view + matrix_swap_offset),
+               (const void*)(primary_view + matrix_swap_offset),
+               matrix_swap_size);
+        swapped_v1_matrices = true;
+
+        static std::atomic<uint64_t> swap_count{0};
+        const auto sn = swap_count.fetch_add(1, std::memory_order_relaxed);
+        if (sn < 8 || (sn % 600) == 0) {
+            const float* v0m = (const float*)(primary_view + matrix_swap_offset);
+            const float* v1m_orig = (const float*)saved_v1_matrix_block.data();
+            SPDLOG_WARN(
+                "[Subnautica2][VolumetricFog][MatrixSwap] call={} off=0x{:x} size={} | v0[0..3]=({:.4f},{:.4f},{:.4f},{:.4f}) v1_was=({:.4f},{:.4f},{:.4f},{:.4f})",
+                sn + 1, matrix_swap_offset, matrix_swap_size,
+                v0m[0], v0m[1], v0m[2], v0m[3],
+                v1m_orig[0], v1m_orig[1], v1m_orig[2], v1m_orig[3]);
+        }
+    }
+
+    fallback_original();
+
+    // Restore view 1's matrices IMMEDIATELY after compute so its basepass uses
+    // its own (correct) matrices to sample the fog volume.
+    if (swapped_v1_matrices) {
+        memcpy((void*)(secondary_view + matrix_swap_offset),
+               saved_v1_matrix_block.data(),
+               matrix_swap_size);
+    }
+
+    // Restore view 0's runtime_view_rect IMMEDIATELY after compute so downstream
+    // passes (basepass etc) see the original per-view rect.
+    if (widened_v0_rect) {
+        auto* const v0_rt = (int32_t*)(primary_view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+        memcpy(v0_rt, saved_v0_runtime_rect, sizeof(saved_v0_runtime_rect));
+    }
+
+    // 2026-05-15 22:50 TARGETED FIX (per user's deep trace):
+    // view+0x2658 IS the IntegratedLightScattering 3D texture pointer.
+    // sub_142FBED20 (compute_volumetric_fog) STORES view 0's texture there at
+    // 0x142FBFAAB; for view 1, that field stays null. SetupFogUniformParameters
+    // (at 0x1426FD275) reads view+0x2658 and falls back to a default BLACK
+    // texture when null -> view 1's basepass samples a black texture -> no fog.
+    // Fix: copy view 0's view+0x2658 to view 1's view+0x2658 after compute.
+    if (state_copy_enabled) {
+        const uintptr_t view0_addr2 = (uintptr_t)primary_view;
+        const uintptr_t view1_addr2 = (uintptr_t)secondary_view;
+        if (is_readable_process_range(view0_addr2 + 0x2658, 8) &&
+            is_writable_process_range(view1_addr2 + 0x2658, 8))
+        {
+            const uintptr_t v0_lightscat = *(uintptr_t*)(view0_addr2 + 0x2658);
+            const uintptr_t v1_lightscat_was = *(uintptr_t*)(view1_addr2 + 0x2658);
+
+            // 2026-05-16 FIX-V2: capture view 1's NATURAL pointer (the right-eye
+            // fog texture) BEFORE the propagation below overwrites it. Stored
+            // in a global for setup_volumetric_fog_ub_hook to use later.
+            if (v1_lightscat_was != 0 && v1_lightscat_was != v0_lightscat) {
+                g_subnautica2_view1_natural_lightscat.store(v1_lightscat_was, std::memory_order_relaxed);
+                g_subnautica2_view0_lightscat.store(v0_lightscat, std::memory_order_relaxed);
+                static std::atomic<uint64_t> capture_calls{0};
+                const auto cn = capture_calls.fetch_add(1, std::memory_order_relaxed);
+                if (cn < 4 || (cn % 600) == 0) {
+                    SPDLOG_WARN(
+                        "[Subnautica2][FixV2] CAPTURED view1_natural_lightscat=0x{:x} view0_lightscat=0x{:x} (call={})",
+                        v1_lightscat_was, v0_lightscat, cn + 1);
+                }
+            }
+
+            if (v0_lightscat != 0 && v0_lightscat != v1_lightscat_was) {
+                *(uintptr_t*)(view1_addr2 + 0x2658) = v0_lightscat;
+
+                static std::atomic<uint64_t> ls_copy_calls{0};
+                const auto cnt2 = ls_copy_calls.fetch_add(1, std::memory_order_relaxed);
+                if (cnt2 < 8 || (cnt2 % 300) == 0) {
+                    SPDLOG_WARN(
+                        "[Subnautica2][VolumetricFog][LightScat2658] call={} view0+0x2658=0x{:x} (was view1=0x{:x}) -> copied",
+                        cnt2 + 1, v0_lightscat, v1_lightscat_was);
+                }
+            }
+        }
+    }
+
+    // 2026-05-15 NEW PATH: state-copy fix. After compute_volumetric_fog ran
+    // for view 0 (filling view 0's FSceneViewState's IntegratedLightScattering
+    // texture handle at state+0x1E00 per user's offline trace), copy that
+    // region from view 0's state to view 1's state. View 1's basepass walker
+    // will then find a valid UB pointer instead of garbage at params+0x2C.
+    if (state_copy_enabled) {
+        const uintptr_t view0_addr = (uintptr_t)primary_view;
+        const uintptr_t view1_addr = (uintptr_t)secondary_view;
+        if (is_readable_process_range(view0_addr + 0x1C10, 8) &&
+            is_readable_process_range(view1_addr + 0x1C10, 8))
+        {
+            const uintptr_t state0 = *(uintptr_t*)(view0_addr + 0x1C10);
+            const uintptr_t state1 = *(uintptr_t*)(view1_addr + 0x1C10);
+            if (state0 != 0 && state1 != 0 && state0 != state1) {
+                const uint32_t copy_size = subnautica2_volumetric_fog_state_copy_size();
+                if (is_readable_process_range(state0 + 0x1E00, copy_size) &&
+                    is_writable_process_range(state1 + 0x1E00, copy_size))
+                {
+                    static std::atomic<uint64_t> copy_calls{0};
+                    const auto cnt = copy_calls.fetch_add(1, std::memory_order_relaxed);
+
+                    uintptr_t before[4]{};
+                    if (copy_size >= 8 && is_readable_process_range(state1 + 0x1E00, 32)) {
+                        memcpy(before, (const void*)(state1 + 0x1E00), 32);
+                    }
+
+                    memcpy((void*)(state1 + 0x1E00), (const void*)(state0 + 0x1E00), copy_size);
+
+                    if (cnt < 8 || (cnt % 300) == 0) {
+                        uintptr_t v0_p = *(uintptr_t*)(state0 + 0x1E00);
+                        uintptr_t v1_p_now = *(uintptr_t*)(state1 + 0x1E00);
+                        SPDLOG_WARN(
+                            "[Subnautica2][VolumetricFog][StateCopy] call={} copied {} bytes state0+0x1E00=0x{:x}->state1+0x1E00 v0_ptr=0x{:x} v1_was=0x{:x} v1_now=0x{:x}",
+                            cnt + 1, copy_size, state0 + 0x1E00,
+                            v0_p, before[0], v1_p_now);
+                    }
+                } else {
+                    SPDLOG_INFO_EVERY_N_SEC(
+                        5,
+                        "[Subnautica2][VolumetricFog][StateCopy] Skipping; state ranges not r/w state0+0x1E00=0x{:x} state1+0x1E00=0x{:x} size={}",
+                        state0 + 0x1E00, state1 + 0x1E00, copy_size);
+                }
+            }
+        }
+    }
+
+    if (double_dispatch_disabled) {
+        // State-copy path: don't double-dispatch (avoids slot-0 overwrite).
+        (void)called_original;
+        return;
+    }
+
+    if (*views_data_ptr != original_views_data ||
+        *views_count_ptr != original_views_count ||
+        *views_max_ptr != original_views_max)
+    {
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[Subnautica2][VolumetricFog] Original call changed renderer views header; skipping second fog build");
+        return;
+    }
+
+    const bool force_view_index = (bool)hook->m_subnautica2_compute_volumetric_fog_view_index_hook;
+
+    *views_data_ptr = secondary_view;
+    *views_count_ptr = 1;
+    *views_max_ptr = 1;
+
+    utility::ScopeGuard restore_views{[&]() {
+        *views_data_ptr = original_views_data;
+        *views_count_ptr = original_views_count;
+        *views_max_ptr = original_views_max;
+    }};
+
+    if (force_view_index) {
+        g_subnautica2_force_volumetric_fog_view_index_one = true;
+        utility::ScopeGuard force_view_index_guard{[]() {
+            g_subnautica2_force_volumetric_fog_view_index_one = false;
+        }};
+
+        call_original();
+    } else {
+        call_original();
+    }
+
+    static std::atomic<uint64_t> logged_calls{0};
+    const auto count = logged_calls.fetch_add(1, std::memory_order_relaxed);
+    if (count < 8 || (count % 300) == 0) {
+        SPDLOG_INFO(
+            "[Subnautica2][VolumetricFog] Ran second fog build for secondary view pass={} index={} original_count={} view_index_forced={} call={}",
+            secondary_pass,
+            secondary_index,
+            original_views_count,
+            force_view_index ? 1 : 0,
+            count + 1);
+    }
+
+    (void)called_original;
+}
+
+void FFakeStereoRenderingHook::subnautica2_init_volumetric_render_target_hook(
+    FRDGBuilder* graph_builder,
+    void* views,
+    void* scene_textures)
+{
+    auto* hook = g_hook;
+
+    if (hook == nullptr || !hook->m_subnautica2_init_volumetric_render_target_hook) {
+        return;
+    }
+
+    auto call_original = [&]() {
+        hook->m_subnautica2_init_volumetric_render_target_hook.unsafe_call<void>(
+            graph_builder,
+            views,
+            scene_textures);
+    };
+
+    thread_local bool inside_hook = false;
+    if (inside_hook) {
+        call_original();
+        return;
+    }
+
+    inside_hook = true;
+    utility::ScopeGuard inside_guard{[]() {
+        inside_hook = false;
+    }};
+
+    auto& vr = VR::get();
+    const bool log_native_stereo =
+        subnautica2_is_current_game() &&
+        vr != nullptr &&
+        vr->is_hmd_active() &&
+        vr->is_native_stereo_fix_enabled() &&
+        !vr->is_native_stereo_fix_same_pass_enabled() &&
+        !vr->is_using_afr();
+
+    if (log_native_stereo) {
+        subnautica2_log_compose_volumetric_render_target("VRTInitBefore", views, false, nullptr);
+    }
+
+    call_original();
+
+    if (log_native_stereo) {
+        subnautica2_log_compose_volumetric_render_target("VRTInitAfter", views, false, nullptr);
+    }
+
+    // Patch L: double-dispatch init_volumetric_render_target for view 1 so
+    // its VolumetricFogResources get allocated. Without this, view 1's RTs
+    // are null when compute/reconstruct/compose try to write/read them.
+    if (log_native_stereo &&
+        views != nullptr &&
+        !subnautica2_disable_volumetric_fog_view_loop_fix())
+    {
+        const uintptr_t views_addr = (uintptr_t)views;
+        if (is_readable_process_range(views_addr, sizeof(uintptr_t) + sizeof(int32_t))) {
+            auto** views_data_ptr2 = (uint8_t**)views_addr;
+            auto* views_count_ptr2 = (int32_t*)(views_addr + sizeof(uintptr_t));
+            auto* const original_views_data2 = *views_data_ptr2;
+            const auto original_views_count2 = *views_count_ptr2;
+
+            if (original_views_data2 != nullptr && original_views_count2 >= 2 &&
+                is_readable_process_range((uintptr_t)original_views_data2, SUBNAUTICA2_SCENEVIEW_STRIDE * 2))
+            {
+                auto* const secondary_view2 = original_views_data2 + SUBNAUTICA2_SCENEVIEW_STRIDE;
+                *views_data_ptr2 = secondary_view2;
+                *views_count_ptr2 = 1;
+
+                utility::ScopeGuard restore_views2{[&]() {
+                    *views_data_ptr2 = original_views_data2;
+                    *views_count_ptr2 = original_views_count2;
+                }};
+
+                call_original();
+
+                static std::atomic<uint64_t> init_second_calls{0};
+                const auto cnt = init_second_calls.fetch_add(1, std::memory_order_relaxed);
+                if (cnt < 8 || (cnt % 300) == 0) {
+                    SPDLOG_INFO(
+                        "[Subnautica2][InitVolumetric] Ran second init for view 1 call={}",
+                        cnt + 1);
+                }
+            }
+        }
+    }
+}
+
+void FFakeStereoRenderingHook::subnautica2_reconstruct_volumetric_render_target_hook(
+    FRDGBuilder* graph_builder,
+    void* views,
+    FRDGTexture* scene_depth,
+    FRDGTexture* half_resolution_depth_checkerboard_minmax,
+    bool wait_finish_fence)
+{
+    auto* hook = g_hook;
+
+    if (hook == nullptr || !hook->m_subnautica2_reconstruct_volumetric_render_target_hook) {
+        return;
+    }
+
+    auto call_original = [&]() {
+        hook->m_subnautica2_reconstruct_volumetric_render_target_hook.unsafe_call<void>(
+            graph_builder,
+            views,
+            scene_depth,
+            half_resolution_depth_checkerboard_minmax,
+            wait_finish_fence);
+    };
+
+    thread_local bool inside_hook = false;
+    if (inside_hook) {
+        call_original();
+        return;
+    }
+
+    inside_hook = true;
+    utility::ScopeGuard inside_guard{[]() {
+        inside_hook = false;
+    }};
+
+    auto& vr = VR::get();
+    const bool log_native_stereo =
+        subnautica2_is_current_game() &&
+        vr != nullptr &&
+        vr->is_hmd_active() &&
+        vr->is_native_stereo_fix_enabled() &&
+        !vr->is_native_stereo_fix_same_pass_enabled() &&
+        !vr->is_using_afr();
+
+    if (log_native_stereo) {
+        subnautica2_log_compose_volumetric_render_target("VRTReconstructBefore", views, false, nullptr);
+    }
+
+    call_original();
+
+    if (log_native_stereo) {
+        subnautica2_log_compose_volumetric_render_target("VRTReconstructAfter", views, false, nullptr);
+    }
+
+    // Patch K: double-dispatch reconstruct for view 1. Like compose, this
+    // function reads views_data[0] only — without a second call, view 1's
+    // ReconstructionRT stays empty and the subsequent compose pass for view 1
+    // reads garbage. Swap views[0] -> &view[1] for a second run.
+    if (log_native_stereo &&
+        views != nullptr &&
+        !subnautica2_disable_volumetric_fog_view_loop_fix())
+    {
+        const uintptr_t views_addr = (uintptr_t)views;
+        if (is_readable_process_range(views_addr, sizeof(uintptr_t) + sizeof(int32_t))) {
+            auto** views_data_ptr2 = (uint8_t**)views_addr;
+            auto* views_count_ptr2 = (int32_t*)(views_addr + sizeof(uintptr_t));
+            auto* const original_views_data2 = *views_data_ptr2;
+            const auto original_views_count2 = *views_count_ptr2;
+
+            if (original_views_data2 != nullptr && original_views_count2 >= 2 &&
+                is_readable_process_range((uintptr_t)original_views_data2, SUBNAUTICA2_SCENEVIEW_STRIDE * 2))
+            {
+                auto* const secondary_view2 = original_views_data2 + SUBNAUTICA2_SCENEVIEW_STRIDE;
+                *views_data_ptr2 = secondary_view2;
+                *views_count_ptr2 = 1;
+
+                utility::ScopeGuard restore_views2{[&]() {
+                    *views_data_ptr2 = original_views_data2;
+                    *views_count_ptr2 = original_views_count2;
+                }};
+
+                call_original();
+
+                static std::atomic<uint64_t> reconstruct_second_calls{0};
+                const auto cnt = reconstruct_second_calls.fetch_add(1, std::memory_order_relaxed);
+                if (cnt < 8 || (cnt % 300) == 0) {
+                    SPDLOG_INFO(
+                        "[Subnautica2][ReconstructVolumetric] Ran second reconstruct for view 1 call={}",
+                        cnt + 1);
+                }
+            }
+        }
+    }
+}
+
+void FFakeStereoRenderingHook::subnautica2_compose_volumetric_render_target_hook(
+    FRDGBuilder* graph_builder,
+    void* views,
+    FRDGTexture* scene_color,
+    FRDGTexture* scene_depth,
+    bool compose_with_water,
+    void* water_pass_data,
+    void* scene_textures)
+{
+    auto* hook = g_hook;
+
+    if (hook == nullptr || !hook->m_subnautica2_compose_volumetric_render_target_hook) {
+        return;
+    }
+
+    auto call_original = [&]() {
+        hook->m_subnautica2_compose_volumetric_render_target_hook.unsafe_call<void>(
+            graph_builder,
+            views,
+            scene_color,
+            scene_depth,
+            compose_with_water,
+            water_pass_data,
+            scene_textures);
+    };
+
+    thread_local bool inside_hook = false;
+    if (inside_hook) {
+        call_original();
+        return;
+    }
+
+    inside_hook = true;
+    utility::ScopeGuard inside_guard{[]() {
+        inside_hook = false;
+    }};
+
+    auto& vr = VR::get();
+
+    // Defaults: no patch
+    uint8_t* patched_view1 = nullptr;
+    int32_t saved_init_rect[4]{};
+    int32_t saved_runtime_rect[4]{};
+    bool patched_init_rect = false;
+    bool patched_runtime_rect = false;
+
+    // Patch M state: expanded view[0] rect to cover full SBS.
+    uint8_t* expanded_view0 = nullptr;
+    int32_t saved_v0_init_rect[4]{};
+    int32_t saved_v0_runtime_rect[4]{};
+    bool expanded_v0_init = false;
+    bool expanded_v0_runtime = false;
+
+    // Patch N state: shared view 0's volumetric ViewState with view 1.
+    uint8_t* patch_n_view1 = nullptr;
+    uintptr_t patch_n_saved_v1_view_state = 0;
+
+    if (subnautica2_is_current_game() &&
+        vr != nullptr &&
+        vr->is_hmd_active() &&
+        vr->is_native_stereo_fix_enabled() &&
+        !vr->is_native_stereo_fix_same_pass_enabled() &&
+        !vr->is_using_afr())
+    {
+        subnautica2_log_compose_volumetric_render_target(
+            "VolCloudComposeOverScene",
+            views,
+            compose_with_water,
+            water_pass_data);
+
+        // Per-eye rect patch. SN2's ComposeVolumetricRenderTargetOverScene reads
+        // both views' init_options.view_rect and runtime view_rect, but for
+        // stereo with view 0 occupying x=[0,W) and view 1 occupying x=[W,2W),
+        // SN2 leaves view 1's rect mirroring view 0's (both starting at x=0).
+        // The composite then writes the fog overlay to the left half only,
+        // producing the "fog only in left eye" symptom on the title screen
+        // and underwater. We detect the mirror and shift view 1's rect right.
+        if (!subnautica2_disable_compose_volumetric_view_rect_fix() && views != nullptr) {
+            const uintptr_t views_addr = (uintptr_t)views;
+
+            if (is_readable_process_range(views_addr, sizeof(uintptr_t) + sizeof(int32_t))) {
+                auto* const views_data = *(uint8_t**)views_addr;
+                const auto views_count = *(int32_t*)(views_addr + sizeof(uintptr_t));
+
+                if (views_data != nullptr && views_count >= 2 &&
+                    is_readable_process_range((uintptr_t)views_data, SUBNAUTICA2_SCENEVIEW_STRIDE * 2))
+                {
+                    auto* const view0 = views_data + 0;
+                    auto* const view1 = views_data + SUBNAUTICA2_SCENEVIEW_STRIDE;
+
+                    auto* const v0_init = (sdk::FSceneViewInitOptionsUE5*)(view0 + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET);
+                    auto* const v1_init = (sdk::FSceneViewInitOptionsUE5*)(view1 + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET);
+                    auto* const v0_rt = (int32_t*)(view0 + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+                    auto* const v1_rt = (int32_t*)(view1 + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+
+                    const int32_t v0_init_width = v0_init->view_rect[2] - v0_init->view_rect[0];
+                    const int32_t v0_rt_width = v0_rt[2] - v0_rt[0];
+
+                    const bool init_mirrored =
+                        v0_init_width > 0 &&
+                        memcmp(v0_init->view_rect, v1_init->view_rect, sizeof(int32_t) * 4) == 0;
+                    const bool rt_mirrored =
+                        v0_rt_width > 0 &&
+                        memcmp(v0_rt, v1_rt, sizeof(int32_t) * 4) == 0;
+
+                    if (init_mirrored) {
+                        memcpy(saved_init_rect, v1_init->view_rect, sizeof(saved_init_rect));
+                        v1_init->view_rect[0] += v0_init_width;
+                        v1_init->view_rect[2] += v0_init_width;
+                        patched_init_rect = true;
+                    }
+                    // Patch M disabled — was making things worse, not better.
+
+                    // Patch N disabled — shared ViewState made compose write view 0's
+                    // rect for both passes (output dimensions come from ViewState).
+                    (void)patch_n_view1;
+                    (void)patch_n_saved_v1_view_state;
+
+                    if (rt_mirrored) {
+                        memcpy(saved_runtime_rect, v1_rt, sizeof(saved_runtime_rect));
+                        // Match DLSS's expected source rect for view 1 exactly:
+                        // DLSS log shows view 1 at (1128, 0, 2249, 1174).
+                        // 8-pixel aligned start (v0_rt[2] rounded up to 8).
+                        // Use full height (init_view_rect[3] * scale = 1760 * 0.667 ≈ 1174).
+                        const int32_t v1_x_start = (v0_rt[2] + 7) & ~7;     // align to 8
+                        const int32_t v1_height = (v0_init->view_rect[3] * 2 + 2) / 3; // 1760 * 2/3
+                        v1_rt[0] = v1_x_start;
+                        v1_rt[1] = v0_rt[1];
+                        v1_rt[2] = v1_x_start + v0_rt_width;
+                        v1_rt[3] = v1_height;
+                        patched_runtime_rect = true;
+                    }
+                    // Patch M removed — was sending compose's output to invalid coords
+                    // (init_view_rect-based shift wrote past the half-res scene_color buffer edge).
+                    expanded_v0_runtime = false;
+                    expanded_v0_init = false;
+                    expanded_view0 = nullptr;
+
+                    if (patched_init_rect || patched_runtime_rect) {
+                        patched_view1 = view1;
+
+                        static uint32_t patch_log_count = 0;
+                        if (patch_log_count < 16) {
+                            SPDLOG_INFO(
+                                "[Subnautica2][ComposeVolumetric] Patched view[1] rect: init=({} {} {} {}) -> ({} {} {} {}); runtime=({} {} {} {}) -> ({} {} {} {})",
+                                saved_init_rect[0], saved_init_rect[1], saved_init_rect[2], saved_init_rect[3],
+                                v1_init->view_rect[0], v1_init->view_rect[1], v1_init->view_rect[2], v1_init->view_rect[3],
+                                saved_runtime_rect[0], saved_runtime_rect[1], saved_runtime_rect[2], saved_runtime_rect[3],
+                                v1_rt[0], v1_rt[1], v1_rt[2], v1_rt[3]);
+                            ++patch_log_count;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // DIAGNOSTIC: log compose exit-check fields for BOTH views before call.
+    // The compose function iterates views[v17] in a while loop but exits to
+    // the next view if any of these fields don't have expected values for
+    // view 1. Identify which exit fires.
+    if (subnautica2_is_current_game() && views != nullptr) {
+        const uintptr_t views_addr = (uintptr_t)views;
+        if (is_readable_process_range(views_addr, sizeof(uintptr_t) + sizeof(int32_t))) {
+            auto* const views_data = *(uint8_t**)views_addr;
+            const auto views_count = *(int32_t*)(views_addr + sizeof(uintptr_t));
+            if (views_data != nullptr && views_count >= 2 &&
+                is_readable_process_range((uintptr_t)views_data, SUBNAUTICA2_SCENEVIEW_STRIDE * 2))
+            {
+                static std::atomic<int> diag_count{0};
+                if (diag_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    for (int eye = 0; eye < 2; ++eye) {
+                        auto* const view = views_data + (SUBNAUTICA2_SCENEVIEW_STRIDE * eye);
+                        const uintptr_t view_addr = (uintptr_t)view;
+                        uintptr_t view_state = 0;
+                        uintptr_t view_family = 0;
+                        uint32_t state_1F50 = 0xDEADBEEF;
+                        uint32_t view_2348_ptr_value = 0xDEADBEEF;
+                        uintptr_t view_2348_ptr = 0;
+
+                        if (is_readable_process_range(view_addr + 0x1C10, 8)) view_state = *(uintptr_t*)(view_addr + 0x1C10);
+                        if (is_readable_process_range(view_addr + 8, 8)) view_family = *(uintptr_t*)(view_addr + 8);
+                        if (view_state != 0 && is_readable_process_range(view_state + 0x1F50, 4)) state_1F50 = *(uint32_t*)(view_state + 0x1F50);
+                        if (is_readable_process_range(view_addr + 0x2348, 8)) view_2348_ptr = *(uintptr_t*)(view_addr + 0x2348);
+                        if (view_2348_ptr != 0 && is_readable_process_range(view_2348_ptr, 4)) view_2348_ptr_value = *(uint32_t*)view_2348_ptr;
+
+                        // Compute the same predicates as sub_142FD72A0 (v26) and the fog enable
+                        // path to identify which view ends up with no-fog shader variant.
+                        const bool state_1F50_passes = ((state_1F50 & 0xFFFFFFFDu) == 0);
+
+                        // 2026-05-15: probe the remaining candidate inputs to compose shader
+                        // permutation key v31 (from offline IDA synthesis). v28 (=*(view+0x2348))
+                        // and v101 (=state+0x1F50) are 0 for both eyes per prior logs.
+                        // Remaining candidates that diverge per-view: v102 (underwater depth at
+                        // view+0x1200), v30 (family+0xA5 — should be shared, sanity-check).
+                        float view_1200_f = 0.0f;
+                        uint32_t view_1200_u = 0xDEADBEEF;
+                        if (is_readable_process_range(view_addr + 0x1200, 4)) {
+                            view_1200_u = *(uint32_t*)(view_addr + 0x1200);
+                            view_1200_f = *(float*)(view_addr + 0x1200);
+                        }
+                        uint32_t view_1204_u = 0xDEADBEEF;
+                        if (is_readable_process_range(view_addr + 0x1204, 4)) {
+                            view_1204_u = *(uint32_t*)(view_addr + 0x1204);
+                        }
+                        uint8_t family_A5 = 0xFF;
+                        if (view_family != 0 && is_readable_process_range(view_family + 0xA5, 1)) {
+                            family_A5 = *(uint8_t*)(view_family + 0xA5);
+                        }
+                        // v102 predicate as decompile suggests: underwater_depth > 0.0f
+                        const bool v102_predicate = (view_1200_f > 0.0f);
+
+                        // 2026-05-15 followup: v28/v101/v102/v30 all match between eyes.
+                        // Remaining v27/v93 depend on ShouldViewRenderVolumetricCloudRenderTarget(view)
+                        // whose per-view inputs are: view+0x11EC (byte; must == 0) AND
+                        // view+0x428 (double; must be < 1.0). These are our prime suspects.
+                        uint8_t view_11EC = 0xFF;
+                        if (is_readable_process_range(view_addr + 0x11EC, 1)) {
+                            view_11EC = *(uint8_t*)(view_addr + 0x11EC);
+                        }
+                        double view_428_d = 0.0;
+                        uint64_t view_428_u = 0xDEADBEEFDEADBEEFull;
+                        if (is_readable_process_range(view_addr + 0x428, 8)) {
+                            view_428_d = *(double*)(view_addr + 0x428);
+                            view_428_u = *(uint64_t*)(view_addr + 0x428);
+                        }
+                        const bool check_11EC_zero = (view_11EC == 0);
+                        const bool check_428_lt1 = (view_428_d < 1.0);
+                        const bool should_render_vcrt =
+                            check_11EC_zero &&
+                            check_428_lt1 &&
+                            (view_state != 0);
+
+                        // 2026-05-15 third diag pass: compose's INNER per-view loop has
+                        // exit checks on STATE-side fields beyond v31 inputs.
+                        // From compose decompile (sub_142FFB190):
+                        //   `(state+7840, !*(BYTE*)(state+7855))` - state+0x1EAF must be nonzero
+                        //   `(v19 = state+7192, state+0xC88: *(float*)(v19+0xCCC)==0 && !(*(byte*)(v19+0x1410)&0x10))` - skip combo
+                        // The state pointer here is view+0x1C10 (ViewState), so:
+                        //   state+0x1EAF must be != 0
+                        //   state+0xCCC must be != 0.0  OR  (state+0x1410 & 0x10) must be set
+                        // These are the FVolumetricRenderTargetViewStateData fields.
+                        // If view 1's state has 0x1EAF==0, compose skips view 1 entirely.
+                        uint8_t state_1EAF = 0xFF;
+                        float state_CCC_f = 0.0f;
+                        uint32_t state_CCC_u = 0xDEADBEEF;
+                        uint8_t state_1410 = 0xFF;
+                        if (view_state != 0) {
+                            if (is_readable_process_range(view_state + 0x1EAF, 1)) state_1EAF = *(uint8_t*)(view_state + 0x1EAF);
+                            if (is_readable_process_range(view_state + 0xCCC, 4)) {
+                                state_CCC_u = *(uint32_t*)(view_state + 0xCCC);
+                                state_CCC_f = *(float*)(view_state + 0xCCC);
+                            }
+                            if (is_readable_process_range(view_state + 0x1410, 1)) state_1410 = *(uint8_t*)(view_state + 0x1410);
+                        }
+                        const bool vrtsd_present = (state_1EAF != 0);
+                        const bool ccc_combo_passes = !((state_CCC_f == 0.0f) && ((state_1410 & 0x10) == 0));
+
+                        // 2026-05-15 user hypothesis: view+0x1C18 = CachedViewUniform ptr.
+                        // If shared/null for view 1, underwater fog shader for view 1 samples
+                        // with view 0's matrices -> no teal in view 1 region.
+                        // Also probe view+0x1C00 (RUNTIME_VIEW_RECT base, per user note this
+                        // is where the draw destination viewport comes from).
+                        uintptr_t view_1C18 = 0;
+                        if (is_readable_process_range(view_addr + 0x1C18, 8)) {
+                            view_1C18 = *(uintptr_t*)(view_addr + 0x1C18);
+                        }
+                        uintptr_t view_1C00 = 0;
+                        if (is_readable_process_range(view_addr + 0x1C00, 8)) {
+                            view_1C00 = *(uintptr_t*)(view_addr + 0x1C00);
+                        }
+                        uintptr_t view_1C08 = 0;
+                        if (is_readable_process_range(view_addr + 0x1C08, 8)) {
+                            view_1C08 = *(uintptr_t*)(view_addr + 0x1C08);
+                        }
+
+                        SPDLOG_WARN(
+                            "[ComposeExitCheck] eye={} view=0x{:x} ViewState=0x{:x} ViewFamily=0x{:x} ViewState+0x1F50=0x{:08x} state_1F50_passes(0or2)={} view+0x2348(ptr)=0x{:x} *(view+0x2348)=0x{:08x} | v102_view+0x1200=0x{:08x}({:.4f}) v102_predicate(>0)={} view+0x1204=0x{:08x} v30_family+0xA5=0x{:02x} | view+0x11EC=0x{:02x} (==0 passes={}) view+0x428=0x{:016x}({:.6f}) (<1.0 passes={}) approx_VCRT={} | state+0x1EAF=0x{:02x} VRTSD_present={} state+0xCCC=0x{:08x}({:.4f}) state+0x1410=0x{:02x} ccc_combo_passes={} | view+0x1C00=0x{:x} view+0x1C08=0x{:x} view+0x1C18(CachedViewUniform)=0x{:x}",
+                            eye, view_addr, view_state, view_family,
+                            state_1F50, state_1F50_passes,
+                            view_2348_ptr, view_2348_ptr_value,
+                            view_1200_u, view_1200_f, v102_predicate,
+                            view_1204_u, family_A5,
+                            view_11EC, check_11EC_zero,
+                            view_428_u, view_428_d, check_428_lt1,
+                            should_render_vcrt,
+                            state_1EAF, vrtsd_present,
+                            state_CCC_u, state_CCC_f,
+                            state_1410, ccc_combo_passes,
+                            view_1C00, view_1C08, view_1C18);
+                    }
+                }
+            }
+        }
+    }
+
+    call_original();
+
+    // Patch J: double-dispatch compose for view 1. The function reads
+    // views_data[0] only; without this, view 1's region of the scene-color
+    // SBS buffer never receives the fog overlay. Unlike compute_volumetric_fog,
+    // compose does NOT call FRDGBuilder::CreateTexture with literal names —
+    // it only RegisterExternalTexture (idempotent) and AddPass (index-based).
+    // So double-dispatching should not assert.
+    if (subnautica2_is_current_game() &&
+        vr != nullptr &&
+        vr->is_hmd_active() &&
+        vr->is_native_stereo_fix_enabled() &&
+        !vr->is_native_stereo_fix_same_pass_enabled() &&
+        !vr->is_using_afr() &&
+        views != nullptr &&
+        !subnautica2_disable_volumetric_fog_view_loop_fix())
+    {
+        const uintptr_t views_addr = (uintptr_t)views;
+        if (is_readable_process_range(views_addr, sizeof(uintptr_t) + sizeof(int32_t))) {
+            auto** views_data_ptr2 = (uint8_t**)views_addr;
+            auto* views_count_ptr2 = (int32_t*)(views_addr + sizeof(uintptr_t));
+            auto* const original_views_data2 = *views_data_ptr2;
+            const auto original_views_count2 = *views_count_ptr2;
+
+            if (original_views_data2 != nullptr && original_views_count2 >= 2 &&
+                is_readable_process_range((uintptr_t)original_views_data2, SUBNAUTICA2_SCENEVIEW_STRIDE * 2))
+            {
+                auto* const secondary_view2 = original_views_data2 + SUBNAUTICA2_SCENEVIEW_STRIDE;
+
+                *views_data_ptr2 = secondary_view2;
+                *views_count_ptr2 = 1;
+
+                utility::ScopeGuard restore_views2{[&]() {
+                    *views_data_ptr2 = original_views_data2;
+                    *views_count_ptr2 = original_views_count2;
+                }};
+
+                call_original();
+
+                static std::atomic<uint64_t> compose_second_calls{0};
+                const auto cnt = compose_second_calls.fetch_add(1, std::memory_order_relaxed);
+                if (cnt < 8 || (cnt % 300) == 0) {
+                    SPDLOG_INFO(
+                        "[Subnautica2][ComposeVolumetric] Ran second compose dispatch for view 1 call={}",
+                        cnt + 1);
+                }
+            }
+        }
+    }
+
+    // Restore view[1]'s rect AFTER the second dispatch so the second call
+    // sees the shifted rect (write to view 1's region of scene color).
+    if (patched_view1 != nullptr) {
+        auto* const v1_init = (sdk::FSceneViewInitOptionsUE5*)(patched_view1 + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET);
+        auto* const v1_rt = (int32_t*)(patched_view1 + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+        if (patched_init_rect) {
+            memcpy(v1_init->view_rect, saved_init_rect, sizeof(saved_init_rect));
+        }
+        if (patched_runtime_rect) {
+            memcpy(v1_rt, saved_runtime_rect, sizeof(saved_runtime_rect));
+        }
+    }
+
+    // Patch M: restore view[0]'s rect after expansion.
+    if (expanded_view0 != nullptr) {
+        auto* const v0_init = (sdk::FSceneViewInitOptionsUE5*)(expanded_view0 + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET);
+        auto* const v0_rt = (int32_t*)(expanded_view0 + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+        if (expanded_v0_init) {
+            memcpy(v0_init->view_rect, saved_v0_init_rect, sizeof(saved_v0_init_rect));
+        }
+        if (expanded_v0_runtime) {
+            memcpy(v0_rt, saved_v0_runtime_rect, sizeof(saved_v0_runtime_rect));
+        }
+    }
+
+    // Patch N: restore view[1]'s volumetric ViewState pointer.
+    if (patch_n_view1 != nullptr) {
+        auto* const v1_view_state_addr = (uintptr_t*)(patch_n_view1 + 0x1C10);
+        if (is_writable_process_range((uintptr_t)v1_view_state_addr, sizeof(uintptr_t))) {
+            *v1_view_state_addr = patch_n_saved_v1_view_state;
+        }
+    }
+}
+
+// Read the override value from UEVR_SUBNAUTICA2_BASEPASS_PSO_FORCE_A3. Values 0..6
+// force every BasePass PSO selection to that case. -1 (or unset) means observe-only.
+static int subnautica2_basepass_pso_force_a3_value() {
+    if (subnautica2_diag_clean_mode()) return -1;
+    static const int result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_BASEPASS_PSO_FORCE_A3", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return -1;
+        }
+
+        const int parsed = _wtoi(value);
+        if (parsed < 0 || parsed > 6) {
+            return -1;
+        }
+        return parsed;
+    }();
+    return result;
+}
+
+// Gate function: read UEVR_SUBNAUTICA2_DISABLE_BASEPASS_MP_CTOR_FIX env var.
+// Default ENABLED (the BasePass MP ctor cull-threshold sync IS the fix).
+static bool subnautica2_disable_basepass_mp_ctor_fix() {
+    if (subnautica2_diag_clean_mode()) return true;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_DISABLE_BASEPASS_MP_CTOR_FIX", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
+__int64 FFakeStereoRenderingHook::subnautica2_basepass_mp_ctor_hook(
+    __int64 a1, __int64 a2, __int64 a3, unsigned int a4,
+    __int64 a5, void* a6, __int64 a7, char a8, int a9)
+{
+    auto* hook = g_hook;
+
+    if (hook == nullptr || !hook->m_subnautica2_basepass_mp_ctor_hook) {
+        return 0;
+    }
+
+    // Call the original ctor first; it sets up *(_DWORD*)(a1+140) = the
+    // per-view cull threshold based on View+0x24CC (only if View+0x11D9 != 0
+    // and other conditions). Without our fix, view 0 gets a tight threshold
+    // (1.0f) and view 1 gets a loose one (~6e7), causing different per-mesh
+    // r12b cull verdicts in TryAddMeshBatch -> different shader-type-getter
+    // variant -> different DXBC -> different fog rendering per eye.
+    auto result = hook->m_subnautica2_basepass_mp_ctor_hook.unsafe_call<__int64>(
+        a1, a2, a3, a4, a5, a6, a7, a8, a9);
+
+    if (subnautica2_disable_basepass_mp_ctor_fix()) {
+        return result;
+    }
+
+    // The ctor wrote *(_DWORD*)(a1+140) (== +0x8C) based on the FSceneView
+    // passed in a5. Detect which view this is via FSceneView+STEREO_PASS,
+    // cache primary's value, and force secondary's to match.
+    static std::atomic<uint32_t> s_primary_threshold_bits{0};
+    static std::atomic<bool> s_have_primary{false};
+    static uint32_t log_count = 0;
+
+    if (a5 != 0 && !IsBadReadPtr((void*)(a5 + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET), sizeof(uint32_t))) {
+        const auto stereo_pass = *(uint32_t*)(a5 + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+        const uint32_t current_bits = *(uint32_t*)(a1 + 0x8C);
+
+        if (stereo_pass == (uint32_t)EStereoscopicPass::eSSP_PRIMARY) {
+            // Cache primary's threshold for the next secondary call to use.
+            s_primary_threshold_bits.store(current_bits, std::memory_order_relaxed);
+            s_have_primary.store(true, std::memory_order_relaxed);
+
+            if (log_count < 16) {
+                SPDLOG_INFO(
+                    "[Subnautica2][BasePassMPCtor] PRIMARY ctor processor={:x} view={:x} pass={} threshold=0x{:08x}",
+                    (uintptr_t)a1, (uintptr_t)a5, stereo_pass, current_bits);
+                ++log_count;
+            }
+        } else if (stereo_pass == (uint32_t)EStereoscopicPass::eSSP_SECONDARY &&
+                   s_have_primary.load(std::memory_order_relaxed))
+        {
+            const uint32_t primary_bits = s_primary_threshold_bits.load(std::memory_order_relaxed);
+
+            if (current_bits != primary_bits) {
+                *(uint32_t*)(a1 + 0x8C) = primary_bits;
+
+                if (log_count < 16) {
+                    SPDLOG_INFO(
+                        "[Subnautica2][BasePassMPCtor] SECONDARY ctor processor={:x} view={:x} pass={} overrode threshold 0x{:08x} -> 0x{:08x}",
+                        (uintptr_t)a1, (uintptr_t)a5, stereo_pass, current_bits, primary_bits);
+                    ++log_count;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+void FFakeStereoRenderingHook::subnautica2_basepass_cull_threshold_hook(safetyhook::Context& ctx) {
+    // Fires immediately AFTER `movss xmm3,[rsi+8Ch]` in TryAddMeshBatch.
+    // ctx.rsi holds FBasePassMeshProcessor*; *(rsi+0x28) is the FSceneView*.
+    // Read the view's stereo pass; if SECONDARY, override xmm3 with the
+    // primary view's cached threshold so per-view shader selection agrees.
+    auto* hook = g_hook;
+    if (hook == nullptr || !hook->m_subnautica2_basepass_cull_threshold_hook) {
+        return;
+    }
+
+    auto& vr = VR::get();
+    if (vr == nullptr || !vr->is_hmd_active() ||
+        !vr->is_native_stereo_fix_enabled() ||
+        vr->is_native_stereo_fix_same_pass_enabled() ||
+        vr->is_using_afr())
+    {
+        return;
+    }
+
+    const auto processor = (uintptr_t)ctx.rsi;
+    // Strict validity check: processor must be a 16-byte-aligned high-half
+    // heap pointer (Windows x64 user-mode addresses < 0x7FFFFFFFFFFF).
+    if (processor == 0 ||
+        (processor & 0xF) != 0 ||
+        processor < 0x10000 ||
+        processor >= 0x7FFFFFFFFFFFull ||
+        IsBadReadPtr((void*)(processor + 0x28), sizeof(uintptr_t)))
+    {
+        return;
+    }
+
+    const auto view_ptr = *(uintptr_t*)(processor + 0x28);
+    if (view_ptr == 0 ||
+        (view_ptr & 0xF) != 0 ||
+        view_ptr < 0x10000 ||
+        view_ptr >= 0x7FFFFFFFFFFFull ||
+        IsBadReadPtr((void*)(view_ptr + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET), sizeof(uint32_t)))
+    {
+        return;
+    }
+
+    const auto stereo_pass = *(uint32_t*)(view_ptr + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+
+    // Must be one of the known EStereoscopicPass values (0=NONE, 1=PRIMARY,
+    // 2=SECONDARY). Garbage stereo_pass means our pointer chase landed in
+    // non-FSceneView memory; do nothing rather than corrupting state.
+    if (stereo_pass > 2) {
+        return;
+    }
+
+    static std::atomic<uint32_t> s_primary_bits{0};
+    static std::atomic<bool> s_have_primary{false};
+    static std::atomic<uint64_t> s_log_count{0};
+
+    if (stereo_pass == (uint32_t)EStereoscopicPass::eSSP_PRIMARY) {
+        // Cache primary's threshold for the matching secondary call.
+        // xmm3 is the 4th XMM register; ctx.xmm3 is a 16-byte struct.
+        const uint32_t bits = *(uint32_t*)&ctx.xmm3;
+        s_primary_bits.store(bits, std::memory_order_relaxed);
+        s_have_primary.store(true, std::memory_order_relaxed);
+
+        const auto n = s_log_count.fetch_add(1, std::memory_order_relaxed);
+        if (n < 32) {
+            SPDLOG_INFO(
+                "[Subnautica2][BasePassCullThreshold] PRIMARY view rsi={:x} view={:x} pass={} threshold_bits=0x{:08x}",
+                processor, view_ptr, stereo_pass, bits);
+        }
+    } else if (stereo_pass == (uint32_t)EStereoscopicPass::eSSP_SECONDARY &&
+               s_have_primary.load(std::memory_order_relaxed))
+    {
+        const uint32_t primary_bits = s_primary_bits.load(std::memory_order_relaxed);
+        const uint32_t before_bits = *(uint32_t*)&ctx.xmm3;
+
+        if (before_bits != primary_bits) {
+            // Log-only mode for crash isolation. To re-enable actual override,
+            // set UEVR_SUBNAUTICA2_BASEPASS_CULL_THRESHOLD_OVERRIDE=1.
+            static const bool override_enabled = []() {
+                wchar_t value[16]{};
+                const auto len = GetEnvironmentVariableW(
+                    L"UEVR_SUBNAUTICA2_BASEPASS_CULL_THRESHOLD_OVERRIDE",
+                    value, (DWORD)std::size(value));
+                return len > 0 && len < std::size(value) &&
+                    value[0] != L'\0' && value[0] != L'0' &&
+                    value[0] != L'f' && value[0] != L'F';
+            }();
+
+            if (override_enabled) {
+                *(uint32_t*)&ctx.xmm3 = primary_bits;
+            }
+
+            const auto n = s_log_count.fetch_add(1, std::memory_order_relaxed);
+            if (n < 32) {
+                SPDLOG_INFO(
+                    "[Subnautica2][BasePassCullThreshold] SECONDARY view rsi={:x} view={:x} pass={} threshold_before=0x{:08x} primary=0x{:08x} override_enabled={}",
+                    processor, view_ptr, stereo_pass, before_bits, primary_bits, override_enabled);
+            }
+        }
+    }
+}
+
+void FFakeStereoRenderingHook::subnautica2_basepass_pso_select_hook(safetyhook::Context& ctx) {
+    // r8d is the 7-way switch input (a3 in IDA's view of sub_142631130).
+    // We can optionally override it to force all calls to use the same case
+    // branch, eliminating per-view PSO divergence.
+    const int a3 = (int)(ctx.r8 & 0xFFFFFFFFu);
+    int effective_a3 = a3;
+    const int forced = subnautica2_basepass_pso_force_a3_value();
+
+    if (subnautica2_is_current_game() && forced >= 0 && forced <= 6) {
+        effective_a3 = forced;
+        ctx.r8 = (uint64_t)(uint32_t)effective_a3;
+    }
+
+    static std::atomic<uint64_t> log_count{0};
+    const auto current = log_count.fetch_add(1, std::memory_order_relaxed);
+    if (current < 96) {
+        SPDLOG_INFO(
+            "[Subnautica2][BasePassPSO] sub_142631130 call#{} rcx={:x} rdx={:x} r8(a3)={} effective_a3={} r9={}",
+            current + 1,
+            (uintptr_t)ctx.rcx,
+            (uintptr_t)ctx.rdx,
+            a3,
+            effective_a3,
+            (uint32_t)(ctx.r9 & 0xFFFFFFFFu));
+    }
+}
+
+bool FFakeStereoRenderingHook::subnautica2_render_fog_wrapper_hook(
+    void* scene_renderer,
+    FRDGBuilder* graph_builder,
+    void* scene_textures,
+    void* scene_color_or_data,
+    bool should_render_volumetric)
+{
+    auto* hook = g_hook;
+
+    if (hook == nullptr || !hook->m_subnautica2_render_fog_wrapper_hook) {
+        return false;
+    }
+
+    auto call_original = [&]() {
+        return hook->m_subnautica2_render_fog_wrapper_hook.unsafe_call<bool>(
+            scene_renderer,
+            graph_builder,
+            scene_textures,
+            scene_color_or_data,
+            should_render_volumetric);
+    };
+
+    thread_local bool inside_hook = false;
+    if (inside_hook) {
+        return call_original();
+    }
+
+    inside_hook = true;
+    utility::ScopeGuard inside_guard{[]() {
+        inside_hook = false;
+    }};
+
+    std::array<Subnautica2RuntimeViewRectPatch, 2> patches{};
+    const bool patched = subnautica2_patch_renderer_runtime_view_rects_for_fog(
+        "RenderFogWrapper",
+        scene_renderer,
+        patches);
+
+    utility::ScopeGuard restore_view_rects{[&]() {
+        if (patched && !subnautica2_persist_render_fog_view_rect_fix()) {
+            subnautica2_restore_runtime_view_rects(patches);
+        }
+    }};
+
+    return call_original();
+}
+
+bool FFakeStereoRenderingHook::subnautica2_render_fog_pass_hook(
+    void* scene_renderer,
+    FRDGBuilder* graph_builder,
+    void* scene_textures,
+    void* scene_color_or_data,
+    bool should_render_volumetric)
+{
+    auto* hook = g_hook;
+
+    if (hook == nullptr || !hook->m_subnautica2_render_fog_pass_hook) {
+        return false;
+    }
+
+    auto call_original = [&]() {
+        return hook->m_subnautica2_render_fog_pass_hook.unsafe_call<bool>(
+            scene_renderer,
+            graph_builder,
+            scene_textures,
+            scene_color_or_data,
+            should_render_volumetric);
+    };
+
+    thread_local bool inside_hook = false;
+    if (inside_hook) {
+        return call_original();
+    }
+
+    inside_hook = true;
+    utility::ScopeGuard inside_guard{[]() {
+        inside_hook = false;
+    }};
+
+    std::array<Subnautica2RuntimeViewRectPatch, 2> patches{};
+    const bool patched = subnautica2_patch_renderer_runtime_view_rects_for_fog(
+        "HeightFogPass",
+        scene_renderer,
+        patches);
+
+    utility::ScopeGuard restore_view_rects{[&]() {
+        if (patched && !subnautica2_persist_render_fog_view_rect_fix()) {
+            subnautica2_restore_runtime_view_rects(patches);
+        }
+    }};
+
+    return call_original();
+}
+
+void FFakeStereoRenderingHook::subnautica2_render_underwater_fog_hook(
+    void* scene_renderer,
+    FRDGBuilder* graph_builder,
+    void* scene_without_water_textures,
+    void* scene_textures)
+{
+    auto* hook = g_hook;
+
+    if (hook == nullptr || !hook->m_subnautica2_render_underwater_fog_hook) {
+        return;
+    }
+
+    auto call_original = [&]() {
+        hook->m_subnautica2_render_underwater_fog_hook.unsafe_call<void>(
+            scene_renderer,
+            graph_builder,
+            scene_without_water_textures,
+            scene_textures);
+    };
+
+    thread_local bool inside_hook = false;
+    if (inside_hook) {
+        call_original();
+        return;
+    }
+
+    inside_hook = true;
+    utility::ScopeGuard inside_guard{[]() {
+        inside_hook = false;
+    }};
+
+    auto& vr = VR::get();
+
+    if (!subnautica2_is_current_game() ||
+        vr == nullptr ||
+        !vr->is_hmd_active() ||
+        !vr->is_native_stereo_fix_enabled() ||
+        vr->is_native_stereo_fix_same_pass_enabled() ||
+        vr->is_using_afr() ||
+        scene_renderer == nullptr ||
+        scene_without_water_textures == nullptr)
+    {
+        call_original();
+        return;
+    }
+
+    const auto renderer = (uintptr_t)scene_renderer;
+
+    if (!is_readable_process_range(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_DATA_OFFSET, sizeof(uintptr_t) + sizeof(int32_t) * 2)) {
+        call_original();
+        return;
+    }
+
+    auto* const views_data = *(uint8_t**)(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_DATA_OFFSET);
+    const auto views_count = *(int32_t*)(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_COUNT_OFFSET);
+    const auto views_max = *(int32_t*)(renderer + SUBNAUTICA2_SCENERENDERER_VIEWS_MAX_OFFSET);
+
+    const auto water = (uintptr_t)scene_without_water_textures;
+
+    if (!is_readable_process_range(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_COLOR_OFFSET, 0x30)) {
+        call_original();
+        return;
+    }
+
+    auto* const water_views = *(Subnautica2SceneWithoutWaterView**)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_VIEWS_DATA_OFFSET);
+    const auto water_views_count = *(int32_t*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_VIEWS_COUNT_OFFSET);
+    const auto water_views_max = *(int32_t*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_VIEWS_MAX_OFFSET);
+    const auto color_texture = *(uintptr_t*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_COLOR_OFFSET);
+    const auto depth_texture = *(uintptr_t*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_DEPTH_OFFSET);
+    const auto refraction_factor_raw = *(float*)(water + SUBNAUTICA2_SCENE_WITHOUT_WATER_REFRACTION_FACTOR_OFFSET);
+
+    if (views_data == nullptr ||
+        views_count < 2 ||
+        views_count > 8 ||
+        views_max < views_count ||
+        water_views == nullptr ||
+        water_views_count < 2 ||
+        water_views_count > 8 ||
+        water_views_max < water_views_count ||
+        !is_readable_process_range((uintptr_t)views_data, SUBNAUTICA2_SCENEVIEW_STRIDE * 2) ||
+        !is_writable_process_range((uintptr_t)water_views, sizeof(Subnautica2SceneWithoutWaterView) * 2))
+    {
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[Subnautica2][UnderwaterFog] Skipping scene-without-water probe; renderer_views={} count={}/{} water_views={} count={}/{}",
+            (uintptr_t)views_data,
+            views_count,
+            views_max,
+            (uintptr_t)water_views,
+            water_views_count,
+            water_views_max);
+        call_original();
+        return;
+    }
+
+    int32_t full_rect[4]{0, 0, 0, 0};
+    int32_t downsample_factor = 1;
+    if (refraction_factor_raw >= 1.5f && refraction_factor_raw <= 8.5f) {
+        downsample_factor = (int32_t)(refraction_factor_raw + 0.5f);
+    }
+
+    std::array<Subnautica2SceneWithoutWaterView, 2> expected{};
+    bool expected_valid[2]{};
+
+    for (int32_t eye = 0; eye < 2; ++eye) {
+        auto* const view = views_data + (SUBNAUTICA2_SCENEVIEW_STRIDE * eye);
+
+        if (!is_readable_process_range(
+                (uintptr_t)view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET,
+                sizeof(sdk::FSceneViewInitOptionsUE5)))
+        {
+            continue;
+        }
+
+        int32_t rect[4]{};
+
+        if (!subnautica2_get_effective_scene_view_rect(view, rect)) {
+            continue;
+        }
+
+        full_rect[0] = std::min(full_rect[0], rect[0]);
+        full_rect[1] = std::min(full_rect[1], rect[1]);
+        full_rect[2] = std::max(full_rect[2], rect[2]);
+        full_rect[3] = std::max(full_rect[3], rect[3]);
+    }
+
+    for (int32_t eye = 0; eye < 2; ++eye) {
+        expected_valid[eye] = subnautica2_expected_scene_without_water_view(
+            views_data + (SUBNAUTICA2_SCENEVIEW_STRIDE * eye),
+            full_rect,
+            downsample_factor,
+            expected[eye]);
+    }
+
+    bool patched_any = false;
+    bool mismatch_any = false;
+
+    if (!subnautica2_disable_underwater_fog_view_data_fix()) {
+        for (int32_t eye = 0; eye < 2; ++eye) {
+            if (!expected_valid[eye]) {
+                continue;
+            }
+
+            auto& current = water_views[eye];
+            const bool rect_mismatch = !subnautica2_rect_equal(current.rect, expected[eye].rect);
+            const bool uv_mismatch = !subnautica2_uv_close(current.minmax_uv, expected[eye].minmax_uv);
+
+            mismatch_any = mismatch_any || rect_mismatch || uv_mismatch;
+
+            if (rect_mismatch || uv_mismatch) {
+                current = expected[eye];
+                patched_any = true;
+            }
+        }
+    } else {
+        for (int32_t eye = 0; eye < 2; ++eye) {
+            if (!expected_valid[eye]) {
+                continue;
+            }
+
+            mismatch_any = mismatch_any ||
+                !subnautica2_rect_equal(water_views[eye].rect, expected[eye].rect) ||
+                !subnautica2_uv_close(water_views[eye].minmax_uv, expected[eye].minmax_uv);
+        }
+    }
+
+    static std::atomic<uint64_t> logged_calls{0};
+    const auto count = logged_calls.fetch_add(1, std::memory_order_relaxed);
+    if (count < 24 || ((count % 600) == 0 && (patched_any || mismatch_any))) {
+        SPDLOG_INFO(
+            "[Subnautica2][UnderwaterFog] call={} renderer_views={} count={}/{} water_views={} count={}/{} color={:x} depth={:x} refraction={} downsample={} full_rect={} {} {} {} patched={} mismatch={}",
+            count + 1,
+            (uintptr_t)views_data,
+            views_count,
+            views_max,
+            (uintptr_t)water_views,
+            water_views_count,
+            water_views_max,
+            color_texture,
+            depth_texture,
+            refraction_factor_raw,
+            downsample_factor,
+            full_rect[0],
+            full_rect[1],
+            full_rect[2],
+            full_rect[3],
+            patched_any,
+            mismatch_any);
+
+        for (int32_t eye = 0; eye < 2; ++eye) {
+            auto* const view = views_data + (SUBNAUTICA2_SCENEVIEW_STRIDE * eye);
+            const auto* init_options = (const sdk::FSceneViewInitOptionsUE5*)(view + SUBNAUTICA2_SCENEVIEW_INIT_OPTIONS_OFFSET);
+            const auto* runtime_view_rect = (const int32_t*)(view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+            const auto& current = water_views[eye];
+
+            SPDLOG_INFO(
+                "[Subnautica2][UnderwaterFog] eye={} view={:x} pass={} stereo_index={} primary_index={} fog_flag={} instanced={} singlepass={} multiviewport={} mobile_multiview={} bind_instanced_ub={} underwater_depth={} water_intersection={} init_rect={} {} {} {} runtime_rect={} {} {} {} current_rect={} {} {} {} current_uv={:.6f} {:.6f} {:.6f} {:.6f} expected_valid={} expected_rect={} {} {} {} expected_uv={:.6f} {:.6f} {:.6f} {:.6f}",
+                eye,
+                (uintptr_t)view,
+                *(uint32_t*)(view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET),
+                *(int32_t*)(view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET),
+                *(int32_t*)(view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET),
+                view[SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAG_OFFSET],
+                view[SUBNAUTICA2_SCENEVIEW_INSTANCED_STEREO_ENABLED_OFFSET],
+                view[SUBNAUTICA2_SCENEVIEW_SINGLE_PASS_STEREO_OFFSET],
+                view[SUBNAUTICA2_SCENEVIEW_MULTI_VIEWPORT_ENABLED_OFFSET],
+                view[SUBNAUTICA2_SCENEVIEW_MOBILE_MULTI_VIEW_ENABLED_OFFSET],
+                view[SUBNAUTICA2_SCENEVIEW_SHOULD_BIND_INSTANCED_VIEW_UB_OFFSET],
+                *(float*)(view + SUBNAUTICA2_SCENEVIEW_UNDERWATER_DEPTH_OFFSET),
+                view[SUBNAUTICA2_SCENEVIEW_WATER_INTERSECTION_OFFSET],
+                init_options->view_rect[0],
+                init_options->view_rect[1],
+                init_options->view_rect[2],
+                init_options->view_rect[3],
+                runtime_view_rect[0],
+                runtime_view_rect[1],
+                runtime_view_rect[2],
+                runtime_view_rect[3],
+                current.rect[0],
+                current.rect[1],
+                current.rect[2],
+                current.rect[3],
+                current.minmax_uv[0],
+                current.minmax_uv[1],
+                current.minmax_uv[2],
+                current.minmax_uv[3],
+                expected_valid[eye],
+                expected[eye].rect[0],
+                expected[eye].rect[1],
+                expected[eye].rect[2],
+                expected[eye].rect[3],
+                expected[eye].minmax_uv[0],
+                expected[eye].minmax_uv[1],
+                expected[eye].minmax_uv[2],
+                expected[eye].minmax_uv[3]);
+        }
+    }
+
+    call_original();
+}
+
+void FFakeStereoRenderingHook::subnautica2_single_layer_water_scene_without_water_hook(safetyhook::Context& ctx) {
+    subnautica2_patch_scene_without_water_views(
+        "SingleLayerWater",
+        (void*)ctx.r14,
+        (void*)ctx.rdi);
+}
+
+void FFakeStereoRenderingHook::subnautica2_compute_volumetric_fog_force_view_index_hook(safetyhook::Context& ctx) {
+    if (!g_subnautica2_force_volumetric_fog_view_index_one) {
+        return;
+    }
+
+    ctx.r12 = 1;
+
+    auto* const stack_view_index = (uint32_t*)(ctx.rbp - 0x1C);
+    if (ctx.rbp != 0 && is_writable_process_range((uintptr_t)stack_view_index, sizeof(uint32_t))) {
+        *stack_view_index = 1;
+    }
+}
+
+// 2026-05-16: UWE trace helper. Logs entry args (rcx/rdx/r8/r9 + first stack
+// args) and dereferences each pointer-shaped arg's first 32 bytes. Gated by
+// the count of total calls so we don't flood the log (these functions fire
+// 700+ times per frame for UWEWaterExtinctionView alone).
+// Per-tag stats for ALL UWE-trace hooks. We just atomically count and store
+// the most recent few argument values. A background thread periodically logs
+// the stats — no per-call spdlog (which was causing 120s render-thread
+// watchdog timeouts).
+struct UweTraceStats {
+    std::atomic<uint64_t> call_count{0};
+    std::atomic<uint64_t> last_rcx{0};
+    std::atomic<uint64_t> last_rdx{0};
+    std::atomic<uint64_t> last_r8{0};
+    std::atomic<uint64_t> last_r9{0};
+    std::atomic<uint64_t> distinct_rdx_seen[8]{};
+    std::atomic<uint32_t> distinct_rdx_count{0};
+    // Track up to 4 distinct thread IDs that called this hook. Knowing
+    // whether the call comes from the render thread (where the per-view bug
+    // lives) vs the game thread vs a worker is highly diagnostic.
+    std::atomic<uint32_t> distinct_tids[4]{};
+    std::atomic<uint32_t> distinct_tid_count{0};
+};
+
+// Map: tag pointer (string literal so addrs are stable) -> stats slot.
+// Use a small fixed table to avoid map lookups in the hot path.
+static constexpr int kUweTraceMaxTags = 20;
+static const char* g_uwe_trace_tag_table[kUweTraceMaxTags] = {};
+static UweTraceStats g_uwe_trace_stats[kUweTraceMaxTags];
+static std::atomic<int> g_uwe_trace_tag_count{0};
+
+static UweTraceStats* uwe_trace_get_stats(const char* tag) {
+    // First-call linear search; fast on subsequent calls since g_uwe_trace_tag_table
+    // is populated in known order during hook install.
+    const int n = g_uwe_trace_tag_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (g_uwe_trace_tag_table[i] == tag) return &g_uwe_trace_stats[i];
+    }
+    // Reserve a slot.
+    const int idx = g_uwe_trace_tag_count.fetch_add(1, std::memory_order_acq_rel);
+    if (idx >= kUweTraceMaxTags) return nullptr;
+    g_uwe_trace_tag_table[idx] = tag;
+    return &g_uwe_trace_stats[idx];
+}
+
+static void subnautica2_uwe_trace_dump(const char* tag, safetyhook::Context& ctx) {
+    auto* s = uwe_trace_get_stats(tag);
+    if (s == nullptr) return;
+
+    // ALL we do in the hot path: count + save the registers. No spdlog, no
+    // formatting, no string ops, no I/O. A background thread does the logging.
+    s->call_count.fetch_add(1, std::memory_order_relaxed);
+    s->last_rcx.store((uint64_t)ctx.rcx, std::memory_order_relaxed);
+    s->last_rdx.store((uint64_t)ctx.rdx, std::memory_order_relaxed);
+    s->last_r8.store((uint64_t)ctx.r8, std::memory_order_relaxed);
+    s->last_r9.store((uint64_t)ctx.r9, std::memory_order_relaxed);
+
+    // Track up to 8 distinct rdx values (which is usually the per-view ptr).
+    const uint64_t rdx = (uint64_t)ctx.rdx;
+    const uint32_t dcnt = s->distinct_rdx_count.load(std::memory_order_relaxed);
+    bool found = false;
+    for (uint32_t i = 0; i < dcnt && i < 8; ++i) {
+        if (s->distinct_rdx_seen[i].load(std::memory_order_relaxed) == rdx) { found = true; break; }
+    }
+    if (!found && dcnt < 8) {
+        // Atomic CAS the slot; if it succeeds, bump count.
+        uint64_t expected = 0;
+        if (s->distinct_rdx_seen[dcnt].compare_exchange_strong(expected, rdx, std::memory_order_acq_rel)) {
+            s->distinct_rdx_count.fetch_add(1, std::memory_order_release);
+        }
+    }
+}
+
+static std::thread g_uwe_trace_reporter_thread;
+static std::atomic<bool> g_uwe_trace_reporter_stop{false};
+
+static void uwe_trace_reporter_loop() {
+    using namespace std::chrono_literals;
+    uint64_t last_counts[kUweTraceMaxTags]{};
+    while (!g_uwe_trace_reporter_stop.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(2s);
+        const int n = g_uwe_trace_tag_count.load(std::memory_order_acquire);
+        for (int i = 0; i < n; ++i) {
+            const auto& s = g_uwe_trace_stats[i];
+            const auto cnt = s.call_count.load(std::memory_order_relaxed);
+            const auto delta = cnt - last_counts[i];
+            last_counts[i] = cnt;
+            if (delta == 0 && cnt > 0) continue;  // quiet tag — skip
+            const uint32_t dcnt = s.distinct_rdx_count.load(std::memory_order_relaxed);
+            uint64_t rdx0 = dcnt > 0 ? s.distinct_rdx_seen[0].load(std::memory_order_relaxed) : 0;
+            uint64_t rdx1 = dcnt > 1 ? s.distinct_rdx_seen[1].load(std::memory_order_relaxed) : 0;
+            uint64_t rdx2 = dcnt > 2 ? s.distinct_rdx_seen[2].load(std::memory_order_relaxed) : 0;
+            SPDLOG_WARN(
+                "[UWE-trace][{}] total={} delta={}/s/2 distinct_rdx={} [{:x} {:x} {:x}] last rcx={:x} rdx={:x} r8={:x} r9={:x}",
+                g_uwe_trace_tag_table[i], cnt, delta, dcnt, rdx0, rdx1, rdx2,
+                s.last_rcx.load(std::memory_order_relaxed),
+                s.last_rdx.load(std::memory_order_relaxed),
+                s.last_r8.load(std::memory_order_relaxed),
+                s.last_r9.load(std::memory_order_relaxed));
+        }
+    }
+}
+
+static void start_uwe_trace_reporter() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        g_uwe_trace_reporter_thread = std::thread(uwe_trace_reporter_loop);
+        g_uwe_trace_reporter_thread.detach();
+    });
+}
+
+void FFakeStereoRenderingHook::subnautica2_uwe_trace_hook_45F890(safetyhook::Context& ctx) {
+    subnautica2_uwe_trace_dump("45F890", ctx);
+}
+void FFakeStereoRenderingHook::subnautica2_uwe_trace_hook_4B2A10(safetyhook::Context& ctx) {
+    subnautica2_uwe_trace_dump("4B2A10", ctx);
+}
+void FFakeStereoRenderingHook::subnautica2_uwe_trace_hook_5665F0(safetyhook::Context& ctx) {
+    subnautica2_uwe_trace_dump("5665F0", ctx);
+}
+void FFakeStereoRenderingHook::subnautica2_uwe_trace_hook_576140(safetyhook::Context& ctx) {
+    subnautica2_uwe_trace_dump("576140", ctx);
+}
+void FFakeStereoRenderingHook::subnautica2_uwe_trace_hook_FD6170(safetyhook::Context& ctx) {
+    // Per-view fog integration setup. rdx = FViewInfo*. Dump heavily so we
+    // see view 0 vs view 1 differences. This is INSIDE compute_volumetric_fog
+    // so we know we're capturing per-view fog work.
+    subnautica2_uwe_trace_dump("FD6170", ctx);
+}
+void FFakeStereoRenderingHook::subnautica2_uwe_trace_hook_FD0A50(safetyhook::Context& ctx) {
+    // UWE Ray-Traced Volumetric Fog Pass dispatcher.
+    // rcx=FRDGBuilder*, rdx=FViewInfo*, r8=FScene*, r9=FVolumetricFogIntegrationParameterData*,
+    // sa5=FRDGTextureRef** (OUTPUT — per-view fog volume handle written here).
+    subnautica2_uwe_trace_dump("FD0A50", ctx);
+}
+
+// Hooks on the 9 functions that read FEngineShowFlags+0xDF (UWEWaterLighting).
+// User-confirmed 2026-05-16: `ShowFlag.UWEWaterLighting 0` makes both eyes match
+// (disables the broken-per-view teal effect in left eye). Hooking these lets us
+// observe which function actually gates the visible-broken render pass.
+void FFakeStereoRenderingHook::subnautica2_uwelit_hook_506DC20(safetyhook::Context& ctx) { subnautica2_uwe_trace_dump("506DC20", ctx); }
+void FFakeStereoRenderingHook::subnautica2_uwelit_hook_5BF08A6(safetyhook::Context& ctx) { subnautica2_uwe_trace_dump("5BF08A6", ctx); }
+void FFakeStereoRenderingHook::subnautica2_uwelit_hook_5D638D1(safetyhook::Context& ctx) { subnautica2_uwe_trace_dump("5D638D1", ctx); }
+void FFakeStereoRenderingHook::subnautica2_uwelit_hook_644EDEC(safetyhook::Context& ctx) { subnautica2_uwe_trace_dump("644EDEC", ctx); }
+void FFakeStereoRenderingHook::subnautica2_uwelit_hook_644FA04(safetyhook::Context& ctx) { subnautica2_uwe_trace_dump("644FA04", ctx); }
+void FFakeStereoRenderingHook::subnautica2_uwelit_hook_6452806(safetyhook::Context& ctx) { subnautica2_uwe_trace_dump("6452806", ctx); }
+void FFakeStereoRenderingHook::subnautica2_uwelit_hook_69D828D(safetyhook::Context& ctx) { subnautica2_uwe_trace_dump("69D828D", ctx); }
+void FFakeStereoRenderingHook::subnautica2_uwelit_hook_7FA6BB5(safetyhook::Context& ctx) { subnautica2_uwe_trace_dump("7FA6BB5", ctx); }
+void FFakeStereoRenderingHook::subnautica2_uwelit_hook_9131F2A(safetyhook::Context& ctx) { subnautica2_uwe_trace_dump("9131F2A", ctx); }
+
+void FFakeStereoRenderingHook::attempt_hook_subnautica2_uwe_trace() {
+    if (m_attempted_hook_subnautica2_uwe_trace) {
+        return;
+    }
+    m_attempted_hook_subnautica2_uwe_trace = true;
+
+    if (!subnautica2_is_current_game()) {
+        return;
+    }
+
+    if (!subnautica2_enable_uwe_trace()) {
+        SPDLOG_INFO("[Subnautica2][UWE-trace] disabled (set UEVR_SUBNAUTICA2_ENABLE_UWE_TRACE=1 to enable)");
+        return;
+    }
+
+    const auto exe_base = (uintptr_t)utility::get_executable();
+    if (exe_base == 0) {
+        SPDLOG_WARN("[Subnautica2][UWE-trace] exe_base==0; cannot install");
+        return;
+    }
+
+    struct TraceTarget {
+        uintptr_t rva;
+        safetyhook::MidHook FFakeStereoRenderingHook::* slot;
+        void (*handler)(safetyhook::Context&);
+        const char* tag;
+    };
+    const TraceTarget targets[] = {
+        {SUBNAUTICA2_UWE_TRACE_45F890_RVA, &FFakeStereoRenderingHook::m_subnautica2_uwe_trace_hook_45F890, &FFakeStereoRenderingHook::subnautica2_uwe_trace_hook_45F890, "sub_14045F890"},
+        {SUBNAUTICA2_UWE_TRACE_4B2A10_RVA, &FFakeStereoRenderingHook::m_subnautica2_uwe_trace_hook_4B2A10, &FFakeStereoRenderingHook::subnautica2_uwe_trace_hook_4B2A10, "sub_1404B2A10"},
+        {SUBNAUTICA2_UWE_TRACE_5665F0_RVA, &FFakeStereoRenderingHook::m_subnautica2_uwe_trace_hook_5665F0, &FFakeStereoRenderingHook::subnautica2_uwe_trace_hook_5665F0, "sub_1405665F0"},
+        {SUBNAUTICA2_UWE_TRACE_576140_RVA, &FFakeStereoRenderingHook::m_subnautica2_uwe_trace_hook_576140, &FFakeStereoRenderingHook::subnautica2_uwe_trace_hook_576140, "sub_140576140"},
+        {SUBNAUTICA2_UWE_TRACE_FD6170_RVA, &FFakeStereoRenderingHook::m_subnautica2_uwe_trace_hook_FD6170, &FFakeStereoRenderingHook::subnautica2_uwe_trace_hook_FD6170, "sub_142FD6170"},
+        {SUBNAUTICA2_UWE_TRACE_FD0A50_RVA, &FFakeStereoRenderingHook::m_subnautica2_uwe_trace_hook_FD0A50, &FFakeStereoRenderingHook::subnautica2_uwe_trace_hook_FD0A50, "sub_142FD0A50"},
+    };
+
+    struct UweLitTarget {
+        uint32_t bit;
+        uintptr_t rva;
+        safetyhook::MidHook FFakeStereoRenderingHook::* slot;
+        void (*handler)(safetyhook::Context&);
+        const char* tag;
+    };
+    // UWEWaterLighting reader hooks. Enable via UEVR_SUBNAUTICA2_UWELIT_HOOK_MASK.
+    // 9-all-at-once hangs the game (cumulative per-frame overhead on hot material
+    // draws). Default mask=1 enables only sub_14506DC20 (material permutation
+    // builder — called per material instantiation, not per draw).
+    const UweLitTarget uwelit_targets[] = {
+        {0x001, 0x506DC20, &FFakeStereoRenderingHook::m_subnautica2_uwelit_hook_506DC20, &FFakeStereoRenderingHook::subnautica2_uwelit_hook_506DC20, "sub_14506DC20"},
+        {0x002, 0x5BF08A6, &FFakeStereoRenderingHook::m_subnautica2_uwelit_hook_5BF08A6, &FFakeStereoRenderingHook::subnautica2_uwelit_hook_5BF08A6, "sub_145BF08A6"},
+        {0x004, 0x5D638D1, &FFakeStereoRenderingHook::m_subnautica2_uwelit_hook_5D638D1, &FFakeStereoRenderingHook::subnautica2_uwelit_hook_5D638D1, "sub_145D638D1"},
+        {0x008, 0x644EDEC, &FFakeStereoRenderingHook::m_subnautica2_uwelit_hook_644EDEC, &FFakeStereoRenderingHook::subnautica2_uwelit_hook_644EDEC, "sub_14644EDEC"},
+        {0x010, 0x644FA04, &FFakeStereoRenderingHook::m_subnautica2_uwelit_hook_644FA04, &FFakeStereoRenderingHook::subnautica2_uwelit_hook_644FA04, "sub_14644FA04"},
+        {0x020, 0x6452806, &FFakeStereoRenderingHook::m_subnautica2_uwelit_hook_6452806, &FFakeStereoRenderingHook::subnautica2_uwelit_hook_6452806, "sub_146452806"},
+        {0x040, 0x69D828D, &FFakeStereoRenderingHook::m_subnautica2_uwelit_hook_69D828D, &FFakeStereoRenderingHook::subnautica2_uwelit_hook_69D828D, "sub_1469D828D"},
+        {0x080, 0x7FA6BB5, &FFakeStereoRenderingHook::m_subnautica2_uwelit_hook_7FA6BB5, &FFakeStereoRenderingHook::subnautica2_uwelit_hook_7FA6BB5, "sub_147FA6BB5"},
+        {0x100, 0x9131F2A, &FFakeStereoRenderingHook::m_subnautica2_uwelit_hook_9131F2A, &FFakeStereoRenderingHook::subnautica2_uwelit_hook_9131F2A, "sub_149131F2A"},
+    };
+    const uint32_t mask = subnautica2_uwelit_hook_mask();
+    SPDLOG_WARN("[Subnautica2][UWE-trace] UWELit hook mask=0x{:x} (UEVR_SUBNAUTICA2_UWELIT_HOOK_MASK)", mask);
+
+    // Spawn background reporter thread (logs per-tag stats every 2s).
+    start_uwe_trace_reporter();
+
+    for (const auto& t : targets) {
+        const auto target = exe_base + t.rva;
+        if (!is_executable_process_range(target, 0x10)) {
+            SPDLOG_WARN("[Subnautica2][UWE-trace] cannot hook {} at {:x} (not executable)", t.tag, target);
+            continue;
+        }
+        auto h = safetyhook::create_mid((void*)target, t.handler);
+        if (!h) {
+            SPDLOG_WARN("[Subnautica2][UWE-trace] safetyhook::create_mid failed for {} at {:x}", t.tag, target);
+            continue;
+        }
+        this->*(t.slot) = std::move(h);
+        SPDLOG_WARN("[Subnautica2][UWE-trace] installed at {} -> {:x}", t.tag, target);
+    }
+    for (const auto& t : uwelit_targets) {
+        if ((mask & t.bit) == 0) {
+            SPDLOG_INFO("[Subnautica2][UWE-trace] SKIPPED UWELit hook {} (bit 0x{:x} not in mask 0x{:x})", t.tag, t.bit, mask);
+            continue;
+        }
+        const auto target = exe_base + t.rva;
+        if (!is_executable_process_range(target, 0x10)) {
+            SPDLOG_WARN("[Subnautica2][UWE-trace] cannot hook {} at {:x} (not executable)", t.tag, target);
+            continue;
+        }
+        auto h = safetyhook::create_mid((void*)target, t.handler);
+        if (!h) {
+            SPDLOG_WARN("[Subnautica2][UWE-trace] safetyhook::create_mid failed for {} at {:x}", t.tag, target);
+            continue;
+        }
+        this->*(t.slot) = std::move(h);
+        SPDLOG_WARN("[Subnautica2][UWE-trace] installed UWELit at {} -> {:x} (bit 0x{:x})", t.tag, target, t.bit);
+    }
+}
+
 bool FFakeStereoRenderingHook::hook_ue418_oculus_pixel_density_sink() {
     if (m_ue418_oculus_pixel_density_hook) {
         return true;
@@ -2827,6 +8955,34 @@ bool FFakeStereoRenderingHook::hook() {
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
     hook_ue418_oculus_pixel_density_sink();
+    attempt_hook_subnautica2_compute_volumetric_fog();
+    attempt_hook_subnautica2_init_volumetric_render_target();
+    attempt_hook_subnautica2_reconstruct_volumetric_render_target();
+    attempt_hook_subnautica2_compose_volumetric_render_target();
+    attempt_hook_subnautica2_render_fog_wrapper();
+    attempt_hook_subnautica2_render_fog_pass();
+    attempt_hook_subnautica2_render_underwater_fog();
+    attempt_hook_subnautica2_setup_volumetric_fog_ub();  // 2026-05-16 FIX-V2 RE-ENABLED: targeted UB handle rewrite
+    // 2026-05-17 evening: RE-ENABLED. Per IDA at 0x142fbfa14 there's a JZ that
+    // skips the texture-creation block when [view_family+0x20]==0; on those
+    // paths r12 stays uninitialized (often 0). The midhook callback already
+    // bails on tex_ptr==0, so it only mirrors when r12 holds a valid texture
+    // (the view-0 success path). Previously disabled "because r12=0" was a
+    // wrong diagnosis: the bail handles that case correctly.
+    attempt_hook_subnautica2_lightscat_store_midhook();
+    // 2026-05-16: disabled both — caused instability when running under RenderDoc
+    attempt_hook_subnautica2_setup_fog_uniform_params();  // FIX-V4: diag cbuffer3
+    // attempt_hook_subnautica2_try_add_mesh_batch_probe();
+    attempt_hook_subnautica2_basepass_pso_select();
+    attempt_hook_subnautica2_basepass_mp_ctor();
+    attempt_hook_subnautica2_basepass_cull_threshold();
+    attempt_hook_subnautica2_basepass_ps_force_nolm();
+    attempt_hook_subnautica2_single_layer_water();
+    attempt_hook_subnautica2_single_layer_water_inner();
+    attempt_hook_subnautica2_slw_per_view();
+    attempt_hook_subnautica2_volumetric_fog_per_view();
+    attempt_hook_subnautica2_single_layer_water_scene_without_water();
+    attempt_hook_subnautica2_uwe_trace();
 
     const auto vtable = locate_fake_stereo_rendering_vtable();
 
@@ -3104,8 +9260,10 @@ bool FFakeStereoRenderingHook::standard_fake_stereo_hook(uintptr_t vtable) {
 
     const auto adjust_view_rect_distance = is_4_18_or_lower ? 2 : 3;
     const auto adjust_view_rect_index = *stereo_view_offset_index - adjust_view_rect_distance;
+    const auto set_final_view_rect_index = adjust_view_rect_index + 1;
 
     SPDLOG_INFO("AdjustViewRect Index: {}", adjust_view_rect_index);
+    SPDLOG_INFO("SetFinalViewRect Index: {}", set_final_view_rect_index);
     
     auto calculate_stereo_projection_matrix_index = *stereo_view_offset_index + 1;
 
@@ -3192,12 +9350,14 @@ bool FFakeStereoRenderingHook::standard_fake_stereo_hook(uintptr_t vtable) {
     const auto init_canvas_index = calculate_stereo_projection_matrix_index + 1;
 
     const auto adjust_view_rect_func = ((uintptr_t*)vtable)[adjust_view_rect_index];
+    const auto set_final_view_rect_func = ((uintptr_t*)vtable)[set_final_view_rect_index];
     const auto calculate_stereo_projection_matrix_func = ((uintptr_t*)vtable)[calculate_stereo_projection_matrix_index];
     const auto init_canvas_func_ptr = &((uintptr_t*)vtable)[init_canvas_index];
     // const auto render_texture_render_thread_func = ((uintptr_t*)*vtable)[*stereo_view_offset_index + 3];
     
 
     SPDLOG_INFO("AdjustViewRect: {:x}", (uintptr_t)adjust_view_rect_func);
+    SPDLOG_INFO("SetFinalViewRect: {:x}", (uintptr_t)set_final_view_rect_func);
     SPDLOG_INFO("CalculateStereoProjectionMatrix: {:x}", (uintptr_t)calculate_stereo_projection_matrix_func);
     SPDLOG_INFO("CalculateStereoViewOffset: {:x}", (uintptr_t)stereo_view_offset_func);
     SPDLOG_INFO("IsStereoEnabled: {:x}", (uintptr_t)*is_stereo_enabled_func_ptr);
@@ -3206,12 +9366,17 @@ bool FFakeStereoRenderingHook::standard_fake_stereo_hook(uintptr_t vtable) {
 
     {
         m_adjust_view_rect_hook = safetyhook::create_inline((void*)adjust_view_rect_func, adjust_view_rect);
+        m_set_final_view_rect_hook = safetyhook::create_inline((void*)set_final_view_rect_func, set_final_view_rect);
         m_calculate_stereo_view_offset_hook_inline = safetyhook::create_inline((void*)stereo_view_offset_func, calculate_stereo_view_offset);
         m_calculate_stereo_projection_matrix_hook = safetyhook::create_inline((void*)calculate_stereo_projection_matrix_func, calculate_stereo_projection_matrix);
     }
     
     if (!m_adjust_view_rect_hook) {
         SPDLOG_ERROR("Failed to create AdjustViewRect hook");
+    }
+
+    if (!m_set_final_view_rect_hook) {
+        SPDLOG_ERROR("Failed to create SetFinalViewRect hook");
     }
 
     if (!m_calculate_stereo_view_offset_hook_inline) {
@@ -4599,6 +10764,28 @@ void FFakeStereoRenderingHook::game_viewport_client_draw_hook(sdk::UGameViewport
         } else {
             vr->update_hmd_state(false);
         }
+
+        if (subnautica2_is_current_game() &&
+            vr->is_native_stereo_fix_enabled() &&
+            !vr->is_native_stereo_fix_same_pass_enabled() &&
+            g_hook->m_tracking_system_hook != nullptr)
+        {
+            const auto controller_camera_guard_active = vr->is_controller_camera_conflict_guard_active();
+            const auto direct_aim_compatibility_fallback =
+                vr->is_hmd_active() &&
+                !controller_camera_guard_active &&
+                (is_deadzone_ue56_executable() || vr->is_direct_aim_compatibility_enabled()) &&
+                (vr->is_headlocked_aim_enabled() ||
+                    (vr->is_controller_aim_enabled() && vr->is_using_controllers()));
+
+            if (vr->is_any_aim_method_active() &&
+                !controller_camera_guard_active &&
+                (vr->is_aim_modify_player_control_rotation_enabled() || direct_aim_compatibility_fallback))
+            {
+                SPDLOG_INFO_ONCE("[Subnautica2][NativeStereoFix] Updating control rotation before both native stereo views");
+                g_hook->m_tracking_system_hook->manual_update_control_rotation();
+            }
+        }
     }
 
     const auto& mods = g_framework->get_mods()->get_mods();
@@ -5338,6 +11525,30 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     const auto true_index = vr->is_using_afr() ? (g_frame_count + last_index) % 2 : last_index;
 
+    if (subnautica2_is_current_game() &&
+        vr->is_native_stereo_fix_enabled() &&
+        !vr->is_native_stereo_fix_same_pass_enabled() &&
+        subnautica2_force_primary_primary_views())
+    {
+        if (true_index == 0 && init_options_scene_state != nullptr) {
+            g_hook->m_sceneview_data.native_stereo_primary_scene_state = init_options_scene_state;
+            g_hook->m_sceneview_data.native_stereo_primary_scene_state_frame = g_frame_count;
+        } else if (
+            true_index == 1 &&
+            g_hook->m_sceneview_data.native_stereo_primary_scene_state != nullptr &&
+            g_hook->m_sceneview_data.native_stereo_primary_scene_state_frame == g_frame_count &&
+            init_options->get_exposure_scene_state() == nullptr)
+        {
+            init_options->set_exposure_scene_state(g_hook->m_sceneview_data.native_stereo_primary_scene_state);
+            SPDLOG_INFO_ONCE("[Subnautica2][NativeStereoFix] Sharing left-eye exposure scene state while using independent primary stereo passes");
+        }
+
+        // Debug fallback: keep each eye as a primary view while StereoViewIndex
+        // and the view rect still distinguish left/right. This is not the default
+        // because Subnautica 2's water/fog path expects a primary+secondary pair.
+        init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
+    }
+
     if (vr->is_splitscreen_compatibility_enabled() || vr->is_sceneview_compatibility_enabled()) {
         int32_t w = vr->get_hmd_width();
         int32_t h = vr->get_hmd_height();
@@ -5386,7 +11597,15 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         auto euler_d = glm::vec<3, double>{euler};
         auto euler_pointer = is_ue5 ? (Rotator<float>*)&euler_d : (Rotator<float>*)&euler;
 
-        g_hook->calculate_stereo_view_offset_(true_index + 1, euler_pointer, 100.0f, &init_options_view_origin);
+        const auto native_stereo_explicit_view_index =
+            subnautica2_is_current_game() &&
+            vr->is_native_stereo_fix_enabled() &&
+            !vr->is_native_stereo_fix_same_pass_enabled();
+        g_hook->calculate_stereo_view_offset_(
+            native_stereo_explicit_view_index ? true_index : true_index + 1,
+            euler_pointer,
+            100.0f,
+            &init_options_view_origin);
 
         if (is_ue5) {
             euler = euler_d;
@@ -5413,6 +11632,38 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
     }
 
     const auto init_options_stereo_pass = init_options->get_stereo_pass();
+
+    if (vr->is_native_stereo_fix_enabled() && !vr->is_native_stereo_fix_same_pass_enabled()) {
+        auto init_options_view_rect = is_ue5 ? init_options_ue5->view_rect : init_options->view_rect;
+        auto init_options_constrained_view_rect = is_ue5 ? init_options_ue5->constrained_view_rect : init_options->constrained_view_rect;
+
+        const auto view_rect_valid =
+            init_options_view_rect[2] > init_options_view_rect[0] &&
+            init_options_view_rect[3] > init_options_view_rect[1];
+        const auto constrained_rect_empty =
+            init_options_constrained_view_rect[2] <= init_options_constrained_view_rect[0] ||
+            init_options_constrained_view_rect[3] <= init_options_constrained_view_rect[1];
+
+        if (view_rect_valid && constrained_rect_empty) {
+            memcpy(init_options_constrained_view_rect, init_options_view_rect, sizeof(int32_t) * 4);
+            SPDLOG_INFO_ONCE("[NativeStereoDebug] Filled empty constrained view rect from view rect for native stereo fix");
+        }
+    }
+
+    {
+        static uint32_t log_count = 0;
+
+        if (vr->is_native_stereo_fix_enabled() && log_count < 8) {
+            const auto& init_options_view_rect = is_ue5 ? init_options_ue5->view_rect : init_options->view_rect;
+            const auto& init_options_constrained_view_rect = is_ue5 ? init_options_ue5->constrained_view_rect : init_options->constrained_view_rect;
+            SPDLOG_INFO("[NativeStereoDebug] FSceneView ctor last_index={} true_index={} stereo_pass={} view_rect={} {} {} {} constrained={} {} {} {} scene_state={:x}",
+                last_index, true_index, init_options_stereo_pass,
+                init_options_view_rect[0], init_options_view_rect[1], init_options_view_rect[2], init_options_view_rect[3],
+                init_options_constrained_view_rect[0], init_options_constrained_view_rect[1], init_options_constrained_view_rect[2], init_options_constrained_view_rect[3],
+                (uintptr_t)init_options_scene_state);
+            ++log_count;
+        }
+    }
 
     std::optional<uint32_t> views_original_count{};
 
@@ -5464,6 +11715,122 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     auto result = g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
 
+    if (result != nullptr && is_ue5 && vr->is_native_stereo_fix_enabled() && !vr->is_native_stereo_fix_same_pass_enabled()) {
+        // UE derives these from platform stereo aspects. Explicit two-view stereo still
+        // needs the secondary eye to keep UE's primary-view link for shared exposure,
+        // LUTs, translucency lighting and other paired stereo resources.
+        auto raw_view = (uint8_t*)result;
+        const auto constructed_stereo_pass = *(uint32_t*)(raw_view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+
+        if (constructed_stereo_pass == EStereoscopicPass::eSSP_PRIMARY || constructed_stereo_pass == EStereoscopicPass::eSSP_SECONDARY) {
+            static uint32_t post_ctor_log_count = 0;
+
+            if (post_ctor_log_count < 8) {
+                SPDLOG_INFO("[NativeStereoDebug] FSceneView post-ctor view={:x} pass={} stereo_view_index={} primary_view_index={} instanced={} singlepass={} multiviewport={} mobile_multiview={} bind_instanced_ub={} underwater_depth={} water_intersection={} aspects=0x{:02x}",
+                    (uintptr_t)result,
+                    constructed_stereo_pass,
+                    *(int32_t*)(raw_view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET),
+                    *(int32_t*)(raw_view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET),
+                    raw_view[SUBNAUTICA2_SCENEVIEW_INSTANCED_STEREO_ENABLED_OFFSET],
+                    raw_view[SUBNAUTICA2_SCENEVIEW_SINGLE_PASS_STEREO_OFFSET],
+                    raw_view[SUBNAUTICA2_SCENEVIEW_MULTI_VIEWPORT_ENABLED_OFFSET],
+                    raw_view[SUBNAUTICA2_SCENEVIEW_MOBILE_MULTI_VIEW_ENABLED_OFFSET],
+                    raw_view[SUBNAUTICA2_SCENEVIEW_SHOULD_BIND_INSTANCED_VIEW_UB_OFFSET],
+                    *(float*)(raw_view + SUBNAUTICA2_SCENEVIEW_UNDERWATER_DEPTH_OFFSET),
+                    raw_view[SUBNAUTICA2_SCENEVIEW_WATER_INTERSECTION_OFFSET],
+                    raw_view[SUBNAUTICA2_SCENEVIEW_STEREO_ASPECTS_FLAGS_OFFSET]);
+                ++post_ctor_log_count;
+            }
+
+            raw_view[SUBNAUTICA2_SCENEVIEW_INSTANCED_STEREO_ENABLED_OFFSET] = 0;
+            raw_view[SUBNAUTICA2_SCENEVIEW_MULTI_VIEWPORT_ENABLED_OFFSET] = 0;
+            raw_view[SUBNAUTICA2_SCENEVIEW_MOBILE_MULTI_VIEW_ENABLED_OFFSET] = 0;
+            raw_view[SUBNAUTICA2_SCENEVIEW_SHOULD_BIND_INSTANCED_VIEW_UB_OFFSET] = 0;
+            raw_view[SUBNAUTICA2_SCENEVIEW_SINGLE_PASS_STEREO_OFFSET] = 0;
+
+            if (subnautica2_is_current_game() &&
+                subnautica2_force_primary_primary_views() &&
+                constructed_stereo_pass == EStereoscopicPass::eSSP_SECONDARY)
+            {
+                auto& stereo_pass = *(uint32_t*)(raw_view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+                auto& stereo_view_index = *(int32_t*)(raw_view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET);
+                auto& primary_view_index = *(int32_t*)(raw_view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET);
+
+                static uint32_t force_primary_log_count = 0;
+                if (force_primary_log_count < 16) {
+                    SPDLOG_WARN(
+                        "[Subnautica2][NativeStereoFix] Post-ctor forcing secondary view to PRIMARY for independent right-eye render test; view_index={} primary_index={} -> {}",
+                        stereo_view_index,
+                        primary_view_index,
+                        stereo_view_index);
+                    ++force_primary_log_count;
+                }
+
+                stereo_pass = (uint32_t)EStereoscopicPass::eSSP_PRIMARY;
+
+                if (stereo_view_index >= 0) {
+                    primary_view_index = stereo_view_index;
+                }
+            }
+
+            if (subnautica2_is_current_game() && subnautica2_clear_stereo_aspects()) {
+                auto& aspects = raw_view[SUBNAUTICA2_SCENEVIEW_STEREO_ASPECTS_FLAGS_OFFSET];
+
+                if (aspects != 0) {
+                    static uint32_t aspects_patch_log_count = 0;
+                    if (aspects_patch_log_count < 16) {
+                        SPDLOG_WARN(
+                            "[Subnautica2][NativeStereoFix] Clearing FSceneView::Aspects flags 0x{:02x} -> 0x00 for explicit two-view native stereo test",
+                            aspects);
+                        ++aspects_patch_log_count;
+                    }
+
+                    aspects = 0;
+                }
+            }
+
+            if (subnautica2_is_current_game() &&
+                subnautica2_force_secondary_primary_view_index() &&
+                constructed_stereo_pass == EStereoscopicPass::eSSP_SECONDARY)
+            {
+                auto& stereo_view_index = *(int32_t*)(raw_view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET);
+                auto& primary_view_index = *(int32_t*)(raw_view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET);
+
+                if (stereo_view_index >= 0 && primary_view_index != stereo_view_index) {
+                    static uint32_t primary_index_patch_log_count = 0;
+                    if (primary_index_patch_log_count < 16) {
+                        SPDLOG_WARN(
+                            "[Subnautica2][NativeStereoFix] Patching secondary PrimaryViewIndex {} -> {} for custom water/fog test",
+                            primary_view_index,
+                            stereo_view_index);
+                        ++primary_index_patch_log_count;
+                    }
+
+                    primary_view_index = stereo_view_index;
+                }
+            }
+
+            static uint32_t post_patch_log_count = 0;
+
+            if (post_patch_log_count < 8) {
+                SPDLOG_INFO("[NativeStereoDebug] FSceneView after native patch view={:x} pass={} stereo_view_index={} primary_view_index={} instanced={} singlepass={} multiviewport={} mobile_multiview={} bind_instanced_ub={} underwater_depth={} water_intersection={} aspects=0x{:02x}",
+                    (uintptr_t)result,
+                    constructed_stereo_pass,
+                    *(int32_t*)(raw_view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET),
+                    *(int32_t*)(raw_view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET),
+                    raw_view[SUBNAUTICA2_SCENEVIEW_INSTANCED_STEREO_ENABLED_OFFSET],
+                    raw_view[SUBNAUTICA2_SCENEVIEW_SINGLE_PASS_STEREO_OFFSET],
+                    raw_view[SUBNAUTICA2_SCENEVIEW_MULTI_VIEWPORT_ENABLED_OFFSET],
+                    raw_view[SUBNAUTICA2_SCENEVIEW_MOBILE_MULTI_VIEW_ENABLED_OFFSET],
+                    raw_view[SUBNAUTICA2_SCENEVIEW_SHOULD_BIND_INSTANCED_VIEW_UB_OFFSET],
+                    *(float*)(raw_view + SUBNAUTICA2_SCENEVIEW_UNDERWATER_DEPTH_OFFSET),
+                    raw_view[SUBNAUTICA2_SCENEVIEW_WATER_INTERSECTION_OFFSET],
+                    raw_view[SUBNAUTICA2_SCENEVIEW_STEREO_ASPECTS_FLAGS_OFFSET]);
+                ++post_patch_log_count;
+            }
+        }
+    }
+
     // Reset the view count back to what it was.
     if (views_original_count.has_value()) {
         auto view_family = init_options->get_view_family();
@@ -5496,6 +11863,9 @@ void FFakeStereoRenderingHook::setup_view_family(ISceneViewExtension* extension,
     if (!vr->is_hmd_active()) {
         return;
     }
+
+    disable_native_instanced_stereo_cvars();
+    force_native_stereo_view_family_show_flag(view_family, "SetupViewFamily");
 
     //vr->update_hmd_state(true, vr->get_runtime()->internal_frame_count + 1);
 }
@@ -5605,6 +11975,10 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     // UE5 passes an TArrayView of ViewFamily pointers instead of a single ViewFamily
     sdk::FSceneViewFamily* view_family = uses_tarrayview ? ue5_view_family_array->data[0] : view_family_candidate;
 
+    if (view_family != nullptr) {
+        force_native_stereo_view_family_show_flag(*view_family, "BeginRenderViewFamilyReal");
+    }
+
     auto views_ptr = view_family->get_views();
     if (views_ptr == nullptr) {
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
@@ -5613,6 +11987,14 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
 
     auto& views = *views_ptr;
     const auto prev_count = views.count;
+
+    if (!vr->is_native_stereo_fix_same_pass_enabled()) {
+        avowed_native_fix_gate_reset("normal native stereo path");
+        rtm->destroy_scene_capture();
+
+        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        return;
+    }
 
     if (auto view_family_target = view_family->get_render_target(); view_family_target != nullptr) {
         g_hook->try_adopt_scene_viewport_render_target(
@@ -5813,8 +12195,40 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
         return;
     }
 
+    disable_native_instanced_stereo_cvars();
+    force_native_stereo_view_family_show_flag(view_family, "BeginRenderViewFamily");
+
     const auto frame_count = *(uint32_t*)((uintptr_t)&view_family + SceneViewExtensionAnalyzer::frame_count_offset);
     auto views_ptr = view_family.get_views();
+
+    if (vr->is_native_stereo_fix_enabled() && views_ptr != nullptr) {
+        static uint32_t log_count = 0;
+
+        if (log_count < 8 && views_ptr->count > 0 && views_ptr->count < 8) {
+            SPDLOG_INFO("[NativeStereoDebug] BeginRenderViewFamily frame={} views_count={}", frame_count, views_ptr->count);
+
+            for (uint32_t i = 0; i < (uint32_t)views_ptr->count; ++i) {
+                auto view = views_ptr->data[i];
+
+                if (view == nullptr) {
+                    SPDLOG_INFO("[NativeStereoDebug] BeginRenderViewFamily view[{}]=null", i);
+                    continue;
+                }
+
+                auto init_options = (sdk::FSceneViewInitOptionsUE5*)((uintptr_t)view + INIT_OPTIONS_OFFSET);
+                const auto stereo_pass = init_options->get_stereo_pass();
+                SPDLOG_INFO("[NativeStereoDebug] BeginRenderViewFamily view[{}]={:x} stereo_pass={} rect={} {} {} {} constrained={} {} {} {} scene_state={:x}",
+                    i, (uintptr_t)view, stereo_pass,
+                    init_options->view_rect[0], init_options->view_rect[1], init_options->view_rect[2], init_options->view_rect[3],
+                    init_options->constrained_view_rect[0], init_options->constrained_view_rect[1], init_options->constrained_view_rect[2], init_options->constrained_view_rect[3],
+                    (uintptr_t)init_options->get_scene_state());
+            }
+
+            ++log_count;
+        }
+    }
+
+    subnautica2_sync_native_stereo_water_state(view_family, frame_count);
 
     //vr->update_hmd_state(true, frame_count);
     auto runtime = vr->get_runtime();
@@ -5949,7 +12363,11 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
     using BeginRenderViewFamilyRealFn = void(*)(void*, sdk::FCanvas*, sdk::FSceneViewFamily*);
     static BeginRenderViewFamilyRealFn begin_rendering_view_family_real_fn = nullptr;
     static bool already_tried = false;
-    if (begin_rendering_view_family_real_fn == nullptr && !already_tried && vr->is_native_stereo_fix_enabled()) {
+    if (begin_rendering_view_family_real_fn == nullptr &&
+        !already_tried &&
+        vr->is_native_stereo_fix_enabled() &&
+        vr->is_native_stereo_fix_same_pass_enabled())
+    {
         already_tried = true;
 
         // Get callstack
@@ -6340,6 +12758,41 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
 
         if (exception->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
             const auto exception_address = exception->ContextRecord->Rip;
+
+            if (subnautica2_is_current_game()) {
+                constexpr uintptr_t subnautica2_vsm_null_projection_start_rva = 0x2FD10D0;
+                constexpr uintptr_t subnautica2_vsm_null_projection_end_rva = 0x2FD1205;
+                constexpr uintptr_t subnautica2_vsm_null_projection_epilogue_rva = 0x2FD1205;
+                const auto exe_base = (uintptr_t)utility::get_executable();
+
+                if (exe_base != 0 &&
+                    exception_address >= exe_base + subnautica2_vsm_null_projection_start_rva &&
+                    exception_address < exe_base + subnautica2_vsm_null_projection_end_rva)
+                {
+                    SPDLOG_WARNING_EVERY_N_SEC(
+                        2,
+                        "[Subnautica2][NativeStereoFix] Skipping virtual shadow map projection helper after access violation at {:x}",
+                        exception_address);
+                    exception->ContextRecord->Rip = exe_base + subnautica2_vsm_null_projection_epilogue_rva;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+
+                constexpr uintptr_t subnautica2_vsm_pass_builder_start_rva = 0x2FD1340;
+                constexpr uintptr_t subnautica2_vsm_pass_builder_end_rva = 0x2FD1C45;
+                constexpr uintptr_t subnautica2_vsm_pass_builder_epilogue_rva = 0x2FD1C29;
+
+                if (exe_base != 0 &&
+                    exception_address >= exe_base + subnautica2_vsm_pass_builder_start_rva &&
+                    exception_address < exe_base + subnautica2_vsm_pass_builder_end_rva)
+                {
+                    SPDLOG_WARNING_EVERY_N_SEC(
+                        2,
+                        "[Subnautica2][NativeStereoFix] Skipping virtual shadow map pass builder after access violation at {:x}",
+                        exception_address);
+                    exception->ContextRecord->Rip = exe_base + subnautica2_vsm_pass_builder_epilogue_rva;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
 
             if (ignored_addresses.contains(exception_address)) {
                 return EXCEPTION_CONTINUE_SEARCH;
@@ -7181,8 +13634,72 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
 
     const auto true_index = index_starts_from_one ? ((index + 1) % 2) : (index % 2);
 
-    if (!VR::get()->is_native_stereo_fix_enabled()) {
+    auto& vr = VR::get();
+
+    if (!vr->is_native_stereo_fix_enabled() || !vr->is_native_stereo_fix_same_pass_enabled()) {
         *x += *w * true_index;
+    }
+
+    if (index >= 0 && index < 4) {
+        static bool logged_index[4]{};
+
+        if (!logged_index[index]) {
+            logged_index[index] = true;
+            SPDLOG_INFO("[NativeStereoDebug] AdjustViewRect index={} true_index={} rect={} {} {} {} native_fix={} same_pass={}",
+                index, true_index, *x, *y, *w, *h, vr->is_native_stereo_fix_enabled(), vr->is_native_stereo_fix_same_pass_enabled());
+        }
+    }
+}
+
+void FFakeStereoRenderingHook::set_final_view_rect(FFakeStereoRendering* stereo, sdk::FRHICommandListBase* cmd_list, int32_t view_index, const FIntRect* final_view_rect) {
+    auto& vr = VR::get();
+    FIntRect corrected_view_rect{};
+    auto rect_to_submit = final_view_rect;
+
+    if (final_view_rect != nullptr &&
+        vr->is_native_stereo_fix_enabled() &&
+        !vr->is_native_stereo_fix_same_pass_enabled() &&
+        view_index == 1 &&
+        final_view_rect->bounds[0] == 0)
+    {
+        corrected_view_rect = *final_view_rect;
+        const auto width = corrected_view_rect.bounds[2] - corrected_view_rect.bounds[0];
+
+        if (width > 0) {
+            corrected_view_rect.bounds[0] += width;
+            corrected_view_rect.bounds[2] += width;
+            rect_to_submit = &corrected_view_rect;
+
+            SPDLOG_INFO_ONCE("[NativeStereoDebug] Corrected right-eye SetFinalViewRect to {} {} {} {}",
+                corrected_view_rect.bounds[0], corrected_view_rect.bounds[1],
+                corrected_view_rect.bounds[2], corrected_view_rect.bounds[3]);
+        }
+    }
+
+#ifdef FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
+    SPDLOG_INFO("set final view rect called! {}", view_index);
+#else
+    SPDLOG_INFO_ONCE("set final view rect called! {}", view_index);
+#endif
+
+    if (rect_to_submit != nullptr && vr->is_native_stereo_fix_enabled()) {
+        static uint32_t log_count = 0;
+
+        if (log_count < 16) {
+            SPDLOG_INFO("[NativeStereoDebug] SetFinalViewRect view_index={} rect={} {} {} {} native_fix={} same_pass={}",
+                view_index,
+                rect_to_submit->bounds[0],
+                rect_to_submit->bounds[1],
+                rect_to_submit->bounds[2],
+                rect_to_submit->bounds[3],
+                vr->is_native_stereo_fix_enabled(),
+                vr->is_native_stereo_fix_same_pass_enabled());
+            ++log_count;
+        }
+    }
+
+    if (g_hook->m_set_final_view_rect_hook) {
+        g_hook->m_set_final_view_rect_hook.call<void>(stereo, cmd_list, view_index, rect_to_submit);
     }
 }
 
@@ -7203,6 +13720,17 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     auto vr = VR::get();
     //std::scoped_lock _{vr->get_vr_mutex()};
 
+    const auto subnautica2_native_stereo_explicit_view_indices =
+        subnautica2_is_current_game() &&
+        vr->is_native_stereo_fix_enabled() &&
+        !vr->is_native_stereo_fix_same_pass_enabled();
+    const auto subnautica2_synced_sequential_explicit_eye =
+        subnautica2_is_current_game() &&
+        vr->is_using_synchronized_afr();
+    const auto subnautica2_explicit_view_zero_is_eye =
+        subnautica2_native_stereo_explicit_view_indices ||
+        subnautica2_synced_sequential_explicit_eye;
+
     static bool index_starts_from_one = true;
     static bool index_was_ever_two = false;
     static bool index_was_ever_negative = false;
@@ -7214,25 +13742,69 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     }
 
     // This is eSSP_FULL, we don't care. It will cause the view to become monoscopic if we do anything.
-    if (index_was_ever_two && view_index == 0) {
+    if (!subnautica2_explicit_view_zero_is_eye && index_was_ever_two && view_index == 0) {
         SPDLOG_INFO_ONCE("calculate stereo view offset called with view index 0 after 2, ignoring.");
         return;
     }
 
     vr->set_world_to_meters(world_to_meters);
 
-    if (view_index == 2) {
+    if (!subnautica2_explicit_view_zero_is_eye && view_index == 2) {
         index_starts_from_one = true;
         index_was_ever_two = true;
-    } else if (view_index == 0 && !index_was_ever_two) {
+    } else if (!subnautica2_explicit_view_zero_is_eye && view_index == 0 && !index_was_ever_two) {
         index_starts_from_one = false;
     }
 
-    const auto is_full_pass = view_index == 0 && !index_was_ever_two && !index_was_ever_negative;
+    const auto is_full_pass =
+        !subnautica2_explicit_view_zero_is_eye &&
+        view_index == 0 &&
+        !index_was_ever_two &&
+        !index_was_ever_negative;
 
-    auto true_index = index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2);
+    auto true_index = subnautica2_native_stereo_explicit_view_indices
+        ? (view_index <= 0 ? 0 : 1)
+        : (index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2));
+    if (subnautica2_synced_sequential_explicit_eye) {
+        true_index = g_frame_count % 2;
+    }
     const auto has_double_precision = g_hook->m_has_double_precision;
     const auto rot_d = (Rotator<double>*)view_rotation;
+
+    const auto log_native_stereo_view_offset_sample = [&](std::string_view phase) {
+        if (!subnautica2_explicit_view_zero_is_eye) {
+            return;
+        }
+
+        static uint32_t log_count = 0;
+        if (log_count >= 64) {
+            return;
+        }
+
+        const auto hmd_rotation = glm::normalize(glm::quat{vr->get_rotation(0)});
+        const auto hmd_position = vr->get_position(0);
+
+        if (has_double_precision) {
+            const auto view_d = (Vector3d*)view_location;
+            SPDLOG_INFO("[Subnautica2][NativeStereoFix] CalcStereoOffset {} view_index={} true_index={} full={} rot={:.3f},{:.3f},{:.3f} loc={:.3f},{:.3f},{:.3f} hmd_pos={:.3f},{:.3f},{:.3f} hmd_rot={:.4f},{:.4f},{:.4f},{:.4f}",
+                phase, view_index, true_index, is_full_pass,
+                rot_d->pitch, rot_d->yaw, rot_d->roll,
+                view_d->x, view_d->y, view_d->z,
+                hmd_position.x, hmd_position.y, hmd_position.z,
+                hmd_rotation.x, hmd_rotation.y, hmd_rotation.z, hmd_rotation.w);
+        } else {
+            SPDLOG_INFO("[Subnautica2][NativeStereoFix] CalcStereoOffset {} view_index={} true_index={} full={} rot={:.3f},{:.3f},{:.3f} loc={:.3f},{:.3f},{:.3f} hmd_pos={:.3f},{:.3f},{:.3f} hmd_rot={:.4f},{:.4f},{:.4f},{:.4f}",
+                phase, view_index, true_index, is_full_pass,
+                view_rotation->pitch, view_rotation->yaw, view_rotation->roll,
+                view_location->x, view_location->y, view_location->z,
+                hmd_position.x, hmd_position.y, hmd_position.z,
+                hmd_rotation.x, hmd_rotation.y, hmd_rotation.z, hmd_rotation.w);
+        }
+
+        ++log_count;
+    };
+
+    log_native_stereo_view_offset_sample("pre");
 
     if (vr->is_using_afr() && !is_full_pass) {
         true_index = g_frame_count % 2;
@@ -7470,6 +14042,8 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         vr->process_snapturn();
     }
 
+    log_native_stereo_view_offset_sample("post");
+
     if (!is_full_pass) {
         for (auto& mod : mods) {
             mod->on_post_calculate_stereo_view_offset(stereo, view_index, view_rotation, world_to_meters, view_location, g_hook->m_has_double_precision);
@@ -7492,7 +14066,13 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
             (vr->is_headlocked_aim_enabled() ||
                 (vr->is_controller_aim_enabled() && vr->is_using_controllers()));
 
+        const auto subnautica2_native_stereo_updates_control_rotation_before_views =
+            subnautica2_is_current_game() &&
+            vr->is_native_stereo_fix_enabled() &&
+            !vr->is_native_stereo_fix_same_pass_enabled();
+
         if (true_index == 1 &&
+            !subnautica2_native_stereo_updates_control_rotation_before_views &&
             vr->is_any_aim_method_active() &&
             !controller_camera_guard_active &&
             (vr->is_aim_modify_player_control_rotation_enabled() || direct_aim_compatibility_fallback))
@@ -7819,7 +14399,7 @@ uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoR
         return 1;
     }
 
-    if (vr->is_native_stereo_fix_enabled()) {
+    if (vr->is_native_stereo_fix_enabled() && vr->is_native_stereo_fix_same_pass_enabled()) {
         auto rtm = g_hook->get_render_target_manager();
         const auto scene_capture_rt_ready = rtm->get_scene_capture_render_target() != nullptr;
         const auto scene_capture_utexture_ready = rtm->get_scene_capture_utexture() != nullptr;
@@ -7863,6 +14443,8 @@ uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoR
                 return 1;
             }
         }
+    } else if (vr->is_native_stereo_fix_enabled()) {
+        SPDLOG_INFO_ONCE("[NativeStereoDebug] GetDesiredNumberOfViews using explicit native stereo path; not waiting on same-pass scene capture");
     }
 
     if (avowed_is_current_game() && vr->is_native_stereo_fix_enabled()) {
@@ -7886,6 +14468,15 @@ EStereoscopicPass FFakeStereoRenderingHook::get_view_pass_for_index_hook(FFakeSt
     // So we need to imitate it here to prevent a crash
     if (!stereo_requested || view_index < 0) {
         return EStereoscopicPass::eSSP_FULL;
+    }
+
+    auto& vr = VR::get();
+
+    if (subnautica2_is_current_game() && vr->is_native_stereo_fix_enabled() &&
+        !vr->is_native_stereo_fix_same_pass_enabled() &&
+        subnautica2_force_primary_primary_views())
+    {
+        return EStereoscopicPass::eSSP_PRIMARY;
     }
 
     return view_index % 2 == 0 ? EStereoscopicPass::eSSP_PRIMARY : EStereoscopicPass::eSSP_SECONDARY;
@@ -10385,7 +16976,13 @@ void VRRenderTargetManager_Base::texture_hook_callback(safetyhook::Context& ctx,
                     texture_source, (uintptr_t)texture);
             } else {
                 SPDLOG_INFO(" Resulting texture: {:x}", (uintptr_t)texture);
-                SPDLOG_INFO(" Real resource: {:x}", (uintptr_t)texture->get_native_resource());
+                try {
+                    SPDLOG_INFO(" Real resource: {:x}", (uintptr_t)texture->get_native_resource());
+                } catch (const std::exception& e) {
+                    SPDLOG_INFO(" Real resource: unavailable ({})", e.what());
+                } catch (...) {
+                    SPDLOG_INFO(" Real resource: unavailable (unknown exception)");
+                }
             }
         } else {
             texture = nullptr;

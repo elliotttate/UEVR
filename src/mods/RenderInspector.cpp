@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <sstream>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #include <imgui.h>
+#include <spdlog/spdlog.h>
 
 #include "Framework.hpp"
 #include "mods/VR.hpp"
@@ -71,6 +73,26 @@ std::string format_bytes(uint64_t bytes) {
 
 ImTextureID to_imgui_texture_id(uint64_t texture_id) {
     return reinterpret_cast<ImTextureID>(static_cast<uintptr_t>(texture_id));
+}
+
+bool env_flag_enabled(const char* name, bool default_value = false) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    return value[0] != '0' && value[0] != 'f' && value[0] != 'F' &&
+        value[0] != 'n' && value[0] != 'N';
+}
+
+int env_int_value(const char* name, int default_value, int min_value = 0) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    const int parsed = std::atoi(value);
+    return parsed < min_value ? min_value : parsed;
 }
 
 std::string make_d3d12_pair_key(const render::ShaderOverrideRegistry::D3D12PipelinePairInfo& pair) {
@@ -432,18 +454,198 @@ std::shared_ptr<RenderInspector>& RenderInspector::get() {
     return instance;
 }
 
+render::FrameResourceInspector& RenderInspector::inspector() {
+    return m_inspector;
+}
+
+const render::FrameResourceInspector& RenderInspector::inspector() const {
+    return m_inspector;
+}
+
+void RenderInspector::set_force_resources_sampling(bool v) {
+    m_force_resources_sampling.store(v);
+}
+
+bool RenderInspector::force_resources_sampling() const {
+    return m_force_resources_sampling.load();
+}
+
+void RenderInspector::set_force_shader_tracking(bool v) {
+    m_force_shader_tracking.store(v);
+}
+
+bool RenderInspector::force_shader_tracking() const {
+    return m_force_shader_tracking.load();
+}
+
+void RenderInspector::set_force_d3d12_diagnostics(bool v) {
+    m_force_d3d12_diagnostics.store(v);
+}
+
+bool RenderInspector::force_d3d12_diagnostics() const {
+    return m_force_d3d12_diagnostics.load();
+}
+
+void RenderInspector::service_shader_hunter_autotest() {
+    ++m_hunter_autotest_frame;
+
+    if (!m_hunter_autotest_initialized) {
+        m_hunter_autotest_initialized = true;
+        m_hunter_autotest_enabled = env_flag_enabled("UEVR_SHADER_HUNTER_AUTOTEST");
+        if (m_hunter_autotest_enabled) {
+            m_hunter_autotest_suppress = env_flag_enabled("UEVR_SHADER_HUNTER_AUTOTEST_SUPPRESS", false);
+            m_hunter_autotest_delay_frames =
+                env_int_value("UEVR_SHADER_HUNTER_AUTOTEST_DELAY_FRAMES", m_hunter_autotest_delay_frames);
+            m_hunter_autotest_collect_frames =
+                env_int_value("UEVR_SHADER_HUNTER_AUTOTEST_COLLECT_FRAMES", m_hunter_autotest_collect_frames, 1);
+            m_hunter_autotest_step_interval_frames =
+                env_int_value("UEVR_SHADER_HUNTER_AUTOTEST_STEP_INTERVAL_FRAMES", m_hunter_autotest_step_interval_frames, 1);
+            m_hunter_autotest_steps =
+                env_int_value("UEVR_SHADER_HUNTER_AUTOTEST_STEPS", m_hunter_autotest_steps, 0);
+            m_hunter_autotest_start_index =
+                env_int_value("UEVR_SHADER_HUNTER_AUTOTEST_START_INDEX", m_hunter_autotest_start_index, -1);
+
+            set_force_shader_tracking(true);
+            set_force_d3d12_diagnostics(true);
+            auto& reg = render::ShaderOverrideRegistry::get();
+            reg.hunter_set_suppression_enabled(m_hunter_autotest_suppress);
+            spdlog::info(
+                "[ShaderHunter][autotest] enabled delay={} collect={} step_interval={} steps={} start_index={} suppress={}",
+                m_hunter_autotest_delay_frames,
+                m_hunter_autotest_collect_frames,
+                m_hunter_autotest_step_interval_frames,
+                m_hunter_autotest_steps,
+                m_hunter_autotest_start_index,
+                m_hunter_autotest_suppress ? 1 : 0);
+        }
+    }
+
+    if (!m_hunter_autotest_enabled || m_hunter_autotest_finished) {
+        return;
+    }
+
+    set_force_shader_tracking(true);
+    set_force_d3d12_diagnostics(true);
+
+    auto& reg = render::ShaderOverrideRegistry::get();
+
+    if (!m_hunter_autotest_started) {
+        if (m_hunter_autotest_frame < static_cast<uint64_t>(m_hunter_autotest_delay_frames)) {
+            return;
+        }
+
+        reg.hunter_set_frame_window(m_hunter_autotest_collect_frames);
+        reg.hunter_start();
+        m_hunter_autotest_started = true;
+        m_hunter_autotest_start_frame = m_hunter_autotest_frame;
+        m_hunter_autotest_last_step_frame = m_hunter_autotest_frame;
+        spdlog::info("[ShaderHunter][autotest] started at inspector_frame={}", m_hunter_autotest_frame);
+        return;
+    }
+
+    auto state = reg.hunter_state();
+    if ((m_hunter_autotest_frame % 120) == 0) {
+        spdlog::info(
+            "[ShaderHunter][autotest] state collected={} live={} scene_live={} active={} age={} active_hash={} suppress={}",
+            state.collected_count,
+            state.live_count,
+            state.scene_live_count,
+            state.active ? 1 : 0,
+            state.active_age_frames,
+            state.active_hash,
+            state.suppression_enabled ? 1 : 0);
+    }
+
+    const uint64_t frames_since_start = m_hunter_autotest_frame >= m_hunter_autotest_start_frame
+        ? (m_hunter_autotest_frame - m_hunter_autotest_start_frame)
+        : 0;
+    const bool collection_elapsed =
+        frames_since_start >= static_cast<uint64_t>(m_hunter_autotest_collect_frames + 15);
+    const bool collection_done = state.window_stopped || collection_elapsed;
+    if (!collection_done) {
+        return;
+    }
+
+    if (!m_hunter_autotest_start_index_applied && m_hunter_autotest_start_index >= 0) {
+        reg.hunter_set_index(m_hunter_autotest_start_index);
+        state = reg.hunter_state();
+        m_hunter_autotest_start_index_applied = true;
+        m_hunter_autotest_last_step_frame = m_hunter_autotest_frame;
+        spdlog::info(
+            "[ShaderHunter][autotest] start_index active_idx={} active_hash={} crc32=0x{:08X} collected={} live={} scene_live={} age={}",
+            state.active_index,
+            state.active_hash,
+            state.active_crc32,
+            state.collected_count,
+            state.live_count,
+            state.scene_live_count,
+            state.active_age_frames);
+        return;
+    }
+
+    if (m_hunter_autotest_steps_done < m_hunter_autotest_steps) {
+        if ((m_hunter_autotest_frame - m_hunter_autotest_last_step_frame) <
+                static_cast<uint64_t>(m_hunter_autotest_step_interval_frames)) {
+            return;
+        }
+
+        reg.hunter_step(+1);
+        state = reg.hunter_state();
+        ++m_hunter_autotest_steps_done;
+        m_hunter_autotest_last_step_frame = m_hunter_autotest_frame;
+        spdlog::info(
+            "[ShaderHunter][autotest] step {}/{} active_idx={} active_hash={} crc32=0x{:08X} collected={} live={} scene_live={} age={}",
+            m_hunter_autotest_steps_done,
+            m_hunter_autotest_steps,
+            state.active_index,
+            state.active_hash,
+            state.active_crc32,
+            state.collected_count,
+            state.live_count,
+            state.scene_live_count,
+            state.active_age_frames);
+        return;
+    }
+
+    if ((m_hunter_autotest_frame - m_hunter_autotest_last_step_frame) <
+            static_cast<uint64_t>(m_hunter_autotest_step_interval_frames)) {
+        return;
+    }
+
+    state = reg.hunter_state();
+    reg.hunter_stop();
+    reg.hunter_set_suppression_enabled(true);
+    set_force_shader_tracking(false);
+    set_force_d3d12_diagnostics(false);
+    m_hunter_autotest_finished = true;
+    spdlog::info(
+        "[ShaderHunter][autotest] finished collected={} live={} scene_live={} steps={} final_hash={}",
+        state.collected_count,
+        state.live_count,
+        state.scene_live_count,
+        m_hunter_autotest_steps_done,
+        state.active_hash);
+}
+
 void RenderInspector::on_present() {
     if (g_framework == nullptr || !g_framework->is_ready()) {
         return;
     }
 
-    const auto resources_active = g_framework->is_sidebar_entry_selected("Resources");
+    service_shader_hunter_autotest();
+
+    const auto resources_active = g_framework->is_sidebar_entry_selected("Resources") ||
+                                   m_force_resources_sampling.load();
     const auto shader_tracking_active =
         g_framework->is_sidebar_entry_selected("PSO Profiler") ||
-        g_framework->is_sidebar_entry_selected("Shaders");
+        g_framework->is_sidebar_entry_selected("Shaders") ||
+        g_framework->is_sidebar_entry_selected("Shader Hunter") ||
+        m_force_shader_tracking.load();
     const auto dx12_diagnostics_active =
         g_framework->is_dx12() &&
-        (g_framework->is_sidebar_entry_selected("DX12 Diagnostics") || shader_tracking_active);
+        (g_framework->is_sidebar_entry_selected("DX12 Diagnostics") ||
+         shader_tracking_active ||
+         m_force_d3d12_diagnostics.load());
 
     render::D3D12Diagnostics::get().set_enabled(dx12_diagnostics_active);
     render::ShaderOverrideRegistry::get().set_inspector_tracking_enabled(shader_tracking_active);
@@ -468,6 +670,10 @@ void RenderInspector::on_draw_sidebar_entry(std::string_view in_entry) {
         draw_pso_profiler();
     } else if (in_entry == "Shaders") {
         draw_shaders();
+    } else if (in_entry == "Shader Hunter") {
+        draw_shader_hunter();
+    } else if (in_entry == "Eye Diff") {
+        draw_eye_diff();
     }
 }
 
@@ -1392,7 +1598,7 @@ void RenderInspector::draw_shaders() {
             ImGuiTableFlags_Resizable |
             ImGuiTableFlags_SizingStretchProp;
 
-        if (ImGui::BeginTable("ShaderOverrideTable", 9, table_flags, ImVec2(0.0f, 280.0f))) {
+        if (ImGui::BeginTable("ShaderOverrideTable", 10, table_flags, ImVec2(0.0f, 280.0f))) {
             ImGui::TableSetupColumn("Name");
             ImGui::TableSetupColumn("Backend");
             ImGui::TableSetupColumn("Stage");
@@ -1400,6 +1606,7 @@ void RenderInspector::draw_shaders() {
             ImGui::TableSetupColumn("Status");
             ImGui::TableSetupColumn("Compiler");
             ImGui::TableSetupColumn("Generation");
+            ImGui::TableSetupColumn("Kind");
             ImGui::TableSetupColumn("Source");
             ImGui::TableSetupColumn("Notes");
             ImGui::TableHeadersRow();
@@ -1420,6 +1627,8 @@ void RenderInspector::draw_shaders() {
                 ImGui::TextUnformatted(entry.compiler.empty() ? "-" : entry.compiler.c_str());
                 ImGui::TableNextColumn();
                 ImGui::Text("%" PRIu64, entry.generation);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(entry.source_kind.empty() ? "-" : entry.source_kind.c_str());
                 ImGui::TableNextColumn();
                 ImGui::TextWrapped("%s", entry.source_path.c_str());
                 ImGui::TableNextColumn();
@@ -1450,5 +1659,499 @@ void RenderInspector::draw_shaders() {
                 ImGui::BulletText("%s", it->c_str());
             }
         }
+    }
+}
+
+// =====================================================================
+// Shader Hunter — interactive ShaderToggler-style PS suppression.
+// =====================================================================
+void RenderInspector::draw_shader_hunter() {
+    auto& reg = render::ShaderOverrideRegistry::get();
+    auto state = reg.hunter_state();
+
+    ImGui::TextWrapped(
+        "Step through every PS hash currently being rendered. The active hash "
+        "can be suppressed so you see what disappears. Mark hashes to save "
+        "them as JSON override manifests. Hotkeys: 1 prev, 2 next, 3 toggle "
+        "mark (only while this panel is open and hunting is active).");
+    ImGui::Separator();
+
+    if (state.active) {
+        if (ImGui::Button("Stop Hunting")) { reg.hunter_stop(); }
+    } else {
+        if (ImGui::Button("Start Hunting")) {
+            reg.hunter_set_frame_window(m_hunter_frame_window_input);
+            reg.hunter_start();
+            set_force_shader_tracking(true);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(state.active ? "Clear + Restart" : "Clear Collected")) {
+        reg.hunter_set_frame_window(m_hunter_frame_window_input);
+        reg.hunter_clear_collected();
+        if (state.active) {
+            set_force_shader_tracking(true);
+        }
+    }
+    ImGui::SameLine();
+    bool hide = state.hide_marked;
+    if (ImGui::Checkbox("Hide marked", &hide)) { reg.hunter_set_hide_marked(hide); }
+    ImGui::SameLine();
+    bool suppress = state.suppression_enabled;
+    if (ImGui::Checkbox("Suppress active", &suppress)) { reg.hunter_set_suppression_enabled(suppress); }
+    ImGui::SameLine();
+    bool cycle_highlight = reg.hunter_cycle_highlight_mode();
+    if (ImGui::Checkbox("Cycle paints magenta", &cycle_highlight)) {
+        // When on, pressing 1/2/3 highlights the active shader in magenta
+        // instead of hiding its draws. Lets you SEE which scene pixels each
+        // shader paints. Mutually exclusive with the hide-when-cycling default.
+        reg.hunter_set_cycle_highlight_mode(cycle_highlight);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save marked -> manifests")) {
+        std::string err;
+        const bool ok = reg.hunter_save_marked_as_manifests(err);
+        if (!ok) ImGui::OpenPopup("HunterSaveErr");
+        else {
+            m_shader_export_status = "Saved marked shaders as JSON manifests";
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Trim to live+scene")) {
+        // Drops everything that's not scene-candidate AND currently live
+        // (last_seen within recent_frame_age). The result is "what's actually
+        // rendering RIGHT NOW", which is usually 10-30 shaders for a static
+        // menu vs 800+ accumulated. Also auto-pauses collection.
+        const size_t kept = reg.hunter_trim_collected(true, true);
+        m_shader_export_status = "Trimmed to " + std::to_string(kept) + " live scene shaders";
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Trim to top 32 hits")) {
+        // Keep only the 32 most-bound shaders. Drops one-off / rare-bind
+        // entries that are unlikely to be the visible-pixel offender.
+        const size_t kept = reg.hunter_trim_to_top_hits(32);
+        m_shader_export_status = "Trimmed to top " + std::to_string(kept) + " by hits";
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear all marks")) {
+        // In-memory marked sets across PS / VS / CS. Does NOT touch any
+        // hunter_ps_*.json manifests on disk — use "Delete saved manifests"
+        // below for that.
+        reg.hunter_clear_all_marks();
+        m_shader_export_status = "Cleared all in-memory marks";
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Delete saved manifests")) {
+        // Delete every hunter_ps_*.json from the profile shader_overrides
+        // dir and drop their in-memory override entries. Combined with
+        // Clear all marks this is the "fresh slate" reset.
+        std::string err;
+        const size_t n = reg.hunter_delete_saved_manifests(err);
+        m_shader_export_status = err.empty()
+            ? ("Deleted " + std::to_string(n) + " hunter_ps_*.json manifests")
+            : err;
+    }
+    if (ImGui::BeginPopupModal("HunterSaveErr", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("No marked shaders to save.");
+        if (ImGui::Button("OK")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    if (!m_shader_export_status.empty()) {
+        ImGui::TextColored({0.4f, 0.9f, 0.4f, 1.0f}, "%s", m_shader_export_status.c_str());
+    }
+
+    ImGui::Separator();
+    // Frame-window cap controls
+    ImGui::SetNextItemWidth(120.0f);
+    if (ImGui::InputInt("Frame window (0=unlimited)", &m_hunter_frame_window_input)) {
+        if (m_hunter_frame_window_input < 0) m_hunter_frame_window_input = 0;
+        reg.hunter_set_frame_window(m_hunter_frame_window_input);
+    }
+    if (state.frame_window > 0) {
+        ImGui::SameLine();
+        if (state.window_stopped) {
+            ImGui::TextColored({0.9f, 0.6f, 0.3f, 1.0f},
+                "Window expired (collection paused). Clear + Restart to restart.");
+        } else if (state.active) {
+            ImGui::Text("frames left: %llu", (unsigned long long)state.window_frames_left);
+        }
+    }
+    ImGui::SetNextItemWidth(120.0f);
+    m_hunter_recent_frame_age_input = state.recent_frame_age;
+    if (ImGui::InputInt("Recent frames", &m_hunter_recent_frame_age_input)) {
+        if (m_hunter_recent_frame_age_input < 0) m_hunter_recent_frame_age_input = 0;
+        reg.hunter_set_recent_frame_age(m_hunter_recent_frame_age_input);
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Collected: %zu  |  Live scene: %zu/%zu  |  Marked: %zu  |  Active idx: %d",
+        state.collected_count, state.scene_live_count, state.live_count,
+        state.marked_count, state.active_index);
+    // Runtime blocklist status: hashes flagged "Block" via per-row button
+    // (or added via UEVR_SHADER_HUNTER_SUPPRESSION_BLOCKLIST env var at startup).
+    {
+        const auto blocklist = reg.hunter_runtime_blocklist_snapshot();
+        if (!blocklist.empty()) {
+            ImGui::TextColored({0.9f, 0.5f, 0.5f, 1.0f},
+                "Runtime blocklist (%zu): %s%s",
+                blocklist.size(),
+                blocklist.front().c_str(),
+                blocklist.size() > 1 ? ", ..." : "");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Clear blocklist")) {
+                reg.hunter_clear_runtime_blocklist();
+            }
+        }
+    }
+    // Highlight set status: hashes that render magenta instead of being skipped.
+    {
+        const auto hl = reg.hunter_highlight_snapshot();
+        if (!hl.empty()) {
+            ImGui::TextColored({1.0f, 0.3f, 1.0f, 1.0f},
+                "Highlighted (%zu): %s%s",
+                hl.size(), hl.front().c_str(), hl.size() > 1 ? ", ..." : "");
+        }
+    }
+    if (!state.active_hash.empty()) {
+        ImGui::Text("Hunted PS hash: %s  (CRC32=0x%08X, age=%llu frames)",
+            state.active_hash.c_str(), state.active_crc32,
+            (unsigned long long)state.active_age_frames);
+    } else {
+        ImGui::TextDisabled("No hunted PS yet.");
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Prev (1)")) reg.hunter_step(-1);
+    ImGui::SameLine();
+    if (ImGui::Button("Next (2)")) reg.hunter_step(+1);
+    ImGui::SameLine();
+    if (ImGui::Button("Mark/Unmark (3)")) reg.hunter_toggle_mark_active();
+
+    // === Stage status lines + per-stage Hunt/Mark buttons ===
+    // ShaderToggler-style three-stage walk. Hotkeys use top-row digits:
+    //   1/2 prev/next, 3 toggle mark  — PIXEL stage
+    //   4/5 prev/next, 6 toggle mark  — VERTEX stage
+    //   7/8 prev/next, 9 toggle mark  — COMPUTE stage
+    using Stage = render::ShaderOverrideRegistry::HunterStage;
+    auto stage_row = [&](Stage stage, const char* label,
+                          ImGuiKey prev_key, ImGuiKey next_key, ImGuiKey mark_key,
+                          int prev_n, int next_n, int mark_n) {
+        const int s = static_cast<int>(stage);
+        const bool active_marked = state.active_is_marked_per_stage[s];
+        // Label/idx/hash in normal color, then a colored [MARKED] tag inline
+        // when the currently-hunted hash for this stage is also in the marked set.
+        ImGui::Text("%s: idx=%d hash=%s (CRC32=0x%08X, age=%llu, count=%zu, marked=%zu)",
+            label,
+            state.active_index_per_stage[s],
+            state.active_hash_per_stage[s].empty() ? "(none)" : state.active_hash_per_stage[s].c_str(),
+            state.active_crc32_per_stage[s],
+            (unsigned long long)state.active_age_frames_per_stage[s],
+            state.collected_count_per_stage[s],
+            state.marked_count_per_stage[s]);
+        if (active_marked) {
+            ImGui::SameLine();
+            ImGui::TextColored({1.0f, 0.4f, 0.4f, 1.0f}, "[MARKED]");
+        }
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "Prev (%d)##%s", prev_n, label);
+        if (ImGui::Button(buf)) reg.hunter_step(stage, -1);
+        ImGui::SameLine();
+        std::snprintf(buf, sizeof(buf), "Next (%d)##%s", next_n, label);
+        if (ImGui::Button(buf)) reg.hunter_step(stage, +1);
+        ImGui::SameLine();
+        std::snprintf(buf, sizeof(buf), "Mark (%d)##%s", mark_n, label);
+        if (ImGui::Button(buf)) reg.hunter_toggle_mark_active(stage);
+        if (state.active) {
+            if (ImGui::IsKeyPressed(prev_key, false)) reg.hunter_step(stage, -1);
+            if (ImGui::IsKeyPressed(next_key, false)) reg.hunter_step(stage, +1);
+            if (ImGui::IsKeyPressed(mark_key, false)) reg.hunter_toggle_mark_active(stage);
+        }
+    };
+    stage_row(Stage::Pixel,   "PIXEL ",   ImGuiKey_1, ImGuiKey_2, ImGuiKey_3, 1, 2, 3);
+    stage_row(Stage::Vertex,  "VERTEX",   ImGuiKey_4, ImGuiKey_5, ImGuiKey_6, 4, 5, 6);
+    stage_row(Stage::Compute, "COMPUTE",  ImGuiKey_7, ImGuiKey_8, ImGuiKey_9, 7, 8, 9);
+
+    ImGui::Separator();
+    ImGui::InputTextWithHint("Filter (PS hash / CRC32)", "hash or crc32 hex...",
+        m_hunter_filter, sizeof(m_hunter_filter));
+    ImGui::InputTextWithHint("VS filter (substring)", "vs hash hex...",
+        m_hunter_vs_filter, sizeof(m_hunter_vs_filter));
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputInt("Min hits", &m_hunter_min_hits);
+    if (m_hunter_min_hits < 0) m_hunter_min_hits = 0;
+    ImGui::SameLine();
+    ImGui::Checkbox("Only show scene candidates", &m_hunter_only_scene_candidates);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(180.0f);
+    ImGui::Combo("Sort##hunter", &m_hunter_sort_mode,
+        "Capture order\0PS hash\0Hits desc\0PS size desc\0VS hash\0Age asc\0Live then hits desc\0\0");
+
+    // Build sortable index
+    std::vector<size_t> indices(state.collected_hashes.size());
+    for (size_t i = 0; i < indices.size(); ++i) indices[i] = i;
+    if (m_hunter_sort_mode == 1) {
+        std::sort(indices.begin(), indices.end(),
+            [&](size_t a, size_t b) { return state.collected_hashes[a] < state.collected_hashes[b]; });
+    } else if (m_hunter_sort_mode == 2) {
+        std::sort(indices.begin(), indices.end(),
+            [&](size_t a, size_t b) { return state.collected_hits[a] > state.collected_hits[b]; });
+    } else if (m_hunter_sort_mode == 3) {
+        std::sort(indices.begin(), indices.end(),
+            [&](size_t a, size_t b) { return state.collected_sizes[a] > state.collected_sizes[b]; });
+    } else if (m_hunter_sort_mode == 4) {
+        // VS hash sort groups material variants together (same VS = same mesh
+        // shading family). Helpful for spotting "this whole material family
+        // is the offender" patterns.
+        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            if (state.collected_vs_hashes[a] != state.collected_vs_hashes[b])
+                return state.collected_vs_hashes[a] < state.collected_vs_hashes[b];
+            return state.collected_hits[a] > state.collected_hits[b];
+        });
+    } else if (m_hunter_sort_mode == 5) {
+        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            if (state.collected_age_frames[a] != state.collected_age_frames[b])
+                return state.collected_age_frames[a] < state.collected_age_frames[b];
+            return state.collected_hits[a] > state.collected_hits[b];
+        });
+    } else if (m_hunter_sort_mode == 6) {
+        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            const bool a_live = state.collected_age_frames[a] <= static_cast<uint64_t>(state.recent_frame_age);
+            const bool b_live = state.collected_age_frames[b] <= static_cast<uint64_t>(state.recent_frame_age);
+            if (a_live != b_live) return a_live;
+            if (state.collected_hits[a] != state.collected_hits[b])
+                return state.collected_hits[a] > state.collected_hits[b];
+            return state.collected_age_frames[a] < state.collected_age_frames[b];
+        });
+    }
+
+    const std::string filter = m_hunter_filter;
+    const std::string vs_filter = m_hunter_vs_filter;
+    // Use the registry-exposed threshold so UI and suppression-eligibility
+    // never drift apart if HUNTER_MIN_SCENE_PS_SIZE is tuned in the .cpp.
+    const size_t min_scene_ps_size = state.min_scene_ps_size > 0
+        ? state.min_scene_ps_size : 1024;
+    if (ImGui::BeginTable("##hunter_table", 8,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+            ImVec2(0.0f, 360.0f))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("#");
+        ImGui::TableSetupColumn("PS hash (FNV1a-64)");
+        ImGui::TableSetupColumn("VS hash");
+        ImGui::TableSetupColumn("CRC32 (ShaderToggler)");
+        ImGui::TableSetupColumn("PS size");
+        ImGui::TableSetupColumn("Hits");
+        ImGui::TableSetupColumn("Age");
+        ImGui::TableSetupColumn("Actions");
+        ImGui::TableHeadersRow();
+        int row_n = 0;
+        for (size_t idx : indices) {
+            const auto& h = state.collected_hashes[idx];
+            const auto& vs = state.collected_vs_hashes[idx];
+            char crc_str[16]{};
+            std::snprintf(crc_str, sizeof(crc_str), "%08X", state.collected_crc32s[idx]);
+            if (static_cast<int>(state.collected_hits[idx]) < m_hunter_min_hits) continue;
+            if (m_hunter_only_scene_candidates) {
+                const bool live = state.collected_age_frames[idx] <= static_cast<uint64_t>(state.recent_frame_age);
+                const bool scene_candidate = !vs.empty() && state.collected_sizes[idx] >= min_scene_ps_size;
+                if (!live || !scene_candidate) continue;
+            }
+            if (!filter.empty()) {
+                const bool match = h.find(filter) != std::string::npos
+                    || std::string{crc_str}.find(filter) != std::string::npos;
+                if (!match) continue;
+            }
+            if (!vs_filter.empty()) {
+                if (vs.find(vs_filter) == std::string::npos) continue;
+            }
+            ImGui::TableNextRow();
+            // Stage-aware active check: a row is "active" only for its own
+            // stage's hunted hash (avoids highlighting PS rows when the user
+            // is on the VS walk and vice versa).
+            const auto row_stage = idx < state.collected_stages.size()
+                ? static_cast<int>(state.collected_stages[idx]) : 0;
+            const bool is_active = (h == state.active_hash_per_stage[row_stage]);
+            const bool is_marked = state.collected_marked[idx];
+            ImGui::TableNextColumn();
+            // Tag with "*" prefix when active+marked so the row stands out
+            // even if the user's cursor isn't on it.
+            if (is_active && is_marked) ImGui::Text("*%d", row_n);
+            else ImGui::Text("%d", row_n);
+            ImGui::TableNextColumn();
+            // Hash color: orange when active+marked (combo), yellow when active
+            // only, light-red when marked only, plain otherwise.
+            if (is_active && is_marked) ImGui::TextColored({1.0f, 0.6f, 0.2f, 1.0f}, "%s [MARKED]", h.c_str());
+            else if (is_active)         ImGui::TextColored({1.0f, 0.9f, 0.3f, 1.0f}, "%s", h.c_str());
+            else if (is_marked)         ImGui::TextColored({1.0f, 0.5f, 0.5f, 1.0f}, "%s", h.c_str());
+            else                        ImGui::TextUnformatted(h.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(vs.empty() ? "(none)" : vs.c_str());
+            ImGui::TableNextColumn();
+            if (is_marked) ImGui::TextColored({1.0f, 0.4f, 0.4f, 1.0f}, "%s", crc_str);
+            else ImGui::TextUnformatted(crc_str);
+            ImGui::TableNextColumn();
+            ImGui::Text("%zu", state.collected_sizes[idx]);
+            ImGui::TableNextColumn();
+            ImGui::Text("%" PRIu64, state.collected_hits[idx]);
+            ImGui::TableNextColumn();
+            ImGui::Text("%" PRIu64, state.collected_age_frames[idx]);
+            ImGui::TableNextColumn();
+            ImGui::PushID(static_cast<int>(idx));
+            if (ImGui::SmallButton("Hunt")) {
+                reg.hunter_set_index(0);
+                auto s2 = reg.hunter_state();
+                int n2 = (int)s2.collected_count;
+                for (int i = 0; i < n2; ++i) {
+                    if (s2.collected_hashes[(size_t)i] == h) { reg.hunter_set_index(i); break; }
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton(is_marked ? "Unmark" : "Mark")) {
+                reg.hunter_toggle_mark_hash(h);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Block")) {
+                // Permanently exclude this hash from suppression (for this session).
+                // Use when a hash crashed the game last time it was suppressed.
+                reg.hunter_add_runtime_blocklist(h);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Hilite")) {
+                // Toggle highlight: instead of skipping, render this shader's
+                // draws with magenta so the user can SEE where it draws.
+                reg.hunter_toggle_highlight_hash(h);
+            }
+            ImGui::SameLine();
+            const bool skip_l = reg.hunter_is_skip_left_only(h);
+            if (skip_l) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.3f, 0.3f, 1.0f));
+            if (ImGui::SmallButton("SkipL")) reg.hunter_toggle_skip_left_only(h);
+            if (skip_l) ImGui::PopStyleColor();
+            ImGui::SameLine();
+            const bool skip_r = reg.hunter_is_skip_right_only(h);
+            if (skip_r) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.3f, 0.3f, 1.0f));
+            if (ImGui::SmallButton("SkipR")) reg.hunter_toggle_skip_right_only(h);
+            if (skip_r) ImGui::PopStyleColor();
+            ImGui::SameLine();
+            if (!vs.empty() && ImGui::SmallButton("VS=")) {
+                // Quick-filter: set the VS-filter to this row's VS so the user
+                // can see every PS sharing the same vertex shader.
+                std::snprintf(m_hunter_vs_filter, sizeof(m_hunter_vs_filter), "%s", vs.c_str());
+            }
+            ImGui::PopID();
+            ++row_n;
+        }
+        ImGui::EndTable();
+    }
+}
+
+// =====================================================================
+// Eye Diff — per-PSO per-eye fingerprint comparison.
+// Identifies PSOs whose left-eye and right-eye inputs diverge (the SN2
+// right-eye bug pattern: same shader bytecode, different descriptors).
+// =====================================================================
+void RenderInspector::draw_eye_diff() {
+    auto& reg = render::ShaderOverrideRegistry::get();
+    bool enabled = reg.eyediff_enabled();
+
+    ImGui::TextWrapped(
+        "Per-PSO per-eye fingerprint tracking. Each time a draw fires we "
+        "record the bound RTV[0] handle and graphics-root descriptor-table[0] "
+        "for the current eye bucket (L / R / Full / Multi). PSOs whose L vs R "
+        "fingerprints diverge are the most likely candidates for per-eye "
+        "rendering bugs.");
+    ImGui::Separator();
+
+    if (ImGui::Checkbox("Enabled (record on every Draw)", &enabled)) {
+        reg.eyediff_set_enabled(enabled);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear")) {
+        reg.eyediff_clear();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(Set UEVR_EYE_DIFF_LOG=1 before launch for per-draw log spam)");
+
+    if (!enabled) {
+        ImGui::TextColored({0.9f, 0.6f, 0.3f, 1.0f},
+            "Disabled — turn on to start recording. Counters update each frame.");
+        return;
+    }
+
+    const auto entries = reg.eyediff_snapshot_top_divergent(128);
+    ImGui::Text("Tracked PSOs: %zu (top 128 by divergence shown)", entries.size());
+
+    if (ImGui::BeginTable("##eyediff_table", 9,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+            ImVec2(0.0f, 480.0f))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("#");
+        ImGui::TableSetupColumn("PS hash");
+        ImGui::TableSetupColumn("VS hash");
+        ImGui::TableSetupColumn("L hits");
+        ImGui::TableSetupColumn("R hits");
+        ImGui::TableSetupColumn("RTV L != R");
+        ImGui::TableSetupColumn("Desc L != R");
+        ImGui::TableSetupColumn("Last frame");
+        ImGui::TableSetupColumn("Actions");
+        ImGui::TableHeadersRow();
+        int row_n = 0;
+        for (const auto& e : entries) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", row_n);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(e.ps_hash.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(e.vs_hash.empty() ? "(none)" : e.vs_hash.c_str());
+            ImGui::TableNextColumn();
+            ImGui::Text("%" PRIu64, e.bind_count_left);
+            ImGui::TableNextColumn();
+            ImGui::Text("%" PRIu64, e.bind_count_right);
+            ImGui::TableNextColumn();
+            if (e.rtv_divergence_seen > 0) {
+                ImGui::TextColored({1.0f, 0.5f, 0.3f, 1.0f}, "%" PRIu64
+                    " (L=0x%llx R=0x%llx)",
+                    e.rtv_divergence_seen, (unsigned long long)e.last_rtv_left, (unsigned long long)e.last_rtv_right);
+            } else {
+                ImGui::TextDisabled("0");
+            }
+            ImGui::TableNextColumn();
+            if (e.desc_divergence_seen > 0) {
+                ImGui::TextColored({1.0f, 0.3f, 0.3f, 1.0f}, "%" PRIu64
+                    " (L=0x%llx R=0x%llx)",
+                    e.desc_divergence_seen, (unsigned long long)e.last_desc_left, (unsigned long long)e.last_desc_right);
+            } else {
+                ImGui::TextDisabled("0");
+            }
+            ImGui::TableNextColumn();
+            ImGui::Text("%" PRIu64, e.last_seen_frame);
+            ImGui::TableNextColumn();
+            ImGui::PushID(row_n);
+            const std::string& ps = e.ps_hash;
+            if (ImGui::SmallButton("Hunt")) {
+                // Find this hash in the Pixel-stage order and set as active.
+                auto s2 = reg.hunter_state();
+                int n2 = (int)s2.collected_count_per_stage[0];
+                for (int i = 0; i < n2; ++i) {
+                    if (s2.collected_hashes[(size_t)i] == ps) {
+                        reg.hunter_set_index(render::ShaderOverrideRegistry::HunterStage::Pixel, i);
+                        break;
+                    }
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Mark")) {
+                reg.hunter_toggle_mark_hash(ps);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Block")) {
+                reg.hunter_add_runtime_blocklist(ps);
+            }
+            ImGui::PopID();
+            ++row_n;
+        }
+        ImGui::EndTable();
     }
 }

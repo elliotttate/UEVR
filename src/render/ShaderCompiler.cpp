@@ -12,6 +12,8 @@
 #include <dxcapi.h>
 #include <wrl/client.h>
 
+#include <spdlog/spdlog.h>
+
 namespace {
 using Microsoft::WRL::ComPtr;
 
@@ -204,10 +206,12 @@ struct DxcRuntime {
 
             loaded_from = dxcompiler_path;
             failure_reason.clear();
+            spdlog::info("[ShaderCompiler] DXC loaded from: {}", dxcompiler_path.string());
             return;
         }
 
         failure_reason = failure_reason.empty() ? "DXC runtime not found" : failure_reason;
+        spdlog::error("[ShaderCompiler] DXC NOT LOADED: {}", failure_reason);
     }
 };
 
@@ -229,8 +233,15 @@ render::ShaderCompileResult compile_with_dxc(const render::ShaderCompileRequest&
         return result;
     }
 
+    // arg_storage MUST NOT reallocate while we're capturing c_str() pointers into args.
+    // emplace_back() on std::vector<std::wstring> can move all elements to a new buffer,
+    // invalidating every previously-stored .c_str() pointer. Symptoms include DXC
+    // reporting "invalid profile" (the -T arg pointed at freed memory) or
+    // "error reading '<garbled>'" (the source-path arg pointed at freed memory).
     std::vector<std::wstring> arg_storage{};
+    arg_storage.reserve(32);
     std::vector<LPCWSTR> args{};
+    args.reserve(32);
     auto push_arg = [&](std::wstring value) {
         arg_storage.emplace_back(std::move(value));
         args.emplace_back(arg_storage.back().c_str());

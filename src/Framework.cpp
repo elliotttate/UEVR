@@ -1,5 +1,8 @@
+#include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <thread>
 
 #include <windows.h>
 #include <ShlObj.h>
@@ -31,6 +34,8 @@
 #include "LicenseStrings.hpp"
 #include "mods/FrameworkConfig.hpp"
 #include "render/D3D12Diagnostics.hpp"
+#include "DumperMode.hpp"
+#include "ProfilerMode.hpp"
 #include "Framework.hpp"
 
 namespace fs = std::filesystem;
@@ -41,6 +46,220 @@ std::unique_ptr<Framework> g_framework{};
 namespace {
 constexpr auto D3D12_INIT_RETRY_INITIAL_BACKOFF = 50ms;
 constexpr auto D3D12_INIT_RETRY_MAX_BACKOFF = 250ms;
+
+// Result of try_load_pix_gpu_capturer:
+//   was_preloaded == true  -> WinPixGpuCapturer.dll was already loaded before
+//                              UEVR ran (typically because pixtool launched the
+//                              process). Programmatic GPU capture is SAFE.
+//   was_preloaded == false -> we LoadLibrary'd it ourselves AFTER the game's
+//                              D3D12 device was created. Begin* will CRASH the
+//                              process. Use only for module-tracing diagnostics.
+struct PixLoadResult {
+    HMODULE module{nullptr};
+    bool    was_preloaded{false};
+};
+
+// Mirrors pix3.h's PIXLoadLatestWinPixGpuCapturerLibrary. Gated by env var
+// UEVR_DISABLE_PIX_BOOTSTRAP=1.
+PixLoadResult try_load_pix_gpu_capturer() {
+    PixLoadResult r{};
+
+    // Nsight mode: PIX and Nsight cannot coexist. See ProfilerMode.hpp.
+    if (uevr::is_nsight_mode()) {
+        return r;
+    }
+
+    wchar_t buf[8]{};
+    if (GetEnvironmentVariableW(L"UEVR_DISABLE_PIX_BOOTSTRAP", buf, (DWORD)std::size(buf)) > 0
+        && buf[0] == L'1') {
+        return r;
+    }
+
+    if (HMODULE existing = GetModuleHandleW(L"WinPixGpuCapturer.dll")) {
+        r.module = existing;
+        r.was_preloaded = true;
+        return r;
+    }
+
+    wchar_t programFiles[MAX_PATH]{};
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_PROGRAM_FILES, NULL, 0, programFiles))) {
+        return r;
+    }
+
+    fs::path pixRoot = fs::path(programFiles) / L"Microsoft PIX";
+    std::error_code ec;
+    if (!fs::exists(pixRoot, ec)) {
+        return r;
+    }
+
+    std::wstring newest;
+    for (auto const& entry : fs::directory_iterator(pixRoot, ec)) {
+        if (!entry.is_directory(ec)) continue;
+        auto name = entry.path().filename().wstring();
+        if (newest.empty() || newest < name) {
+            newest = std::move(name);
+        }
+    }
+    if (newest.empty()) return r;
+
+    auto dllPath = pixRoot / newest / L"WinPixGpuCapturer.dll";
+    r.module = LoadLibraryW(dllPath.c_str());
+    r.was_preloaded = false;
+    return r;
+}
+
+// ---- PIX programmatic capture ------------------------------------------------
+// pixtool's external `attach` requires the process to be launched by PIX.
+// Since UEVR is injected post-launch, we drive captures from inside the
+// process via PIX's in-process API exported by WinPixGpuCapturer.dll.
+//
+// Trigger: write a sentinel file to
+//   %TEMP%\uevr_pix_capture.req
+// The file's first line is the output .wpix path. If empty, a timestamped
+// path under %TEMP% is used. Optional second line is "frames=N" (default 1).
+// On detection: PIXBeginCapture2 → wait N frames → PIXEndCapture(FALSE).
+// The watcher polls every 250ms.
+
+// PPIXCaptureParameters minimal layout (matches pix3.h / PIXEventsCommon.h
+// GpuCaptureParameters branch). Other unions are unused for GPU capture.
+struct PixCaptureGpuParams {
+    PCWSTR FileName;
+};
+union PixCaptureParameters {
+    PixCaptureGpuParams GpuCaptureParameters;
+    // pix3.h declares larger unions for timing/HF captures; we only use the GPU branch.
+    uint8_t Pad[32];
+};
+
+// Actual WinPixGpuCapturer.dll exports (pix3.h's PIXBeginCapture2 / PIXEndCapture
+// are header-only wrappers around these):
+//   HRESULT WINAPI BeginProgrammaticGpuCapture(const PIXCaptureParameters*);
+//   HRESULT WINAPI EndProgrammaticGpuCapture();
+using PFN_BeginProgrammaticGpuCapture = HRESULT(WINAPI*)(const PixCaptureParameters* captureParameters);
+using PFN_EndProgrammaticGpuCapture   = HRESULT(WINAPI*)();
+
+struct PixCaptureState {
+    HMODULE module{nullptr};
+    PFN_BeginProgrammaticGpuCapture begin{nullptr};
+    PFN_EndProgrammaticGpuCapture   end{nullptr};
+    bool capture_safe{false}; // false when PIX wasn't preloaded; Begin would crash.
+    std::atomic<bool> stop{false};
+    std::thread watcher;
+    std::filesystem::path sentinel_path;
+};
+
+PixCaptureState g_pix_state;
+
+void pix_watcher_thread(PixCaptureState* state) {
+    spdlog::info("[PIX] capture watcher started; sentinel={}", state->sentinel_path.string());
+    while (!state->stop.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+        std::error_code ec;
+        if (!std::filesystem::exists(state->sentinel_path, ec)) continue;
+
+        // Read sentinel file contents. PowerShell `-Encoding UTF8` writes a BOM
+        // (EF BB BF) which used to crash codecvt when we naively cast bytes to
+        // wchar_t. Strip BOM then convert UTF-8 -> UTF-16 properly.
+        std::wstring requested_path;
+        int frames = 1;
+        try {
+            std::ifstream f(state->sentinel_path, std::ios::binary);
+            std::string line;
+            if (std::getline(f, line)) {
+                if (line.size() >= 3 && (uint8_t)line[0] == 0xEF && (uint8_t)line[1] == 0xBB && (uint8_t)line[2] == 0xBF) {
+                    line.erase(0, 3);
+                }
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+                if (!line.empty()) {
+                    int n = MultiByteToWideChar(CP_UTF8, 0, line.c_str(), (int)line.size(), nullptr, 0);
+                    if (n > 0) {
+                        requested_path.resize(n);
+                        MultiByteToWideChar(CP_UTF8, 0, line.c_str(), (int)line.size(), requested_path.data(), n);
+                    }
+                }
+            }
+            if (std::getline(f, line)) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+                const std::string prefix = "frames=";
+                if (line.rfind(prefix, 0) == 0) {
+                    try { frames = std::stoi(line.substr(prefix.size())); } catch (...) {}
+                }
+            }
+        } catch (...) {}
+
+        // Delete sentinel before triggering capture so we don't retrigger.
+        std::filesystem::remove(state->sentinel_path, ec);
+
+        if (!state->capture_safe) {
+            spdlog::warn("[PIX] capture request seen but capture_safe=false (PIX was LoadLibrary'd post-D3D12CreateDevice). "
+                         "Calling BeginProgrammaticGpuCapture would crash this process. "
+                         "Re-launch SN2 via `pixtool launch` so PIX preloads before device creation, "
+                         "then this watcher will service capture requests safely.");
+            continue;
+        }
+
+        // Default output path if blank: %TEMP%\sn2_pix_<timestamp>.wpix
+        if (requested_path.empty()) {
+            wchar_t tempDir[MAX_PATH]{};
+            GetTempPathW(MAX_PATH, tempDir);
+            SYSTEMTIME st{};
+            GetLocalTime(&st);
+            wchar_t name[128]{};
+            swprintf_s(name, L"sn2_pix_%04u%02u%02u_%02u%02u%02u.wpix",
+                       st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+            requested_path = std::wstring(tempDir) + name;
+        }
+
+        PixCaptureParameters params{};
+        params.GpuCaptureParameters.FileName = requested_path.c_str();
+
+        spdlog::warn("[PIX] BEGIN capture frames={} -> {}", frames,
+            std::filesystem::path(requested_path).string());
+
+        HRESULT hr = state->begin(&params);
+        if (FAILED(hr)) {
+            spdlog::error("[PIX] BeginProgrammaticGpuCapture failed hr=0x{:08x}", static_cast<uint32_t>(hr));
+            continue;
+        }
+
+        // Give the engine time to present the requested frames before End.
+        // PIX is asynchronous; the End call schedules finalization.
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::max(100, frames * 80)));
+
+        hr = state->end();
+        if (FAILED(hr)) {
+            spdlog::error("[PIX] EndProgrammaticGpuCapture failed hr=0x{:08x}", static_cast<uint32_t>(hr));
+        } else {
+            spdlog::warn("[PIX] END capture (success) — file should land at {}",
+                std::filesystem::path(requested_path).string());
+        }
+    }
+    spdlog::info("[PIX] capture watcher stopped");
+}
+
+void start_pix_capture_watcher(const PixLoadResult& pix) {
+    if (pix.module == nullptr) return;
+    g_pix_state.module = pix.module;
+    g_pix_state.capture_safe = pix.was_preloaded;
+    g_pix_state.begin = reinterpret_cast<PFN_BeginProgrammaticGpuCapture>(GetProcAddress(pix.module, "BeginProgrammaticGpuCapture"));
+    g_pix_state.end   = reinterpret_cast<PFN_EndProgrammaticGpuCapture>(GetProcAddress(pix.module, "EndProgrammaticGpuCapture"));
+    if (g_pix_state.begin == nullptr || g_pix_state.end == nullptr) {
+        spdlog::warn("[PIX] could not resolve BeginProgrammaticGpuCapture/EndProgrammaticGpuCapture (begin={}, end={})",
+            (void*)g_pix_state.begin, (void*)g_pix_state.end);
+        return;
+    }
+
+    wchar_t tempDir[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, tempDir) == 0) return;
+    g_pix_state.sentinel_path = fs::path(tempDir) / L"uevr_pix_capture.req";
+    // Clear any stale sentinel left over from a previous run.
+    std::error_code ec;
+    std::filesystem::remove(g_pix_state.sentinel_path, ec);
+
+    g_pix_state.watcher = std::thread(pix_watcher_thread, &g_pix_state);
+    g_pix_state.watcher.detach();
+}
 
 bool is_imgui_mouse_message(UINT message) {
     switch (message) {
@@ -197,6 +416,64 @@ void Framework::hook_monitor() {
         }
     }
 
+    // Dumper mode: we never rely on D3D hooks for rendering, so skip the
+    // rehook-if-not-presenting monitor. On fragile games this loop was
+    // causing "Last chance encountered for hooking" death spirals during
+    // reflection dumps.
+    //
+    // Normal UEVR bootstraps plugins in two phases:
+    //   1. Framework ctor calls PluginLoader::early_init → LoadLibrary each DLL
+    //   2. On first D3D Present, Framework::on_frame_d3d11/12 calls
+    //      Mods::on_initialize_d3d_thread → PluginLoader queries device/
+    //      swapchain, calls uevr_plugin_required_version + uevr_plugin_initialize
+    //   3. Stereo hook's on_frame installs UGameEngine::Tick hook
+    //   4. Engine tick hook fans out on_pre_engine_tick to all mods + plugins
+    //
+    // In dumper mode there's no Present → phases 2-4 never fire without
+    // intervention. We drive them from here instead: first mods::on_initialize
+    // + on_initialize_d3d_thread (which now skips the D3D device queries),
+    // then the stereo-hook's on_frame to install the tick hook.
+    // See DumperMode.hpp.
+    if (uevr::is_dumper_mode()) {
+        m_last_present_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+
+        // One-shot phase-2: mods + plugin init. Equivalent of what the first
+        // D3D Present would trigger. Must also set m_game_data_initialized
+        // so the engine_tick_hook fans out on_pre_engine_tick to mods —
+        // otherwise the hook runs but returns before dispatching.
+        if (!m_dumper_mods_initialized) {
+            try {
+                if (m_mods == nullptr) m_mods = std::make_unique<Mods>();
+                (void)m_mods->on_initialize();
+                (void)m_mods->on_initialize_d3d_thread();
+                // m_game_data_initialized is the gate on engine_tick_hook
+                // fanning out to mods. Don't set m_initialized — that gates
+                // imgui rendering which requires D3D in dumper mode.
+                m_game_data_initialized = true;
+                m_mods_fully_initialized = true;
+                m_dumper_mods_initialized = true;
+                spdlog::info("[DumperMode] Mods + plugins initialized.");
+            } catch (...) {
+                spdlog::error("[DumperMode] Exception during mods init; will retry.");
+            }
+        }
+
+        // Recurring phase-3: keep calling stereo_hook->on_frame until the
+        // engine tick hook installs. Once installed, engine_tick_hook fans
+        // out on_pre_engine_tick to all mods including PluginLoader.
+        if (m_vr != nullptr) {
+            auto& stereo_hook = m_vr->get_fake_stereo_hook();
+            if (stereo_hook != nullptr) {
+                try {
+                    stereo_hook->on_frame();
+                } catch (...) {
+                    spdlog::warn("[DumperMode] stereo_hook->on_frame() threw (tick-hook install retry)");
+                }
+            }
+        }
+        return;
+    }
+
     const auto now = std::chrono::steady_clock::now();
 
     auto& d3d11 = get_d3d11_hook();
@@ -320,6 +597,32 @@ Framework::Framework(HMODULE framework_module)
     // Keep immediate flushing for actual errors only.
     spdlog::flush_on(spdlog::level::err);
     spdlog::info("UnrealVR entry");
+
+    // Profiler integration is one-of-N: PIX OR Nsight, not both. PIX's
+    // WinPixGpuCapturer.dll detours D3D12 in a way that breaks Nsight
+    // Graphics' capture path, so Nsight mode short-circuits PIX bootstrap.
+    // See ProfilerMode.hpp.
+    if (uevr::is_nsight_mode()) {
+        spdlog::info("[Profiler] Nsight mode active — skipping PIX bootstrap so NVIDIA Nsight can attach cleanly.");
+    } else if (auto pix = try_load_pix_gpu_capturer(); pix.module != nullptr) {
+        // Bootstrap PIX GPU capturer if not already loaded. Then spawn the
+        // sentinel-file watcher. Programmatic capture only works if PIX was
+        // loaded BEFORE the game created its D3D12 device — i.e. when the
+        // process was launched via `pixtool launch`. The watcher detects this
+        // and refuses to call Begin if PIX was loaded late (it would crash SN2).
+        spdlog::info("PIX GPU capturer loaded: 0x{:x} (preloaded={})",
+            reinterpret_cast<uintptr_t>(pix.module), pix.was_preloaded);
+        if (!pix.was_preloaded) {
+            spdlog::warn("[PIX] capture_safe=false: PIX was LoadLibrary'd post-D3D12CreateDevice. "
+                         "Sentinel watcher will refuse Begin to avoid crashing the game. "
+                         "Re-launch via `pixtool launch ... --captureFromStart` for safe captures.");
+        }
+        start_pix_capture_watcher(pix);
+    } else {
+        spdlog::info("PIX GPU capturer not loaded (UEVR_DISABLE_PIX_BOOTSTRAP={} or PIX not installed)",
+            []{ wchar_t b[8]{}; GetEnvironmentVariableW(L"UEVR_DISABLE_PIX_BOOTSTRAP", b, 8); return b[0] == L'1'; }());
+    }
+
     spdlog::info("Commit hash: {}", UEVR_COMMIT_HASH);
     spdlog::info("Tag: {}", UEVR_TAG);
     spdlog::info("Commits past tag: {}", UEVR_COMMITS_PAST_TAG);
@@ -439,6 +742,11 @@ Framework::Framework(HMODULE framework_module)
 }
 
 bool Framework::hook_d3d11() {
+    // Dumper mode: never hook D3D. See DumperMode.hpp.
+    if (uevr::is_dumper_mode()) {
+        spdlog::info("[DumperMode] Skipping D3D11 hook installation.");
+        return false;
+    }
     //if (m_d3d11_hook == nullptr) {
         m_d3d11_hook.reset();
         m_d3d11_hook = std::make_unique<D3D11Hook>();
@@ -471,6 +779,12 @@ bool Framework::hook_d3d11() {
 }
 
 bool Framework::hook_d3d12() {
+    // Dumper mode: never hook D3D. See DumperMode.hpp.
+    if (uevr::is_dumper_mode()) {
+        spdlog::info("[DumperMode] Skipping D3D12 hook installation.");
+        return false;
+    }
+
     // windows 7?
     if (LoadLibraryA("d3d12.dll") == nullptr) {
         spdlog::info("d3d12.dll not found, user is probably running Windows 7.");
@@ -1327,9 +1641,9 @@ void Framework::draw_ui() {
             style.Alpha = 1.0f;
         } else {
             if (ImGui::IsWindowHovered(ImGuiFocusedFlags_AnyWindow)) {
-                style.Alpha = 0.9f;
+                style.Alpha = 0.55f;
             } else {
-                style.Alpha = 0.8f;
+                style.Alpha = 0.35f;
             }
         }
     } else {

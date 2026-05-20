@@ -51,11 +51,20 @@ bool TextureContext::create_rtv(ID3D12Device* device, std::optional<DXGI_FORMAT>
     render::D3D12Diagnostics::get().register_descriptor_heap("VR::TextureContext::create_rtv", rtv_heap->Heap(), 1, true, "TextureContext RTV Heap");
 
     if (format) {
+        const auto desc = texture->GetDesc();
         D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{};
         rtv_desc.Format = (DXGI_FORMAT)*format;
-        rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        rtv_desc.Texture2D.MipSlice = 0;
-        rtv_desc.Texture2D.PlaneSlice = 0;
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize > 1) {
+            rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+            rtv_desc.Texture2DArray.MipSlice = 0;
+            rtv_desc.Texture2DArray.FirstArraySlice = 0;
+            rtv_desc.Texture2DArray.ArraySize = desc.DepthOrArraySize;
+            rtv_desc.Texture2DArray.PlaneSlice = 0;
+        } else {
+            rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            rtv_desc.Texture2D.MipSlice = 0;
+            rtv_desc.Texture2D.PlaneSlice = 0;
+        }
         device->CreateRenderTargetView(texture.Get(), &rtv_desc, get_rtv());
     } else {
         device->CreateRenderTargetView(texture.Get(), nullptr, get_rtv());
@@ -87,14 +96,25 @@ bool TextureContext::create_srv(ID3D12Device* device, std::optional<DXGI_FORMAT>
     render::D3D12Diagnostics::get().register_descriptor_heap("VR::TextureContext::create_srv", srv_heap->Heap(), 1, true, "TextureContext SRV Heap");
 
     if (format) {
+        const auto desc = texture->GetDesc();
         D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
         srv_desc.Format = (DXGI_FORMAT)*format;
-        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv_desc.Texture2D.MipLevels = 1;
-        srv_desc.Texture2D.MostDetailedMip = 0;
-        srv_desc.Texture2D.PlaneSlice = 0;
-        srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize > 1) {
+            srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            srv_desc.Texture2DArray.MipLevels = 1;
+            srv_desc.Texture2DArray.MostDetailedMip = 0;
+            srv_desc.Texture2DArray.FirstArraySlice = 0;
+            srv_desc.Texture2DArray.ArraySize = desc.DepthOrArraySize;
+            srv_desc.Texture2DArray.PlaneSlice = 0;
+            srv_desc.Texture2DArray.ResourceMinLODClamp = 0.0f;
+        } else {
+            srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv_desc.Texture2D.MipLevels = 1;
+            srv_desc.Texture2D.MostDetailedMip = 0;
+            srv_desc.Texture2D.PlaneSlice = 0;
+            srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+        }
         device->CreateShaderResourceView(texture.Get(), &srv_desc, get_srv_cpu());
     } else {
         device->CreateShaderResourceView(texture.Get(), nullptr, get_srv_cpu());

@@ -30,6 +30,20 @@ public:
 
     void execute_console_script(sdk::UGameEngine* engine, const std::string& filename);
 
+    // Snapshot view for the render-diagnostics FFI. Lists all cvars the
+    // CVarManager is tracking (the ones the user can override in cvars.txt),
+    // along with their current frozen state.
+    struct CVarFfiSnapshot {
+        std::string module{};
+        std::string name{};
+        std::string key{};
+        bool frozen{};
+        bool ever_frozen{};
+        int frozen_int{};
+        float frozen_float{};
+    };
+    std::vector<CVarFfiSnapshot> ffi_snapshot() const;
+
     struct ChangeSnapshot {
         uint64_t counter{};
         std::string name{};

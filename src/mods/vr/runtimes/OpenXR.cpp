@@ -1426,7 +1426,7 @@ VRRuntime::Error OpenXR::consume_events(std::function<void(void*)> callback) {
                     this->session_ready_since = std::chrono::steady_clock::now();
                     this->last_ready_state_probe_log = {};
                     this->last_valid_pose_probe_log = {};
-                    spdlog::info("[OpenXR] Session is READY; synchronizing first frame");
+                    spdlog::info("[OpenXR] Session is READY; first frame sync will occur on the render thread");
                     this->last_frame_timing_log = {};
                     this->wait_frame_timing.reset();
                     this->begin_frame_timing.reset();
@@ -1435,7 +1435,6 @@ VRRuntime::Error OpenXR::consume_events(std::function<void(void*)> callback) {
                     for (auto& timing : this->wait_frame_callsite_timing) {
                         timing.reset();
                     }
-                    synchronize_frame(std::nullopt, SyncFrameCallsite::OpenXRSessionReady);
                 }
             } else if (ev->state == XR_SESSION_STATE_LOSS_PENDING) {
                 spdlog::info("VR: XR_SESSION_STATE_LOSS_PENDING");
@@ -2880,10 +2879,20 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
     }
 
     const auto is_afr = VR::get()->is_using_afr();
+    const auto has_native_stereo_array =
+        !is_afr &&
+        this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::NATIVE_STEREO_ARRAY);
+    const auto has_native_split_eye_swapchains =
+        !is_afr &&
+        !has_native_stereo_array &&
+        this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_LEFT_EYE) &&
+        this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_RIGHT_EYE);
 
-    if (is_afr) {
-        if (!this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_LEFT_EYE) || !this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_RIGHT_EYE)) {
-            spdlog::error("[VR] AFR swapchains not created");
+    if (is_afr || has_native_split_eye_swapchains || has_native_stereo_array) {
+        if (!has_native_stereo_array && !has_native_split_eye_swapchains &&
+            (!this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_LEFT_EYE) ||
+             !this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_RIGHT_EYE))) {
+            spdlog::error("[VR] Per-eye swapchains not created");
             return XR_ERROR_VALIDATION_FAILURE;
         }
 
@@ -2892,7 +2901,10 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
             return XR_ERROR_VALIDATION_FAILURE;
         }*/
 
-        has_depth = has_depth && this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_DEPTH_LEFT_EYE) && this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_DEPTH_RIGHT_EYE);
+        has_depth = !has_native_stereo_array &&
+            has_depth &&
+            this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_DEPTH_LEFT_EYE) &&
+            this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_DEPTH_RIGHT_EYE);
     } else {
         if (!this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::DOUBLE_WIDE)) {
             spdlog::error("[VR] Double wide swapchain not created");
@@ -2963,7 +2975,9 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
         for (auto i = 0; i < projection_layer_views.size(); ++i) {            
             Swapchain* swapchain = nullptr;
 
-            if (is_afr) {
+            if (has_native_stereo_array) {
+                swapchain = &this->swapchains[(uint32_t)OpenXR::SwapchainIndex::NATIVE_STEREO_ARRAY];
+            } else if (is_afr || has_native_split_eye_swapchains) {
                 if (i == 0) {
                     swapchain = &this->swapchains[(uint32_t)OpenXR::SwapchainIndex::AFR_LEFT_EYE];
                 } else {
@@ -2977,11 +2991,12 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
             projection_layer_views[i].pose = pipelined_stage_views[i].pose;
             projection_layer_views[i].fov = pipelined_stage_views[i].fov;
             projection_layer_views[i].subImage.swapchain = swapchain->handle;
+            projection_layer_views[i].subImage.imageArrayIndex = has_native_stereo_array ? (uint32_t)i : 0;
 
             int32_t offset_x = 0, offset_y = 0, extent_x = 0, extent_y = 0;
             // if we're working with a double-wide texture, use half the view bounds adjustment (as they apply to a single eye)
-            int texture_area_width = is_afr ? swapchain->width : swapchain->width / 2;
-            if (is_afr || i == 0) {
+            int texture_area_width = (is_afr || has_native_split_eye_swapchains || has_native_stereo_array) ? swapchain->width : swapchain->width / 2;
+            if (is_afr || has_native_split_eye_swapchains || has_native_stereo_array || i == 0) {
                 offset_x = view_bounds[i][0] * texture_area_width;
                 extent_x = view_bounds[i][1] * texture_area_width - offset_x;
             } else {
@@ -2995,6 +3010,21 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
             // SPDLOG_INFO("image calc for eye {} {}, {}, {}, {}", i, offset_x, extent_x, offset_y, extent_y);
             projection_layer_views[i].subImage.imageRect.offset = {offset_x, offset_y};
             projection_layer_views[i].subImage.imageRect.extent = {extent_x, extent_y};
+
+            if (has_native_stereo_array) {
+                static bool logged_native_array_eye[2]{};
+                if (i < 2 && !logged_native_array_eye[i]) {
+                    logged_native_array_eye[i] = true;
+                    SPDLOG_INFO("[NativeStereoDebug] OpenXR native stereo array submit swapchain={} eye={} array_slice={} rect={} {} {} {}",
+                        (uint32_t)OpenXR::SwapchainIndex::NATIVE_STEREO_ARRAY,
+                        i,
+                        projection_layer_views[i].subImage.imageArrayIndex,
+                        offset_x,
+                        offset_y,
+                        extent_x,
+                        extent_y);
+                }
+            }
 
             if (has_depth) {
                 Swapchain* depth_swapchain = nullptr;

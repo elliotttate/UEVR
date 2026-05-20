@@ -7,10 +7,14 @@
 #include <utility/Logging.hpp>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <DirectXMath.h>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <sstream>
 #include <unordered_set>
+#include <vector>
 
 #include "Framework.hpp"
 #include "render/D3D12Diagnostics.hpp"
@@ -280,6 +284,342 @@ bool shf_texture_desc_matches(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE
            a.SampleDesc.Quality == b.SampleDesc.Quality;
 }
 
+float native_stereo_half_to_float(uint16_t value) {
+    const auto sign = (value & 0x8000) != 0 ? -1.0f : 1.0f;
+    const auto exponent = (value >> 10) & 0x1f;
+    const auto mantissa = value & 0x03ff;
+
+    if (exponent == 0) {
+        return sign * std::ldexp((float)mantissa, -24);
+    }
+
+    if (exponent == 31) {
+        return mantissa == 0 ? sign * INFINITY : NAN;
+    }
+
+    return sign * std::ldexp((float)(mantissa + 1024), (int)exponent - 25);
+}
+
+uint8_t native_stereo_float_to_byte(float value) {
+    if (!std::isfinite(value)) {
+        value = 0.0f;
+    }
+
+    value = std::clamp(value, 0.0f, 1.0f);
+    value = std::pow(value, 1.0f / 2.2f);
+    return (uint8_t)std::clamp((int)std::lround(value * 255.0f), 0, 255);
+}
+
+uint32_t native_stereo_bytes_per_pixel(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return 4;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+        return 8;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+bool native_stereo_decode_pixel(DXGI_FORMAT format, const uint8_t* pixel, uint8_t& r, uint8_t& g, uint8_t& b) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        r = pixel[0];
+        g = pixel[1];
+        b = pixel[2];
+        return true;
+
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        b = pixel[0];
+        g = pixel[1];
+        r = pixel[2];
+        return true;
+
+    case DXGI_FORMAT_R10G10B10A2_UNORM: {
+        const auto packed = *(const uint32_t*)pixel;
+        r = native_stereo_float_to_byte((float)(packed & 0x3ff) / 1023.0f);
+        g = native_stereo_float_to_byte((float)((packed >> 10) & 0x3ff) / 1023.0f);
+        b = native_stereo_float_to_byte((float)((packed >> 20) & 0x3ff) / 1023.0f);
+        return true;
+    }
+
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: {
+        const auto* halfs = (const uint16_t*)pixel;
+        r = native_stereo_float_to_byte(native_stereo_half_to_float(halfs[0]));
+        g = native_stereo_float_to_byte(native_stereo_half_to_float(halfs[1]));
+        b = native_stereo_float_to_byte(native_stereo_half_to_float(halfs[2]));
+        return true;
+    }
+
+    case DXGI_FORMAT_R16G16B16A16_UNORM: {
+        const auto* values = (const uint16_t*)pixel;
+        r = native_stereo_float_to_byte((float)values[0] / 65535.0f);
+        g = native_stereo_float_to_byte((float)values[1] / 65535.0f);
+        b = native_stereo_float_to_byte((float)values[2] / 65535.0f);
+        return true;
+    }
+
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: {
+        const auto* values = (const float*)pixel;
+        r = native_stereo_float_to_byte(values[0]);
+        g = native_stereo_float_to_byte(values[1]);
+        b = native_stereo_float_to_byte(values[2]);
+        return true;
+    }
+
+    default:
+        return false;
+    }
+}
+
+}
+
+bool D3D12Component::dump_texture_region_to_bmp(
+    ID3D12Resource* texture,
+    const D3D12_BOX& src_box,
+    D3D12_RESOURCE_STATES source_state,
+    const std::filesystem::path& path)
+{
+    if (texture == nullptr) {
+        return false;
+    }
+
+    const auto desc = texture->GetDesc();
+    const auto width = src_box.right - src_box.left;
+    const auto height = src_box.bottom - src_box.top;
+    const auto bytes_per_pixel = native_stereo_bytes_per_pixel(desc.Format);
+
+    if (width == 0 || height == 0 || bytes_per_pixel == 0) {
+        SPDLOG_WARN("[NativeStereoDebug] Cannot dump region {}x{} format={}", width, height, (int)desc.Format);
+        return false;
+    }
+
+    auto& hook = g_framework->get_d3d12_hook();
+    auto device = hook->get_device();
+
+    auto region_desc = desc;
+    region_desc.Width = width;
+    region_desc.Height = height;
+    region_desc.DepthOrArraySize = 1;
+    region_desc.MipLevels = 1;
+    region_desc.SampleDesc.Count = 1;
+    region_desc.SampleDesc.Quality = 0;
+    region_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{};
+    UINT num_rows{};
+    UINT64 row_size_bytes{};
+    UINT64 total_bytes{};
+    device->GetCopyableFootprints(&region_desc, 0, 1, 0, &layout, &num_rows, &row_size_bytes, &total_bytes);
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+    heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = total_bytes;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.Format = DXGI_FORMAT_UNKNOWN;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.SampleDesc.Quality = 0;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    buffer_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    ComPtr<ID3D12Resource> readback{};
+    if (FAILED(device->CreateCommittedResource(
+            &heap_props,
+            D3D12_HEAP_FLAG_NONE,
+            &buffer_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(&readback)))) {
+        SPDLOG_WARN("[NativeStereoDebug] Failed to create readback buffer for {}", path.string());
+        return false;
+    }
+
+    if (!m_native_debug_dump_commands.ready()) {
+        if (!m_native_debug_dump_commands.setup(L"Native stereo debug dump commands")) {
+            return false;
+        }
+    }
+
+    m_native_debug_dump_commands.wait(INFINITE);
+
+    auto* cmd_list = m_native_debug_dump_commands.cmd_list.Get();
+    if (cmd_list == nullptr) {
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER src_barrier{};
+    src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    src_barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    src_barrier.Transition.pResource = texture;
+    src_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    src_barrier.Transition.StateBefore = source_state;
+    src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cmd_list->ResourceBarrier(1, &src_barrier);
+
+    D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+    dst_loc.pResource = readback.Get();
+    dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst_loc.PlacedFootprint = layout;
+
+    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+    src_loc.pResource = texture;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_loc.SubresourceIndex = 0;
+
+    cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &src_box);
+
+    src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    src_barrier.Transition.StateAfter = source_state;
+    cmd_list->ResourceBarrier(1, &src_barrier);
+
+    m_native_debug_dump_commands.has_commands = true;
+    m_native_debug_dump_commands.execute();
+    m_native_debug_dump_commands.wait(INFINITE);
+
+    uint8_t* mapped = nullptr;
+    D3D12_RANGE read_range{0, total_bytes};
+    if (FAILED(readback->Map(0, &read_range, (void**)&mapped)) || mapped == nullptr) {
+        SPDLOG_WARN("[NativeStereoDebug] Failed to map readback buffer for {}", path.string());
+        return false;
+    }
+
+    std::filesystem::create_directories(path.parent_path());
+
+    const uint32_t bmp_stride = ((width * 3) + 3) & ~3u;
+    const uint32_t image_size = bmp_stride * height;
+    const uint32_t file_size = 14 + 40 + image_size;
+
+    std::ofstream out{path, std::ios::binary};
+    if (!out) {
+        D3D12_RANGE write_range{0, 0};
+        readback->Unmap(0, &write_range);
+        SPDLOG_WARN("[NativeStereoDebug] Failed to open dump path {}", path.string());
+        return false;
+    }
+
+    auto write_u16 = [&](uint16_t value) {
+        out.put((char)(value & 0xff));
+        out.put((char)((value >> 8) & 0xff));
+    };
+
+    auto write_u32 = [&](uint32_t value) {
+        out.put((char)(value & 0xff));
+        out.put((char)((value >> 8) & 0xff));
+        out.put((char)((value >> 16) & 0xff));
+        out.put((char)((value >> 24) & 0xff));
+    };
+
+    auto write_i32 = [&](int32_t value) {
+        write_u32((uint32_t)value);
+    };
+
+    write_u16(0x4d42);
+    write_u32(file_size);
+    write_u16(0);
+    write_u16(0);
+    write_u32(54);
+
+    write_u32(40);
+    write_i32((int32_t)width);
+    write_i32(-(int32_t)height);
+    write_u16(1);
+    write_u16(24);
+    write_u32(0);
+    write_u32(image_size);
+    write_i32(2835);
+    write_i32(2835);
+    write_u32(0);
+    write_u32(0);
+
+    std::vector<uint8_t> row(bmp_stride);
+    double luma_sum = 0.0;
+    uint64_t nonblack_count = 0;
+    const uint64_t pixel_count = (uint64_t)width * (uint64_t)height;
+
+    for (uint32_t y = 0; y < height; ++y) {
+        std::fill(row.begin(), row.end(), 0);
+        const auto* src_row = mapped + layout.Offset + ((size_t)y * layout.Footprint.RowPitch);
+
+        for (uint32_t x = 0; x < width; ++x) {
+            uint8_t r{};
+            uint8_t g{};
+            uint8_t b{};
+            native_stereo_decode_pixel(desc.Format, src_row + ((size_t)x * bytes_per_pixel), r, g, b);
+
+            const auto dst = x * 3;
+            row[dst + 0] = b;
+            row[dst + 1] = g;
+            row[dst + 2] = r;
+
+            const auto luma = (0.2126 * (double)r) + (0.7152 * (double)g) + (0.0722 * (double)b);
+            luma_sum += luma;
+
+            if (luma > 15.0) {
+                ++nonblack_count;
+            }
+        }
+
+        out.write((const char*)row.data(), row.size());
+    }
+
+    D3D12_RANGE write_range{0, 0};
+    readback->Unmap(0, &write_range);
+
+    SPDLOG_INFO("[NativeStereoDebug] Dumped {} format={} region={} {} {} {} mean_luma={:.2f} nonblack={:.2f}%",
+        path.string(), (int)desc.Format,
+        src_box.left, src_box.top, src_box.right, src_box.bottom,
+        pixel_count != 0 ? luma_sum / (double)pixel_count : 0.0,
+        pixel_count != 0 ? (100.0 * (double)nonblack_count / (double)pixel_count) : 0.0);
+
+    return true;
+}
+
+void D3D12Component::dump_native_stereo_backbuffer_once(
+    ID3D12Resource* backbuffer,
+    const D3D12_BOX& left_box,
+    const D3D12_BOX& right_box,
+    D3D12_RESOURCE_STATES source_state)
+{
+    if (m_native_debug_dumped_backbuffer || backbuffer == nullptr) {
+        return;
+    }
+
+    auto vr = VR::get();
+    if (vr == nullptr || !vr->is_native_stereo_fix_enabled() || vr->is_native_stereo_fix_same_pass_enabled()) {
+        return;
+    }
+
+    if (++m_native_debug_submit_count < 30) {
+        return;
+    }
+
+    m_native_debug_dumped_backbuffer = true;
+
+    const auto dump_dir = Framework::get_persistent_dir() / "native_stereo_debug";
+    dump_texture_region_to_bmp(backbuffer, left_box, source_state, dump_dir / "submit_source_left.bmp");
+    dump_texture_region_to_bmp(backbuffer, right_box, source_state, dump_dir / "submit_source_right.bmp");
 }
 
 const char* D3D12Component::shf_scene_mode_name(ShfSceneMode mode) {
@@ -1545,14 +1885,132 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     }
                 }
             } else {
-                // Copy over the entire double wide instead
+                // Copy over the entire double wide, or split native stereo into per-eye OpenXR swapchains.
                 if (suppress_scene_copy) {
                     SPDLOG_INFO_EVERY_N_SEC(2, "[OpenXR][debug] Skipping double-wide scene copy for perf isolation");
                     if (!debug_submit_empty_frame) {
                         m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, nullptr, scene_source_state, nullptr);
                     }
                 } else {
-                    if (m_scene_capture_tex.texture.Get() == nullptr || shf_using_mono_expansion) {
+                    const auto native_left_swapchain = (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE;
+                    const auto native_right_swapchain = (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE;
+                    const auto native_stereo_array_swapchain = (uint32_t)runtimes::OpenXR::SwapchainIndex::NATIVE_STEREO_ARRAY;
+                    const auto use_native_split_submit =
+                        vr->is_native_stereo_fix_enabled() &&
+                        !vr->is_native_stereo_fix_same_pass_enabled() &&
+                        vr->m_openxr->swapchains.contains(native_left_swapchain) &&
+                        vr->m_openxr->swapchains.contains(native_right_swapchain);
+                    const auto use_native_array_submit =
+                        !use_native_split_submit &&
+                        vr->is_native_stereo_fix_enabled() &&
+                        !vr->is_native_stereo_fix_same_pass_enabled() &&
+                        vr->m_openxr->swapchains.contains(native_stereo_array_swapchain);
+
+                    if (use_native_split_submit || use_native_array_submit) {
+                        const auto backbuffer_desc = backbuffer->GetDesc();
+                        SPDLOG_INFO_ONCE("[NativeStereoDebug] Split submit source backbuffer={}x{} configured={}x{} state={} mode={}",
+                            backbuffer_desc.Width,
+                            backbuffer_desc.Height,
+                            m_backbuffer_size[0],
+                            m_backbuffer_size[1],
+                            (uint32_t)scene_source_state,
+                            use_native_split_submit ? "per-eye" : "array");
+
+                        D3D12_BOX left_src_box{};
+                        left_src_box.left = 0;
+                        left_src_box.top = 0;
+                        left_src_box.right = m_backbuffer_size[0] / 2;
+                        left_src_box.bottom = m_backbuffer_size[1];
+                        left_src_box.front = 0;
+                        left_src_box.back = 1;
+
+                        D3D12_BOX right_src_box{};
+                        right_src_box.left = m_backbuffer_size[0] / 2;
+                        right_src_box.top = 0;
+                        right_src_box.right = m_backbuffer_size[0];
+                        right_src_box.bottom = m_backbuffer_size[1];
+                        right_src_box.front = 0;
+                        right_src_box.back = 1;
+
+                        SPDLOG_INFO_ONCE("[NativeStereoDebug] Split submit left box={} {} {} {}, right box={} {} {} {}",
+                            left_src_box.left, left_src_box.top, left_src_box.right, left_src_box.bottom,
+                            right_src_box.left, right_src_box.top, right_src_box.right, right_src_box.bottom);
+
+                        dump_native_stereo_backbuffer_once(backbuffer.Get(), left_src_box, right_src_box, scene_source_state);
+
+                        if (use_native_split_submit) {
+                            SPDLOG_INFO_ONCE("[NativeStereoDebug] Split submit using native per-eye OpenXR swapchains");
+                            // SN2 fog hack: check env var to mirror left half to right eye.
+                            static const bool mirror_left_to_right = []() {
+                                wchar_t value[16]{};
+                                const auto len = GetEnvironmentVariableW(
+                                    L"UEVR_SUBNAUTICA2_MIRROR_LEFT_TO_RIGHT_EYE",
+                                    value, (DWORD)std::size(value));
+                                return len > 0 && value[0] != L'\0' && value[0] != L'0';
+                            }();
+                            m_openxr.copy(native_left_swapchain, backbuffer.Get(), scene_source_state, &left_src_box);
+                            if (mirror_left_to_right) {
+                                SPDLOG_INFO_ONCE("[NativeStereoDebug] MIRROR ENABLED: right eye sampling left half of backbuffer");
+                                m_openxr.copy(native_right_swapchain, backbuffer.Get(), scene_source_state, &left_src_box);
+                            } else {
+                                m_openxr.copy(native_right_swapchain, backbuffer.Get(), scene_source_state, &right_src_box);
+                            }
+                        } else {
+                            SPDLOG_INFO_ONCE("[NativeStereoDebug] Array submit using native stereo swapchain slices 0/1");
+                            // SN2 fog hack: mirror ONLY THE TOP HALF (sky region with teal fog)
+                            // of left eye to right eye. Right eye keeps its own foreground
+                            // render with parallax for the bottom half.
+                            static const bool mirror_top_half = []() {
+                                wchar_t value[16]{};
+                                const auto len = GetEnvironmentVariableW(
+                                    L"UEVR_SUBNAUTICA2_MIRROR_LEFT_TO_RIGHT_EYE",
+                                    value, (DWORD)std::size(value));
+                                return len > 0 && value[0] != L'\0' && value[0] != L'0';
+                            }();
+                            // Compute top-half source box from left half of backbuffer.
+                            D3D12_BOX left_top_src_box = left_src_box;
+                            left_top_src_box.bottom = left_src_box.top + (left_src_box.bottom - left_src_box.top) / 2;
+                            SPDLOG_INFO_ONCE("[NativeStereoDebug] Mirror flag (sky-only top half): {}, left_top box={}-{} {}-{}",
+                                mirror_top_half,
+                                left_top_src_box.left, left_top_src_box.right,
+                                left_top_src_box.top, left_top_src_box.bottom);
+                            m_openxr.copy(
+                                native_stereo_array_swapchain,
+                                nullptr,
+                                [backbuffer, left_src_box, right_src_box, left_top_src_box, scene_source_state, mirror = mirror_top_half](d3d12::CommandContext& commands, ID3D12Resource* dst) mutable {
+                                    // Slice 0 (left eye): full left half
+                                    commands.copy_region_to_subresource(
+                                        backbuffer.Get(),
+                                        dst,
+                                        &left_src_box,
+                                        0,
+                                        scene_source_state,
+                                        D3D12_RESOURCE_STATE_RENDER_TARGET);
+                                    // Slice 1 (right eye): full right half first (preserves right-eye parallax everywhere)
+                                    commands.copy_region_to_subresource(
+                                        backbuffer.Get(),
+                                        dst,
+                                        &right_src_box,
+                                        1,
+                                        scene_source_state,
+                                        D3D12_RESOURCE_STATE_RENDER_TARGET);
+                                    // Then overlay top half from left eye (the sky region with teal fog)
+                                    // ONLY if mirror flag is set.
+                                    if (mirror) {
+                                        commands.copy_region_to_subresource(
+                                            backbuffer.Get(),
+                                            dst,
+                                            &left_top_src_box,
+                                            1,
+                                            scene_source_state,
+                                            D3D12_RESOURCE_STATE_RENDER_TARGET);
+                                    }
+                                },
+                                std::nullopt,
+                                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                nullptr);
+                        }
+                    } else if (m_scene_capture_tex.texture.Get() == nullptr || shf_using_mono_expansion) {
                         m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, backbuffer.Get(), scene_source_state, nullptr);
                     } else {
                         m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, nullptr, pre_render, std::nullopt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
@@ -1850,6 +2308,143 @@ bool D3D12Component::has_game_and_ui_textures() const {
     return m_game_tex.texture.Get() != nullptr &&
         m_game_ui_tex.texture.Get() != nullptr;
 }
+
+bool D3D12Component::is_initialized() const {
+    if (m_openvr.left_eye_tex[0].texture != nullptr) {
+        return true;
+    }
+
+    std::scoped_lock _{const_cast<std::recursive_mutex&>(m_openxr.mtx)};
+    for (const auto& [_, ctx] : m_openxr.contexts) {
+        if (!ctx.textures.empty() && ctx.textures[0].texture != nullptr) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+const char* D3D12Component::get_shf_scene_mode_str() const {
+    return shf_scene_mode_name(m_shf_scene_mode);
+}
+
+D3D12Component::EyeTarget D3D12Component::get_current_eye_target(int side) const {
+    using SwapIdx = ::runtimes::OpenXR::SwapchainIndex;
+    using XRContext = D3D12Component::OpenXR::SwapchainContext;
+    EyeTarget out{};
+    const bool right = (side == 1);
+
+    // 1) OpenVR mirror eye textures — populated only when running OpenVR.
+    if (m_openvr.left_eye_tex[0].texture != nullptr) {
+        const auto idx = m_openvr.texture_counter % m_openvr.left_eye_tex.size();
+        out.texture = right ? m_openvr.right_eye_tex[idx].texture : m_openvr.left_eye_tex[idx].texture;
+        if (out.texture != nullptr) {
+            const auto desc = out.texture->GetDesc();
+            out.region_w = static_cast<UINT>(desc.Width);
+            out.region_h = desc.Height;
+            out.path = "OpenVR";
+            return out;
+        }
+    }
+
+    std::scoped_lock _{const_cast<std::recursive_mutex&>(m_openxr.mtx)};
+
+    auto get_xr_ctx = [&](SwapIdx which) -> const XRContext* {
+        auto it = m_openxr.contexts.find(static_cast<uint32_t>(which));
+        if (it == m_openxr.contexts.end()) return nullptr;
+        if (it->second.textures.empty()) return nullptr;
+        return &it->second;
+    };
+    auto current_tex = [](const XRContext& ctx) -> ID3D12Resource* {
+        if (ctx.textures.empty()) return nullptr;
+        const auto i = (std::min)((size_t)ctx.last_acquired_texture, ctx.textures.size() - 1);
+        return ctx.textures[i].texture;
+    };
+
+    // 2) OpenXR AFR — separate swapchains per eye.
+    if (const auto* afr = get_xr_ctx(right ? SwapIdx::AFR_RIGHT_EYE : SwapIdx::AFR_LEFT_EYE);
+        afr != nullptr && current_tex(*afr) != nullptr) {
+        out.texture = current_tex(*afr);
+        const auto desc = out.texture->GetDesc();
+        out.region_w = static_cast<UINT>(desc.Width);
+        out.region_h = desc.Height;
+        out.path = right ? "OpenXR/AFR_RIGHT_EYE" : "OpenXR/AFR_LEFT_EYE";
+        return out;
+    }
+
+    // 3) OpenXR NATIVE_STEREO_ARRAY — single texture, two array slices.
+    if (const auto* arr = get_xr_ctx(SwapIdx::NATIVE_STEREO_ARRAY);
+        arr != nullptr && current_tex(*arr) != nullptr) {
+        out.texture = current_tex(*arr);
+        const auto desc = out.texture->GetDesc();
+        out.region_w = static_cast<UINT>(desc.Width);
+        out.region_h = desc.Height;
+        out.array_slice = right ? 1u : 0u;
+        out.path = "OpenXR/NATIVE_STEREO_ARRAY";
+        return out;
+    }
+
+    // 4) OpenXR DOUBLE_WIDE — single texture, eye = half-region.
+    if (const auto* dw = get_xr_ctx(SwapIdx::DOUBLE_WIDE);
+        dw != nullptr && current_tex(*dw) != nullptr) {
+        out.texture = current_tex(*dw);
+        const auto desc = out.texture->GetDesc();
+        const UINT w = static_cast<UINT>(desc.Width);
+        const UINT h = desc.Height;
+        const UINT half = w / 2;
+        out.region_x = right ? half : 0;
+        out.region_y = 0;
+        out.region_w = half;
+        out.region_h = h;
+        out.path = "OpenXR/DOUBLE_WIDE";
+        return out;
+    }
+
+    // 5) Last-ditch fallback: the game's actual swapchain backbuffer, sampled as
+    //    a half-region. This is what's actually presented in native stereo when
+    //    UEVR isn't bouncing through its own mirror, e.g. some Mono2D paths.
+    if (g_framework != nullptr) {
+        if (auto& hook = g_framework->get_d3d12_hook(); hook != nullptr) {
+            if (auto* swap = hook->get_swap_chain(); swap != nullptr) {
+                Microsoft::WRL::ComPtr<ID3D12Resource> bb{};
+                UINT idx = 0;
+                if (auto* swap3 = static_cast<IDXGISwapChain3*>(swap); swap3 != nullptr) {
+                    idx = swap3->GetCurrentBackBufferIndex();
+                }
+                if (SUCCEEDED(swap->GetBuffer(idx, IID_PPV_ARGS(&bb))) && bb != nullptr) {
+                    const auto desc = bb->GetDesc();
+                    const UINT w = static_cast<UINT>(desc.Width);
+                    const UINT h = desc.Height;
+                    const UINT half = (w >= 2) ? w / 2 : w;
+                    out.texture = bb;
+                    out.region_x = right ? half : 0;
+                    out.region_y = 0;
+                    out.region_w = (w >= 2) ? half : w;
+                    out.region_h = h;
+                    out.path = "Framework/Swapchain";
+                    out.note = "Fallback: full backbuffer sampled as half-region. May not actually be a stereo backbuffer.";
+                    return out;
+                }
+            }
+        }
+    }
+
+    out.path = "none";
+    return out;
+}
+
+namespace {
+D3D12Component::FfiTiming to_ffi(const auto& s) {
+    return {s.count, s.avg(), s.max_ms};
+}
+}
+
+D3D12Component::FfiTiming D3D12Component::get_timing_on_frame()         const { return to_ffi(m_perf_on_frame); }
+D3D12Component::FfiTiming D3D12Component::get_timing_ui_copy()          const { return to_ffi(m_perf_ui_copy); }
+D3D12Component::FfiTiming D3D12Component::get_timing_swapchain_copy()   const { return to_ffi(m_perf_swapchain_copy); }
+D3D12Component::FfiTiming D3D12Component::get_timing_openxr_submit()    const { return to_ffi(m_perf_openxr_submit); }
+D3D12Component::FfiTiming D3D12Component::get_timing_spectator_mirror() const { return to_ffi(m_perf_spectator_mirror); }
+D3D12Component::FfiTiming D3D12Component::get_timing_post_present()     const { return to_ffi(m_perf_post_present); }
 
 D3D12Component::HitchFrameSnapshot D3D12Component::get_hitch_frame_snapshot(VR* vr) const {
     HitchFrameSnapshot snapshot{};
@@ -2363,6 +2958,9 @@ void D3D12Component::on_reset(VR* vr) {
     m_scene_capture_tex.reset();
     m_shf_mono_scene_tex.reset();
     m_shf_mono_scene_commands.reset();
+    m_native_debug_dump_commands.reset();
+    m_native_debug_dumped_backbuffer = false;
+    m_native_debug_submit_count = 0;
     m_shf_mono_scene_width = 0;
     m_shf_mono_scene_height = 0;
     m_shf_mono_scene_format = DXGI_FORMAT_UNKNOWN;
@@ -2571,6 +3169,10 @@ bool D3D12Component::setup() {
         if (!commands.setup(L"Generic commands")) {
             return false;
         }
+    }
+
+    if (!m_native_debug_dump_commands.setup(L"Native stereo debug dump commands")) {
+        return false;
     }
 
     if (!vr->is_extreme_compatibility_mode_enabled()) {
@@ -2798,6 +3400,24 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
         if (auto err = create_swapchain((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, standard_swapchain_create_info, hmd_desc)) {
             return err;
         }
+
+        if (vr->is_native_stereo_fix_enabled() && !vr->is_native_stereo_fix_same_pass_enabled()) {
+            auto native_stereo_array_create_info = standard_swapchain_create_info;
+            auto native_stereo_array_desc = hmd_desc;
+
+            native_stereo_array_create_info.width = vr->get_hmd_width();
+            native_stereo_array_create_info.arraySize = 2;
+            native_stereo_array_desc.Width = vr->get_hmd_width();
+            native_stereo_array_desc.DepthOrArraySize = 2;
+
+            spdlog::info("[VR] Creating native stereo texture array swapchain");
+            spdlog::info("[VR] Width: {}", vr->get_hmd_width());
+            spdlog::info("[VR] Height: {}", vr->get_hmd_height());
+            spdlog::info("[VR] Array size: 2");
+            if (auto err = create_swapchain((uint32_t)runtimes::OpenXR::SwapchainIndex::NATIVE_STEREO_ARRAY, native_stereo_array_create_info, native_stereo_array_desc)) {
+                return err;
+            }
+        }
     } else {
         spdlog::info("[VR] Creating AFR swapchain for eyes");
         spdlog::info("[VR] Width: {}", vr->get_hmd_width());
@@ -3015,7 +3635,8 @@ void D3D12Component::OpenXR::copy(
     std::optional<std::function<void(d3d12::CommandContext&, ID3D12Resource*)>> pre_commands, 
     std::optional<std::function<void(d3d12::CommandContext&)>> additional_commands, 
     D3D12_RESOURCE_STATES src_state, 
-    D3D12_BOX* src_box) 
+    D3D12_BOX* src_box,
+    uint32_t dst_subresource) 
 {
     std::scoped_lock _{this->mtx};
 
@@ -3071,6 +3692,7 @@ void D3D12Component::OpenXR::copy(
         spdlog::error("[VR] xrAcquireSwapchainImage failed: {}", vr->m_openxr->get_result_string(result));
     } else {
         ctx.num_textures_acquired++;
+        ctx.last_acquired_texture = texture_index;
 
         XrSwapchainImageWaitInfo wait_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
         //wait_info.timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(1)).count();
@@ -3102,9 +3724,10 @@ void D3D12Component::OpenXR::copy(
                         src_state, 
                         dst_state);
                 } else {
-                    texture_ctx->commands.copy_region(
+                    texture_ctx->commands.copy_region_to_subresource(
                         resource, 
                         ctx.textures[texture_index].texture, src_box,
+                        dst_subresource,
                         src_state, 
                         D3D12_RESOURCE_STATE_RENDER_TARGET);
                 }

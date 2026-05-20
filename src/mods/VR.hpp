@@ -806,6 +806,10 @@ public:
         return m_d3d12;
     }
 
+    CVarManager* get_cvar_manager() const {
+        return m_cvar_manager.get();
+    }
+
     bool has_d3d12_game_ui_textures() const {
         return m_is_d3d12 && m_d3d12.has_game_and_ui_textures();
     }

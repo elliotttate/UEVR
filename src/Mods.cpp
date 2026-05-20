@@ -8,6 +8,7 @@
 #include <spdlog/spdlog.h>
 
 #include "Framework.hpp"
+#include "DumperMode.hpp"
 
 #include "mods/FrameworkConfig.hpp"
 #include "mods/RenderInspector.hpp"
@@ -141,8 +142,20 @@ bool migrate_ui_invert_alpha(utility::Config& cfg) {
 
 Mods::Mods() {
     m_mods.emplace_back(FrameworkConfig::get());
-    m_mods.emplace_back(VR::get());
-    m_mods.emplace_back(RenderInspector::get());
+
+    // Dumper mode: skip the VR mod and RenderInspector entirely. VR's
+    // on_pre_engine_tick dispatches to CVarManager, RenderTargetPoolHook,
+    // overlay drawing, etc — none of which are needed for reflection
+    // dumping, and some of which touch graphics state we never set up.
+    // RenderInspector is D3D12-only diagnostics; without a hooked D3D
+    // device it has nothing to inspect. Keep UObjectHook (reflection) +
+    // PluginLoader (plugin DLLs) + LuaLoader.
+    // See DumperMode.hpp.
+    if (!uevr::is_dumper_mode()) {
+        m_mods.emplace_back(VR::get());
+        m_mods.emplace_back(RenderInspector::get());
+    }
+
     m_mods.emplace_back(UObjectHook::get());
 
     m_mods.emplace_back(PluginLoader::get());

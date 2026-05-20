@@ -3,13 +3,17 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <optional>
 #include <sstream>
 #include <string_view>
+
+#include <Windows.h>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -23,10 +27,86 @@ using json = nlohmann::json;
 
 namespace {
 constexpr size_t MAX_RECENT_EVENTS = 64;
-constexpr auto AUTO_RELOAD_INTERVAL = std::chrono::milliseconds(1000);
-constexpr auto IDLE_AUTO_RELOAD_INTERVAL = std::chrono::milliseconds(30000);
+constexpr auto AUTO_RELOAD_INTERVAL = std::chrono::milliseconds(30000);
+constexpr auto IDLE_AUTO_RELOAD_INTERVAL = std::chrono::milliseconds(60000);
 constexpr uint64_t MAX_PSO_BIND_CONTEXT_AGE_FRAMES = 2;
 constexpr size_t MAX_PSO_USAGE_ENTRIES = 8;
+constexpr size_t HUNTER_MIN_SCENE_PS_SIZE = 1024;
+constexpr int HUNTER_DEFAULT_RECENT_FRAME_AGE = 30;
+
+bool verbose_pso_logging_enabled() {
+    static const bool enabled = [] {
+        char value[16]{};
+        const DWORD len = GetEnvironmentVariableA("UEVR_SHADER_HUNTER_VERBOSE_PSO_LOG", value, sizeof(value));
+        return len > 0 && value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool env_flag_enabled(const char* name, bool default_value = false) {
+    char value[32]{};
+    const DWORD len = GetEnvironmentVariableA(name, value, sizeof(value));
+    if (len == 0) {
+        return default_value;
+    }
+
+    const std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
+    return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+}
+
+bool shader_hunter_pretrack_enabled() {
+    static const bool enabled = [] {
+        char value[32]{};
+        if (GetEnvironmentVariableA("UEVR_SHADER_HUNTER_PRETRACK", value, sizeof(value)) > 0) {
+            return env_flag_enabled("UEVR_SHADER_HUNTER_PRETRACK");
+        }
+
+        return env_flag_enabled("UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS");
+    }();
+    return enabled;
+}
+
+// CRC32 (IEEE 802.3, reflected, polynomial 0xEDB88320). Matches what
+// ShaderToggler uses to identify shaders, so we can correlate the user's
+// ShaderToggler hash dumps with UEVR's runtime PSO captures.
+uint32_t crc32_ieee(const void* data, size_t size) {
+    static uint32_t table[256] = {};
+    static bool initialized = false;
+    if (!initialized) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; ++j) {
+                c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+            }
+            table[i] = c;
+        }
+        initialized = true;
+    }
+    uint32_t crc = 0xFFFFFFFF;
+    const auto* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        crc = table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+void dump_dxbc_once(const void* data, size_t size, uint32_t crc) {
+    if (data == nullptr || size < 20) return;
+    static std::array<bool, 65536> dumped{};
+    const auto bucket = crc & 0xFFFF;
+    if (dumped[bucket]) {
+        // crc-mod-65536 collision; not perfect dedup but cheap
+    }
+    dumped[bucket] = true;
+    char path[260]{};
+    std::snprintf(path, sizeof(path), "C:\\Users\\ellio\\AppData\\Local\\Temp\\uevr_ps_crc%08X_sz%zu.dxbc", crc, size);
+    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(h, data, static_cast<DWORD>(size), &written, nullptr);
+    CloseHandle(h);
+}
 
 std::string backend_to_string(render::ShaderOverrideRegistry::Backend backend) {
     switch (backend) {
@@ -134,6 +214,48 @@ std::string normalize_hash(std::string value) {
     return value;
 }
 
+bool shader_hunter_compute_suppression_enabled() {
+    return env_flag_enabled("UEVR_SHADER_HUNTER_ALLOW_COMPUTE_SUPPRESS", false);
+}
+
+const std::unordered_set<std::string>& shader_hunter_suppression_blocklist() {
+    static const std::unordered_set<std::string> blocklist = [] {
+        std::unordered_set<std::string> values{};
+        char raw[2048]{};
+        const DWORD len = GetEnvironmentVariableA(
+            "UEVR_SHADER_HUNTER_SUPPRESSION_BLOCKLIST",
+            raw,
+            static_cast<DWORD>(sizeof(raw)));
+
+        if (len == 0) {
+            return values;
+        }
+
+        std::string token{};
+        const std::string_view text{raw, std::min<DWORD>(len, static_cast<DWORD>(sizeof(raw) - 1))};
+        for (char c : text) {
+            if (c == ',' || c == ';' || std::isspace(static_cast<unsigned char>(c)) != 0) {
+                auto normalized = normalize_hash(token);
+                if (!normalized.empty()) {
+                    values.insert(std::move(normalized));
+                }
+                token.clear();
+            } else {
+                token.push_back(c);
+            }
+        }
+
+        auto normalized = normalize_hash(token);
+        if (!normalized.empty()) {
+            values.insert(std::move(normalized));
+        }
+
+        return values;
+    }();
+
+    return blocklist;
+}
+
 std::string default_profile(render::ShaderOverrideRegistry::Backend backend, render::ShaderOverrideRegistry::Stage stage) {
     if (backend == render::ShaderOverrideRegistry::Backend::D3D12) {
         return stage == render::ShaderOverrideRegistry::Stage::Vertex ? "vs_6_0" : "ps_6_0";
@@ -150,8 +272,204 @@ std::string compiler_to_string(render::ShaderCompilerBackend compiler) {
         return "fxc";
     case render::ShaderCompilerBackend::Auto:
     default:
-        return "auto";
+    return "auto";
     }
+}
+
+std::string source_kind_to_string(render::ShaderOverrideRegistry::OverrideSourceKind kind) {
+    switch (kind) {
+    case render::ShaderOverrideRegistry::OverrideSourceKind::Hlsl:
+        return "hlsl";
+    case render::ShaderOverrideRegistry::OverrideSourceKind::Bytecode:
+        return "bytecode";
+    case render::ShaderOverrideRegistry::OverrideSourceKind::DxilPatch:
+        return "dxil_patch";
+    default:
+        return "unknown";
+    }
+}
+
+std::filesystem::file_time_type file_write_time_or_empty(const std::filesystem::path& path) {
+    std::error_code ec{};
+    if (path.empty() || !std::filesystem::exists(path, ec)) {
+        return std::filesystem::file_time_type{};
+    }
+
+    ec.clear();
+    return std::filesystem::last_write_time(path, ec);
+}
+
+std::filesystem::path resolve_manifest_relative_path(const std::filesystem::path& manifest_path, const std::string& raw_path) {
+    std::filesystem::path path{raw_path};
+    if (path.is_relative()) {
+        path = manifest_path.parent_path() / path;
+    }
+
+    return path.lexically_normal();
+}
+
+bool read_binary_file(const std::filesystem::path& path, std::vector<uint8_t>& out, std::string& error_out) {
+    std::ifstream file{path, std::ios::binary};
+    if (!file) {
+        error_out = "Failed to open " + path.string();
+        return false;
+    }
+
+    file.seekg(0, std::ios::end);
+    const auto end = file.tellg();
+    if (end < 0) {
+        error_out = "Failed to size " + path.string();
+        return false;
+    }
+
+    file.seekg(0, std::ios::beg);
+    out.resize(static_cast<size_t>(end));
+    if (!out.empty()) {
+        file.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size()));
+        if (!file) {
+            error_out = "Failed to read " + path.string();
+            out.clear();
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool write_binary_file(const std::filesystem::path& path, const void* data, size_t size, std::string& error_out) {
+    std::error_code ec{};
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+        error_out = "Failed to create " + path.parent_path().string() + ": " + ec.message();
+        return false;
+    }
+
+    std::ofstream file{path, std::ios::binary | std::ios::trunc};
+    if (!file) {
+        error_out = "Failed to open " + path.string() + " for writing";
+        return false;
+    }
+
+    if (size > 0) {
+        file.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+    }
+
+    if (!file) {
+        error_out = "Failed to write " + path.string();
+        return false;
+    }
+
+    return true;
+}
+
+std::filesystem::path current_module_dir() {
+    HMODULE module{};
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&current_module_dir),
+            &module)) {
+        return {};
+    }
+
+    wchar_t path[MAX_PATH]{};
+    const auto len = GetModuleFileNameW(module, path, static_cast<DWORD>(std::size(path)));
+    if (len == 0 || len >= std::size(path)) {
+        return {};
+    }
+
+    return std::filesystem::path{std::wstring_view{path, len}}.parent_path();
+}
+
+std::filesystem::path default_dxil_patch_tool_path() {
+    wchar_t env[32768]{};
+    const auto len = GetEnvironmentVariableW(L"UEVR_DXIL_PATCH_TOOL", env, static_cast<DWORD>(std::size(env)));
+    if (len > 0 && len < std::size(env)) {
+        return std::filesystem::path{std::wstring_view{env, len}};
+    }
+
+    const auto module_dir = current_module_dir();
+    if (!module_dir.empty()) {
+        return module_dir / "dxil-patch.exe";
+    }
+
+    return "dxil-patch.exe";
+}
+
+std::wstring quote_command_arg(const std::filesystem::path& arg) {
+    std::wstring raw = arg.wstring();
+    std::wstring out = L"\"";
+    for (wchar_t ch : raw) {
+        if (ch == L'"') {
+            out += L"\\\"";
+        } else {
+            out += ch;
+        }
+    }
+    out += L"\"";
+    return out;
+}
+
+std::wstring quote_command_arg(std::wstring_view arg) {
+    std::wstring out = L"\"";
+    for (wchar_t ch : arg) {
+        if (ch == L'"') {
+            out += L"\\\"";
+        } else {
+            out += ch;
+        }
+    }
+    out += L"\"";
+    return out;
+}
+
+bool run_process_wait(const std::filesystem::path& exe, const std::wstring& arguments, DWORD timeout_ms, DWORD& exit_code, std::string& error_out) {
+    std::wstring command_line = quote_command_arg(exe) + L" " + arguments;
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+
+    if (!CreateProcessW(
+            nullptr,
+            command_line.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            nullptr,
+            &startup,
+            &process)) {
+        error_out = "Failed to start " + exe.string() + " (GetLastError=" + std::to_string(GetLastError()) + ")";
+        return false;
+    }
+
+    const DWORD wait_result = WaitForSingleObject(process.hProcess, timeout_ms);
+    if (wait_result == WAIT_TIMEOUT) {
+        TerminateProcess(process.hProcess, 0xFFFFFFFFu);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        error_out = "Timed out running " + exe.string();
+        return false;
+    }
+
+    if (wait_result != WAIT_OBJECT_0) {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        error_out = "Failed waiting for " + exe.string();
+        return false;
+    }
+
+    if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        error_out = "Failed to get exit code for " + exe.string();
+        return false;
+    }
+
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
 }
 
 thread_local bool g_inside_d3d12_override_pipeline_creation = false;
@@ -612,6 +930,36 @@ bool ShaderOverrideRegistry::copy_pipeline_state_stream(
     return true;
 }
 
+// === ShaderHunter self-test counters ===
+// Atomic counters incremented from hot paths so we can verify which hooks
+// actually fire and how often. Drained periodically by on_present so a
+// "ShaderHunter stats" log line tells us if draw-skip is reaching the GPU.
+// Auto-enable EyeDiff from env var. Useful for headless/scripted hunting
+// where the user isn't going to click the UI checkbox.
+static bool eyediff_auto_enable_from_env() {
+    static const bool enabled = []() {
+        char buf[4]{};
+        return GetEnvironmentVariableA("UEVR_EYE_DIFF_AUTO_ENABLE", buf, sizeof(buf)) > 0
+            && buf[0] == '1';
+    }();
+    return enabled;
+}
+
+static std::atomic<uint64_t> g_hunter_setpso_calls{0};
+static std::atomic<uint64_t> g_hunter_setpso_skip_true{0};
+static std::atomic<uint64_t> g_hunter_draw_hits{0};
+static std::atomic<uint64_t> g_hunter_draw_skipped{0};
+static std::atomic<uint64_t> g_hunter_draw_indexed_hits{0};
+static std::atomic<uint64_t> g_hunter_draw_indexed_skipped{0};
+static std::atomic<uint64_t> g_hunter_dispatch_hits{0};
+static std::atomic<uint64_t> g_hunter_dispatch_skipped{0};
+static std::atomic<uint64_t> g_hunter_execute_indirect_hits{0};
+static std::atomic<uint64_t> g_hunter_execute_indirect_skipped{0};
+static std::atomic<uint64_t> g_hunter_execute_bundle_hits{0};
+static std::atomic<uint64_t> g_hunter_execute_bundle_skipped{0};
+static std::atomic<uint64_t> g_hunter_dispatch_mesh_hits{0};
+static std::atomic<uint64_t> g_hunter_dispatch_mesh_skipped{0};
+
 ShaderOverrideRegistry& ShaderOverrideRegistry::get() {
     static ShaderOverrideRegistry instance{};
     return instance;
@@ -620,6 +968,56 @@ ShaderOverrideRegistry& ShaderOverrideRegistry::get() {
 void ShaderOverrideRegistry::on_present(Framework&) {
     std::scoped_lock _{m_mutex};
     ++m_frame;
+
+    // === ShaderHunter periodic stats dump ===
+    // Every 120 frames (~2s at 60fps), log hook-firing counters so we can tell
+    // whether draw-skip is actually reaching the GPU. If draw_hits stays at
+    // zero while hunting is active, the diagnostic command-list hooks weren't
+    // installed (likely UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS env
+    // var didn't propagate to the game process).
+    // Auto-enable EyeDiff from env var (once) so headless scripted hunting
+    // can find divergent PSOs without user clicking the UI checkbox.
+    if (eyediff_auto_enable_from_env() && !m_eyediff_enabled.load(std::memory_order_relaxed)) {
+        m_eyediff_enabled.store(true, std::memory_order_relaxed);
+        spdlog::info("[EyeDiff] auto-enabled from UEVR_EYE_DIFF_AUTO_ENABLE=1");
+    }
+    // Periodically dump top divergent PSOs to log so a script can grep them.
+    if (m_eyediff_enabled.load(std::memory_order_relaxed) && (m_frame % 300) == 0 && m_frame > 0) {
+        const auto entries = eyediff_snapshot_top_divergent(20);
+        spdlog::info("[EyeDiff] top {} divergent PSOs (frame {})", entries.size(), m_frame);
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const auto& e = entries[i];
+            spdlog::info("[EyeDiff]  #{} ps={} L_hits={} R_hits={} rtv_div={} desc_div={}",
+                i, e.ps_hash, e.bind_count_left, e.bind_count_right,
+                e.rtv_divergence_seen, e.desc_divergence_seen);
+        }
+    }
+    if (m_hunter_active.load(std::memory_order_relaxed) && (m_frame % 120) == 0) {
+        const auto setpso = g_hunter_setpso_calls.exchange(0, std::memory_order_relaxed);
+        const auto setpso_skip = g_hunter_setpso_skip_true.exchange(0, std::memory_order_relaxed);
+        const auto draws = g_hunter_draw_hits.exchange(0, std::memory_order_relaxed);
+        const auto draws_skipped = g_hunter_draw_skipped.exchange(0, std::memory_order_relaxed);
+        const auto draws_i = g_hunter_draw_indexed_hits.exchange(0, std::memory_order_relaxed);
+        const auto draws_i_skipped = g_hunter_draw_indexed_skipped.exchange(0, std::memory_order_relaxed);
+        const auto dispatches = g_hunter_dispatch_hits.exchange(0, std::memory_order_relaxed);
+        const auto dispatches_skipped = g_hunter_dispatch_skipped.exchange(0, std::memory_order_relaxed);
+        const auto indirect = g_hunter_execute_indirect_hits.exchange(0, std::memory_order_relaxed);
+        const auto indirect_skipped = g_hunter_execute_indirect_skipped.exchange(0, std::memory_order_relaxed);
+        const auto bundles = g_hunter_execute_bundle_hits.exchange(0, std::memory_order_relaxed);
+        const auto bundles_skipped = g_hunter_execute_bundle_skipped.exchange(0, std::memory_order_relaxed);
+        const auto meshes = g_hunter_dispatch_mesh_hits.exchange(0, std::memory_order_relaxed);
+        const auto meshes_skipped = g_hunter_dispatch_mesh_skipped.exchange(0, std::memory_order_relaxed);
+        spdlog::info("[ShaderHunter] stats(2s): set_pipeline_state={} skip_true={} | "
+            "draw_instanced={} (skipped {}) | draw_indexed_instanced={} (skipped {}) | "
+            "dispatch={} (skipped {}) | execute_indirect={} (skipped {}) | "
+            "execute_bundle={} (skipped {}) | dispatch_mesh={} (skipped {}) | "
+            "active={} marked={} hunted={}",
+            setpso, setpso_skip,
+            draws, draws_skipped, draws_i, draws_i_skipped,
+            dispatches, dispatches_skipped, indirect, indirect_skipped,
+            bundles, bundles_skipped, meshes, meshes_skipped,
+            m_hunter_collected.size(), m_hunter_marked.size(), m_hunter_active_hash);
+    }
 
     const auto now = std::chrono::steady_clock::now();
     const auto full_tracking_active = should_track_d3d11_shaders() || should_track_d3d12_pipelines();
@@ -644,7 +1042,13 @@ bool ShaderOverrideRegistry::should_track_d3d11_shaders() const {
 bool ShaderOverrideRegistry::should_track_d3d12_pipelines() const {
     return m_has_active_d3d12_overrides.load(std::memory_order_relaxed) ||
         m_inspector_tracking_enabled.load(std::memory_order_relaxed) ||
+        m_hunter_active.load(std::memory_order_relaxed) ||
+        m_hunter_hide_marked.load(std::memory_order_relaxed) ||
         m_capture_next_d3d12_change_hot_path.load(std::memory_order_relaxed);
+}
+
+bool ShaderOverrideRegistry::should_record_d3d12_pipeline_creations() const {
+    return should_track_d3d12_pipelines() || shader_hunter_pretrack_enabled();
 }
 
 void ShaderOverrideRegistry::request_reload() {
@@ -882,6 +1286,7 @@ ShaderOverrideRegistry::Snapshot ShaderOverrideRegistry::snapshot() const {
         info.target_hash = entry.target_hash;
         info.manifest_path = entry.manifest_path.string();
         info.source_path = entry.source_path.string();
+        info.source_kind = source_kind_to_string(entry.source_kind);
         info.entry_point = entry.entry_point;
         info.profile = entry.profile;
         info.enabled = entry.enabled;
@@ -1035,7 +1440,7 @@ void ShaderOverrideRegistry::register_d3d12_graphics_pipeline_state_creation(
     ID3D12PipelineState* pipeline_state,
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc
 ) {
-    if (!should_track_d3d12_pipelines()) {
+    if (!should_record_d3d12_pipeline_creations()) {
         return;
     }
 
@@ -1100,14 +1505,88 @@ void ShaderOverrideRegistry::register_d3d12_graphics_pipeline_state_creation(
     record.owned_desc.refresh_views();
     record.vertex_hash = hash_shader_bytecode(desc->VS.pShaderBytecode, desc->VS.BytecodeLength);
     record.pixel_hash = hash_shader_bytecode(desc->PS.pShaderBytecode, desc->PS.BytecodeLength);
+    record.compute_hash.clear();
+    record.amplification_hash.clear();
+    record.mesh_hash.clear();
+    record.vertex_crc32 = (desc->VS.pShaderBytecode != nullptr && desc->VS.BytecodeLength > 0)
+        ? crc32_ieee(desc->VS.pShaderBytecode, desc->VS.BytecodeLength) : 0;
+    record.pixel_crc32 = (desc->PS.pShaderBytecode != nullptr && desc->PS.BytecodeLength > 0)
+        ? crc32_ieee(desc->PS.pShaderBytecode, desc->PS.BytecodeLength) : 0;
+    record.compute_crc32 = 0;
+    record.amplification_crc32 = 0;
+    record.mesh_crc32 = 0;
     record.last_seen_frame = m_frame;
     if (record.first_seen_frame == 0) {
         record.first_seen_frame = m_frame;
         record.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        if (verbose_pso_logging_enabled()) {
+            spdlog::info("[ShaderOverrideRegistry] GFX PSO new pso=0x{:x} vs={} ps={} ps_crc32=0x{:08x} ps_size={}",
+                record.pipeline_state_pointer, record.vertex_hash, record.pixel_hash, record.pixel_crc32, desc->PS.BytecodeLength);
+        }
+        // Dump always when we see a new PSO — gives the user the raw DXBC for
+        // disassembly/analysis regardless of whether verbose logging is on.
+        dump_dxbc_once(desc->PS.pShaderBytecode, desc->PS.BytecodeLength, record.pixel_crc32);
     }
     ++record.seen_count;
 
-    update_d3d12_override_pipeline_state(record);
+    if (m_has_active_d3d12_overrides.load(std::memory_order_relaxed)) {
+        update_d3d12_override_pipeline_state(record);
+    }
+}
+
+void ShaderOverrideRegistry::register_d3d12_compute_pipeline_state_creation(
+    ID3D12Device* device,
+    ID3D12PipelineState* pipeline_state,
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc
+) {
+    if (!should_record_d3d12_pipeline_creations()) {
+        return;
+    }
+
+    if (device == nullptr || pipeline_state == nullptr || desc == nullptr) {
+        return;
+    }
+
+    if (g_inside_d3d12_override_pipeline_creation) {
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+
+    auto& record = m_d3d12_graphics_pso_records[reinterpret_cast<uintptr_t>(pipeline_state)];
+    record.pipeline_state_pointer = reinterpret_cast<uintptr_t>(pipeline_state);
+    record.device = device;
+    record.is_pipeline_stream = false;
+    record.tracking_note = "compute pso";
+    record.last_error.clear();
+    record.override_pipeline_state.Reset();
+    record.owned_desc = {};
+    record.owned_stream = {};
+    record.owned_stream.root_signature = desc->pRootSignature;
+    record.owned_stream.compute_shader = copy_shader_bytecode_blob(desc->CS);
+    record.vertex_hash.clear();
+    record.pixel_hash.clear();
+    record.compute_hash = hash_shader_bytecode(desc->CS.pShaderBytecode, desc->CS.BytecodeLength);
+    record.amplification_hash.clear();
+    record.mesh_hash.clear();
+    record.vertex_crc32 = 0;
+    record.pixel_crc32 = 0;
+    record.compute_crc32 = (desc->CS.pShaderBytecode != nullptr && desc->CS.BytecodeLength > 0)
+        ? crc32_ieee(desc->CS.pShaderBytecode, desc->CS.BytecodeLength) : 0;
+    record.amplification_crc32 = 0;
+    record.mesh_crc32 = 0;
+    record.last_seen_frame = m_frame;
+
+    if (record.first_seen_frame == 0) {
+        record.first_seen_frame = m_frame;
+        record.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        if (verbose_pso_logging_enabled()) {
+            spdlog::info("[ShaderOverrideRegistry] COMPUTE PSO new pso=0x{:x} cs={} cs_crc32=0x{:08x} cs_size={}",
+                record.pipeline_state_pointer, record.compute_hash, record.compute_crc32, desc->CS.BytecodeLength);
+        }
+        dump_dxbc_once(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, record.compute_crc32);
+    }
+    ++record.seen_count;
 }
 
 void ShaderOverrideRegistry::register_d3d12_pipeline_state_stream_creation(
@@ -1115,7 +1594,7 @@ void ShaderOverrideRegistry::register_d3d12_pipeline_state_stream_creation(
     ID3D12PipelineState* pipeline_state,
     const D3D12_PIPELINE_STATE_STREAM_DESC* desc
 ) {
-    if (!should_track_d3d12_pipelines()) {
+    if (!should_record_d3d12_pipeline_creations()) {
         return;
     }
 
@@ -1151,11 +1630,34 @@ void ShaderOverrideRegistry::register_d3d12_pipeline_state_stream_creation(
 
     record.vertex_hash = hash_shader_bytecode(record.owned_stream.vertex_shader.data(), record.owned_stream.vertex_shader.size());
     record.pixel_hash = hash_shader_bytecode(record.owned_stream.pixel_shader.data(), record.owned_stream.pixel_shader.size());
+    record.compute_hash = hash_shader_bytecode(record.owned_stream.compute_shader.data(), record.owned_stream.compute_shader.size());
+    record.amplification_hash = hash_shader_bytecode(record.owned_stream.amplification_shader.data(), record.owned_stream.amplification_shader.size());
+    record.mesh_hash = hash_shader_bytecode(record.owned_stream.mesh_shader.data(), record.owned_stream.mesh_shader.size());
+    record.vertex_crc32 = !record.owned_stream.vertex_shader.empty()
+        ? crc32_ieee(record.owned_stream.vertex_shader.data(), record.owned_stream.vertex_shader.size()) : 0;
+    record.pixel_crc32 = !record.owned_stream.pixel_shader.empty()
+        ? crc32_ieee(record.owned_stream.pixel_shader.data(), record.owned_stream.pixel_shader.size()) : 0;
+    record.compute_crc32 = !record.owned_stream.compute_shader.empty()
+        ? crc32_ieee(record.owned_stream.compute_shader.data(), record.owned_stream.compute_shader.size()) : 0;
+    record.amplification_crc32 = !record.owned_stream.amplification_shader.empty()
+        ? crc32_ieee(record.owned_stream.amplification_shader.data(), record.owned_stream.amplification_shader.size()) : 0;
+    record.mesh_crc32 = !record.owned_stream.mesh_shader.empty()
+        ? crc32_ieee(record.owned_stream.mesh_shader.data(), record.owned_stream.mesh_shader.size()) : 0;
     record.last_seen_frame = m_frame;
 
     if (record.first_seen_frame == 0) {
         record.first_seen_frame = m_frame;
         record.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        if (verbose_pso_logging_enabled()) {
+            spdlog::info("[ShaderOverrideRegistry] STREAM PSO new pso=0x{:x} vs={} ps={} ps_crc32=0x{:08x} ps_size={}",
+                record.pipeline_state_pointer, record.vertex_hash, record.pixel_hash, record.pixel_crc32, record.owned_stream.pixel_shader.size());
+        }
+        if (!record.owned_stream.pixel_shader.empty()) {
+            dump_dxbc_once(record.owned_stream.pixel_shader.data(), record.owned_stream.pixel_shader.size(), record.pixel_crc32);
+        }
+        if (!record.owned_stream.compute_shader.empty()) {
+            dump_dxbc_once(record.owned_stream.compute_shader.data(), record.owned_stream.compute_shader.size(), record.compute_crc32);
+        }
     }
 
     ++record.seen_count;
@@ -1170,7 +1672,9 @@ void ShaderOverrideRegistry::register_d3d12_pipeline_state_stream_creation(
         }
     }
 
-    update_d3d12_override_pipeline_state(record);
+    if (m_has_active_d3d12_overrides.load(std::memory_order_relaxed)) {
+        update_d3d12_override_pipeline_state(record);
+    }
 }
 
 ID3D12PipelineState* ShaderOverrideRegistry::resolve_d3d12_pipeline_state(ID3D12PipelineState* pipeline_state) {
@@ -1189,10 +1693,20 @@ ID3D12PipelineState* ShaderOverrideRegistry::resolve_d3d12_pipeline_state(ID3D12
         return pipeline_state;
     }
 
+    if (!m_has_active_d3d12_overrides.load(std::memory_order_relaxed)) {
+        return pipeline_state;
+    }
+
     auto& record = it->second;
     update_d3d12_override_pipeline_state(record);
 
     if (record.override_active && record.override_pipeline_state != nullptr) {
+        if (!record.logged_substitution) {
+            record.logged_substitution = true;
+            spdlog::info("[ShaderOverrideRegistry] >>> SUBSTITUTED pso=0x{:x} vs_hash={} ps_hash={} vs_override={} ps_override={}",
+                record.pipeline_state_pointer, record.vertex_hash, record.pixel_hash,
+                record.vertex_override_name, record.pixel_override_name);
+        }
         return record.override_pipeline_state.Get();
     }
 
@@ -1281,18 +1795,32 @@ void ShaderOverrideRegistry::note_d3d12_pipeline_state_bound(ID3D12PipelineState
 void ShaderOverrideRegistry::scan_override_directories() {
     std::unordered_map<std::string, std::filesystem::path> discovered_entries{};
 
-    scan_single_directory(global_override_dir(), false);
+    const auto global_dir = global_override_dir();
+    const auto profile_dir = profile_override_dir();
+    spdlog::info("[ShaderOverrideRegistry] scan tick: global={} profile={} overrides_before={}",
+        global_dir.string(), profile_dir.string(), m_overrides.size());
+
+    scan_single_directory(global_dir, false);
     for (const auto& [key, entry] : m_overrides) {
         discovered_entries[key] = entry.manifest_path;
     }
 
-    scan_single_directory(profile_override_dir(), true);
+    scan_single_directory(profile_dir, true);
     for (const auto& [key, entry] : m_overrides) {
         discovered_entries[key] = entry.manifest_path;
     }
 
     remove_deleted_entries(discovered_entries);
     refresh_active_override_flags_locked();
+
+    spdlog::info("[ShaderOverrideRegistry] scan done: overrides_after={} d3d12_active={} d3d11_active={}",
+        m_overrides.size(),
+        m_has_active_d3d12_overrides.load(std::memory_order_relaxed),
+        m_has_active_d3d11_overrides.load(std::memory_order_relaxed));
+    for (const auto& [k, e] : m_overrides) {
+        spdlog::info("[ShaderOverrideRegistry]   override key={} hash={} compiled={} bytes={} status={} err={}",
+            k, e.target_hash, e.compiled, e.compiled_bytecode.size(), e.status, e.last_error);
+    }
 }
 
 void ShaderOverrideRegistry::scan_single_directory(const std::filesystem::path& dir, bool from_profile_dir) {
@@ -1309,6 +1837,17 @@ void ShaderOverrideRegistry::scan_single_directory(const std::filesystem::path& 
         }
 
         if (!file.is_regular_file()) {
+            continue;
+        }
+
+        bool under_cache = false;
+        for (const auto& part : file.path().lexically_relative(dir)) {
+            if (part == "cache") {
+                under_cache = true;
+                break;
+            }
+        }
+        if (under_cache) {
             continue;
         }
 
@@ -1340,13 +1879,19 @@ void ShaderOverrideRegistry::scan_single_directory(const std::filesystem::path& 
 
         const bool changed =
             current.manifest_path != entry.manifest_path ||
+            current.source_kind != entry.source_kind ||
             current.source_path != entry.source_path ||
+            current.bytecode_path != entry.bytecode_path ||
+            current.patch_path != entry.patch_path ||
+            current.patch_tool_path != entry.patch_tool_path ||
             current.enabled != entry.enabled ||
             current.entry_point != entry.entry_point ||
             current.profile != entry.profile ||
             current.name != entry.name ||
             current.manifest_write_time != entry.manifest_write_time ||
             current.source_write_time != entry.source_write_time ||
+            current.bytecode_write_time != entry.bytecode_write_time ||
+            current.patch_write_time != entry.patch_write_time ||
             current.from_profile_dir != entry.from_profile_dir;
 
         entry.generation = current.generation;
@@ -1354,6 +1899,8 @@ void ShaderOverrideRegistry::scan_single_directory(const std::filesystem::path& 
         entry.compiled = current.compiled;
         entry.status = current.status;
         entry.last_error = current.last_error;
+        entry.cached_bytecode_path = current.cached_bytecode_path;
+        entry.compiled_original_hash = current.compiled_original_hash;
 
         if (changed) {
             compile_or_refresh_entry(entry);
@@ -1390,10 +1937,10 @@ void ShaderOverrideRegistry::compile_or_refresh_entry(OverrideEntry& entry) {
     std::string error{};
     if (compile_entry(entry, error)) {
         ++entry.generation;
-        entry.compiled = true;
+        entry.compiled = entry.source_kind != OverrideSourceKind::DxilPatch || !entry.compiled_bytecode.empty();
         entry.last_error.clear();
         ++m_override_revision;
-        push_event("Compiled shader override " + entry.key + " with " + entry.compiler);
+        push_event((entry.source_kind == OverrideSourceKind::DxilPatch ? "Loaded shader override " : "Compiled shader override ") + entry.key + " with " + entry.compiler);
     } else {
         entry.compiled = !entry.compiled_bytecode.empty();
         entry.status = "Compile failed";
@@ -1412,6 +1959,24 @@ std::optional<ShaderOverrideRegistry::OverrideEntry> ShaderOverrideRegistry::par
         }
 
         const auto manifest = json::parse(file);
+        if (!manifest.is_object()) {
+            return std::nullopt;
+        }
+
+        const bool has_manifest_keys =
+            manifest.contains("backend") &&
+            manifest.contains("stage") &&
+            manifest.contains("target_hash");
+        if (!has_manifest_keys) {
+            if (manifest.contains("patches") || manifest.contains("replacements")) {
+                return std::nullopt;
+            }
+
+            push_event("Skipped invalid shader override manifest " + manifest_path.string());
+            spdlog::error("[ShaderOverrideRegistry] {} is missing backend, stage, or target_hash", manifest_path.string());
+            return std::nullopt;
+        }
+
         const auto backend_value = manifest.at("backend").get<std::string>();
         const auto stage_value = manifest.at("stage").get<std::string>();
         const auto hash_value = normalize_hash(manifest.at("target_hash").get<std::string>());
@@ -1445,19 +2010,40 @@ std::optional<ShaderOverrideRegistry::OverrideEntry> ShaderOverrideRegistry::par
             }
         }
 
-        auto source_value = manifest.at("source").get<std::string>();
-        std::filesystem::path source_path = source_value;
-        if (source_path.is_relative()) {
-            source_path = manifest_path.parent_path() / source_path;
+        const bool has_source = manifest.contains("source");
+        const bool has_bytecode = manifest.contains("bytecode");
+        const bool has_patch = manifest.contains("patch") || manifest.contains("dxil_patch");
+        const int source_count = static_cast<int>(has_source) + static_cast<int>(has_bytecode) + static_cast<int>(has_patch);
+        if (source_count != 1) {
+            push_event("Skipped invalid shader override manifest " + manifest_path.string());
+            spdlog::error("[ShaderOverrideRegistry] {} must specify exactly one of source, bytecode, or patch/dxil_patch", manifest_path.string());
+            return std::nullopt;
         }
-        entry.source_path = source_path.lexically_normal();
+
+        if (has_source) {
+            entry.source_kind = OverrideSourceKind::Hlsl;
+            entry.source_path = resolve_manifest_relative_path(manifest_path, manifest.at("source").get<std::string>());
+        } else if (has_bytecode) {
+            entry.source_kind = OverrideSourceKind::Bytecode;
+            entry.bytecode_path = resolve_manifest_relative_path(manifest_path, manifest.at("bytecode").get<std::string>());
+            entry.source_path = entry.bytecode_path;
+            entry.compiler = "bytecode";
+        } else {
+            entry.source_kind = OverrideSourceKind::DxilPatch;
+            const auto patch_key = manifest.contains("patch") ? "patch" : "dxil_patch";
+            entry.patch_path = resolve_manifest_relative_path(manifest_path, manifest.at(patch_key).get<std::string>());
+            entry.source_path = entry.patch_path;
+            entry.compiler = "dxil-patch";
+            if (manifest.contains("patch_tool")) {
+                entry.patch_tool_path = resolve_manifest_relative_path(manifest_path, manifest.at("patch_tool").get<std::string>());
+            }
+        }
 
         std::error_code ec{};
         entry.manifest_write_time = std::filesystem::last_write_time(entry.manifest_path, ec);
-        ec.clear();
-        entry.source_write_time = std::filesystem::exists(entry.source_path, ec)
-            ? std::filesystem::last_write_time(entry.source_path, ec)
-            : std::filesystem::file_time_type{};
+        entry.source_write_time = file_write_time_or_empty(entry.source_path);
+        entry.bytecode_write_time = file_write_time_or_empty(entry.bytecode_path);
+        entry.patch_write_time = file_write_time_or_empty(entry.patch_path);
 
         return entry;
     } catch (const std::exception& e) {
@@ -1471,6 +2057,46 @@ bool ShaderOverrideRegistry::compile_entry(OverrideEntry& entry, std::string& er
     if (!std::filesystem::exists(entry.source_path)) {
         error_out = "Source file does not exist: " + entry.source_path.string();
         return false;
+    }
+
+    entry.compiled_bytecode.clear();
+    entry.compiled_original_hash.clear();
+    entry.cached_bytecode_path.clear();
+
+    if (entry.source_kind == OverrideSourceKind::Bytecode) {
+        if (entry.backend == Backend::D3D11 && entry.profile.find("_6_") != std::string::npos) {
+            error_out = "DX11 live bytecode overrides require DXBC-compatible shader models";
+            return false;
+        }
+
+        if (!read_binary_file(entry.bytecode_path, entry.compiled_bytecode, error_out)) {
+            return false;
+        }
+
+        if (entry.compiled_bytecode.empty()) {
+            error_out = "Bytecode file is empty: " + entry.bytecode_path.string();
+            return false;
+        }
+
+        entry.compiler = "bytecode";
+        entry.status = "Loaded bytecode";
+        return true;
+    }
+
+    if (entry.source_kind == OverrideSourceKind::DxilPatch) {
+        if (entry.backend != Backend::D3D12) {
+            error_out = "DXIL patch overrides are only supported for DX12";
+            return false;
+        }
+
+        if (!std::filesystem::exists(entry.patch_path)) {
+            error_out = "Patch file does not exist: " + entry.patch_path.string();
+            return false;
+        }
+
+        entry.compiler = "dxil-patch";
+        entry.status = "Deferred DXIL patch";
+        return true;
     }
 
     if (entry.backend == Backend::D3D11 && entry.profile.find("_6_") != std::string::npos) {
@@ -1512,6 +2138,114 @@ bool ShaderOverrideRegistry::compile_entry(OverrideEntry& entry, std::string& er
     return true;
 }
 
+bool ShaderOverrideRegistry::ensure_d3d12_patch_entry_compiled(
+    OverrideEntry& entry,
+    const void* original_bytecode,
+    size_t original_bytecode_size,
+    std::string_view original_hash,
+    std::string& error_out
+) {
+    if (entry.source_kind != OverrideSourceKind::DxilPatch) {
+        return true;
+    }
+
+    if (original_bytecode == nullptr || original_bytecode_size == 0) {
+        error_out = "Original DXIL bytecode is empty";
+        return false;
+    }
+
+    if (!entry.compiled_bytecode.empty() && entry.compiled_original_hash == original_hash) {
+        return true;
+    }
+
+    const auto tool_path = entry.patch_tool_path.empty() ? default_dxil_patch_tool_path() : entry.patch_tool_path;
+    if (tool_path.empty() || !std::filesystem::exists(tool_path)) {
+        error_out = "dxil-patch tool not found: " + tool_path.string() + " (set UEVR_DXIL_PATCH_TOOL or use manifest patch_tool)";
+        return false;
+    }
+
+    const auto cache_root = profile_override_dir() / "cache" / "dxil_patch";
+    std::error_code ec{};
+    std::filesystem::create_directories(cache_root, ec);
+    if (ec) {
+        error_out = "Failed to create DXIL patch cache: " + ec.message();
+        return false;
+    }
+
+    const auto manifest_stamp = std::filesystem::exists(entry.manifest_path)
+        ? std::filesystem::last_write_time(entry.manifest_path, ec).time_since_epoch().count()
+        : 0;
+    ec.clear();
+    const auto patch_stamp = std::filesystem::exists(entry.patch_path)
+        ? std::filesystem::last_write_time(entry.patch_path, ec).time_since_epoch().count()
+        : 0;
+
+    std::ostringstream key{};
+    key << entry.target_hash << "_" << original_hash << "_" << manifest_stamp << "_" << patch_stamp;
+    const auto original_path = cache_root / (key.str() + ".original.dxbc");
+    const auto output_path = cache_root / (key.str() + ".patched.dxbc");
+    const auto report_path = cache_root / (key.str() + ".report.json");
+
+    if (!std::filesystem::exists(output_path)) {
+        if (!write_binary_file(original_path, original_bytecode, original_bytecode_size, error_out)) {
+            return false;
+        }
+
+        const std::wstring args =
+            L"patch " +
+            quote_command_arg(original_path) +
+            L" " +
+            quote_command_arg(entry.patch_path) +
+            L" -o " +
+            quote_command_arg(output_path) +
+            L" --report " +
+            quote_command_arg(report_path);
+
+        DWORD exit_code = 0;
+        std::string process_error{};
+        if (!run_process_wait(tool_path, args, 30000, exit_code, process_error)) {
+            error_out = process_error;
+            return false;
+        }
+
+        if (exit_code != 0) {
+            error_out = "dxil-patch failed with exit code " + std::to_string(exit_code);
+            if (std::filesystem::exists(report_path)) {
+                std::ifstream report{report_path, std::ios::binary};
+                if (report) {
+                    std::ostringstream ss{};
+                    ss << report.rdbuf();
+                    error_out += ": " + ss.str();
+                }
+            }
+            return false;
+        }
+    }
+
+    std::vector<uint8_t> patched{};
+    if (!read_binary_file(output_path, patched, error_out)) {
+        return false;
+    }
+
+    if (patched.empty()) {
+        error_out = "dxil-patch produced an empty output: " + output_path.string();
+        return false;
+    }
+
+    entry.compiled_bytecode = std::move(patched);
+    entry.compiled_original_hash = std::string{original_hash};
+    entry.cached_bytecode_path = output_path;
+    entry.compiled = true;
+    entry.status = "Patched DXIL";
+    entry.compiler = "dxil-patch";
+    entry.last_error.clear();
+
+    push_event("Patched DXIL override " + entry.key + " -> " + output_path.string());
+    spdlog::info("[ShaderOverrideRegistry] Patched DXIL override key={} input={} output={} bytes={}",
+        entry.key, original_path.string(), output_path.string(), entry.compiled_bytecode.size());
+    return true;
+}
+
 void ShaderOverrideRegistry::push_event(std::string message) {
     if (m_recent_events.size() >= MAX_RECENT_EVENTS) {
         m_recent_events.erase(m_recent_events.begin());
@@ -1525,7 +2259,10 @@ void ShaderOverrideRegistry::refresh_active_override_flags_locked() {
     bool has_d3d12 = false;
 
     for (const auto& [_, entry] : m_overrides) {
-        if (!entry.enabled || !entry.compiled || !entry.apply_supported) {
+        const bool can_activate = entry.enabled &&
+            entry.apply_supported &&
+            (entry.compiled || entry.source_kind == OverrideSourceKind::DxilPatch);
+        if (!can_activate) {
             continue;
         }
 
@@ -1749,25 +2486,137 @@ void ShaderOverrideRegistry::update_d3d11_override_shader(D3D11ShaderRecord& rec
 void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsPsoRecord& record) {
     const auto vertex_key = record.vertex_hash.empty() ? std::string{} : make_override_key(Backend::D3D12, Stage::Vertex, record.vertex_hash);
     const auto pixel_key = record.pixel_hash.empty() ? std::string{} : make_override_key(Backend::D3D12, Stage::Pixel, record.pixel_hash);
+    // Parallel CRC32 lookup keys. A manifest whose target_hash is 8 hex chars
+    // (== ShaderToggler-format CRC32) lives in m_overrides at this key. This
+    // lets users drop their ShaderToggler hashes straight into UEVR manifests.
+    char crc_buf[32]{};
+    std::snprintf(crc_buf, sizeof(crc_buf), "%08x", record.vertex_crc32);
+    const auto vertex_crc_key = record.vertex_crc32 == 0 ? std::string{}
+        : make_override_key(Backend::D3D12, Stage::Vertex, crc_buf);
+    std::snprintf(crc_buf, sizeof(crc_buf), "%08x", record.pixel_crc32);
+    const auto pixel_crc_key = record.pixel_crc32 == 0 ? std::string{}
+        : make_override_key(Backend::D3D12, Stage::Pixel, crc_buf);
 
     OverrideEntry* vertex_entry = nullptr;
     OverrideEntry* pixel_entry = nullptr;
 
-    if (!vertex_key.empty()) {
-        if (const auto it = m_overrides.find(vertex_key); it != m_overrides.end() && it->second.enabled && it->second.compiled) {
-            vertex_entry = &it->second;
+    auto try_lookup = [this](const std::string& key) -> OverrideEntry* {
+        if (key.empty()) return nullptr;
+        const auto it = m_overrides.find(key);
+        if (it == m_overrides.end() ||
+            !it->second.enabled ||
+            !it->second.apply_supported ||
+            (!it->second.compiled && it->second.source_kind != OverrideSourceKind::DxilPatch)) {
+            return nullptr;
+        }
+        return &it->second;
+    };
+
+    vertex_entry = try_lookup(vertex_key);
+    if (vertex_entry == nullptr) vertex_entry = try_lookup(vertex_crc_key);
+    pixel_entry = try_lookup(pixel_key);
+    if (pixel_entry == nullptr) pixel_entry = try_lookup(pixel_crc_key);
+
+    // === Highlight mode: if PS hash is in highlight set OR the cycle-mode
+    // highlight flag is on AND the hash matches the active hunted PS hash,
+    // synthesize a transient OverrideEntry whose compiled_bytecode is the
+    // magenta PS variant matching the PSO's RT count. ===
+    static thread_local OverrideEntry hunter_highlight_transient{};
+    const bool cycle_highlight = m_hunter_cycle_highlight_mode.load(std::memory_order_relaxed);
+    const bool match_per_row_highlight = !record.pixel_hash.empty() && m_hunter_highlight.count(record.pixel_hash) > 0;
+    const bool match_cycle_active_ps = cycle_highlight && !record.pixel_hash.empty() && record.pixel_hash == m_hunter_active_hash;
+    const bool match_cycle_active_vs = cycle_highlight && !record.vertex_hash.empty() && record.vertex_hash == m_hunter_active_hash_vs;
+    if (pixel_entry == nullptr && (match_per_row_highlight || match_cycle_active_ps || match_cycle_active_vs)) {
+        // Pick the RT count: graphics-desc gives it directly; stream PSOs
+        // require trial-and-error (the rt_formats subobject isn't parsed
+        // out). For stream PSOs we'll retry with each variant from 8 down
+        // to 1 below if CreatePipelineState fails. Start with a best guess.
+        int rt_count = -1;
+        if (!record.is_pipeline_stream) {
+            const auto& d = record.owned_desc.desc;
+            if (d.NumRenderTargets >= 1 && d.NumRenderTargets <= 8) {
+                rt_count = static_cast<int>(d.NumRenderTargets);
+            }
+        }
+        // For stream PSOs: try the LARGEST variant first (8) — most likely
+        // to match a UE5 deferred basepass with 4-6 RTs. The PSO-create call
+        // below will reject mismatches; retry logic at the bottom of this
+        // function falls back to smaller variants.
+        if (rt_count < 1) rt_count = 8;
+        if (rt_count >= 1 && rt_count <= 8 && !m_hunter_magenta_ps[rt_count].empty()) {
+            hunter_highlight_transient = OverrideEntry{};
+            hunter_highlight_transient.backend = Backend::D3D12;
+            hunter_highlight_transient.stage = Stage::Pixel;
+            hunter_highlight_transient.target_hash = record.pixel_hash;
+            hunter_highlight_transient.key = "dx12:ps:highlight:" + record.pixel_hash;
+            hunter_highlight_transient.name = "hunter_highlight";
+            hunter_highlight_transient.enabled = true;
+            hunter_highlight_transient.entry_point = "main";
+            hunter_highlight_transient.profile = "ps_6_0";
+            hunter_highlight_transient.preferred_compiler = ShaderCompilerBackend::Dxc;
+            hunter_highlight_transient.compiled = true;
+            hunter_highlight_transient.apply_supported = true;
+            hunter_highlight_transient.compiled_bytecode = m_hunter_magenta_ps[rt_count];
+            hunter_highlight_transient.status = "Hunter-highlight (RT" + std::to_string(rt_count) + ")";
+            pixel_entry = &hunter_highlight_transient;
         }
     }
 
-    if (!pixel_key.empty()) {
-        if (const auto it = m_overrides.find(pixel_key); it != m_overrides.end() && it->second.enabled && it->second.compiled) {
-            pixel_entry = &it->second;
+    auto ensure_patch_entry = [this, &record](OverrideEntry*& entry, Stage stage) {
+        if (entry == nullptr || entry->source_kind != OverrideSourceKind::DxilPatch) {
+            return;
         }
-    }
+
+        const std::vector<uint8_t>* original = nullptr;
+        std::string_view original_hash{};
+        if (record.is_pipeline_stream) {
+            if (stage == Stage::Vertex) {
+                original = &record.owned_stream.vertex_shader;
+                original_hash = record.vertex_hash;
+            } else {
+                original = &record.owned_stream.pixel_shader;
+                original_hash = record.pixel_hash;
+            }
+        } else {
+            if (stage == Stage::Vertex) {
+                original = &record.owned_desc.vertex_shader;
+                original_hash = record.vertex_hash;
+            } else {
+                original = &record.owned_desc.pixel_shader;
+                original_hash = record.pixel_hash;
+            }
+        }
+
+        std::string patch_error{};
+        if (original == nullptr || original->empty() ||
+            !ensure_d3d12_patch_entry_compiled(*entry, original->data(), original->size(), original_hash, patch_error)) {
+            const auto stage_name = stage == Stage::Vertex ? "VS" : "PS";
+            record.last_error = std::string{"Failed to build DXIL patch "} + stage_name + "=" + entry->name + ": " + patch_error;
+            entry->last_error = record.last_error;
+            entry->status = "DXIL patch failed";
+            entry->compiled = false;
+            entry = nullptr;
+            push_event(record.last_error);
+            spdlog::error("[ShaderOverrideRegistry] {}", record.last_error);
+            return;
+        }
+
+        if (entry->compiled_bytecode.empty()) {
+            record.last_error = "DXIL patch produced no bytecode for " + entry->name;
+            entry->last_error = record.last_error;
+            entry->compiled = false;
+            entry = nullptr;
+            push_event(record.last_error);
+        }
+    };
 
     if (record.applied_override_revision == m_override_revision) {
         return;
     }
+
+    ensure_patch_entry(vertex_entry, Stage::Vertex);
+    ensure_patch_entry(pixel_entry, Stage::Pixel);
+    const auto preflight_error = record.last_error;
 
     record.applied_override_revision = m_override_revision;
     record.override_active = false;
@@ -1782,6 +2631,9 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
     }
 
     if (vertex_entry == nullptr && pixel_entry == nullptr) {
+        if (!preflight_error.empty()) {
+            record.last_error = preflight_error;
+        }
         return;
     }
 
@@ -1826,6 +2678,21 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
 
         ScopedD3D12OverridePipelineCreation scoped_creation{};
         hr = device2->CreatePipelineState(&replacement_stream.desc, IID_PPV_ARGS(&replacement_pso));
+        // Highlight-mode RT-count fallback: if the magenta-8 variant failed
+        // (PSO has fewer RTs), retry from 7 down to 1. Cheap because variants
+        // are pre-compiled and we typically converge in 1-2 tries.
+        if (FAILED(hr) && pixel_entry == &hunter_highlight_transient) {
+            for (int try_n = 7; try_n >= 1 && FAILED(hr); --try_n) {
+                if (m_hunter_magenta_ps[try_n].empty()) continue;
+                replacement_stream.pixel_shader = m_hunter_magenta_ps[try_n];
+                replacement_stream.refresh_views();
+                replacement_pso.Reset();
+                hr = device2->CreatePipelineState(&replacement_stream.desc, IID_PPV_ARGS(&replacement_pso));
+                if (SUCCEEDED(hr)) {
+                    hunter_highlight_transient.status = "Hunter-highlight (RT" + std::to_string(try_n) + " fallback)";
+                }
+            }
+        }
     } else {
         auto replacement_desc = record.owned_desc;
 
@@ -1907,5 +2774,1386 @@ std::filesystem::path ShaderOverrideRegistry::global_override_dir() const {
 
 std::filesystem::path ShaderOverrideRegistry::profile_override_dir() const {
     return Framework::get_persistent_dir("shader_overrides");
+}
+
+// =====================================================================
+// Shader Hunter implementation
+// =====================================================================
+//
+// Lets users interactively cycle through every PS hash bound during the
+// last N frames, suppressing one at a time so they can see what each
+// shader draws. Marked hashes are persisted to JSON manifests using
+// CRC32 (the 8-hex-char form the registry treats as a ShaderToggler
+// hash) for portability with ShaderToggler's own format.
+void ShaderOverrideRegistry::hunter_ensure_discard_compiled_locked() {
+    if (m_hunter_tried_compile_discard) return;
+    m_hunter_tried_compile_discard = true;
+    // Write a tiny discard PS source to the profile override dir
+    // (an unobtrusive location that already exists) and compile via the
+    // existing DXC pipeline.
+    namespace fs = std::filesystem;
+    fs::path dir = profile_override_dir();
+    std::error_code ec{};
+    fs::create_directories(dir, ec);
+    fs::path src_path = dir / "_uevr_hunter_discard.hlsl";
+    // Always rewrite so old variants are replaced. D3D12 rule: PS output
+    // signature must have <= RT count of the PSO. An 8-output PS substituted
+    // into a 1-RT PSO -> E_INVALIDARG. A 1-output PS substituted into a
+    // 4-RT MRT PSO -> GPU TDR (writes nothing to slots 1..3, undefined).
+    // The most-portable PS: ZERO outputs (void return + discard). D3D12
+    // accepts a PS with no output signature for ANY RT count because the
+    // discard kills the pixel before any write would occur.
+    {
+        std::ofstream out{src_path, std::ios::binary | std::ios::trunc};
+        out << "// auto-generated by UEVR Shader Hunter — discards every fragment.\n";
+        out << "// Zero output signature so it's valid for PSOs with any RT count.\n";
+        out << "void main() { discard; }\n";
+    }
+    ShaderCompileRequest req{};
+    req.source_path = src_path;
+    req.entry_point = "main";
+    req.profile = "ps_6_0";
+    req.preferred_backend = ShaderCompilerBackend::Dxc;
+    auto result = compile_shader_file(req);
+    if (result.succeeded) {
+        m_hunter_discard_ps = std::move(result.bytecode);
+        spdlog::info("[ShaderHunter] discard PS compiled, {} bytes", m_hunter_discard_ps.size());
+    } else {
+        spdlog::error("[ShaderHunter] discard PS compile failed: {}", result.error);
+    }
+}
+
+void ShaderOverrideRegistry::hunter_record_bind_locked(const D3D12GraphicsPsoRecord& record) {
+    if (!m_hunter_active.load(std::memory_order_relaxed)) return;
+    const bool compute_only = record.pixel_hash.empty() && !record.compute_hash.empty();
+    const auto& hunted_hash = compute_only ? record.compute_hash : record.pixel_hash;
+    if (hunted_hash.empty()) return;
+
+    const bool window_expired = m_hunter_frame_window > 0 &&
+        m_frame >= m_hunter_window_start_frame + static_cast<uint64_t>(m_hunter_frame_window);
+    if (window_expired && !m_hunter_window_stopped) {
+        m_hunter_window_stopped = true;
+        spdlog::info("[ShaderHunter] frame window expired ({} frames). Collection paused; {} hashes captured.",
+            m_hunter_frame_window, m_hunter_collected.size());
+    }
+
+    auto it = m_hunter_collected.find(hunted_hash);
+    if (it == m_hunter_collected.end()) {
+        // After the frame window expires, keep live/hit data fresh for captured
+        // hashes, but do not let new hashes shift the list being hunted.
+        if (window_expired) {
+            return;
+        }
+
+        auto [inserted_it, inserted] = m_hunter_collected.emplace(hunted_hash, HunterCollectedEntry{});
+        it = inserted_it;
+        it->second.first_seen_frame = m_frame;
+        it->second.last_seen_frame = m_frame;
+        m_hunter_order.push_back(hunted_hash);
+    }
+
+    auto& e = it->second;
+    e.crc32 = compute_only ? record.compute_crc32 : record.pixel_crc32;
+    e.vs_hash = compute_only ? std::string{"CS"} : (!record.vertex_hash.empty() ? record.vertex_hash : record.mesh_hash);
+    e.ps_size = compute_only ? record.owned_stream.compute_shader.size() : record.owned_stream.pixel_shader.size();
+    if (!compute_only && e.ps_size == 0 && record.owned_desc.pixel_shader.size() > 0) {
+        e.ps_size = record.owned_desc.pixel_shader.size();
+    }
+    e.last_seen_frame = m_frame;
+    e.hits += 1;
+    e.stage = compute_only ? HunterStage::Compute : HunterStage::Pixel;
+
+    // === Vertex-stage walk tracking ===
+    // VS hashes get their own map so the VS walk (hotkeys 4/5/6) iterates
+    // unique vertex shaders only. We also record the most-recently-seen
+    // companion PS hash and PSO bytecode size for context in the UI.
+    if (!compute_only && !record.vertex_hash.empty()) {
+        auto vs_it = m_hunter_collected_vs.find(record.vertex_hash);
+        if (vs_it == m_hunter_collected_vs.end() && !window_expired) {
+            auto [inserted, _] = m_hunter_collected_vs.emplace(record.vertex_hash, HunterCollectedEntry{});
+            vs_it = inserted;
+            vs_it->second.first_seen_frame = m_frame;
+            vs_it->second.last_seen_frame = m_frame;
+            vs_it->second.stage = HunterStage::Vertex;
+            m_hunter_order_vs.push_back(record.vertex_hash);
+        }
+        if (vs_it != m_hunter_collected_vs.end()) {
+            vs_it->second.vs_hash = record.pixel_hash; // companion PS hash for context
+            vs_it->second.ps_size = record.owned_stream.vertex_shader.size();
+            if (vs_it->second.ps_size == 0 && record.owned_desc.vertex_shader.size() > 0) {
+                vs_it->second.ps_size = record.owned_desc.vertex_shader.size();
+            }
+            vs_it->second.last_seen_frame = m_frame;
+            vs_it->second.hits += 1;
+        }
+    }
+
+    // === Compute-stage walk tracking ===
+    // For compute_only PSOs the main map already holds the entry but we
+    // mirror it into a CS-only map so the UI can iterate just compute shaders.
+    if (compute_only) {
+        auto cs_it = m_hunter_collected_cs.find(record.compute_hash);
+        if (cs_it == m_hunter_collected_cs.end() && !window_expired) {
+            auto [inserted, _] = m_hunter_collected_cs.emplace(record.compute_hash, HunterCollectedEntry{});
+            cs_it = inserted;
+            cs_it->second.first_seen_frame = m_frame;
+            cs_it->second.last_seen_frame = m_frame;
+            cs_it->second.stage = HunterStage::Compute;
+            m_hunter_order_cs.push_back(record.compute_hash);
+        }
+        if (cs_it != m_hunter_collected_cs.end()) {
+            cs_it->second.crc32 = record.compute_crc32;
+            cs_it->second.ps_size = record.owned_stream.compute_shader.size();
+            cs_it->second.last_seen_frame = m_frame;
+            cs_it->second.hits += 1;
+        }
+    }
+}
+
+bool ShaderOverrideRegistry::hunter_should_suppress_locked(const D3D12GraphicsPsoRecord& record) const {
+    const bool compute_only = record.pixel_hash.empty() && !record.compute_hash.empty();
+    const auto& hunted_hash = compute_only ? record.compute_hash : record.pixel_hash;
+    if (hunted_hash.empty()) return false;
+    if (shader_hunter_suppression_blocklist().count(hunted_hash) > 0) return false;
+    if (compute_only && !shader_hunter_compute_suppression_enabled()) return false;
+    if (!hunter_record_is_safe_suppression_candidate_locked(record)) return false;
+    // Runtime blocklist (UI-flagged crashy hashes for this session).
+    if (m_hunter_runtime_blocklist.count(record.pixel_hash) > 0) return false;
+    if (!record.vertex_hash.empty() && m_hunter_runtime_blocklist.count(record.vertex_hash) > 0) return false;
+    if (!record.compute_hash.empty() && m_hunter_runtime_blocklist.count(record.compute_hash) > 0) return false;
+    const bool suppress_active = m_hunter_suppression_enabled.load(std::memory_order_relaxed);
+    const bool hunting_active = m_hunter_active.load(std::memory_order_relaxed);
+    const bool hide_marked = m_hunter_hide_marked.load(std::memory_order_relaxed);
+    // When cycle-highlight mode is on, the active hash gets a magenta PSO
+    // substitution (via the highlight path in update_d3d12_override_pipeline_state)
+    // instead of being skipped. Don't double-action by also skipping.
+    const bool highlight_mode = m_hunter_cycle_highlight_mode.load(std::memory_order_relaxed);
+    // === Pixel stage ===
+    if (suppress_active && hunting_active && hunted_hash == m_hunter_active_hash && !highlight_mode) return true;
+    if (hide_marked && m_hunter_marked.count(hunted_hash) > 0) return true;
+    // === Vertex stage ===
+    if (!compute_only && !record.vertex_hash.empty()) {
+        if (suppress_active && hunting_active && record.vertex_hash == m_hunter_active_hash_vs && !highlight_mode) return true;
+        if (hide_marked && m_hunter_marked_vs.count(record.vertex_hash) > 0) return true;
+    }
+    // === Compute stage ===
+    if (compute_only) {
+        if (suppress_active && hunting_active && record.compute_hash == m_hunter_active_hash_cs && !highlight_mode) return true;
+        if (hide_marked && m_hunter_marked_cs.count(record.compute_hash) > 0) return true;
+    }
+    return false;
+}
+
+bool ShaderOverrideRegistry::hunter_record_is_safe_suppression_candidate_locked(const D3D12GraphicsPsoRecord& record) const {
+    if (record.pixel_hash.empty() && !record.compute_hash.empty()) {
+        return record.owned_stream.compute_shader.size() >= HUNTER_MIN_SCENE_PS_SIZE;
+    }
+
+    size_t ps_size = record.owned_stream.pixel_shader.size();
+    if (ps_size == 0 && record.owned_desc.pixel_shader.size() > 0) {
+        ps_size = record.owned_desc.pixel_shader.size();
+    }
+
+    return (!record.vertex_hash.empty() || !record.mesh_hash.empty()) && ps_size >= HUNTER_MIN_SCENE_PS_SIZE;
+}
+
+bool ShaderOverrideRegistry::hunter_entry_is_scene_candidate_locked(const HunterCollectedEntry& entry) const {
+    return !entry.vs_hash.empty() && entry.ps_size >= HUNTER_MIN_SCENE_PS_SIZE;
+}
+
+void ShaderOverrideRegistry::hunter_rebuild_active_locked() {
+    if (m_hunter_order.empty()) {
+        m_hunter_active_hash.clear();
+        m_hunter_active_index = -1;
+        return;
+    }
+    if (m_hunter_active_index < 0) m_hunter_active_index = 0;
+    if (m_hunter_active_index >= static_cast<int>(m_hunter_order.size())) {
+        m_hunter_active_index = static_cast<int>(m_hunter_order.size()) - 1;
+    }
+    const std::string new_hash = m_hunter_order[static_cast<size_t>(m_hunter_active_index)];
+    const std::string old_hash = m_hunter_active_hash;
+    if (new_hash == old_hash) return;
+    m_hunter_active_hash = new_hash;
+    // Only invalidate records whose pixel_hash matches the OLD hunted hash
+    // (need to UN-suppress) or the NEW hunted hash (need to suppress).
+    // Avoids bumping the global revision counter which would re-evaluate
+    // every tracked PSO and trigger driver pressure / GPU TDR.
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        if (rec.pixel_hash == old_hash || rec.pixel_hash == new_hash ||
+            rec.compute_hash == old_hash || rec.compute_hash == new_hash) {
+            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        }
+    }
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+}
+
+void ShaderOverrideRegistry::hunter_start() {
+    std::scoped_lock _{m_mutex};
+    m_hunter_active = true;
+    m_hunter_collected.clear();
+    m_hunter_order.clear();
+    m_hunter_active_index = -1;
+    m_hunter_active_hash.clear();
+    m_hunter_window_start_frame = m_frame;
+    m_hunter_window_stopped = false;
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+    push_event("Shader Hunter: started");
+    spdlog::info("[ShaderHunter] started (frame_window={})", m_hunter_frame_window);
+}
+
+void ShaderOverrideRegistry::hunter_stop() {
+    std::scoped_lock _{m_mutex};
+    m_hunter_active = false;
+    m_hunter_active_index = -1;
+    m_hunter_active_hash.clear();
+    m_hunter_active_index_vs = -1;
+    m_hunter_active_hash_vs.clear();
+    m_hunter_active_index_cs = -1;
+    m_hunter_active_hash_cs.clear();
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+    ++m_override_revision;
+    refresh_active_override_flags_locked();
+    push_event("Shader Hunter: stopped");
+    spdlog::info("[ShaderHunter] stopped");
+}
+
+void ShaderOverrideRegistry::hunter_clear_collected() {
+    std::scoped_lock _{m_mutex};
+    m_hunter_collected.clear();
+    m_hunter_collected_vs.clear();
+    m_hunter_collected_cs.clear();
+    m_hunter_order.clear();
+    m_hunter_order_vs.clear();
+    m_hunter_order_cs.clear();
+    m_hunter_active_index = -1;
+    m_hunter_active_hash.clear();
+    m_hunter_active_index_vs = -1;
+    m_hunter_active_hash_vs.clear();
+    m_hunter_active_index_cs = -1;
+    m_hunter_active_hash_cs.clear();
+    // Reset frame window so a fresh collection starts from now.
+    m_hunter_window_start_frame = m_frame;
+    m_hunter_window_stopped = false;
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+    ++m_override_revision;
+    push_event("Shader Hunter: collection cleared");
+    spdlog::info("[ShaderHunter] cleared collected hashes; collection {}",
+        m_hunter_active.load(std::memory_order_relaxed) ? "restarted" : "idle");
+}
+
+void ShaderOverrideRegistry::hunter_set_frame_window(int frames) {
+    std::scoped_lock _{m_mutex};
+    m_hunter_frame_window = frames < 0 ? 0 : frames;
+    // Reset the start point so a newly-set window starts counting from now.
+    m_hunter_window_start_frame = m_frame;
+    m_hunter_window_stopped = false;
+}
+
+void ShaderOverrideRegistry::hunter_set_recent_frame_age(int frames) {
+    std::scoped_lock _{m_mutex};
+    m_hunter_recent_frame_age = frames < 0 ? HUNTER_DEFAULT_RECENT_FRAME_AGE : frames;
+}
+
+void ShaderOverrideRegistry::hunter_step(int delta) {
+    std::scoped_lock _{m_mutex};
+    if (m_hunter_order.empty()) return;
+
+    std::vector<int> scene_live_candidates{};
+    std::vector<int> live_candidates{};
+    std::vector<int> scene_candidates{};
+    std::vector<int> all_candidates{};
+    scene_live_candidates.reserve(m_hunter_order.size());
+    live_candidates.reserve(m_hunter_order.size());
+    scene_candidates.reserve(m_hunter_order.size());
+    all_candidates.reserve(m_hunter_order.size());
+
+    for (int i = 0; i < static_cast<int>(m_hunter_order.size()); ++i) {
+        const auto it = m_hunter_collected.find(m_hunter_order[static_cast<size_t>(i)]);
+        if (it == m_hunter_collected.end()) {
+            continue;
+        }
+
+        all_candidates.push_back(i);
+        const bool scene_candidate = hunter_entry_is_scene_candidate_locked(it->second);
+        if (scene_candidate) {
+            scene_candidates.push_back(i);
+        }
+
+        const auto age = m_frame >= it->second.last_seen_frame
+            ? (m_frame - it->second.last_seen_frame)
+            : 0;
+        if (age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
+            live_candidates.push_back(i);
+            if (scene_candidate) {
+                scene_live_candidates.push_back(i);
+            }
+        }
+    }
+
+    const auto live_candidate_count = live_candidates.size();
+    const auto scene_live_candidate_count = scene_live_candidates.size();
+    const auto* candidates = &scene_live_candidates;
+    if (candidates->empty() && !scene_candidates.empty()) {
+        candidates = &scene_candidates;
+    }
+    if (candidates->empty() && !live_candidates.empty()) {
+        candidates = &live_candidates;
+    }
+    if (candidates->empty()) {
+        candidates = &all_candidates;
+    }
+
+    int current_pos = -1;
+    for (int i = 0; i < static_cast<int>(candidates->size()); ++i) {
+        if ((*candidates)[static_cast<size_t>(i)] == m_hunter_active_index) {
+            current_pos = i;
+            break;
+        }
+    }
+
+    const int n = static_cast<int>(candidates->size());
+    if (n == 0) return;
+    int next_pos = current_pos + delta;
+    if (current_pos < 0) {
+        next_pos = delta < 0 ? (n - 1) : 0;
+    }
+    while (next_pos < 0) next_pos += n;
+    next_pos = next_pos % n;
+    m_hunter_active_index = (*candidates)[static_cast<size_t>(next_pos)];
+    hunter_rebuild_active_locked();
+    spdlog::info("[ShaderHunter] hunting idx={} hash={} (total={} scene_live_candidates={} live_candidates={})",
+        m_hunter_active_index, m_hunter_active_hash, m_hunter_order.size(),
+        scene_live_candidate_count, live_candidate_count);
+}
+
+void ShaderOverrideRegistry::hunter_set_index(int index) {
+    std::scoped_lock _{m_mutex};
+    if (m_hunter_order.empty()) return;
+    const int n = static_cast<int>(m_hunter_order.size());
+    if (index < 0) index = 0;
+    if (index >= n) index = n - 1;
+    m_hunter_active_index = index;
+    hunter_rebuild_active_locked();
+}
+
+// === Stage-aware overloads (new) ===
+// Pixel stage dispatches to the existing single-stage impls (which contain
+// the more sophisticated scene-candidate / live-candidate fallback logic).
+// VS and CS get simpler implementations that just step through the per-stage
+// order vector.
+void ShaderOverrideRegistry::hunter_step(HunterStage stage, int delta) {
+    if (stage == HunterStage::Pixel) { hunter_step(delta); return; }
+    std::scoped_lock _{m_mutex};
+    auto& order = (stage == HunterStage::Vertex) ? m_hunter_order_vs : m_hunter_order_cs;
+    auto& idx = (stage == HunterStage::Vertex) ? m_hunter_active_index_vs : m_hunter_active_index_cs;
+    auto& hash = (stage == HunterStage::Vertex) ? m_hunter_active_hash_vs : m_hunter_active_hash_cs;
+    if (order.empty()) return;
+    const int n = static_cast<int>(order.size());
+    int next = idx + delta;
+    if (idx < 0) next = (delta < 0) ? (n - 1) : 0;
+    while (next < 0) next += n;
+    next = next % n;
+    const std::string old_hash = hash;
+    idx = next;
+    hash = order[static_cast<size_t>(idx)];
+    // Invalidate any records whose corresponding stage hash matches old or new
+    // so SetPipelineState re-evaluates suppression for them.
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        const auto& h = (stage == HunterStage::Vertex) ? rec.vertex_hash : rec.compute_hash;
+        if (h == old_hash || h == hash) {
+            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        }
+    }
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+    spdlog::info("[ShaderHunter] hunting stage={} idx={} hash={} (total={})",
+        static_cast<int>(stage), idx, hash, n);
+}
+
+void ShaderOverrideRegistry::hunter_set_index(HunterStage stage, int index) {
+    if (stage == HunterStage::Pixel) { hunter_set_index(index); return; }
+    std::scoped_lock _{m_mutex};
+    auto& order = (stage == HunterStage::Vertex) ? m_hunter_order_vs : m_hunter_order_cs;
+    auto& idx = (stage == HunterStage::Vertex) ? m_hunter_active_index_vs : m_hunter_active_index_cs;
+    auto& hash = (stage == HunterStage::Vertex) ? m_hunter_active_hash_vs : m_hunter_active_hash_cs;
+    if (order.empty()) return;
+    const int n = static_cast<int>(order.size());
+    if (index < 0) index = 0;
+    if (index >= n) index = n - 1;
+    idx = index;
+    hash = order[static_cast<size_t>(idx)];
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+}
+
+void ShaderOverrideRegistry::hunter_toggle_mark_active(HunterStage stage) {
+    if (stage == HunterStage::Pixel) { hunter_toggle_mark_active(); return; }
+    std::scoped_lock _{m_mutex};
+    auto& hash = (stage == HunterStage::Vertex) ? m_hunter_active_hash_vs : m_hunter_active_hash_cs;
+    auto& marked = (stage == HunterStage::Vertex) ? m_hunter_marked_vs : m_hunter_marked_cs;
+    if (hash.empty()) return;
+    if (marked.count(hash) > 0) {
+        marked.erase(hash);
+        spdlog::info("[ShaderHunter] unmarked stage={} {}", static_cast<int>(stage), hash);
+    } else {
+        marked.insert(hash);
+        spdlog::info("[ShaderHunter] marked stage={} {}", static_cast<int>(stage), hash);
+    }
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        const auto& h = (stage == HunterStage::Vertex) ? rec.vertex_hash : rec.compute_hash;
+        if (h == hash) {
+            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        }
+    }
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+}
+
+void ShaderOverrideRegistry::hunter_toggle_mark_active() {
+    std::scoped_lock _{m_mutex};
+    if (m_hunter_active_hash.empty()) return;
+    if (m_hunter_marked.count(m_hunter_active_hash) > 0) {
+        m_hunter_marked.erase(m_hunter_active_hash);
+        spdlog::info("[ShaderHunter] unmarked {}", m_hunter_active_hash);
+    } else {
+        m_hunter_marked.insert(m_hunter_active_hash);
+        spdlog::info("[ShaderHunter] marked {}", m_hunter_active_hash);
+    }
+    // Only invalidate records with this PS hash (avoid global revision bump
+    // which would force every tracked PSO to re-create on next bind).
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        if (rec.pixel_hash == m_hunter_active_hash || rec.compute_hash == m_hunter_active_hash) {
+            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        }
+    }
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+}
+
+void ShaderOverrideRegistry::hunter_toggle_mark_hash(std::string_view hash) {
+    std::scoped_lock _{m_mutex};
+    std::string h{hash};
+    if (m_hunter_marked.count(h) > 0) m_hunter_marked.erase(h);
+    else m_hunter_marked.insert(h);
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        if (rec.pixel_hash == h || rec.compute_hash == h) {
+            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        }
+    }
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+}
+
+void ShaderOverrideRegistry::hunter_add_runtime_blocklist(std::string_view hash) {
+    std::scoped_lock _{m_mutex};
+    std::string h{hash};
+    if (h.empty()) return;
+    m_hunter_runtime_blocklist.insert(h);
+    spdlog::info("[ShaderHunter] runtime blocklist += {} (now {} entries)",
+        h, m_hunter_runtime_blocklist.size());
+    // Invalidate any records this hash might match so they recompute and
+    // un-suppress next bind.
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        if (rec.pixel_hash == h || rec.vertex_hash == h || rec.compute_hash == h) {
+            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        }
+    }
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+}
+
+// === Eye-Diff Tracker implementation ===
+void ShaderOverrideRegistry::eyediff_set_enabled(bool v) {
+    m_eyediff_enabled.store(v, std::memory_order_relaxed);
+    spdlog::info("[EyeDiff] enabled={}", v ? 1 : 0);
+}
+
+void ShaderOverrideRegistry::eyediff_clear() {
+    std::scoped_lock _{m_eyediff_mutex};
+    m_eyediff_by_pshash.clear();
+}
+
+std::pair<std::string, std::string> ShaderOverrideRegistry::snapshot_pso_hashes_for(uintptr_t pso_pointer) const {
+    std::scoped_lock _{m_mutex};
+    auto it = m_d3d12_graphics_pso_records.find(pso_pointer);
+    if (it == m_d3d12_graphics_pso_records.end()) return {std::string{}, std::string{}};
+    return {it->second.pixel_hash, it->second.vertex_hash};
+}
+
+// Raw per-draw log gated on UEVR_EYE_DIFF_LOG=1. Heavy — emits ~thousands of
+// lines per frame. Use only briefly when collecting diff data for grep+awk.
+static bool eyediff_log_enabled() {
+    static const bool enabled = []() {
+        char buf[8]{};
+        return GetEnvironmentVariableA("UEVR_EYE_DIFF_LOG", buf, sizeof(buf)) > 0 && buf[0] == '1';
+    }();
+    return enabled;
+}
+
+void ShaderOverrideRegistry::eyediff_record_draw(const std::string& ps_hash, const std::string& vs_hash,
+                                                  int eye_bucket, uint64_t rtv0_handle, uint64_t desc_table0_handle) {
+    if (!m_eyediff_enabled.load(std::memory_order_relaxed)) return;
+    if (ps_hash.empty()) return;
+    if (eye_bucket < 0 || eye_bucket > 4) eye_bucket = 0;
+    if (eyediff_log_enabled()) {
+        static const char* k_bucket[] = {"U", "L", "R", "F", "M"};
+        spdlog::info("[EyeDiff] eye={} ps={} vs={} rtv=0x{:x} desc0=0x{:x}",
+            k_bucket[eye_bucket], ps_hash, vs_hash, rtv0_handle, desc_table0_handle);
+    }
+    std::scoped_lock _{m_eyediff_mutex};
+    auto& rec = m_eyediff_by_pshash[ps_hash];
+    if (rec.first_seen_frame == 0) rec.first_seen_frame = m_frame;
+    rec.last_seen_frame = m_frame;
+    rec.ps_hash = ps_hash;
+    rec.vs_hash = vs_hash;
+    rec.bind_count_per_eye[eye_bucket] += 1;
+    // Update last-seen RTV / descriptor handle for this eye bucket.
+    if (rtv0_handle != 0) rec.last_rtv_handle_per_eye[eye_bucket] = rtv0_handle;
+    if (desc_table0_handle != 0) rec.last_descriptor_table0_per_eye[eye_bucket] = desc_table0_handle;
+    // Divergence flags: only meaningful when BOTH left (1) and right (2) eyes
+    // have at least one binding and the most-recent handles differ.
+    if (rec.bind_count_per_eye[1] > 0 && rec.bind_count_per_eye[2] > 0) {
+        if (rec.last_rtv_handle_per_eye[1] != 0 && rec.last_rtv_handle_per_eye[2] != 0 &&
+                rec.last_rtv_handle_per_eye[1] != rec.last_rtv_handle_per_eye[2]) {
+            rec.rtv_divergence_seen += 1;
+        }
+        if (rec.last_descriptor_table0_per_eye[1] != 0 && rec.last_descriptor_table0_per_eye[2] != 0 &&
+                rec.last_descriptor_table0_per_eye[1] != rec.last_descriptor_table0_per_eye[2]) {
+            rec.desc_divergence_seen += 1;
+        }
+    }
+}
+
+std::vector<ShaderOverrideRegistry::EyeDiffEntry> ShaderOverrideRegistry::eyediff_snapshot_top_divergent(size_t max_entries) const {
+    std::vector<EyeDiffEntry> out{};
+    std::scoped_lock _{m_eyediff_mutex};
+    out.reserve(m_eyediff_by_pshash.size());
+    for (const auto& [hash, rec] : m_eyediff_by_pshash) {
+        EyeDiffEntry e{};
+        e.ps_hash = rec.ps_hash;
+        e.vs_hash = rec.vs_hash;
+        e.bind_count_left = rec.bind_count_per_eye[1];
+        e.bind_count_right = rec.bind_count_per_eye[2];
+        e.bind_count_full = rec.bind_count_per_eye[3];
+        e.bind_count_other = rec.bind_count_per_eye[0] + rec.bind_count_per_eye[4];
+        e.last_rtv_left = rec.last_rtv_handle_per_eye[1];
+        e.last_rtv_right = rec.last_rtv_handle_per_eye[2];
+        e.last_desc_left = rec.last_descriptor_table0_per_eye[1];
+        e.last_desc_right = rec.last_descriptor_table0_per_eye[2];
+        e.rtv_divergence_seen = rec.rtv_divergence_seen;
+        e.desc_divergence_seen = rec.desc_divergence_seen;
+        e.last_seen_frame = rec.last_seen_frame;
+        out.push_back(std::move(e));
+    }
+    // Sort by divergence-score desc: prefer entries with desc-table divergence
+    // (most direct evidence of "different inputs per eye"), then RTV divergence,
+    // then asymmetric bind counts.
+    std::sort(out.begin(), out.end(), [](const EyeDiffEntry& a, const EyeDiffEntry& b) {
+        auto score = [](const EyeDiffEntry& x) {
+            const uint64_t asym = x.bind_count_left > x.bind_count_right
+                ? (x.bind_count_left - x.bind_count_right)
+                : (x.bind_count_right - x.bind_count_left);
+            return x.desc_divergence_seen * 1000 + x.rtv_divergence_seen * 100 + asym;
+        };
+        return score(a) > score(b);
+    });
+    if (out.size() > max_entries) out.resize(max_entries);
+    return out;
+}
+
+void ShaderOverrideRegistry::hunter_ensure_magenta_compiled_locked() {
+    if (m_hunter_tried_compile_magenta) return;
+    m_hunter_tried_compile_magenta = true;
+    namespace fs = std::filesystem;
+    fs::path dir = profile_override_dir();
+    std::error_code ec{};
+    fs::create_directories(dir, ec);
+    // Compile 8 variants of the magenta PS — one per SV_Target count from 1 to 8.
+    // At substitute time we'll pick the variant matching the original PSO's
+    // NumRenderTargets so D3D12 doesn't reject the swap.
+    for (int n = 1; n <= 8; ++n) {
+        char fname[128]{};
+        std::snprintf(fname, sizeof(fname), "_uevr_hunter_magenta_rt%d.hlsl", n);
+        fs::path src_path = dir / fname;
+        {
+            std::ofstream out{src_path, std::ios::binary | std::ios::trunc};
+            out << "// auto-generated UEVR Shader Hunter magenta PS, " << n << " RT(s)\n";
+            out << "struct Out {\n";
+            for (int i = 0; i < n; ++i) {
+                out << "    float4 t" << i << " : SV_Target" << i << ";\n";
+            }
+            out << "};\n";
+            out << "Out main() {\n";
+            out << "    Out o;\n";
+            for (int i = 0; i < n; ++i) {
+                out << "    o.t" << i << " = float4(1.0, 0.0, 1.0, 1.0);\n";
+            }
+            out << "    return o;\n";
+            out << "}\n";
+        }
+        ShaderCompileRequest req{};
+        req.source_path = src_path;
+        req.entry_point = "main";
+        req.profile = "ps_6_0";
+        req.preferred_backend = ShaderCompilerBackend::Dxc;
+        auto result = compile_shader_file(req);
+        if (result.succeeded) {
+            m_hunter_magenta_ps[n] = std::move(result.bytecode);
+            spdlog::info("[ShaderHunter] magenta PS rt{} compiled, {} bytes", n, m_hunter_magenta_ps[n].size());
+        } else {
+            spdlog::error("[ShaderHunter] magenta PS rt{} compile failed: {}", n, result.error);
+        }
+    }
+}
+
+void ShaderOverrideRegistry::hunter_toggle_highlight_hash(std::string_view hash) {
+    std::scoped_lock _{m_mutex};
+    std::string h{hash};
+    if (h.empty()) return;
+    if (m_hunter_highlight.count(h) > 0) {
+        m_hunter_highlight.erase(h);
+        spdlog::info("[ShaderHunter] highlight - {}", h);
+    } else {
+        m_hunter_highlight.insert(h);
+        hunter_ensure_magenta_compiled_locked();
+        spdlog::info("[ShaderHunter] highlight + {} (set size now {})", h, m_hunter_highlight.size());
+    }
+    // Force re-eval for any record whose PS hash matches so substitution kicks
+    // in (or stops) on the next bind.
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        if (rec.pixel_hash == h) {
+            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        }
+    }
+    // Make sure registry tracks D3D12 so the substitution path runs.
+    m_has_active_d3d12_overrides.store(true, std::memory_order_relaxed);
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+}
+
+std::vector<std::string> ShaderOverrideRegistry::hunter_highlight_snapshot() const {
+    std::scoped_lock _{m_mutex};
+    return {m_hunter_highlight.begin(), m_hunter_highlight.end()};
+}
+
+// Optional pre-populate of per-eye-skip sets from env vars. Called once on
+// first hunter operation. Lets the launch script pre-bake known-broken
+// shaders so the right eye is fixed from frame 1.
+static void seed_per_eye_skip_from_env(std::unordered_set<std::string>& left_set,
+                                       std::unordered_set<std::string>& right_set) {
+    static bool seeded = false;
+    if (seeded) return;
+    seeded = true;
+    auto parse = [](const char* env_name, std::unordered_set<std::string>& set) {
+        char raw[2048]{};
+        const DWORD n = GetEnvironmentVariableA(env_name, raw, sizeof(raw));
+        if (n == 0 || n >= sizeof(raw)) return;
+        std::string token{};
+        for (char c : std::string_view{raw, n}) {
+            if (c == ',' || c == ';' || std::isspace(static_cast<unsigned char>(c)) != 0) {
+                auto h = normalize_hash(token);
+                if (!h.empty()) set.insert(std::move(h));
+                token.clear();
+            } else {
+                token.push_back(c);
+            }
+        }
+        auto h = normalize_hash(token);
+        if (!h.empty()) set.insert(std::move(h));
+    };
+    parse("UEVR_SHADER_HUNTER_SKIP_LEFT_ONLY", left_set);
+    parse("UEVR_SHADER_HUNTER_SKIP_RIGHT_ONLY", right_set);
+}
+
+void ShaderOverrideRegistry::hunter_toggle_skip_left_only(std::string_view hash) {
+    std::scoped_lock _{m_mutex};
+    std::string h{hash};
+    if (h.empty()) return;
+    if (m_hunter_skip_left_only.count(h) > 0) {
+        m_hunter_skip_left_only.erase(h);
+        spdlog::info("[ShaderHunter] skip_left_only - {}", h);
+    } else {
+        m_hunter_skip_left_only.insert(h);
+        spdlog::info("[ShaderHunter] skip_left_only + {}", h);
+    }
+    // Invalidate matching records so SetPipelineState re-evaluates.
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        if (rec.pixel_hash == h) rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+    }
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+}
+
+void ShaderOverrideRegistry::hunter_toggle_skip_right_only(std::string_view hash) {
+    std::scoped_lock _{m_mutex};
+    std::string h{hash};
+    if (h.empty()) return;
+    if (m_hunter_skip_right_only.count(h) > 0) {
+        m_hunter_skip_right_only.erase(h);
+        spdlog::info("[ShaderHunter] skip_right_only - {}", h);
+    } else {
+        m_hunter_skip_right_only.insert(h);
+        spdlog::info("[ShaderHunter] skip_right_only + {}", h);
+    }
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        if (rec.pixel_hash == h) rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+    }
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+}
+
+bool ShaderOverrideRegistry::hunter_is_skip_left_only(std::string_view hash) const {
+    std::scoped_lock _{m_mutex};
+    return m_hunter_skip_left_only.count(std::string{hash}) > 0;
+}
+
+bool ShaderOverrideRegistry::hunter_is_skip_right_only(std::string_view hash) const {
+    std::scoped_lock _{m_mutex};
+    return m_hunter_skip_right_only.count(std::string{hash}) > 0;
+}
+
+void ShaderOverrideRegistry::hunter_set_cycle_highlight_mode(bool v) {
+    std::scoped_lock _{m_mutex};
+    m_hunter_cycle_highlight_mode.store(v, std::memory_order_relaxed);
+    if (v) hunter_ensure_magenta_compiled_locked();
+    // Force re-eval of all hunter-active records.
+    const auto h_ps = m_hunter_active_hash;
+    const auto h_vs = m_hunter_active_hash_vs;
+    const auto h_cs = m_hunter_active_hash_cs;
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        if (rec.pixel_hash == h_ps || rec.vertex_hash == h_vs || rec.compute_hash == h_cs) {
+            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        }
+    }
+    m_has_active_d3d12_overrides.store(true, std::memory_order_relaxed);
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+    spdlog::info("[ShaderHunter] cycle_highlight_mode={}", v ? 1 : 0);
+}
+
+size_t ShaderOverrideRegistry::hunter_trim_collected(bool scene_only, bool live_only) {
+    std::scoped_lock _{m_mutex};
+    const size_t before = m_hunter_order.size();
+    std::vector<std::string> new_order{};
+    new_order.reserve(before);
+    for (const auto& hash : m_hunter_order) {
+        auto it = m_hunter_collected.find(hash);
+        if (it == m_hunter_collected.end()) continue;
+        const auto& info = it->second;
+        if (live_only) {
+            const auto age = m_frame >= info.last_seen_frame
+                ? (m_frame - info.last_seen_frame) : 0;
+            if (age > static_cast<uint64_t>(m_hunter_recent_frame_age)) {
+                m_hunter_collected.erase(it);
+                continue;
+            }
+        }
+        if (scene_only && !hunter_entry_is_scene_candidate_locked(info)) {
+            m_hunter_collected.erase(it);
+            continue;
+        }
+        new_order.push_back(hash);
+    }
+    m_hunter_order = std::move(new_order);
+    // Snap active idx back into range.
+    if (m_hunter_active_index >= static_cast<int>(m_hunter_order.size())) {
+        m_hunter_active_index = static_cast<int>(m_hunter_order.size()) - 1;
+    }
+    if (m_hunter_active_index < 0 && !m_hunter_order.empty()) m_hunter_active_index = 0;
+    if (!m_hunter_order.empty()) {
+        m_hunter_active_hash = m_hunter_order[static_cast<size_t>(m_hunter_active_index)];
+    } else {
+        m_hunter_active_hash.clear();
+        m_hunter_active_index = -1;
+    }
+    // Also auto-pause collection so the trimmed list stays stable.
+    m_hunter_window_stopped = true;
+    const size_t after = m_hunter_order.size();
+    spdlog::info("[ShaderHunter] trim_collected: {} -> {} (scene_only={} live_only={})",
+        before, after, scene_only ? 1 : 0, live_only ? 1 : 0);
+    return after;
+}
+
+size_t ShaderOverrideRegistry::hunter_trim_to_top_hits(size_t keep_count) {
+    std::scoped_lock _{m_mutex};
+    if (keep_count == 0) return 0;
+    const size_t before = m_hunter_order.size();
+    if (before <= keep_count) return before;
+    std::vector<std::pair<uint64_t, std::string>> by_hits{};
+    by_hits.reserve(before);
+    for (const auto& hash : m_hunter_order) {
+        auto it = m_hunter_collected.find(hash);
+        if (it == m_hunter_collected.end()) continue;
+        by_hits.emplace_back(it->second.hits, hash);
+    }
+    std::sort(by_hits.begin(), by_hits.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::unordered_set<std::string> keep_set{};
+    keep_set.reserve(keep_count);
+    for (size_t i = 0; i < keep_count && i < by_hits.size(); ++i) {
+        keep_set.insert(by_hits[i].second);
+    }
+    std::vector<std::string> new_order{};
+    new_order.reserve(keep_count);
+    for (const auto& hash : m_hunter_order) {
+        if (keep_set.count(hash) > 0) new_order.push_back(hash);
+    }
+    // Erase dropped entries from m_hunter_collected.
+    for (auto it = m_hunter_collected.begin(); it != m_hunter_collected.end(); ) {
+        if (keep_set.count(it->first) == 0) it = m_hunter_collected.erase(it);
+        else ++it;
+    }
+    m_hunter_order = std::move(new_order);
+    if (m_hunter_active_index >= static_cast<int>(m_hunter_order.size())) {
+        m_hunter_active_index = static_cast<int>(m_hunter_order.size()) - 1;
+    }
+    if (m_hunter_active_index < 0 && !m_hunter_order.empty()) m_hunter_active_index = 0;
+    if (!m_hunter_order.empty()) {
+        m_hunter_active_hash = m_hunter_order[static_cast<size_t>(m_hunter_active_index)];
+    } else {
+        m_hunter_active_hash.clear();
+        m_hunter_active_index = -1;
+    }
+    m_hunter_window_stopped = true;
+    spdlog::info("[ShaderHunter] trim_to_top_hits: {} -> {}", before, m_hunter_order.size());
+    return m_hunter_order.size();
+}
+
+void ShaderOverrideRegistry::hunter_clear_all_marks() {
+    std::scoped_lock _{m_mutex};
+    const auto pixel_marks = m_hunter_marked;
+    const auto vertex_marks = m_hunter_marked_vs;
+    const auto compute_marks = m_hunter_marked_cs;
+    m_hunter_marked.clear();
+    m_hunter_marked_vs.clear();
+    m_hunter_marked_cs.clear();
+    // Invalidate any tracked record whose hash was previously marked so
+    // suppression state recomputes on next bind.
+    auto touched = [&](const std::string& h) {
+        return pixel_marks.count(h) > 0 || vertex_marks.count(h) > 0 || compute_marks.count(h) > 0;
+    };
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        if (touched(rec.pixel_hash) || touched(rec.vertex_hash) || touched(rec.compute_hash)) {
+            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        }
+    }
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+    spdlog::info("[ShaderHunter] cleared all marks: ps={} vs={} cs={}",
+        pixel_marks.size(), vertex_marks.size(), compute_marks.size());
+}
+
+size_t ShaderOverrideRegistry::hunter_delete_saved_manifests(std::string& error_out) {
+    std::scoped_lock _{m_mutex};
+    namespace fs = std::filesystem;
+    fs::path dir = profile_override_dir();
+    std::error_code ec{};
+    if (!fs::exists(dir, ec)) {
+        error_out = "Profile shader_overrides dir does not exist: " + dir.string();
+        return 0;
+    }
+    size_t deleted = 0;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file()) continue;
+        const auto& path = entry.path();
+        const auto name = path.filename().string();
+        // Match the hunter_save_marked_as_manifests() naming pattern.
+        if (name.rfind("hunter_ps_", 0) != 0) continue;
+        if (path.extension() != ".json") continue;
+        std::error_code rm_ec{};
+        fs::remove(path, rm_ec);
+        if (!rm_ec) {
+            ++deleted;
+            spdlog::info("[ShaderHunter] deleted manifest {}", path.string());
+        }
+    }
+    // Drop in-memory entries whose key starts with the dx12:ps: prefix and
+    // whose manifest path matches a hunter_ps_*.json under this dir.
+    std::vector<std::string> dead_keys;
+    for (const auto& [key, entry] : m_overrides) {
+        const auto& mp = entry.manifest_path;
+        if (!mp.empty() && mp.filename().string().rfind("hunter_ps_", 0) == 0) {
+            dead_keys.push_back(key);
+        }
+    }
+    for (const auto& k : dead_keys) {
+        m_overrides.erase(k);
+    }
+    ++m_override_revision;
+    refresh_active_override_flags_locked();
+    push_event("Shader Hunter: deleted " + std::to_string(deleted) + " saved hunter_ps_*.json manifests");
+    spdlog::info("[ShaderHunter] deleted {} hunter_ps_*.json manifests + {} in-memory entries",
+        deleted, dead_keys.size());
+    return deleted;
+}
+
+void ShaderOverrideRegistry::hunter_clear_runtime_blocklist() {
+    std::scoped_lock _{m_mutex};
+    m_hunter_runtime_blocklist.clear();
+    spdlog::info("[ShaderHunter] runtime blocklist cleared");
+}
+
+std::vector<std::string> ShaderOverrideRegistry::hunter_runtime_blocklist_snapshot() const {
+    std::scoped_lock _{m_mutex};
+    return {m_hunter_runtime_blocklist.begin(), m_hunter_runtime_blocklist.end()};
+}
+
+void ShaderOverrideRegistry::hunter_set_hide_marked(bool v) {
+    std::scoped_lock _{m_mutex};
+    m_hunter_hide_marked.store(v, std::memory_order_relaxed);
+    // Invalidate all marked-hash records so they pick up new hide state.
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        if (m_hunter_marked.count(rec.pixel_hash) > 0 || m_hunter_marked.count(rec.compute_hash) > 0) {
+            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        }
+    }
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+}
+
+void ShaderOverrideRegistry::hunter_set_suppression_enabled(bool v) {
+    std::scoped_lock _{m_mutex};
+    m_hunter_suppression_enabled.store(v, std::memory_order_relaxed);
+    const auto active_hash = m_hunter_active_hash;
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        if (!active_hash.empty() && (rec.pixel_hash == active_hash || rec.compute_hash == active_hash)) {
+            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        }
+    }
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+    spdlog::info("[ShaderHunter] suppression_enabled={}", v ? 1 : 0);
+}
+
+ShaderOverrideRegistry::HunterStateView ShaderOverrideRegistry::hunter_state() const {
+    std::scoped_lock _{m_mutex};
+    HunterStateView v{};
+    v.active = m_hunter_active.load(std::memory_order_relaxed);
+    v.hide_marked = m_hunter_hide_marked.load(std::memory_order_relaxed);
+    v.suppression_enabled = m_hunter_suppression_enabled.load(std::memory_order_relaxed);
+    v.active_index = m_hunter_active_index;
+    v.active_hash = m_hunter_active_hash;
+    // Mirror per-stage state into the per-stage arrays in the view.
+    v.active_index_per_stage[0] = m_hunter_active_index;
+    v.active_hash_per_stage[0] = m_hunter_active_hash;
+    v.active_index_per_stage[1] = m_hunter_active_index_vs;
+    v.active_hash_per_stage[1] = m_hunter_active_hash_vs;
+    v.active_index_per_stage[2] = m_hunter_active_index_cs;
+    v.active_hash_per_stage[2] = m_hunter_active_hash_cs;
+    v.collected_count_per_stage[0] = m_hunter_order.size();
+    v.collected_count_per_stage[1] = m_hunter_order_vs.size();
+    v.collected_count_per_stage[2] = m_hunter_order_cs.size();
+    v.marked_count_per_stage[0] = m_hunter_marked.size();
+    v.marked_count_per_stage[1] = m_hunter_marked_vs.size();
+    v.marked_count_per_stage[2] = m_hunter_marked_cs.size();
+    // Flag whether the currently-hunted hash for each stage is also marked.
+    v.active_is_marked_per_stage[0] = !m_hunter_active_hash.empty() &&
+        m_hunter_marked.count(m_hunter_active_hash) > 0;
+    v.active_is_marked_per_stage[1] = !m_hunter_active_hash_vs.empty() &&
+        m_hunter_marked_vs.count(m_hunter_active_hash_vs) > 0;
+    v.active_is_marked_per_stage[2] = !m_hunter_active_hash_cs.empty() &&
+        m_hunter_marked_cs.count(m_hunter_active_hash_cs) > 0;
+    v.collected_count = m_hunter_order.size();
+    v.marked_count = m_hunter_marked.size();
+    v.frame_window = m_hunter_frame_window;
+    v.recent_frame_age = m_hunter_recent_frame_age;
+    v.min_scene_ps_size = HUNTER_MIN_SCENE_PS_SIZE;
+    v.window_stopped = m_hunter_window_stopped;
+    if (m_hunter_frame_window > 0 && !m_hunter_window_stopped) {
+        const uint64_t end_frame = m_hunter_window_start_frame +
+            static_cast<uint64_t>(m_hunter_frame_window);
+        v.window_frames_left = (end_frame > m_frame) ? (end_frame - m_frame) : 0;
+    } else {
+        v.window_frames_left = 0;
+    }
+    v.collected_hashes.reserve(v.collected_count);
+    v.collected_vs_hashes.reserve(v.collected_count);
+    v.collected_crc32s.reserve(v.collected_count);
+    v.collected_sizes.reserve(v.collected_count);
+    v.collected_hits.reserve(v.collected_count);
+    v.collected_age_frames.reserve(v.collected_count);
+    v.collected_marked.reserve(v.collected_count);
+    for (const auto& hash : m_hunter_order) {
+        const auto it = m_hunter_collected.find(hash);
+        if (it == m_hunter_collected.end()) {
+            continue;
+        }
+
+        const auto& info = it->second;
+        const auto age = m_frame >= info.last_seen_frame ? (m_frame - info.last_seen_frame) : 0;
+        if (age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
+            ++v.live_count;
+            if (hunter_entry_is_scene_candidate_locked(info)) {
+                ++v.scene_live_count;
+            }
+        }
+
+        v.collected_hashes.push_back(hash);
+        v.collected_vs_hashes.push_back(info.vs_hash);
+        v.collected_crc32s.push_back(info.crc32);
+        v.collected_sizes.push_back(info.ps_size);
+        v.collected_hits.push_back(info.hits);
+        v.collected_age_frames.push_back(age);
+        v.collected_marked.push_back(m_hunter_marked.count(hash) > 0);
+        v.collected_stages.push_back(HunterStage::Pixel);
+        if (hash == m_hunter_active_hash) {
+            v.active_crc32 = info.crc32;
+            v.active_age_frames = age;
+            v.active_crc32_per_stage[0] = info.crc32;
+            v.active_age_frames_per_stage[0] = age;
+        }
+    }
+    v.live_count_per_stage[0] = v.live_count;
+    // === VS-stage loop ===
+    for (const auto& vs_hash : m_hunter_order_vs) {
+        const auto it = m_hunter_collected_vs.find(vs_hash);
+        if (it == m_hunter_collected_vs.end()) continue;
+        const auto& info = it->second;
+        const auto age = m_frame >= info.last_seen_frame ? (m_frame - info.last_seen_frame) : 0;
+        if (age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
+            ++v.live_count_per_stage[1];
+        }
+        v.collected_hashes.push_back(vs_hash);
+        v.collected_vs_hashes.push_back(info.vs_hash);  // companion PS for context
+        v.collected_crc32s.push_back(info.crc32);
+        v.collected_sizes.push_back(info.ps_size);
+        v.collected_hits.push_back(info.hits);
+        v.collected_age_frames.push_back(age);
+        v.collected_marked.push_back(m_hunter_marked_vs.count(vs_hash) > 0);
+        v.collected_stages.push_back(HunterStage::Vertex);
+        if (vs_hash == m_hunter_active_hash_vs) {
+            v.active_crc32_per_stage[1] = info.crc32;
+            v.active_age_frames_per_stage[1] = age;
+        }
+    }
+    // === CS-stage loop ===
+    for (const auto& cs_hash : m_hunter_order_cs) {
+        const auto it = m_hunter_collected_cs.find(cs_hash);
+        if (it == m_hunter_collected_cs.end()) continue;
+        const auto& info = it->second;
+        const auto age = m_frame >= info.last_seen_frame ? (m_frame - info.last_seen_frame) : 0;
+        if (age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
+            ++v.live_count_per_stage[2];
+        }
+        v.collected_hashes.push_back(cs_hash);
+        v.collected_vs_hashes.push_back("");
+        v.collected_crc32s.push_back(info.crc32);
+        v.collected_sizes.push_back(info.ps_size);
+        v.collected_hits.push_back(info.hits);
+        v.collected_age_frames.push_back(age);
+        v.collected_marked.push_back(m_hunter_marked_cs.count(cs_hash) > 0);
+        v.collected_stages.push_back(HunterStage::Compute);
+        if (cs_hash == m_hunter_active_hash_cs) {
+            v.active_crc32_per_stage[2] = info.crc32;
+            v.active_age_frames_per_stage[2] = age;
+        }
+    }
+    v.collected_count = v.collected_hashes.size();
+    return v;
+}
+
+void ShaderOverrideRegistry::hunter_record_set_pipeline_state(void* command_list, void* original_pso) {
+    // Legacy variant — delegates with unknown eye bucket. Caller that wants
+    // per-eye selective skip should call hunter_record_set_pipeline_state_with_eye.
+    hunter_record_set_pipeline_state_with_eye(command_list, original_pso, 0);
+}
+
+namespace {
+bool sn2_diag_clean_disables_shader_skips() {
+    static const bool enabled = []() {
+        auto env_enabled = [](const char* name) {
+            char value[32]{};
+            const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+            if (len == 0 || len >= sizeof(value)) return false;
+            std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
+            return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+        };
+        return env_enabled("UEVR_SN2_DIAG_CLEAN") || env_enabled("UEVR_SN2_DIAG_STRICT");
+    }();
+    return enabled;
+}
+}
+
+void ShaderOverrideRegistry::hunter_record_set_pipeline_state_with_eye(void* command_list, void* original_pso, int eye_bucket) {
+    g_hunter_setpso_calls.fetch_add(1, std::memory_order_relaxed);
+    // Fast path: hunter not active, no marked-suppress, no per-eye-skip targets — nothing to do.
+    const bool clean_diag = sn2_diag_clean_disables_shader_skips();
+    if (!clean_diag) {
+        seed_per_eye_skip_from_env(m_hunter_skip_left_only, m_hunter_skip_right_only);
+    }
+    const bool has_per_eye = !clean_diag && (!m_hunter_skip_left_only.empty() || !m_hunter_skip_right_only.empty());
+    if (!m_hunter_active.load(std::memory_order_relaxed) &&
+            !m_hunter_hide_marked.load(std::memory_order_relaxed) &&
+            !has_per_eye) {
+        // Clear any stale skip flag for this CL so we don't skip after a
+        // previous bound suppression.
+        std::scoped_lock _{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.erase(command_list);
+        return;
+    }
+
+    // ShaderToggler's model: pipeline init records handle -> shader hashes;
+    // bind_pipeline updates the command-list active handle and, during the
+    // collection window, records that active handle. Keep all hunter collection
+    // on this bind path instead of forcing the normal override/PSO update path.
+    bool skip = false;
+    bool is_compute = false;
+    bool is_graphics = false;
+    {
+        std::scoped_lock _{m_mutex};
+        auto it = m_d3d12_graphics_pso_records.find(reinterpret_cast<uintptr_t>(original_pso));
+        if (it != m_d3d12_graphics_pso_records.end()) {
+            const auto& record = it->second;
+            is_compute = !record.compute_hash.empty() && record.pixel_hash.empty() && record.mesh_hash.empty();
+            is_graphics = !record.pixel_hash.empty() || !record.mesh_hash.empty();
+            hunter_record_bind_locked(record);
+            skip = clean_diag ? false : hunter_should_suppress_locked(record);
+            // Per-eye selective skip: eye_bucket 1 = Left, 2 = Right.
+            // Matches against both FNV1a-64 (16-char) and CRC32 (8-char) entries.
+            if (!clean_diag && !skip && (!record.pixel_hash.empty() || record.pixel_crc32 != 0)) {
+                char crc_str[16]{};
+                std::snprintf(crc_str, sizeof(crc_str), "%08x", record.pixel_crc32);
+                const std::string crc_key = crc_str;
+                if (eye_bucket == 1 && (m_hunter_skip_left_only.count(record.pixel_hash) > 0 ||
+                                         m_hunter_skip_left_only.count(crc_key) > 0)) skip = true;
+                if (eye_bucket == 2 && (m_hunter_skip_right_only.count(record.pixel_hash) > 0 ||
+                                         m_hunter_skip_right_only.count(crc_key) > 0)) skip = true;
+            }
+        }
+    }
+    if (skip) g_hunter_setpso_skip_true.fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock _{m_hunter_skip_mutex};
+    if (!is_compute && !is_graphics) {
+        m_hunter_skip_by_cmdlist.erase(command_list);
+        return;
+    }
+
+    auto& state = m_hunter_skip_by_cmdlist[command_list];
+    if (is_compute) {
+        state.compute = skip;
+    }
+    if (is_graphics) {
+        state.graphics = skip;
+    }
+}
+
+uint32_t ShaderOverrideRegistry::d3d12_pso_pixel_crc32(uintptr_t pso_pointer) const {
+    std::scoped_lock _{m_mutex};
+    auto it = m_d3d12_graphics_pso_records.find(pso_pointer);
+    if (it == m_d3d12_graphics_pso_records.end()) return 0;
+    return it->second.pixel_crc32;
+}
+
+uint32_t ShaderOverrideRegistry::d3d12_pso_compute_crc32(uintptr_t pso_pointer) const {
+    std::scoped_lock _{m_mutex};
+    auto it = m_d3d12_graphics_pso_records.find(pso_pointer);
+    if (it == m_d3d12_graphics_pso_records.end()) return 0;
+    return it->second.compute_crc32;
+}
+
+bool ShaderOverrideRegistry::hunter_should_skip_draw_per_eye(uintptr_t pso_pointer, int eye_bucket) const {
+    if (sn2_diag_clean_disables_shader_skips()) {
+        return false;
+    }
+    // === Extreme-test env vars: kill EVERY draw on one eye. ===
+    // UEVR_SHADER_HUNTER_KILL_RIGHT_EYE=1 → skip all right-eye draws. If the
+    // right eye then goes black, the per-eye skip mechanism is firing
+    // correctly and the bug is just shader-selection. If right eye still
+    // renders normally, the mechanism itself is broken.
+    static const int kill_eye = []() {
+        char buf[4]{};
+        if (GetEnvironmentVariableA("UEVR_SHADER_HUNTER_KILL_RIGHT_EYE", buf, sizeof(buf)) > 0
+                && buf[0] == '1') return 2;
+        if (GetEnvironmentVariableA("UEVR_SHADER_HUNTER_KILL_LEFT_EYE", buf, sizeof(buf)) > 0
+                && buf[0] == '1') return 1;
+        return 0;
+    }();
+    if (kill_eye != 0 && eye_bucket == kill_eye) {
+        // Log once per process so we know it's firing.
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            spdlog::info("[ShaderHunter] KILL_{}_EYE active — skipping all draws on eye_bucket={}",
+                kill_eye == 1 ? "LEFT" : "RIGHT", eye_bucket);
+        }
+        return true;
+    }
+    // Ensure env-var seeds are loaded (idempotent).
+    seed_per_eye_skip_from_env(const_cast<std::unordered_set<std::string>&>(m_hunter_skip_left_only),
+                               const_cast<std::unordered_set<std::string>&>(m_hunter_skip_right_only));
+    // Cheap fast-path when nothing is configured per-eye.
+    if (m_hunter_skip_left_only.empty() && m_hunter_skip_right_only.empty()) return false;
+    if (eye_bucket != 1 && eye_bucket != 2) return false;
+    std::scoped_lock _{m_mutex};
+    auto it = m_d3d12_graphics_pso_records.find(pso_pointer);
+    if (it == m_d3d12_graphics_pso_records.end()) return false;
+    const auto& rec = it->second;
+    // Match PS hash for graphics PSOs OR compute hash for compute PSOs.
+    const auto& which_hash = !rec.pixel_hash.empty() ? rec.pixel_hash : rec.compute_hash;
+    const uint32_t which_crc = !rec.pixel_hash.empty() ? rec.pixel_crc32 : rec.compute_crc32;
+    if (which_hash.empty() && which_crc == 0) return false;
+    char crc_str[16]{};
+    std::snprintf(crc_str, sizeof(crc_str), "%08x", which_crc);
+    const std::string crc_key = crc_str;
+    const auto& set = (eye_bucket == 1) ? m_hunter_skip_left_only : m_hunter_skip_right_only;
+    return set.count(which_hash) > 0 || set.count(crc_key) > 0;
+}
+
+bool ShaderOverrideRegistry::hunter_should_skip_draw(void* command_list) const {
+    const bool skip = hunter_should_skip_graphics(command_list);
+    if (skip) {
+        g_hunter_draw_skipped.fetch_add(1, std::memory_order_relaxed);
+    }
+    return skip;
+}
+
+bool ShaderOverrideRegistry::hunter_should_skip_graphics(void* command_list) const {
+    std::scoped_lock _{m_hunter_skip_mutex};
+    auto it = m_hunter_skip_by_cmdlist.find(command_list);
+    return it != m_hunter_skip_by_cmdlist.end() && it->second.graphics;
+}
+
+bool ShaderOverrideRegistry::hunter_should_skip_compute(void* command_list) const {
+    std::scoped_lock _{m_hunter_skip_mutex};
+    auto it = m_hunter_skip_by_cmdlist.find(command_list);
+    return it != m_hunter_skip_by_cmdlist.end() && it->second.compute;
+}
+
+void ShaderOverrideRegistry::hunter_clear_command_list(void* command_list) {
+    std::scoped_lock _{m_hunter_skip_mutex};
+    m_hunter_skip_by_cmdlist.erase(command_list);
+}
+
+void ShaderOverrideRegistry::hunter_inc_draw_hit() {
+    g_hunter_draw_hits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderOverrideRegistry::hunter_inc_draw_skipped() {
+    g_hunter_draw_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderOverrideRegistry::hunter_inc_draw_indexed_hit() {
+    g_hunter_draw_indexed_hits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderOverrideRegistry::hunter_inc_draw_indexed_skipped() {
+    g_hunter_draw_indexed_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderOverrideRegistry::hunter_inc_dispatch_hit() {
+    g_hunter_dispatch_hits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderOverrideRegistry::hunter_inc_dispatch_skipped() {
+    g_hunter_dispatch_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderOverrideRegistry::hunter_inc_execute_indirect_hit() {
+    g_hunter_execute_indirect_hits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderOverrideRegistry::hunter_inc_execute_indirect_skipped() {
+    g_hunter_execute_indirect_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderOverrideRegistry::hunter_inc_execute_bundle_hit() {
+    g_hunter_execute_bundle_hits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderOverrideRegistry::hunter_inc_execute_bundle_skipped() {
+    g_hunter_execute_bundle_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderOverrideRegistry::hunter_inc_dispatch_mesh_hit() {
+    g_hunter_dispatch_mesh_hits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderOverrideRegistry::hunter_inc_dispatch_mesh_skipped() {
+    g_hunter_dispatch_mesh_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool ShaderOverrideRegistry::hunter_save_marked_as_manifests(std::string& error_out) {
+    std::scoped_lock _{m_mutex};
+    if (m_hunter_marked.empty()) {
+        error_out = "no marked shaders to save";
+        return false;
+    }
+    namespace fs = std::filesystem;
+    fs::path dir = profile_override_dir();
+    std::error_code ec{};
+    fs::create_directories(dir, ec);
+    fs::path src_path = dir / "_uevr_hunter_discard.hlsl";
+    if (!fs::exists(src_path, ec)) {
+        std::ofstream out{src_path, std::ios::binary | std::ios::trunc};
+        out << "float4 main() : SV_Target { discard; return float4(0,0,0,0); }\n";
+    }
+    int written = 0;
+    for (const auto& hash : m_hunter_marked) {
+        // Locate the CRC32 for this hash from the collected map
+        uint32_t crc = 0;
+        if (auto it = m_hunter_collected.find(hash); it != m_hunter_collected.end()) crc = it->second.crc32;
+        char fname[128]{};
+        std::snprintf(fname, sizeof(fname), "hunter_ps_%s.json", hash.c_str());
+        fs::path mpath = dir / fname;
+        std::ofstream mfile{mpath, std::ios::binary | std::ios::trunc};
+        // Write a manifest that uses the FNV1a-64 hash. (CRC32 also works
+        // via the same map since 8-hex-char target_hash is treated as CRC32,
+        // but using the FNV hash makes the file deterministic from this
+        // session's captures.)
+        mfile << "{\n";
+        mfile << "  \"backend\": \"dx12\",\n";
+        mfile << "  \"stage\": \"pixel\",\n";
+        mfile << "  \"target_hash\": \"" << hash << "\",\n";
+        mfile << "  \"name\": \"hunter_ps_" << hash << "\",\n";
+        mfile << "  \"enabled\": true,\n";
+        mfile << "  \"entry_point\": \"main\",\n";
+        mfile << "  \"profile\": \"ps_6_0\",\n";
+        mfile << "  \"compiler\": \"dxc\",\n";
+        mfile << "  \"source\": \"_uevr_hunter_discard.hlsl\",\n";
+        mfile << "  \"_uevr_hunter_crc32\": \"" << std::hex << crc << std::dec << "\"\n";
+        mfile << "}\n";
+        ++written;
+    }
+    spdlog::info("[ShaderHunter] saved {} marked shader manifests to {}", written, dir.string());
+    request_reload();
+    return true;
 }
 } // namespace render
