@@ -1,0 +1,193 @@
+From 5e6e0d6e7a539a0dd483d229a16f55983daafa96 Mon Sep 17 00:00:00 2001
+From: elliotttate <elliotttate@gmail.com>
+Date: Wed, 20 May 2026 10:07:06 -0400
+Subject: [PATCH] Add UE5 stereo view diagnostics
+
+---
+ src/sdk/FSceneView.cpp  | 14 ++++++++++++-
+ src/sdk/FSceneView.hpp  | 17 ++++++++++++++++
+ src/sdk/StereoStuff.cpp | 45 +++++++++++++++++++++++++++++------------
+ 3 files changed, 62 insertions(+), 14 deletions(-)
+
+diff --git a/src/sdk/FSceneView.cpp b/src/sdk/FSceneView.cpp
+index cf70bf9..2e36340 100644
+--- a/src/sdk/FSceneView.cpp
++++ b/src/sdk/FSceneView.cpp
+@@ -19,12 +19,18 @@ namespace {
+ bool is_ue56_or_newer() {
+     static const auto result = []() {
+         auto version = sdk::search_for_version(utility::get_executable()).value_or(L"");
++        const auto file_version = sdk::get_file_version_info();
+ 
+         for (auto& ch : version) {
+             ch = static_cast<wchar_t>(std::towlower(ch));
+         }
+ 
+-        return version.starts_with(L"5.6") || version.starts_with(L"5.7");
++        return version.starts_with(L"5.6") ||
++            version.starts_with(L"5.7") ||
++            version.starts_with(L"5.8") ||
++            version.starts_with(L"5.9") ||
++            file_version.dwFileVersionMS == 0x00050006 ||
++            file_version.dwFileVersionMS == 0x00050007;
+     }();
+ 
+     return result;
+@@ -118,8 +124,14 @@ void FSceneViewInitOptionsBase::update_offsets(FSceneViewInitOptionsBase* option
+     static_assert(UE56_STEREO_PASS_DELTA == 0x68, "FSceneViewInitOptions UE5.6+ stereo_pass delta is not 0x68");
+ 
+     s_stereo_pass_offset = *s_view_family_offset + (is_ue56_or_newer() ? UE56_STEREO_PASS_DELTA : UE4_UE55_STEREO_PASS_DELTA);
++    s_exposure_scene_state_offset = is_ue56_or_newer()
++        ? std::optional<uint32_t>{*s_scene_state_offset + (uint32_t)sizeof(void*)}
++        : std::nullopt;
+ 
+     SPDLOG_INFO("[FSceneViewInitOptions] Found stereo pass offset at {:x}", *s_stereo_pass_offset);
++    if (s_exposure_scene_state_offset) {
++        SPDLOG_INFO("[FSceneViewInitOptions] Found exposure scene state offset at {:x}", *s_exposure_scene_state_offset);
++    }
+ }
+ 
+ void FSceneView::constructor(const FSceneViewInitOptions* options) {
+diff --git a/src/sdk/FSceneView.hpp b/src/sdk/FSceneView.hpp
+index 4973d3f..9492de9 100644
+--- a/src/sdk/FSceneView.hpp
++++ b/src/sdk/FSceneView.hpp
+@@ -46,6 +46,22 @@ public:
+         *(sdk::FSceneViewStateInterface**)((uintptr_t)this + *s_scene_state_offset) = state;
+     }
+ 
++    sdk::FSceneViewStateInterface* get_exposure_scene_state() const {
++        if (!s_exposure_scene_state_offset.has_value()) {
++            return nullptr;
++        }
++
++        return *(sdk::FSceneViewStateInterface**)((uintptr_t)this + *s_exposure_scene_state_offset);
++    }
++
++    void set_exposure_scene_state(sdk::FSceneViewStateInterface* state) {
++        if (!s_exposure_scene_state_offset.has_value()) {
++            return;
++        }
++
++        *(sdk::FSceneViewStateInterface**)((uintptr_t)this + *s_exposure_scene_state_offset) = state;
++    }
++
+     uint32_t get_stereo_pass() const {
+         if (!s_stereo_pass_offset.has_value()) {
+             return 0;
+@@ -65,6 +81,7 @@ public:
+ protected:
+     static inline std::optional<uint32_t> s_view_family_offset{};
+     static inline std::optional<uint32_t> s_scene_state_offset{};
++    static inline std::optional<uint32_t> s_exposure_scene_state_offset{};
+     static inline std::optional<uint32_t> s_stereo_pass_offset{};
+     static inline bool s_attempted_update{false};
+ };
+diff --git a/src/sdk/StereoStuff.cpp b/src/sdk/StereoStuff.cpp
+index 646fbed..bf005ff 100644
+--- a/src/sdk/StereoStuff.cpp
++++ b/src/sdk/StereoStuff.cpp
+@@ -15,7 +15,11 @@
+ // is GetNativeResource.
+ void* FRHITexture::get_native_resource() const {
+     static std::optional<uintptr_t> offset_to_resource{}; // this is some shit that happens on D3D12 on old UE versions
+-    static auto vtable_index = [](const FRHITexture* tex) -> size_t {
++    static std::optional<size_t> vtable_index{};
++
++    if (!vtable_index.has_value()) {
++        const auto tex = this;
++        vtable_index = [&]() -> std::optional<size_t> {
+         ZoneScopedN("FRHITexture::get_native_resource static init");
+         SPDLOG_INFO("Attempting to get vtable index for FRHITexture::GetNativeResource");
+ 
+@@ -23,7 +27,7 @@ void* FRHITexture::get_native_resource() const {
+ 
+         if (vtable == 0) {
+             SPDLOG_ERROR("FRHITexture vtable is null");
+-            return 0;
++            return std::nullopt;
+         }
+ 
+         const auto vtable_module = utility::get_module_within(vtable);
+@@ -39,6 +43,7 @@ void* FRHITexture::get_native_resource() const {
+             module_path_lower.ends_with("d3d12.dll") || 
+             module_path_lower.ends_with("d3d12core.dll") ||
+             module_path_lower.ends_with("dxgi.dll") ||
++            module_path_lower.ends_with("renderdoc.dll") ||
+             module_path_lower.ends_with("d3d12sdklayers.dll") ||
+             module_path_lower.ends_with("d3d11_1sdklayers.dll") ||
+             module_path_lower.ends_with("d3d11_2sdklayers.dll") ||
+@@ -205,7 +210,7 @@ void* FRHITexture::get_native_resource() const {
+ 
+             if (!desc_offset.has_value()) {
+                 SPDLOG_WARN("Refusing unsafe UE 5.5/5.6 D3D12 FRHITexture::GetNativeResource scan for non-texture candidate {:x}", (uintptr_t)tex);
+-                throw std::runtime_error("Refusing unsafe FRHITexture::GetNativeResource scan for non-texture candidate");
++                return std::nullopt;
+             }
+ 
+             // UE 5.5/5.6 source puts GetNativeResource after GetDefaultBindlessHandle.
+@@ -235,7 +240,7 @@ void* FRHITexture::get_native_resource() const {
+ 
+             SPDLOG_WARN("UE 5.5/5.6 D3D12 direct FRHITexture::GetNativeResource slots {} and {} did not return a valid D3D resource for {:x}",
+                 ue55_ue56_get_native_resource_indices[0], ue55_ue56_get_native_resource_indices[1], (uintptr_t)tex);
+-            throw std::runtime_error("UE 5.5/5.6 D3D12 FRHITexture::GetNativeResource direct slot failed");
++            return std::nullopt;
+         }
+ 
+         std::optional<int> first_index_that_wasnt_self{};
+@@ -250,14 +255,18 @@ void* FRHITexture::get_native_resource() const {
+             const auto func = vtable[i];
+ 
+             if (seen_vtables.contains(addr_of_func) || func == nullptr) {
+-                SPDLOG_INFO("Reached the end of the vtable, falling back to first index that wasn't self: {}", *first_index_that_wasnt_self);
+-                return *first_index_that_wasnt_self;
++                if (first_index_that_wasnt_self.has_value()) {
++                    SPDLOG_INFO("Reached the end of the vtable, falling back to first index that wasn't self: {}", *first_index_that_wasnt_self);
++                    return *first_index_that_wasnt_self;
++                }
++
++                SPDLOG_WARN("Reached the end of the vtable before finding a native-resource candidate");
++                return std::nullopt;
+             }
+ 
+             if (func == nullptr || IsBadReadPtr(func, 1)) {
+                 SPDLOG_ERROR("Encountered bad function pointer at index {} before finding GetNativeResource", i);
+-                throw std::runtime_error("Encountered bad function pointer before finding GetNativeResource");
+-                return 0;
++                return std::nullopt;
+             }
+ 
+             // Pass in dummy data in-case the function has an out parameter
+@@ -382,14 +391,24 @@ void* FRHITexture::get_native_resource() const {
+ 
+         
+         SPDLOG_ERROR("Failed to find vtable index for FRHITexture::GetNativeResource");
+-        throw std::runtime_error("Could not find vtable index for FRHITexture::GetNativeResource");
+-        return 0;
+-    }(this);
++        return std::nullopt;
++        }();
++
++        if (!vtable_index.has_value()) {
++            return nullptr;
++        }
++    }
+ 
+     const auto vtable = *(void* (***)(const FRHITexture*))this;
+-    const auto func = vtable[vtable_index];
++    const auto func = vtable[*vtable_index];
+ 
+-    const auto result = func(this);
++    void* result = nullptr;
++
++    try {
++        result = func(this);
++    } catch (...) {
++        return nullptr;
++    }
+ 
+     if (result == nullptr) {
+         return nullptr;
+-- 
+2.45.2.windows.1
+
