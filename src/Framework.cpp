@@ -23,6 +23,7 @@
 #include "utility/Input.hpp"
 
 #include "WindowFilter.hpp"
+#include "hooks/Sn2OverlayUI.hpp"
 
 #include "Mods.hpp"
 #include "mods/PluginLoader.hpp"
@@ -1906,6 +1907,10 @@ void Framework::draw_ui() {
     m_last_window_size = ImGui::GetWindowSize();
 
     ImGui::End();
+
+    // SN2 diagnostics overlay (gated by UEVR_SN2_OVERLAY_UI=1).
+    // Independent floating window; body lives in Sn2OverlayUI.cpp.
+    sn2_overlay_ui::render();
 
     // save the menu state in config
     if (m_draw_ui != m_last_draw_ui) {

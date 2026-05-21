@@ -2774,6 +2774,10 @@ XrResult OpenXR::begin_frame(const char* caller) {
     this->trace_begin_frame_request(caller);
     emit_openxr_state_probes(this, "begin_frame");
 
+    if (this->can_run_frame_loop() && this->got_first_poses && !this->frame_synced && !this->frame_began) {
+        synchronize_frame(std::nullopt, SyncFrameCallsite::OpenXRBeginFrameRecovery);
+    }
+
     if (!this->can_run_frame_loop() || !this->got_first_poses || !this->frame_synced) {
         this->log_frame_lifecycle_state("begin_frame refused because runtime was not ready");
         return XR_ERROR_SESSION_NOT_READY;

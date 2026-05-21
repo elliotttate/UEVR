@@ -1,0 +1,25 @@
+{
+  "name": "sn2_right_eye_lut_redirect",
+  "description": "SN2 right-eye LUT redirect starting point. Duplicate a base override manifest, set this as right_transform/right_dxil_transform, and fill the SRV range/index values from the flagged right-eye draw's reflection + descriptor lineage.",
+  "uevr_template": true,
+  "target_game": "Subnautica 2",
+  "transforms": [
+    {
+      "kind": "require_regex",
+      "note": "Most LUT/post-process shaders sample one or more SRVs.",
+      "find": "dx\\.op\\.sample|dx\\.op\\.textureLoad|dx\\.op\\.createHandle",
+      "required": true
+    },
+    {
+      "kind": "redirect_handle",
+      "note": "Set from_* to the wrong right-eye SRV and to_* to the matching left/right-correct SRV.",
+      "resource_class": "srv",
+      "from_range_id": 0,
+      "from_index": 0,
+      "to_range_id": 0,
+      "to_index": 0,
+      "required": true
+    }
+  ]
+}
+

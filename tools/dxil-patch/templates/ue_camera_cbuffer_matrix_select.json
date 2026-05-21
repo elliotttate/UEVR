@@ -1,0 +1,16 @@
+{
+  "name": "ue_camera_cbuffer_matrix_select",
+  "description": "Rewrite one cbufferLoad register index to read a different UE camera/view matrix row or vector. Fill handle/from_index/to_index from dxil-patch analysis_before.cbuffer_loads or MCP shader reflection.",
+  "uevr_template": true,
+  "transforms": [
+    {
+      "kind": "rewrite_cbuffer_load_index",
+      "note": "Example: redirect a view/projection row from the mono slot to the right-eye slot.",
+      "handle": "%CAMERA_CBUFFER_HANDLE",
+      "from_index": 0,
+      "to_index": 0,
+      "required": true
+    }
+  ]
+}
+

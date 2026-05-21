@@ -12,11 +12,12 @@
 #include <wrl/client.h>
 
 namespace {
-constexpr size_t MAX_RECENT_BINDINGS = 96;
-constexpr size_t MAX_RECENT_ROOT_BINDS = 384;
-constexpr size_t MAX_RECENT_DRAW_EVENTS = 512;
-constexpr size_t MAX_RECENT_BARRIERS = 128;
+constexpr size_t MAX_RECENT_BINDINGS = 512;
+constexpr size_t MAX_RECENT_ROOT_BINDS = 4096;
+constexpr size_t MAX_RECENT_DRAW_EVENTS = 4096;
+constexpr size_t MAX_RECENT_BARRIERS = 512;
 constexpr size_t MAX_RECENT_WARNINGS = 64;
+constexpr size_t MAX_RECENT_PIPELINE_CACHE_EVENTS = 256;
 
 // Try to read an engine-supplied debug name off a resource. UE's RHI sets
 // WKPDID_D3DDebugObjectName / WKPDID_D3DDebugObjectNameW on render targets
@@ -533,8 +534,10 @@ void D3D12Diagnostics::set_enabled(bool enabled) {
         return;
     }
 
-    std::scoped_lock _{m_mutex};
-    clear_state_locked();
+    if (!enabled) {
+        std::scoped_lock _{m_mutex};
+        clear_state_locked();
+    }
 }
 
 bool D3D12Diagnostics::is_enabled() const {
@@ -648,12 +651,11 @@ void D3D12Diagnostics::register_resource(
     bool transient,
     std::string_view name
 ) {
-    if (!is_enabled()) {
-        return;
-    }
-
     if (resource == nullptr) {
-        push_warning(source, "Attempted to register a null resource");
+        if (is_enabled()) {
+            std::scoped_lock _{m_mutex};
+            push_warning(source, "Attempted to register a null resource");
+        }
         return;
     }
 
@@ -703,12 +705,11 @@ void D3D12Diagnostics::register_rtv_descriptor(
     D3D12_CPU_DESCRIPTOR_HANDLE handle,
     std::string_view name
 ) {
-    if (!is_enabled()) {
-        return;
-    }
-
     if (handle.ptr == 0) {
-        push_warning(source, "Attempted to register a null RTV descriptor");
+        if (is_enabled()) {
+            std::scoped_lock _{m_mutex};
+            push_warning(source, "Attempted to register a null RTV descriptor");
+        }
         return;
     }
 
@@ -755,12 +756,11 @@ void D3D12Diagnostics::register_dsv_descriptor(
     D3D12_CPU_DESCRIPTOR_HANDLE handle,
     std::string_view name
 ) {
-    if (!is_enabled()) {
-        return;
-    }
-
     if (handle.ptr == 0) {
-        push_warning(source, "Attempted to register a null DSV descriptor");
+        if (is_enabled()) {
+            std::scoped_lock _{m_mutex};
+            push_warning(source, "Attempted to register a null DSV descriptor");
+        }
         return;
     }
 
@@ -807,12 +807,11 @@ void D3D12Diagnostics::register_srv_descriptor(
     D3D12_CPU_DESCRIPTOR_HANDLE handle,
     std::string_view name
 ) {
-    if (!is_enabled()) {
-        return;
-    }
-
     if (handle.ptr == 0) {
-        push_warning(source, "Attempted to register a null SRV descriptor");
+        if (is_enabled()) {
+            std::scoped_lock _{m_mutex};
+            push_warning(source, "Attempted to register a null SRV descriptor");
+        }
         return;
     }
 
@@ -852,12 +851,11 @@ void D3D12Diagnostics::register_uav_descriptor(
     D3D12_CPU_DESCRIPTOR_HANDLE handle,
     std::string_view name
 ) {
-    if (!is_enabled()) {
-        return;
-    }
-
     if (handle.ptr == 0) {
-        push_warning(source, "Attempted to register a null UAV descriptor");
+        if (is_enabled()) {
+            std::scoped_lock _{m_mutex};
+            push_warning(source, "Attempted to register a null UAV descriptor");
+        }
         return;
     }
 
@@ -896,7 +894,7 @@ void D3D12Diagnostics::record_descriptor_copy(
     D3D12_CPU_DESCRIPTOR_HANDLE dst,
     D3D12_CPU_DESCRIPTOR_HANDLE src
 ) {
-    if (!is_enabled() || dst.ptr == 0 || src.ptr == 0) {
+    if (dst.ptr == 0 || src.ptr == 0) {
         return;
     }
 
@@ -911,6 +909,8 @@ void D3D12Diagnostics::record_descriptor_copy(
 
         auto copy = it->second;
         copy.handle = static_cast<uintptr_t>(dst.ptr);
+        copy.source_handle = static_cast<uintptr_t>(src.ptr);
+        copy.source_frame = m_frame;
         copy.source = std::string{source};
         copy.last_seen_frame = m_frame;
         descriptors[copy.handle] = std::move(copy);
@@ -1196,12 +1196,61 @@ void D3D12Diagnostics::record_root_bind(
     push_ring(m_recent_root_binds, std::move(event), MAX_RECENT_ROOT_BINDS);
 }
 
+void D3D12Diagnostics::record_rtv_write(
+    std::string_view source,
+    uintptr_t command_list,
+    uintptr_t pipeline_state,
+    int32_t eye_bucket,
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+    std::string_view kind
+) {
+    if (!is_enabled() || rtv.ptr == 0) {
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+    const auto descriptor_key = static_cast<uintptr_t>(rtv.ptr);
+    uintptr_t resource_key = 0;
+    std::string name{};
+    if (const auto descriptor = m_rtv_descriptors.find(descriptor_key); descriptor != m_rtv_descriptors.end()) {
+        resource_key = descriptor->second.resource;
+        name = descriptor->second.name;
+    }
+
+    const auto lineage_key = resource_key != 0 ? resource_key : descriptor_key;
+    m_last_resource_writes[lineage_key] = ResourceProducerInfo{
+        m_frame,
+        m_draw_events_this_frame,
+        pipeline_state,
+        command_list,
+        std::string{kind.empty() ? source : kind},
+        descriptor_key,
+        0,
+        eye_bucket,
+        std::move(name)
+    };
+}
+
 void D3D12Diagnostics::record_draw_event(
     std::string_view source,
     std::string_view kind,
     uintptr_t command_list,
     uintptr_t pipeline_state,
+    uintptr_t root_signature,
     int32_t eye_bucket,
+    bool executed,
+    bool has_viewport,
+    float viewport_top_left_x,
+    float viewport_top_left_y,
+    float viewport_width,
+    float viewport_height,
+    uint32_t viewport_count,
+    bool has_scissor,
+    int32_t scissor_left,
+    int32_t scissor_top,
+    int32_t scissor_right,
+    int32_t scissor_bottom,
+    uint32_t scissor_count,
     uint32_t arg0,
     uint32_t arg1,
     uint32_t arg2,
@@ -1237,34 +1286,103 @@ void D3D12Diagnostics::record_draw_event(
     event.kind = std::string{kind};
     event.command_list = command_list;
     event.pipeline_state = pipeline_state;
-    if (const auto root_signature = m_pso_root_signatures.find(pipeline_state); root_signature != m_pso_root_signatures.end()) {
-        event.root_signature = root_signature->second;
+    event.root_signature = root_signature;
+    if (event.root_signature == 0) {
+        if (const auto pso_root = m_pso_root_signatures.find(pipeline_state); pso_root != m_pso_root_signatures.end()) {
+            event.root_signature = pso_root->second;
+        }
     }
     event.eye_bucket = eye_bucket;
+    event.executed = executed;
+    event.has_viewport = has_viewport;
+    event.viewport_top_left_x = viewport_top_left_x;
+    event.viewport_top_left_y = viewport_top_left_y;
+    event.viewport_width = viewport_width;
+    event.viewport_height = viewport_height;
+    event.viewport_count = viewport_count;
+    event.has_scissor = has_scissor;
+    event.scissor_left = scissor_left;
+    event.scissor_top = scissor_top;
+    event.scissor_right = scissor_right;
+    event.scissor_bottom = scissor_bottom;
+    event.scissor_count = scissor_count;
     event.arg0 = arg0;
     event.arg1 = arg1;
     event.arg2 = arg2;
     event.arg3 = arg3;
     event.arg4 = arg4;
     event.rtv0 = rtv0;
-    if (rtv0 != 0) {
-        if (const auto descriptor = m_rtv_descriptors.find(rtv0); descriptor != m_rtv_descriptors.end()) {
-            event.rtv0_resource = descriptor->second.resource;
-        }
 
-        const auto lineage_key = event.rtv0_resource != 0 ? event.rtv0_resource : rtv0;
+    auto make_write_info = [&](const BoundTargetInfo& target, uint32_t target_index, std::string_view write_kind) {
+        ResourceWriteInfo write{};
+        write.target_index = target_index;
+        write.descriptor = target.handle;
+        write.resource = target.resource;
+        write.name = target.name;
+        write.kind = std::string{write_kind};
+
+        const auto lineage_key = write.resource != 0 ? write.resource : write.descriptor;
         if (const auto producer = m_last_resource_writes.find(lineage_key); producer != m_last_resource_writes.end()) {
-            event.prior_rtv0_producer_frame = producer->second.frame;
-            event.prior_rtv0_producer_draw = producer->second.draw_index;
-            event.prior_rtv0_producer_pso = producer->second.pipeline_state;
+            write.prior_producer_frame = producer->second.frame;
+            write.prior_producer_draw = producer->second.draw_index;
+            write.prior_producer_pso = producer->second.pipeline_state;
+            write.prior_producer_command_list = producer->second.command_list;
+            write.prior_producer_kind = producer->second.kind;
+            write.prior_producer_descriptor = producer->second.descriptor;
+            write.prior_producer_target_index = producer->second.target_index;
+            write.prior_producer_eye_bucket = producer->second.eye_bucket;
         }
 
-        m_last_resource_writes[lineage_key] = ResourceProducerInfo{
-            event.frame,
-            event.draw_index,
-            pipeline_state,
-            command_list
-        };
+        if (event.executed) {
+            m_last_resource_writes[lineage_key] = ResourceProducerInfo{
+                event.frame,
+                event.draw_index,
+                pipeline_state,
+                command_list,
+                std::string{write_kind},
+                write.descriptor,
+                target_index,
+                eye_bucket,
+                write.name
+            };
+        }
+
+        return write;
+    };
+
+    if (m_current_bind_context.has_value() &&
+        m_current_bind_context->frame == m_frame &&
+        !m_current_bind_context->render_targets.empty()) {
+        event.render_target_writes.reserve(m_current_bind_context->render_targets.size());
+        for (uint32_t i = 0; i < m_current_bind_context->render_targets.size(); ++i) {
+            auto write = make_write_info(m_current_bind_context->render_targets[i], i, "draw_rtv");
+            if (i == 0) {
+                event.rtv0 = write.descriptor;
+                event.rtv0_resource = write.resource;
+                event.prior_rtv0_producer_frame = write.prior_producer_frame;
+                event.prior_rtv0_producer_draw = write.prior_producer_draw;
+                event.prior_rtv0_producer_pso = write.prior_producer_pso;
+            }
+            event.render_target_writes.emplace_back(std::move(write));
+        }
+    } else if (rtv0 != 0) {
+        BoundTargetInfo target{};
+        target.handle = rtv0;
+        target.descriptor_type = "RTV";
+        if (const auto descriptor = m_rtv_descriptors.find(rtv0); descriptor != m_rtv_descriptors.end()) {
+            target.resource = descriptor->second.resource;
+            target.name = descriptor->second.name;
+        }
+        if (target.name.empty()) {
+            target.name = format_pointer(rtv0);
+        }
+
+        auto write = make_write_info(target, 0, "draw_rtv");
+        event.rtv0_resource = write.resource;
+        event.prior_rtv0_producer_frame = write.prior_producer_frame;
+        event.prior_rtv0_producer_draw = write.prior_producer_draw;
+        event.prior_rtv0_producer_pso = write.prior_producer_pso;
+        event.render_target_writes.emplace_back(std::move(write));
     }
     event.graphics_root_descriptor_tables = graphics_root_descriptor_tables;
     event.compute_root_descriptor_tables = compute_root_descriptor_tables;
@@ -1280,7 +1398,31 @@ void D3D12Diagnostics::record_draw_event(
     event.compute_root_constants_hash = compute_root_constants_hash;
     event.graphics_root_descriptor_table_resource_hash = graphics_root_descriptor_table_resource_hash;
     event.compute_root_descriptor_table_resource_hash = compute_root_descriptor_table_resource_hash;
-    event.descriptor_reads = descriptor_reads;
+
+    std::array<bool, MAX_ROOT_BIND_SLOTS> descriptor_table_roots{};
+    bool has_root_signature_filter = false;
+    if (event.root_signature != 0) {
+        if (const auto root_it = m_root_signatures.find(event.root_signature); root_it != m_root_signatures.end()) {
+            has_root_signature_filter = true;
+            for (const auto& parameter : root_it->second.parameters) {
+                if (parameter.index < descriptor_table_roots.size() &&
+                    parameter.parameter_type == "descriptor_table") {
+                    descriptor_table_roots[parameter.index] = true;
+                }
+            }
+        }
+    }
+
+    event.descriptor_reads.reserve(descriptor_reads.size());
+    for (const auto& read : descriptor_reads) {
+        if (has_root_signature_filter &&
+            (read.root_parameter >= descriptor_table_roots.size() ||
+             !descriptor_table_roots[read.root_parameter])) {
+            continue;
+        }
+
+        event.descriptor_reads.emplace_back(read);
+    }
 
     for (auto& read : event.descriptor_reads) {
         if (read.resource == 0) {
@@ -1291,10 +1433,197 @@ void D3D12Diagnostics::record_draw_event(
             read.producer_frame = producer->second.frame;
             read.producer_draw = producer->second.draw_index;
             read.producer_pso = producer->second.pipeline_state;
+            read.producer_command_list = producer->second.command_list;
+            read.producer_kind = producer->second.kind;
+            read.producer_descriptor = producer->second.descriptor;
+            read.producer_target_index = producer->second.target_index;
+            read.producer_eye_bucket = producer->second.eye_bucket;
+        }
+
+        if (read.descriptor_type == "UAV") {
+            BoundTargetInfo target{};
+            target.handle = read.descriptor_cpu;
+            target.resource = read.resource;
+            target.descriptor_type = "UAV";
+            target.name = format_pointer(read.resource);
+            auto write = make_write_info(target, read.descriptor_index, kind == "dispatch" ? "dispatch_uav" : "draw_uav");
+            event.uav_writes.emplace_back(std::move(write));
         }
     }
 
     push_ring(m_recent_draw_events, std::move(event), MAX_RECENT_DRAW_EVENTS);
+}
+
+void D3D12Diagnostics::record_resource_copy(
+    std::string_view source,
+    std::string_view kind,
+    uintptr_t command_list,
+    uintptr_t dst_resource,
+    uintptr_t src_resource,
+    uint32_t dst_subresource,
+    uint32_t src_subresource,
+    uint64_t byte_count,
+    uint32_t width,
+    uint32_t height,
+    uint32_t depth,
+    uint64_t dst_byte_offset,
+    uint64_t src_byte_offset
+) {
+    if (!is_enabled() || (dst_resource == 0 && src_resource == 0)) {
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+
+    DrawEvent event{};
+    event.frame = m_frame;
+    event.draw_index = ++m_draw_events_this_frame;
+    event.source = std::string{source};
+    event.kind = std::string{kind};
+    event.command_list = command_list;
+    event.eye_bucket = -1;
+    event.arg0 = dst_subresource;
+    event.arg1 = src_subresource;
+    event.arg2 = static_cast<uint32_t>((std::min)(byte_count, static_cast<uint64_t>(UINT32_MAX)));
+    event.arg3 = static_cast<int32_t>(width);
+    event.arg4 = height != 0 ? height : depth;
+    event.copy_dst_byte_offset = dst_byte_offset;
+    event.copy_src_byte_offset = src_byte_offset;
+    event.copy_byte_count = byte_count;
+
+    auto resource_name = [&](uintptr_t resource) {
+        if (resource == 0) {
+            return std::string{};
+        }
+        if (const auto it = m_resources.find(resource); it != m_resources.end() && !it->second.name.empty()) {
+            return it->second.name;
+        }
+        auto* resource_ptr = reinterpret_cast<ID3D12Resource*>(resource);
+        auto debug_name = try_resolve_d3d_debug_name(resource_ptr);
+        if (!debug_name.empty()) {
+            return debug_name;
+        }
+        return format_pointer(resource);
+    };
+
+    if (src_resource != 0) {
+        DescriptorReadInfo read{};
+        read.root_parameter = 0;
+        read.descriptor_index = src_subresource;
+        read.descriptor_cpu = src_resource;
+        read.resource = src_resource;
+        read.descriptor_type = "RESOURCE";
+        if (const auto producer = m_last_resource_writes.find(src_resource); producer != m_last_resource_writes.end()) {
+            read.producer_frame = producer->second.frame;
+            read.producer_draw = producer->second.draw_index;
+            read.producer_pso = producer->second.pipeline_state;
+            read.producer_command_list = producer->second.command_list;
+            read.producer_kind = producer->second.kind;
+            read.producer_descriptor = producer->second.descriptor;
+            read.producer_target_index = producer->second.target_index;
+            read.producer_eye_bucket = producer->second.eye_bucket;
+        }
+        event.descriptor_reads.emplace_back(std::move(read));
+    }
+
+    if (dst_resource != 0) {
+        ResourceWriteInfo write{};
+        write.target_index = dst_subresource;
+        write.descriptor = dst_resource;
+        write.resource = dst_resource;
+        write.name = resource_name(dst_resource);
+        write.kind = std::string{kind};
+
+        if (const auto producer = m_last_resource_writes.find(dst_resource); producer != m_last_resource_writes.end()) {
+            write.prior_producer_frame = producer->second.frame;
+            write.prior_producer_draw = producer->second.draw_index;
+            write.prior_producer_pso = producer->second.pipeline_state;
+            write.prior_producer_command_list = producer->second.command_list;
+            write.prior_producer_kind = producer->second.kind;
+            write.prior_producer_descriptor = producer->second.descriptor;
+            write.prior_producer_target_index = producer->second.target_index;
+            write.prior_producer_eye_bucket = producer->second.eye_bucket;
+        }
+
+        m_last_resource_writes[dst_resource] = ResourceProducerInfo{
+            event.frame,
+            event.draw_index,
+            0,
+            command_list,
+            std::string{kind},
+            dst_resource,
+            dst_subresource,
+            -1,
+            write.name
+        };
+
+        event.render_target_writes.emplace_back(std::move(write));
+        event.rtv0_resource = dst_resource;
+    }
+
+    push_ring(m_recent_draw_events, std::move(event), MAX_RECENT_DRAW_EVENTS);
+}
+
+void D3D12Diagnostics::record_extra_descriptor_read(
+    std::string_view source,
+    uintptr_t command_list,
+    uintptr_t pipeline_state,
+    DescriptorReadInfo read
+) {
+    if (!is_enabled() || command_list == 0 || read.resource == 0) {
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+
+    const auto fill_producer = [this](DescriptorReadInfo& candidate) {
+        if (candidate.resource == 0) {
+            return;
+        }
+
+        if (const auto producer = m_last_resource_writes.find(candidate.resource); producer != m_last_resource_writes.end()) {
+            candidate.producer_frame = producer->second.frame;
+            candidate.producer_draw = producer->second.draw_index;
+            candidate.producer_pso = producer->second.pipeline_state;
+            candidate.producer_command_list = producer->second.command_list;
+            candidate.producer_kind = producer->second.kind;
+            candidate.producer_descriptor = producer->second.descriptor;
+            candidate.producer_target_index = producer->second.target_index;
+            candidate.producer_eye_bucket = producer->second.eye_bucket;
+        }
+    };
+
+    fill_producer(read);
+
+    for (auto it = m_recent_draw_events.rbegin(); it != m_recent_draw_events.rend(); ++it) {
+        if (it->frame != m_frame) {
+            break;
+        }
+
+        if (it->command_list != command_list) {
+            continue;
+        }
+
+        if (pipeline_state != 0 && it->pipeline_state != 0 && it->pipeline_state != pipeline_state) {
+            continue;
+        }
+
+        const auto duplicate = std::any_of(
+            it->descriptor_reads.begin(),
+            it->descriptor_reads.end(),
+            [&read](const auto& existing) {
+                return existing.root_parameter == read.root_parameter &&
+                       existing.descriptor_index == read.descriptor_index &&
+                       existing.descriptor_cpu == read.descriptor_cpu &&
+                       existing.resource == read.resource;
+            });
+        if (!duplicate) {
+            it->descriptor_reads.emplace_back(std::move(read));
+        }
+        return;
+    }
+
+    push_warning(source, "extra descriptor read could not be matched to a recent draw event");
 }
 
 std::optional<D3D12Diagnostics::DescriptorReadInfo> D3D12Diagnostics::resolve_descriptor_read(
@@ -1302,7 +1631,7 @@ std::optional<D3D12Diagnostics::DescriptorReadInfo> D3D12Diagnostics::resolve_de
     uint32_t descriptor_index,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor
 ) const {
-    if (!is_enabled() || descriptor.ptr == 0) {
+    if (descriptor.ptr == 0) {
         return std::nullopt;
     }
 
@@ -1314,6 +1643,8 @@ std::optional<D3D12Diagnostics::DescriptorReadInfo> D3D12Diagnostics::resolve_de
         info.root_parameter = root_parameter;
         info.descriptor_index = descriptor_index;
         info.descriptor_cpu = key;
+        info.descriptor_source_cpu = tracked.source_handle;
+        info.descriptor_source_frame = tracked.source_frame;
         info.resource = tracked.resource;
         info.descriptor_type = tracked.descriptor_type;
         return info;
@@ -1328,6 +1659,30 @@ std::optional<D3D12Diagnostics::DescriptorReadInfo> D3D12Diagnostics::resolve_de
     }
 
     return std::nullopt;
+}
+
+std::optional<D3D12Diagnostics::ResourceProducerSnapshot> D3D12Diagnostics::last_resource_producer(uintptr_t resource) const {
+    if (resource == 0) {
+        return std::nullopt;
+    }
+
+    std::scoped_lock _{m_mutex};
+    const auto it = m_last_resource_writes.find(resource);
+    if (it == m_last_resource_writes.end()) {
+        return std::nullopt;
+    }
+
+    ResourceProducerSnapshot out{};
+    out.frame = it->second.frame;
+    out.draw_index = it->second.draw_index;
+    out.pipeline_state = it->second.pipeline_state;
+    out.command_list = it->second.command_list;
+    out.kind = it->second.kind;
+    out.descriptor = it->second.descriptor;
+    out.target_index = it->second.target_index;
+    out.eye_bucket = it->second.eye_bucket;
+    out.name = it->second.name;
+    return out;
 }
 
 void D3D12Diagnostics::record_gpu_timing_sample(
@@ -1355,6 +1710,42 @@ void D3D12Diagnostics::record_gpu_timing_sample(
     aggregate.total_ms += milliseconds;
     aggregate.max_ms = (std::max)(aggregate.max_ms, milliseconds);
     aggregate.last_frame = m_frame;
+}
+
+void D3D12Diagnostics::record_pipeline_cache_event(
+    std::string_view source,
+    std::string_view action,
+    uintptr_t device,
+    uintptr_t library,
+    uintptr_t pipeline_state,
+    std::string_view name,
+    uint64_t cached_blob_size,
+    bool has_cached_pso,
+    bool stripped_cached_pso,
+    uint32_t result,
+    std::string_view note
+) {
+    if (!is_enabled()) {
+        return;
+    }
+
+    std::scoped_lock _{m_mutex};
+
+    PipelineCacheEvent event{};
+    event.frame = m_frame;
+    event.source = std::string{source};
+    event.action = std::string{action};
+    event.device = device;
+    event.library = library;
+    event.pipeline_state = pipeline_state;
+    event.name = std::string{name};
+    event.cached_blob_size = cached_blob_size;
+    event.has_cached_pso = has_cached_pso;
+    event.stripped_cached_pso = stripped_cached_pso;
+    event.result = result;
+    event.note = std::string{note};
+
+    push_ring(m_recent_pipeline_cache_events, std::move(event), MAX_RECENT_PIPELINE_CACHE_EVENTS);
 }
 
 D3D12Diagnostics::Snapshot D3D12Diagnostics::snapshot() const {
@@ -1443,6 +1834,7 @@ D3D12Diagnostics::Snapshot D3D12Diagnostics::snapshot() const {
     if (out.gpu_timings.size() > 128) {
         out.gpu_timings.resize(128);
     }
+    out.recent_pipeline_cache_events = m_recent_pipeline_cache_events;
     out.recent_barriers = m_recent_barriers;
     out.recent_warnings = m_recent_warnings;
 
@@ -1465,6 +1857,39 @@ std::optional<D3D12Diagnostics::CurrentBindContext> D3D12Diagnostics::current_bi
     return m_current_bind_context;
 }
 
+std::optional<D3D12Diagnostics::RootSignatureInfo> D3D12Diagnostics::root_signature_for_pipeline(uintptr_t pipeline_state) const {
+    if (pipeline_state == 0) {
+        return std::nullopt;
+    }
+
+    std::scoped_lock _{m_mutex};
+    const auto root_it = m_pso_root_signatures.find(pipeline_state);
+    if (root_it == m_pso_root_signatures.end() || root_it->second == 0) {
+        return std::nullopt;
+    }
+
+    const auto info_it = m_root_signatures.find(root_it->second);
+    if (info_it == m_root_signatures.end()) {
+        return std::nullopt;
+    }
+
+    return info_it->second;
+}
+
+std::optional<D3D12Diagnostics::RootSignatureInfo> D3D12Diagnostics::root_signature(uintptr_t root_signature) const {
+    if (root_signature == 0) {
+        return std::nullopt;
+    }
+
+    std::scoped_lock _{m_mutex};
+    const auto info_it = m_root_signatures.find(root_signature);
+    if (info_it == m_root_signatures.end()) {
+        return std::nullopt;
+    }
+
+    return info_it->second;
+}
+
 void D3D12Diagnostics::reset() {
     std::scoped_lock _{m_mutex};
     clear_state_locked();
@@ -1482,6 +1907,7 @@ void D3D12Diagnostics::clear_state_locked() {
     m_recent_bindings.clear();
     m_recent_root_binds.clear();
     m_recent_draw_events.clear();
+    m_recent_pipeline_cache_events.clear();
     m_recent_barriers.clear();
     m_recent_warnings.clear();
     m_current_bind_context.reset();

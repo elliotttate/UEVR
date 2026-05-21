@@ -1,0 +1,23 @@
+{
+  "name": "sn2_sky_atmos_right_eye_probe",
+  "description": "Diagnostic transform scaffold for SN2 sky-atmosphere right-eye investigations. It first requires the shader body to contain known sampling/math ops, then lets a narrowed replace rule be filled from disassembly.",
+  "uevr_template": true,
+  "target_game": "Subnautica 2",
+  "transforms": [
+    {
+      "kind": "require_regex",
+      "note": "Confirms the shader has texture sampling or cbuffer camera reads before attempting a narrow edit.",
+      "find": "dx\\.op\\.(sample|textureLoad|cbufferLoad)",
+      "required": true
+    },
+    {
+      "kind": "replace_regex",
+      "note": "Fill only after the symmetry oracle, reflection, and lineage identify the exact bad op.",
+      "find": "__FILL_WITH_EXACT_DXIL_REGEX__",
+      "replace": "__FILL_WITH_REPLACEMENT_IR__",
+      "count": 1,
+      "required": false
+    }
+  ]
+}
+

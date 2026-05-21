@@ -12,6 +12,7 @@
 
 #include <Windows.h>
 #include <d3dcompiler.h>
+#include <d3d12shader.h>
 #include <dxcapi.h>
 #include <oleauto.h>
 #include <wrl/client.h>
@@ -394,6 +395,342 @@ bool validate_container_bytes(
     return true;
 }
 
+std::string cbuffer_type_to_string(D3D_CBUFFER_TYPE type) {
+    switch (type) {
+    case D3D_CT_CBUFFER: return "cbuffer";
+    case D3D_CT_TBUFFER: return "tbuffer";
+    case D3D_CT_INTERFACE_POINTERS: return "interface_pointers";
+    case D3D_CT_RESOURCE_BIND_INFO: return "resource_bind_info";
+    default: return "unknown";
+    }
+}
+
+std::string variable_class_to_string(D3D_SHADER_VARIABLE_CLASS cls) {
+    switch (cls) {
+    case D3D_SVC_SCALAR: return "scalar";
+    case D3D_SVC_VECTOR: return "vector";
+    case D3D_SVC_MATRIX_ROWS: return "matrix_rows";
+    case D3D_SVC_MATRIX_COLUMNS: return "matrix_columns";
+    case D3D_SVC_OBJECT: return "object";
+    case D3D_SVC_STRUCT: return "struct";
+    case D3D_SVC_INTERFACE_CLASS: return "interface_class";
+    case D3D_SVC_INTERFACE_POINTER: return "interface_pointer";
+    default: return "unknown";
+    }
+}
+
+std::string variable_type_to_string(D3D_SHADER_VARIABLE_TYPE type) {
+    switch (type) {
+    case D3D_SVT_VOID: return "void";
+    case D3D_SVT_BOOL: return "bool";
+    case D3D_SVT_INT: return "int";
+    case D3D_SVT_FLOAT: return "float";
+    case D3D_SVT_STRING: return "string";
+    case D3D_SVT_TEXTURE: return "texture";
+    case D3D_SVT_TEXTURE1D: return "texture1d";
+    case D3D_SVT_TEXTURE2D: return "texture2d";
+    case D3D_SVT_TEXTURE3D: return "texture3d";
+    case D3D_SVT_TEXTURECUBE: return "texturecube";
+    case D3D_SVT_SAMPLER: return "sampler";
+    case D3D_SVT_SAMPLER1D: return "sampler1d";
+    case D3D_SVT_SAMPLER2D: return "sampler2d";
+    case D3D_SVT_SAMPLER3D: return "sampler3d";
+    case D3D_SVT_SAMPLERCUBE: return "samplercube";
+    case D3D_SVT_PIXELSHADER: return "pixelshader";
+    case D3D_SVT_VERTEXSHADER: return "vertexshader";
+    case D3D_SVT_UINT: return "uint";
+    case D3D_SVT_UINT8: return "uint8";
+    case D3D_SVT_GEOMETRYSHADER: return "geometryshader";
+    case D3D_SVT_RASTERIZER: return "rasterizer";
+    case D3D_SVT_DEPTHSTENCIL: return "depthstencil";
+    case D3D_SVT_BLEND: return "blend";
+    case D3D_SVT_BUFFER: return "buffer";
+    case D3D_SVT_CBUFFER: return "cbuffer";
+    case D3D_SVT_TBUFFER: return "tbuffer";
+    case D3D_SVT_TEXTURE1DARRAY: return "texture1darray";
+    case D3D_SVT_TEXTURE2DARRAY: return "texture2darray";
+    case D3D_SVT_RENDERTARGETVIEW: return "rendertargetview";
+    case D3D_SVT_DEPTHSTENCILVIEW: return "depthstencilview";
+    case D3D_SVT_TEXTURE2DMS: return "texture2dms";
+    case D3D_SVT_TEXTURE2DMSARRAY: return "texture2dmsarray";
+    case D3D_SVT_TEXTURECUBEARRAY: return "texturecubearray";
+    case D3D_SVT_HULLSHADER: return "hullshader";
+    case D3D_SVT_DOMAINSHADER: return "domainshader";
+    case D3D_SVT_INTERFACE_POINTER: return "interface_pointer";
+    case D3D_SVT_COMPUTESHADER: return "computeshader";
+    case D3D_SVT_DOUBLE: return "double";
+    case D3D_SVT_RWTEXTURE1D: return "rwtexture1d";
+    case D3D_SVT_RWTEXTURE1DARRAY: return "rwtexture1darray";
+    case D3D_SVT_RWTEXTURE2D: return "rwtexture2d";
+    case D3D_SVT_RWTEXTURE2DARRAY: return "rwtexture2darray";
+    case D3D_SVT_RWTEXTURE3D: return "rwtexture3d";
+    case D3D_SVT_RWBUFFER: return "rwbuffer";
+    case D3D_SVT_BYTEADDRESS_BUFFER: return "byteaddressbuffer";
+    case D3D_SVT_RWBYTEADDRESS_BUFFER: return "rwbyteaddressbuffer";
+    case D3D_SVT_STRUCTURED_BUFFER: return "structuredbuffer";
+    case D3D_SVT_RWSTRUCTURED_BUFFER: return "rwstructuredbuffer";
+    case D3D_SVT_APPEND_STRUCTURED_BUFFER: return "appendstructuredbuffer";
+    case D3D_SVT_CONSUME_STRUCTURED_BUFFER: return "consumestructuredbuffer";
+    case D3D_SVT_MIN8FLOAT: return "min8float";
+    case D3D_SVT_MIN10FLOAT: return "min10float";
+    case D3D_SVT_MIN16FLOAT: return "min16float";
+    case D3D_SVT_MIN12INT: return "min12int";
+    case D3D_SVT_MIN16INT: return "min16int";
+    case D3D_SVT_MIN16UINT: return "min16uint";
+    default: return "unknown";
+    }
+}
+
+std::string input_type_to_string(D3D_SHADER_INPUT_TYPE type) {
+    switch (type) {
+    case D3D_SIT_CBUFFER: return "cbv";
+    case D3D_SIT_TBUFFER: return "tbuffer";
+    case D3D_SIT_TEXTURE: return "srv";
+    case D3D_SIT_SAMPLER: return "sampler";
+    case D3D_SIT_UAV_RWTYPED: return "uav";
+    case D3D_SIT_STRUCTURED: return "srv";
+    case D3D_SIT_UAV_RWSTRUCTURED: return "uav";
+    case D3D_SIT_BYTEADDRESS: return "srv";
+    case D3D_SIT_UAV_RWBYTEADDRESS: return "uav";
+    case D3D_SIT_UAV_APPEND_STRUCTURED: return "uav";
+    case D3D_SIT_UAV_CONSUME_STRUCTURED: return "uav";
+    case D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER: return "uav";
+    case D3D_SIT_RTACCELERATIONSTRUCTURE: return "acceleration_structure";
+    case D3D_SIT_UAV_FEEDBACKTEXTURE: return "uav";
+    default: return "unknown";
+    }
+}
+
+std::string return_type_to_string(D3D_RESOURCE_RETURN_TYPE type) {
+    switch (type) {
+    case D3D_RETURN_TYPE_UNORM: return "unorm";
+    case D3D_RETURN_TYPE_SNORM: return "snorm";
+    case D3D_RETURN_TYPE_SINT: return "sint";
+    case D3D_RETURN_TYPE_UINT: return "uint";
+    case D3D_RETURN_TYPE_FLOAT: return "float";
+    case D3D_RETURN_TYPE_MIXED: return "mixed";
+    case D3D_RETURN_TYPE_DOUBLE: return "double";
+    case D3D_RETURN_TYPE_CONTINUED: return "continued";
+    default: return "unknown";
+    }
+}
+
+std::string srv_dimension_to_string(D3D_SRV_DIMENSION dimension) {
+    switch (dimension) {
+    case D3D_SRV_DIMENSION_UNKNOWN: return "unknown";
+    case D3D_SRV_DIMENSION_BUFFER: return "buffer";
+    case D3D_SRV_DIMENSION_TEXTURE1D: return "texture1d";
+    case D3D_SRV_DIMENSION_TEXTURE1DARRAY: return "texture1darray";
+    case D3D_SRV_DIMENSION_TEXTURE2D: return "texture2d";
+    case D3D_SRV_DIMENSION_TEXTURE2DARRAY: return "texture2darray";
+    case D3D_SRV_DIMENSION_TEXTURE2DMS: return "texture2dms";
+    case D3D_SRV_DIMENSION_TEXTURE2DMSARRAY: return "texture2dmsarray";
+    case D3D_SRV_DIMENSION_TEXTURE3D: return "texture3d";
+    case D3D_SRV_DIMENSION_TEXTURECUBE: return "texturecube";
+    case D3D_SRV_DIMENSION_TEXTURECUBEARRAY: return "texturecubearray";
+    case D3D_SRV_DIMENSION_BUFFEREX: return "bufferex";
+    default: return "unknown";
+    }
+}
+
+std::string system_value_to_string(D3D_NAME value) {
+    switch (value) {
+    case D3D_NAME_UNDEFINED: return "undefined";
+    case D3D_NAME_POSITION: return "position";
+    case D3D_NAME_CLIP_DISTANCE: return "clip_distance";
+    case D3D_NAME_CULL_DISTANCE: return "cull_distance";
+    case D3D_NAME_RENDER_TARGET_ARRAY_INDEX: return "render_target_array_index";
+    case D3D_NAME_VIEWPORT_ARRAY_INDEX: return "viewport_array_index";
+    case D3D_NAME_VERTEX_ID: return "vertex_id";
+    case D3D_NAME_PRIMITIVE_ID: return "primitive_id";
+    case D3D_NAME_INSTANCE_ID: return "instance_id";
+    case D3D_NAME_IS_FRONT_FACE: return "is_front_face";
+    case D3D_NAME_SAMPLE_INDEX: return "sample_index";
+    case D3D_NAME_FINAL_QUAD_EDGE_TESSFACTOR: return "final_quad_edge_tessfactor";
+    case D3D_NAME_FINAL_QUAD_INSIDE_TESSFACTOR: return "final_quad_inside_tessfactor";
+    case D3D_NAME_FINAL_TRI_EDGE_TESSFACTOR: return "final_tri_edge_tessfactor";
+    case D3D_NAME_FINAL_TRI_INSIDE_TESSFACTOR: return "final_tri_inside_tessfactor";
+    case D3D_NAME_FINAL_LINE_DETAIL_TESSFACTOR: return "final_line_detail_tessfactor";
+    case D3D_NAME_FINAL_LINE_DENSITY_TESSFACTOR: return "final_line_density_tessfactor";
+    case D3D_NAME_TARGET: return "target";
+    case D3D_NAME_DEPTH: return "depth";
+    case D3D_NAME_COVERAGE: return "coverage";
+    case D3D_NAME_DEPTH_GREATER_EQUAL: return "depth_greater_equal";
+    case D3D_NAME_DEPTH_LESS_EQUAL: return "depth_less_equal";
+    case D3D_NAME_STENCIL_REF: return "stencil_ref";
+    case D3D_NAME_INNER_COVERAGE: return "inner_coverage";
+    default: return "unknown";
+    }
+}
+
+std::string component_type_to_string(D3D_REGISTER_COMPONENT_TYPE type) {
+    switch (type) {
+    case D3D_REGISTER_COMPONENT_UNKNOWN: return "unknown";
+    case D3D_REGISTER_COMPONENT_UINT32: return "uint32";
+    case D3D_REGISTER_COMPONENT_SINT32: return "sint32";
+    case D3D_REGISTER_COMPONENT_FLOAT32: return "float32";
+    default: return "unknown";
+    }
+}
+
+render::ShaderReflectionSignatureParamInfo signature_param_to_info(const D3D12_SIGNATURE_PARAMETER_DESC& desc) {
+    render::ShaderReflectionSignatureParamInfo out{};
+    out.semantic_name = desc.SemanticName != nullptr ? desc.SemanticName : "";
+    out.semantic_index = desc.SemanticIndex;
+    out.register_index = desc.Register;
+    out.system_value = system_value_to_string(desc.SystemValueType);
+    out.component_type = component_type_to_string(desc.ComponentType);
+    out.mask = desc.Mask;
+    out.read_write_mask = desc.ReadWriteMask;
+    out.stream = desc.Stream;
+    return out;
+}
+
+render::ShaderReflectionInfo reflect_shader_bytecode(const void* bytecode, size_t bytecode_size) {
+    render::ShaderReflectionInfo out{};
+
+    ComPtr<ID3D12ShaderReflection> reflection{};
+    HRESULT hr = E_FAIL;
+
+    // Prefer DXC for DXIL blobs (SM 6+). If dxcompiler isn't loadable at all,
+    // we still want to try D3DReflect (which handles DXBC/SM5 via d3dcompiler)
+    // before giving up — otherwise SM5 reflection silently dies on systems
+    // without DXC.
+    auto& runtime = DxcRuntime::instance();
+    std::string dxc_error{};
+    if (runtime.ensure_loaded()) {
+        const DxcBuffer buffer{
+            .Ptr = bytecode,
+            .Size = bytecode_size,
+            .Encoding = DXC_CP_ACP
+        };
+        hr = runtime.utils->CreateReflection(&buffer, IID_PPV_ARGS(&reflection));
+    } else {
+        dxc_error = runtime.failure_reason;
+    }
+
+    if (FAILED(hr) || reflection == nullptr) {
+        // Fall back to d3dcompiler (DXBC/SM5; also accepts some DXIL on
+        // recent d3dcompiler_47 builds).
+        reflection.Reset();
+        hr = D3DReflect(bytecode, bytecode_size, IID_PPV_ARGS(&reflection));
+    }
+
+    if (FAILED(hr) || reflection == nullptr) {
+        out.error = "Shader reflection failed: " + hr_to_string(hr);
+        if (!dxc_error.empty()) {
+            out.error += " (dxc unavailable: " + dxc_error + ")";
+        }
+        return out;
+    }
+
+    D3D12_SHADER_DESC desc{};
+    hr = reflection->GetDesc(&desc);
+    if (FAILED(hr)) {
+        out.error = "ID3D12ShaderReflection::GetDesc failed: " + hr_to_string(hr);
+        return out;
+    }
+
+    out.ok = true;
+    out.creator = desc.Creator != nullptr ? desc.Creator : "";
+    out.instruction_count = desc.InstructionCount;
+    out.constant_buffer_count = desc.ConstantBuffers;
+    out.bound_resource_count = desc.BoundResources;
+    out.input_parameter_count = desc.InputParameters;
+    out.output_parameter_count = desc.OutputParameters;
+
+    out.constant_buffers.reserve(desc.ConstantBuffers);
+    for (UINT i = 0; i < desc.ConstantBuffers; ++i) {
+        ID3D12ShaderReflectionConstantBuffer* cbuffer = reflection->GetConstantBufferByIndex(i);
+        if (cbuffer == nullptr) {
+            continue;
+        }
+
+        D3D12_SHADER_BUFFER_DESC buffer_desc{};
+        if (FAILED(cbuffer->GetDesc(&buffer_desc))) {
+            continue;
+        }
+
+        render::ShaderReflectionConstantBufferInfo cbuffer_info{};
+        cbuffer_info.name = buffer_desc.Name != nullptr ? buffer_desc.Name : "";
+        cbuffer_info.type = cbuffer_type_to_string(buffer_desc.Type);
+        cbuffer_info.size = buffer_desc.Size;
+        cbuffer_info.variables.reserve(buffer_desc.Variables);
+
+        for (UINT var_index = 0; var_index < buffer_desc.Variables; ++var_index) {
+            ID3D12ShaderReflectionVariable* variable = cbuffer->GetVariableByIndex(var_index);
+            if (variable == nullptr) {
+                continue;
+            }
+
+            D3D12_SHADER_VARIABLE_DESC variable_desc{};
+            if (FAILED(variable->GetDesc(&variable_desc))) {
+                continue;
+            }
+
+            render::ShaderReflectionVariableInfo variable_info{};
+            variable_info.name = variable_desc.Name != nullptr ? variable_desc.Name : "";
+            variable_info.start_offset = variable_desc.StartOffset;
+            variable_info.size = variable_desc.Size;
+            variable_info.flags = variable_desc.uFlags;
+
+            if (ID3D12ShaderReflectionType* type = variable->GetType(); type != nullptr) {
+                D3D12_SHADER_TYPE_DESC type_desc{};
+                if (SUCCEEDED(type->GetDesc(&type_desc))) {
+                    variable_info.type_name = type_desc.Name != nullptr ? type_desc.Name : "";
+                    variable_info.type_class = variable_class_to_string(type_desc.Class);
+                    variable_info.type_kind = variable_type_to_string(type_desc.Type);
+                    variable_info.rows = type_desc.Rows;
+                    variable_info.columns = type_desc.Columns;
+                    variable_info.elements = type_desc.Elements;
+                    variable_info.members = type_desc.Members;
+                }
+            }
+
+            cbuffer_info.variables.emplace_back(std::move(variable_info));
+        }
+
+        out.constant_buffers.emplace_back(std::move(cbuffer_info));
+    }
+
+    out.bound_resources.reserve(desc.BoundResources);
+    for (UINT i = 0; i < desc.BoundResources; ++i) {
+        D3D12_SHADER_INPUT_BIND_DESC bind_desc{};
+        if (FAILED(reflection->GetResourceBindingDesc(i, &bind_desc))) {
+            continue;
+        }
+
+        render::ShaderReflectionResourceBindingInfo resource{};
+        resource.name = bind_desc.Name != nullptr ? bind_desc.Name : "";
+        resource.type = input_type_to_string(bind_desc.Type);
+        resource.return_type = return_type_to_string(bind_desc.ReturnType);
+        resource.dimension = srv_dimension_to_string(bind_desc.Dimension);
+        resource.bind_point = bind_desc.BindPoint;
+        resource.bind_count = bind_desc.BindCount;
+        resource.space = bind_desc.Space;
+        resource.flags = bind_desc.uFlags;
+        out.bound_resources.emplace_back(std::move(resource));
+    }
+
+    out.input_parameters.reserve(desc.InputParameters);
+    for (UINT i = 0; i < desc.InputParameters; ++i) {
+        D3D12_SIGNATURE_PARAMETER_DESC param{};
+        if (SUCCEEDED(reflection->GetInputParameterDesc(i, &param))) {
+            out.input_parameters.emplace_back(signature_param_to_info(param));
+        }
+    }
+
+    out.output_parameters.reserve(desc.OutputParameters);
+    for (UINT i = 0; i < desc.OutputParameters; ++i) {
+        D3D12_SIGNATURE_PARAMETER_DESC param{};
+        if (SUCCEEDED(reflection->GetOutputParameterDesc(i, &param))) {
+            out.output_parameters.emplace_back(signature_param_to_info(param));
+        }
+    }
+
+    return out;
+}
+
 std::vector<render::ShaderRecoveredSourceInfo> recover_sources_from_pdb_or_dxil(
     const void* bytecode,
     size_t bytecode_size,
@@ -765,6 +1102,8 @@ ShaderBytecodeInspection inspect_shader_bytecode(
             result.error += "; PDB/source recovery: " + pdb_error;
         }
     }
+
+    result.reflection = reflect_shader_bytecode(bytecode, bytecode_size);
 
     result.ok = result.error.empty() || !result.chunks.empty() || !result.disassembly.empty();
     return result;

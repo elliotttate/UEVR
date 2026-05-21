@@ -47,6 +47,55 @@
 #include "UObjectHook.hpp"
 #include "GameSpecific.hpp"
 
+namespace {
+bool vr_env_truthy(const char* name) {
+    char value[32]{};
+    const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+    if (len == 0 || len >= sizeof(value)) {
+        return false;
+    }
+
+    std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
+    return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+}
+
+bool vr_env_explicit_false(const char* name) {
+    char value[32]{};
+    const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+    if (len == 0 || len >= sizeof(value)) {
+        return false;
+    }
+
+    std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
+    return raw == "0" || raw == "false" || raw == "FALSE" || raw == "off" || raw == "OFF";
+}
+
+bool vr_is_subnautica2_process() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && exe_path->find(L"Subnautica2-Win64-Shipping") != std::wstring::npos;
+    }();
+
+    return result;
+}
+
+bool vr_disable_gamepad_spoof() {
+    static const bool result = []() {
+        if (vr_env_truthy("UEVR_DISABLE_GAMEPAD_SPOOF")) {
+            return true;
+        }
+
+        if (vr_is_subnautica2_process()) {
+            return !vr_env_explicit_false("UEVR_SN2_DISABLE_GAMEPAD_SPOOF");
+        }
+
+        return false;
+    }();
+
+    return result;
+}
+}
+
 std::shared_ptr<VR>& VR::get() {
     //static std::shared_ptr<VR> instance = std::make_shared<VR>();
     return g_framework->vr();
@@ -2669,7 +2718,7 @@ bool VR::is_any_action_down() {
 bool VR::on_message(HWND wnd, UINT message, WPARAM w_param, LPARAM l_param) {
     ZoneScopedN(__FUNCTION__);
 
-    if (message == WM_DEVICECHANGE && !m_spoofed_gamepad_connection) {
+    if (message == WM_DEVICECHANGE && !vr_disable_gamepad_spoof() && !m_spoofed_gamepad_connection) {
         spdlog::info("[VR] Received WM_DEVICECHANGE");
         m_last_xinput_spoof_sent = std::chrono::steady_clock::now();
     }
@@ -5624,7 +5673,7 @@ void VR::update_action_states() {
         m_spoofed_gamepad_connection = false;
     }
 
-    if (!m_spoofed_gamepad_connection && last_xinput_update_is_late && should_be_spoofing) {
+    if (!vr_disable_gamepad_spoof() && !m_spoofed_gamepad_connection && last_xinput_update_is_late && should_be_spoofing) {
         spdlog::info("[VR] Attempting to spoof gamepad connection");
         g_framework->post_message(WM_DEVICECHANGE, 0, 0);
         g_framework->activate_window();

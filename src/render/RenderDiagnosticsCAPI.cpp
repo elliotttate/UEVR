@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -41,6 +42,8 @@
 using json = nlohmann::json;
 template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
+extern "C" int sn2_get_current_fog_view();
+
 namespace {
 
 thread_local std::string g_capi_return_buffer{};
@@ -61,6 +64,23 @@ std::string format_pointer(uintptr_t pointer) {
     return ss.str();
 }
 
+std::string format_crc32(uint32_t value) {
+    std::ostringstream ss{};
+    ss << "0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << value;
+    return ss.str();
+}
+
+int64_t steady_age_ms(
+    std::chrono::steady_clock::time_point now,
+    std::chrono::steady_clock::time_point timestamp
+) {
+    if (timestamp.time_since_epoch().count() == 0) {
+        return -1;
+    }
+
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now - timestamp).count();
+}
+
 const char* backend_name(render::FrameResourceInspector::Backend backend) {
     return backend == render::FrameResourceInspector::Backend::D3D12 ? "D3D12" : "D3D11";
 }
@@ -73,6 +93,7 @@ const char* stage_name(render::ShaderOverrideRegistry::Stage stage) {
     switch (stage) {
     case render::ShaderOverrideRegistry::Stage::Vertex: return "VS";
     case render::ShaderOverrideRegistry::Stage::Pixel: return "PS";
+    case render::ShaderOverrideRegistry::Stage::Geometry: return "GS";
     case render::ShaderOverrideRegistry::Stage::Compute: return "CS";
     case render::ShaderOverrideRegistry::Stage::Amplification: return "AS";
     case render::ShaderOverrideRegistry::Stage::Mesh: return "MS";
@@ -173,6 +194,23 @@ json warning_to_json(const render::D3D12Diagnostics::WarningEvent& e) {
     return {{"frame", e.frame}, {"source", e.source}, {"message", e.message}};
 }
 
+json pipeline_cache_event_to_json(const render::D3D12Diagnostics::PipelineCacheEvent& e) {
+    return {
+        {"frame", e.frame},
+        {"source", e.source},
+        {"action", e.action},
+        {"device", format_pointer(e.device)},
+        {"library", format_pointer(e.library)},
+        {"pipeline_state", format_pointer(e.pipeline_state)},
+        {"name", e.name},
+        {"cached_blob_size", e.cached_blob_size},
+        {"has_cached_pso", e.has_cached_pso},
+        {"stripped_cached_pso", e.stripped_cached_pso},
+        {"result", format_pointer(static_cast<uintptr_t>(e.result))},
+        {"note", e.note},
+    };
+}
+
 template <typename Array>
 json root_slot_array_to_json(const Array& values) {
     json result = json::array();
@@ -222,6 +260,24 @@ json root_bind_to_json(const render::D3D12Diagnostics::RootBindEvent& e) {
     };
 }
 
+json resource_write_to_json(const render::D3D12Diagnostics::ResourceWriteInfo& w) {
+    return {
+        {"target_index", w.target_index},
+        {"descriptor", format_pointer(w.descriptor)},
+        {"resource", format_pointer(w.resource)},
+        {"name", w.name},
+        {"kind", w.kind},
+        {"prior_producer_frame", w.prior_producer_frame},
+        {"prior_producer_draw", w.prior_producer_draw},
+        {"prior_producer_pso", format_pointer(w.prior_producer_pso)},
+        {"prior_producer_command_list", format_pointer(w.prior_producer_command_list)},
+        {"prior_producer_kind", w.prior_producer_kind},
+        {"prior_producer_descriptor", format_pointer(w.prior_producer_descriptor)},
+        {"prior_producer_target_index", w.prior_producer_target_index},
+        {"prior_producer_eye_bucket", w.prior_producer_eye_bucket},
+    };
+}
+
 json draw_event_to_json(const render::D3D12Diagnostics::DrawEvent& e) {
     json descriptor_reads = json::array();
     for (const auto& read : e.descriptor_reads) {
@@ -229,12 +285,29 @@ json draw_event_to_json(const render::D3D12Diagnostics::DrawEvent& e) {
             {"root_parameter", read.root_parameter},
             {"descriptor_index", read.descriptor_index},
             {"descriptor_cpu", format_pointer(read.descriptor_cpu)},
+            {"descriptor_source_cpu", format_pointer(read.descriptor_source_cpu)},
+            {"descriptor_source_frame", read.descriptor_source_frame},
             {"resource", format_pointer(read.resource)},
             {"descriptor_type", read.descriptor_type},
             {"producer_frame", read.producer_frame},
             {"producer_draw", read.producer_draw},
             {"producer_pso", format_pointer(read.producer_pso)},
+            {"producer_command_list", format_pointer(read.producer_command_list)},
+            {"producer_kind", read.producer_kind},
+            {"producer_descriptor", format_pointer(read.producer_descriptor)},
+            {"producer_target_index", read.producer_target_index},
+            {"producer_eye_bucket", read.producer_eye_bucket},
         });
+    }
+
+    json render_target_writes = json::array();
+    for (const auto& write : e.render_target_writes) {
+        render_target_writes.push_back(resource_write_to_json(write));
+    }
+
+    json uav_writes = json::array();
+    for (const auto& write : e.uav_writes) {
+        uav_writes.push_back(resource_write_to_json(write));
     }
 
     return {
@@ -246,16 +319,39 @@ json draw_event_to_json(const render::D3D12Diagnostics::DrawEvent& e) {
         {"pipeline_state", format_pointer(e.pipeline_state)},
         {"root_signature", format_pointer(e.root_signature)},
         {"eye_bucket", e.eye_bucket},
+        {"executed", e.executed},
+        {"skipped", !e.executed},
+        {"has_viewport", e.has_viewport},
+        {"viewport_count", e.viewport_count},
+        {"viewport0", {
+            {"x", e.viewport_top_left_x},
+            {"y", e.viewport_top_left_y},
+            {"w", e.viewport_width},
+            {"h", e.viewport_height},
+        }},
+        {"has_scissor", e.has_scissor},
+        {"scissor_count", e.scissor_count},
+        {"scissor0", {
+            {"left", e.scissor_left},
+            {"top", e.scissor_top},
+            {"right", e.scissor_right},
+            {"bottom", e.scissor_bottom},
+        }},
         {"arg0", e.arg0},
         {"arg1", e.arg1},
         {"arg2", e.arg2},
         {"arg3", e.arg3},
         {"arg4", e.arg4},
+        {"copy_dst_byte_offset", e.copy_dst_byte_offset},
+        {"copy_src_byte_offset", e.copy_src_byte_offset},
+        {"copy_byte_count", e.copy_byte_count},
         {"rtv0", format_pointer(e.rtv0)},
         {"rtv0_resource", format_pointer(e.rtv0_resource)},
         {"prior_rtv0_producer_frame", e.prior_rtv0_producer_frame},
         {"prior_rtv0_producer_draw", e.prior_rtv0_producer_draw},
         {"prior_rtv0_producer_pso", format_pointer(e.prior_rtv0_producer_pso)},
+        {"render_target_writes", std::move(render_target_writes)},
+        {"uav_writes", std::move(uav_writes)},
         {"graphics_root_descriptor_tables", root_slot_array_to_json(e.graphics_root_descriptor_tables)},
         {"compute_root_descriptor_tables", root_slot_array_to_json(e.compute_root_descriptor_tables)},
         {"graphics_root_cbvs", root_slot_array_to_json(e.graphics_root_cbvs)},
@@ -309,6 +405,20 @@ uint64_t draw_resource_fingerprint(const render::D3D12Diagnostics::DrawEvent& e)
     hash_u64(hash, e.root_signature);
     hash_u64(hash, e.rtv0);
     hash_u64(hash, e.rtv0_resource);
+    for (const auto& write : e.render_target_writes) {
+        hash_u64(hash, write.target_index);
+        hash_u64(hash, write.descriptor);
+        hash_u64(hash, write.resource);
+        hash_u64(hash, write.prior_producer_draw);
+        hash_u64(hash, write.prior_producer_pso);
+    }
+    for (const auto& write : e.uav_writes) {
+        hash_u64(hash, write.target_index);
+        hash_u64(hash, write.descriptor);
+        hash_u64(hash, write.resource);
+        hash_u64(hash, write.prior_producer_draw);
+        hash_u64(hash, write.prior_producer_pso);
+    }
     hash_root_array(hash, e.graphics_root_descriptor_tables);
     hash_root_array(hash, e.compute_root_descriptor_tables);
     hash_root_array(hash, e.graphics_root_cbvs);
@@ -327,9 +437,11 @@ uint64_t draw_resource_fingerprint(const render::D3D12Diagnostics::DrawEvent& e)
         hash_u64(hash, read.root_parameter);
         hash_u64(hash, read.descriptor_index);
         hash_u64(hash, read.descriptor_cpu);
+        hash_u64(hash, read.descriptor_source_cpu);
         hash_u64(hash, read.resource);
         hash_u64(hash, read.producer_draw);
         hash_u64(hash, read.producer_pso);
+        hash_u64(hash, read.producer_descriptor);
     }
     return hash;
 }
@@ -477,6 +589,8 @@ json bound_shader_to_json(const render::ShaderOverrideRegistry::BoundShaderInfo&
         {"original_pointer", format_pointer(s.original_pointer)},
         {"bound_pointer", format_pointer(s.bound_pointer)},
         {"hash", s.hash},
+        {"crc32", format_crc32(s.crc32)},
+        {"crc32_u32", s.crc32},
         {"override_active", s.override_active},
         {"override_name", s.override_name},
         {"note", s.note},
@@ -496,6 +610,7 @@ json pso_pair_to_json(const render::ShaderOverrideRegistry::D3D12PipelinePairInf
         {"tracking_note", p.tracking_note},
         {"vertex_shader", bound_shader_to_json(p.vertex_shader)},
         {"pixel_shader", bound_shader_to_json(p.pixel_shader)},
+        {"geometry_shader", bound_shader_to_json(p.geometry_shader)},
     };
 }
 
@@ -523,8 +638,16 @@ json pso_aggregate_to_json(const render::ShaderOverrideRegistry::D3D12PsoAggrega
         {"tracking_note", a.tracking_note},
         {"vs_hash", a.vs_hash},
         {"ps_hash", a.ps_hash},
+        {"gs_hash", a.gs_hash},
+        {"vs_crc32", format_crc32(a.vs_crc32)},
+        {"ps_crc32", format_crc32(a.ps_crc32)},
+        {"gs_crc32", format_crc32(a.gs_crc32)},
+        {"vs_crc32_u32", a.vs_crc32},
+        {"ps_crc32_u32", a.ps_crc32},
+        {"gs_crc32_u32", a.gs_crc32},
         {"vs_override", a.vs_override},
         {"ps_override", a.ps_override},
+        {"gs_override", a.gs_override},
         {"likely_targets", json::array()},
     };
     for (const auto& u : a.likely_targets) {
@@ -550,6 +673,10 @@ json override_entry_to_json(const render::ShaderOverrideRegistry::OverrideEntryI
         {"apply_supported", e.apply_supported},
         {"from_profile_dir", e.from_profile_dir},
         {"per_eye_variants", e.per_eye_variants},
+        {"has_left_payload", e.has_left_payload},
+        {"has_right_payload", e.has_right_payload},
+        {"left_source_kind", e.left_source_kind},
+        {"right_source_kind", e.right_source_kind},
         {"generation", e.generation},
         {"status", e.status},
         {"compiler", e.compiler},
@@ -612,7 +739,202 @@ json shader_chunk_to_json(const render::ShaderContainerChunkInfo& c) {
     };
 }
 
+std::string reflection_root_kind(const render::ShaderReflectionResourceBindingInfo& r) {
+    if (r.type == "cbv") {
+        return "cbv";
+    }
+    if (r.type == "tbuffer" || r.type == "srv" || r.type == "acceleration_structure") {
+        return "srv";
+    }
+    if (r.type == "uav") {
+        return "uav";
+    }
+    if (r.type == "sampler") {
+        return "sampler";
+    }
+    return {};
+}
+
+bool register_in_root_range(const render::D3D12Diagnostics::RootDescriptorRangeInfo& range, uint32_t bind_point) {
+    if (bind_point < range.base_shader_register) {
+        return false;
+    }
+
+    if (range.num_descriptors == UINT32_MAX) {
+        return true;
+    }
+
+    const uint64_t end = static_cast<uint64_t>(range.base_shader_register) +
+                         static_cast<uint64_t>(range.num_descriptors);
+    return static_cast<uint64_t>(bind_point) < end;
+}
+
+json root_binding_match_to_json(
+    const render::ShaderReflectionResourceBindingInfo& resource,
+    const render::D3D12Diagnostics::RootSignatureInfo* root_signature
+) {
+    if (root_signature == nullptr) {
+        return nullptr;
+    }
+
+    const auto kind = reflection_root_kind(resource);
+    if (kind.empty()) {
+        return nullptr;
+    }
+
+    for (const auto& param : root_signature->parameters) {
+        if ((param.parameter_type == kind ||
+             (kind == "cbv" && param.parameter_type == "32bit_constants")) &&
+            param.shader_register == resource.bind_point &&
+            param.register_space == resource.space) {
+            return {
+                {"root_parameter", param.index},
+                {"root_parameter_type", param.parameter_type},
+                {"shader_register", param.shader_register},
+                {"register_space", param.register_space},
+            };
+        }
+
+        if (param.parameter_type != "descriptor_table") {
+            continue;
+        }
+
+        for (size_t range_index = 0; range_index < param.ranges.size(); ++range_index) {
+            const auto& range = param.ranges[range_index];
+            if (range.type != kind ||
+                range.register_space != resource.space ||
+                !register_in_root_range(range, resource.bind_point)) {
+                continue;
+            }
+
+            return {
+                {"root_parameter", param.index},
+                {"root_parameter_type", param.parameter_type},
+                {"root_range_index", range_index},
+                {"root_range_type", range.type},
+                {"root_range_base_shader_register", range.base_shader_register},
+                {"root_range_register_space", range.register_space},
+                {"descriptor_index", resource.bind_point - range.base_shader_register},
+            };
+        }
+    }
+
+    return nullptr;
+}
+
+json shader_reflection_variable_to_json(const render::ShaderReflectionVariableInfo& v) {
+    return {
+        {"name", v.name},
+        {"start_offset", v.start_offset},
+        {"size", v.size},
+        {"flags", v.flags},
+        {"type_name", v.type_name},
+        {"type_class", v.type_class},
+        {"type_kind", v.type_kind},
+        {"rows", v.rows},
+        {"columns", v.columns},
+        {"elements", v.elements},
+        {"members", v.members},
+    };
+}
+
+json shader_reflection_cbuffer_to_json(const render::ShaderReflectionConstantBufferInfo& c) {
+    json variables = json::array();
+    for (const auto& v : c.variables) {
+        variables.push_back(shader_reflection_variable_to_json(v));
+    }
+
+    return {
+        {"name", c.name},
+        {"type", c.type},
+        {"size", c.size},
+        {"variables", std::move(variables)},
+    };
+}
+
+json shader_reflection_resource_to_json(
+    const render::ShaderReflectionResourceBindingInfo& r,
+    const render::D3D12Diagnostics::RootSignatureInfo* root_signature
+) {
+    json out{
+        {"name", r.name},
+        {"type", r.type},
+        {"return_type", r.return_type},
+        {"dimension", r.dimension},
+        {"bind_point", r.bind_point},
+        {"bind_count", r.bind_count},
+        {"space", r.space},
+        {"flags", r.flags},
+    };
+
+    auto match = root_binding_match_to_json(r, root_signature);
+    if (!match.is_null()) {
+        out["root_binding"] = std::move(match);
+    }
+
+    return out;
+}
+
+json shader_reflection_signature_to_json(const render::ShaderReflectionSignatureParamInfo& p) {
+    return {
+        {"semantic_name", p.semantic_name},
+        {"semantic_index", p.semantic_index},
+        {"register_index", p.register_index},
+        {"system_value", p.system_value},
+        {"component_type", p.component_type},
+        {"mask", p.mask},
+        {"read_write_mask", p.read_write_mask},
+        {"stream", p.stream},
+    };
+}
+
+json shader_reflection_to_json(
+    const render::ShaderReflectionInfo& r,
+    const render::D3D12Diagnostics::RootSignatureInfo* root_signature
+) {
+    json cbuffers = json::array();
+    for (const auto& c : r.constant_buffers) {
+        cbuffers.push_back(shader_reflection_cbuffer_to_json(c));
+    }
+
+    json resources = json::array();
+    for (const auto& b : r.bound_resources) {
+        resources.push_back(shader_reflection_resource_to_json(b, root_signature));
+    }
+
+    json inputs = json::array();
+    for (const auto& p : r.input_parameters) {
+        inputs.push_back(shader_reflection_signature_to_json(p));
+    }
+
+    json outputs = json::array();
+    for (const auto& p : r.output_parameters) {
+        outputs.push_back(shader_reflection_signature_to_json(p));
+    }
+
+    return {
+        {"ok", r.ok},
+        {"error", r.error},
+        {"creator", r.creator},
+        {"instruction_count", r.instruction_count},
+        {"constant_buffer_count", r.constant_buffer_count},
+        {"bound_resource_count", r.bound_resource_count},
+        {"input_parameter_count", r.input_parameter_count},
+        {"output_parameter_count", r.output_parameter_count},
+        {"constant_buffers", std::move(cbuffers)},
+        {"bound_resources", std::move(resources)},
+        {"input_parameters", std::move(inputs)},
+        {"output_parameters", std::move(outputs)},
+    };
+}
+
 json shader_bytecode_inspection_to_json(const render::ShaderOverrideRegistry::D3D12ShaderBytecodeInspection& i) {
+    auto root_signature = render::D3D12Diagnostics::get().root_signature_for_pipeline(i.pipeline_state);
+    if (!root_signature.has_value() && i.root_signature != 0) {
+        root_signature = render::D3D12Diagnostics::get().root_signature(i.root_signature);
+    }
+    const auto* root_signature_ptr = root_signature.has_value() ? &*root_signature : nullptr;
+
     json bytecode{
         {"ok", i.bytecode.ok},
         {"container", i.bytecode.container},
@@ -644,14 +966,23 @@ json shader_bytecode_inspection_to_json(const render::ShaderOverrideRegistry::D3
         }
     }
 
-    return {
+    bytecode["reflection"] = shader_reflection_to_json(i.bytecode.reflection, root_signature_ptr);
+
+    json result{
         {"found", i.found},
         {"requested_stage", i.requested_stage},
         {"requested_hash", i.requested_hash},
         {"matched_stage", i.matched_stage},
         {"pipeline_state", format_pointer(i.pipeline_state)},
+        {"root_signature_pointer", format_pointer(i.root_signature)},
         {"bytecode", std::move(bytecode)},
     };
+
+    if (root_signature_ptr != nullptr) {
+        result["root_signature"] = root_signature_to_json(*root_signature_ptr);
+    }
+
+    return result;
 }
 
 json preview_to_json(const render::FrameResourceInspector::PreviewInfo& p) {
@@ -729,6 +1060,7 @@ json d3d12_snapshot_to_json(const render::D3D12Diagnostics::Snapshot& s, int max
     result["recent_draw_events"] = tail(s.recent_draw_events, [](const auto& e) { return draw_event_to_json(e); });
     result["gpu_timings"] = tail(s.gpu_timings, [](const auto& e) { return gpu_timing_to_json(e); });
     result["symmetry_oracle"] = symmetry_oracle_to_json(s.recent_draw_events);
+    result["recent_pipeline_cache_events"] = tail(s.recent_pipeline_cache_events, [](const auto& e) { return pipeline_cache_event_to_json(e); });
     result["recent_barriers"] = tail(s.recent_barriers, [](const auto& e) { return barrier_to_json(e); });
     result["recent_warnings"] = tail(s.recent_warnings, [](const auto& e) { return warning_to_json(e); });
     return result;
@@ -958,6 +1290,104 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_hunter_capture_active_o
             {"manifest_path", manifest_path.string()},
             {"source_path", source_path.string()},
             {"enabled", false},
+        });
+    } catch (const std::exception& e) {
+        return publish(json{{"ok", false}, {"error", e.what()}});
+    }
+}
+
+extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_hunter_highlight_hash_json(const char* hash, int enabled) {
+    try {
+        auto& registry = render::ShaderOverrideRegistry::get();
+        auto normalize = [](std::string value) {
+            value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) {
+                return std::isspace(c) != 0;
+            }), value.end());
+            if (value.rfind("0x", 0) == 0 || value.rfind("0X", 0) == 0) {
+                value.erase(0, 2);
+            }
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return value;
+        };
+
+        const std::string h = normalize(hash != nullptr ? hash : "");
+        if (h.empty()) {
+            return publish(json{{"ok", false}, {"error", "hash is required"}});
+        }
+
+        if (h == "*" && enabled == 0) {
+            for (const auto& item : registry.hunter_highlight_snapshot()) {
+                registry.hunter_toggle_highlight_hash(item);
+            }
+        } else if (h == "*") {
+            return publish(json{{"ok", false}, {"error", "hash='*' only supports enabled=false"}});
+        } else {
+            const auto before = registry.hunter_highlight_snapshot();
+            const bool was_enabled = std::find(before.begin(), before.end(), h) != before.end();
+            const bool should_enable = enabled != 0;
+            if (was_enabled != should_enable) {
+                registry.hunter_toggle_highlight_hash(h);
+            }
+        }
+
+        return publish(json{
+            {"ok", true},
+            {"hash", h},
+            {"enabled", enabled != 0},
+            {"highlights", registry.hunter_highlight_snapshot()},
+        });
+    } catch (const std::exception& e) {
+        return publish(json{{"ok", false}, {"error", e.what()}});
+    }
+}
+
+extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_hunter_skip_eye_hash_json(
+    const char* hash,
+    int eye,
+    int enabled
+) {
+    try {
+        auto& registry = render::ShaderOverrideRegistry::get();
+        auto normalize = [](std::string value) {
+            value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) {
+                return std::isspace(c) != 0;
+            }), value.end());
+            if (value.rfind("0x", 0) == 0 || value.rfind("0X", 0) == 0) {
+                value.erase(0, 2);
+            }
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return value;
+        };
+
+        const std::string h = normalize(hash != nullptr ? hash : "");
+        if (h.empty()) {
+            return publish(json{{"ok", false}, {"error", "hash is required"}});
+        }
+
+        const bool left = eye == 0;
+        const bool was_enabled = left
+            ? registry.hunter_is_skip_left_only(h)
+            : registry.hunter_is_skip_right_only(h);
+        const bool should_enable = enabled != 0;
+        if (was_enabled != should_enable) {
+            if (left) {
+                registry.hunter_toggle_skip_left_only(h);
+            } else {
+                registry.hunter_toggle_skip_right_only(h);
+            }
+        }
+
+        return publish(json{
+            {"ok", true},
+            {"hash", h},
+            {"eye", left ? "left" : "right"},
+            {"enabled", should_enable},
+            {"skip_left", registry.hunter_is_skip_left_only(h)},
+            {"skip_right", registry.hunter_is_skip_right_only(h)},
         });
     } catch (const std::exception& e) {
         return publish(json{{"ok", false}, {"error", e.what()}});
@@ -1329,8 +1759,13 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_stereo_summary_json() {
                     {"total_samples", agg.total_samples},
                     {"vs_hash", agg.vs_hash},
                     {"ps_hash", agg.ps_hash},
+                    {"gs_hash", agg.gs_hash},
+                    {"vs_crc32", format_crc32(agg.vs_crc32)},
+                    {"ps_crc32", format_crc32(agg.ps_crc32)},
+                    {"gs_crc32", format_crc32(agg.gs_crc32)},
                     {"vs_override", agg.vs_override},
                     {"ps_override", agg.ps_override},
+                    {"gs_override", agg.gs_override},
                     {"likely_targets_count", agg.likely_targets.size()},
                 });
             }
@@ -1689,6 +2124,39 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_vr_state_json() {
             runtime["ready"] = rt->ready();
             runtime["is_openxr"] = rt->is_openxr();
             runtime["is_openvr"] = rt->is_openvr();
+            if (rt->is_openxr()) {
+                if (auto* openxr = vr->get_openxr_runtime(); openxr != nullptr) {
+                    const auto now = std::chrono::steady_clock::now();
+                    runtime["session_state"] = static_cast<int>(openxr->session_state);
+                    runtime["session_state_name"] = openxr->get_session_state_string(openxr->session_state);
+                    runtime["session_ready"] = openxr->session_ready;
+                    runtime["can_run_frame_loop"] = openxr->can_run_frame_loop();
+                    runtime["frame_synced"] = openxr->frame_synced;
+                    runtime["frame_began"] = openxr->frame_began;
+                    runtime["got_first_poses"] = openxr->got_first_poses;
+                    runtime["got_first_valid_poses"] = openxr->got_first_valid_poses;
+                    runtime["accepted_relaxed_startup_poses"] = openxr->accepted_relaxed_startup_poses;
+                    runtime["ever_submitted"] = openxr->ever_submitted;
+                    runtime["frame_state_should_render"] = openxr->frame_state.shouldRender == XR_TRUE;
+                    runtime["internal_frame_count"] = openxr->internal_frame_count;
+                    runtime["internal_render_frame_count"] = openxr->internal_render_frame_count;
+                    runtime["has_render_frame_count"] = openxr->has_render_frame_count;
+                    runtime["last_begin_frame_caller"] = openxr->last_begin_frame_caller != nullptr
+                        ? openxr->last_begin_frame_caller
+                        : "";
+                    runtime["last_frame_synced_clear_reason"] = openxr->last_frame_synced_clear_reason != nullptr
+                        ? openxr->last_frame_synced_clear_reason
+                        : "";
+                    runtime["frame_synced_skip_streak"] = openxr->frame_synced_skip_streak;
+                    runtime["frame_began_skip_streak"] = openxr->frame_began_skip_streak;
+                    runtime["forced_frame_recovery_count"] = openxr->forced_frame_recovery_count;
+                    runtime["focused_frame_loop_recovery_count"] = openxr->focused_frame_loop_recovery_count;
+                    runtime["last_successful_wait_age_ms"] = steady_age_ms(now, openxr->last_successful_wait_frame);
+                    runtime["last_successful_begin_age_ms"] = steady_age_ms(now, openxr->last_successful_begin_frame);
+                    runtime["last_successful_end_age_ms"] = steady_age_ms(now, openxr->last_successful_end_frame);
+                    runtime["last_successful_pose_update_age_ms"] = steady_age_ms(now, openxr->last_successful_pose_update);
+                }
+            }
         } else {
             runtime["name"] = "none";
             runtime["loaded"] = false;
@@ -2014,8 +2482,15 @@ ReadbackResult readback_texture_region(
 
 } // namespace
 
-extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_eye_pixel_sample_json(
-    int side, int sample_w, int sample_h
+namespace {
+
+const char* eye_pixel_sample_json_impl(
+    int side,
+    int sample_w,
+    int sample_h,
+    int sample_x,
+    int sample_y,
+    bool explicit_origin
 ) {
     try {
         if (g_framework == nullptr || !g_framework->is_ready()) {
@@ -2042,9 +2517,17 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_eye_pixel_sample_json(
         UINT sh = (sample_h <= 0) ? (std::min)(h, 64u) : (UINT)sample_h;
         sw = (std::min)(sw, w);
         sh = (std::min)(sh, h);
-        // Centre the sample within the eye region (NOT the full texture).
-        const UINT cx = tgt.region_x + (w - sw) / 2;
-        const UINT cy = tgt.region_y + (h - sh) / 2;
+
+        UINT local_x = (w - sw) / 2;
+        UINT local_y = (h - sh) / 2;
+        if (explicit_origin) {
+            local_x = sample_x <= 0 ? 0u : static_cast<UINT>(sample_x);
+            local_y = sample_y <= 0 ? 0u : static_cast<UINT>(sample_y);
+            local_x = (std::min)(local_x, w - sw);
+            local_y = (std::min)(local_y, h - sh);
+        }
+        const UINT cx = tgt.region_x + local_x;
+        const UINT cy = tgt.region_y + local_y;
 
         // Pick the right expected state for the path so we don't fight the engine's barriers.
         D3D12_RESOURCE_STATES expected = D3D12_RESOURCE_STATE_COMMON;
@@ -2108,6 +2591,8 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_eye_pixel_sample_json(
             {"sampled_w", rb.width},
             {"sampled_h", rb.height},
             {"sampled_at", {{"x", cx}, {"y", cy}}},
+            {"sampled_at_eye", {{"x", local_x}, {"y", local_y}}},
+            {"sample_origin", explicit_origin ? "explicit_eye_relative" : "center"},
             {"array_slice", tgt.array_slice},
             {"format", (int)rb.format},
             {"channels", "RGBA8"},
@@ -2127,6 +2612,20 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_eye_pixel_sample_json(
     } catch (const std::exception& e) {
         return publish(json{{"available", false}, {"error", e.what()}});
     }
+}
+
+} // namespace
+
+extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_eye_pixel_sample_json(
+    int side, int sample_w, int sample_h
+) {
+    return eye_pixel_sample_json_impl(side, sample_w, sample_h, 0, 0, false);
+}
+
+extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_eye_region_sample_json(
+    int side, int sample_x, int sample_y, int sample_w, int sample_h
+) {
+    return eye_pixel_sample_json_impl(side, sample_w, sample_h, sample_x, sample_y, true);
 }
 
 // ── Eye dump to disk (PNG / JPG / BMP via WIC) ───────────────────────
@@ -2225,7 +2724,229 @@ std::filesystem::path default_eye_dump_path(int side, int fmt) {
     return base / name.str();
 }
 
+std::optional<std::string> env_value_a(const char* name) {
+    if (name == nullptr || *name == '\0') {
+        return std::nullopt;
+    }
+
+    char buffer[4096]{};
+    const DWORD len = GetEnvironmentVariableA(name, buffer, static_cast<DWORD>(std::size(buffer)));
+    if (len == 0) {
+        return std::nullopt;
+    }
+    if (len >= std::size(buffer)) {
+        std::string value(static_cast<size_t>(len) + 1, '\0');
+        const DWORD read = GetEnvironmentVariableA(name, value.data(), len + 1);
+        if (read == 0) {
+            return std::nullopt;
+        }
+        value.resize(read);
+        return value;
+    }
+
+    return std::string{buffer, len};
+}
+
+bool env_truthy(const std::optional<std::string>& value) {
+    if (!value.has_value() || value->empty()) {
+        return false;
+    }
+
+    std::string lower{};
+    lower.reserve(8);
+    for (const char c : *value) {
+        if (lower.size() >= 16) {
+            break;
+        }
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+
+    return lower != "0" &&
+           lower != "false" &&
+           lower != "no" &&
+           lower != "off" &&
+           lower != "disable" &&
+           lower != "disabled";
+}
+
+json env_entry_json(const char* name) {
+    const auto value = env_value_a(name);
+    return {
+        {"name", name},
+        {"set", value.has_value()},
+        {"value", value.value_or("")},
+        {"truthy", env_truthy(value)},
+    };
+}
+
+bool string_in_list(std::string_view value, std::initializer_list<std::string_view> list) {
+    for (const auto item : list) {
+        if (value == item) {
+            return true;
+        }
+    }
+    return false;
+}
+
+json sn2_env_snapshot_json() {
+    static constexpr const char* kNames[] = {
+        "UEVR_DIAG_CLEAN",
+        "UEVR_HIDE_MENU_ON_STARTUP",
+        "UEVR_FORCE_MENU_CLOSED",
+        "UEVR_D3D12_STRIP_CACHED_PSO",
+        "UEVR_ENABLE_D3D12_GPU_TIMESTAMPS",
+        "UEVR_SN2_FOG_SRV_REDIRECT",
+        "UEVR_SN2_FOG_SRV_REDIRECT_SLOTS",
+        "UEVR_SN2_COPYRECT_RIGHT_TABLE0_FROM_LEFT",
+        "UEVR_SN2_COPYRECT_CB2_MODE",
+        "UEVR_SN2_COPYRECT_RIGHT_CBV_FROM_LEFT",
+        "UEVR_SN2_UPSTREAM_SKIP_CRCS",
+        "UEVR_SN2_SKYATMOS_SKIP_RIGHT",
+        "UEVR_SN2_PSO3069_SUBST",
+        "UEVR_SN2_PSO3069_CAPTURE_NEXT",
+        "UEVR_SN2_PSO3069_CAPTURE_MARK_FILE",
+        "UEVR_SN2_BASEPASS_SNAPSHOT",
+        "UEVR_SN2_TAIL_SRV_REPAIR",
+        "UEVR_SN2_TAIL_SRV_REPAIR_TARGET_CRC",
+        "UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_PER_VIEW_HOOK",
+        "UEVR_SUBNAUTICA2_DISABLE_VOLUMETRIC_FOG_VIEW_LOOP_FIX",
+        "UEVR_SUBNAUTICA2_DISABLE_VOLUMETRIC_RT_REPLAY",
+        "UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_VIEW_INDEX_FORCE",
+        "UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_STATE_COPY",
+        "UEVR_SUBNAUTICA2_DISABLE_COMPOSE_VOLUMETRIC_VIEW_RECT_FIX",
+        "UEVR_SUBNAUTICA2_DISABLE_RENDER_FOG_VIEW_RECT_FIX",
+        "UEVR_SUBNAUTICA2_DISABLE_UNDERWATER_FOG_VIEW_DATA_FIX",
+        "UEVR_SUBNAUTICA2_DISABLE_SINGLE_LAYER_WATER_VIEW_RECT_FIX",
+        "UEVR_SUBNAUTICA2_FOG_ALIAS_THUNK_DIAG",
+        "UEVR_SUBNAUTICA2_FOG_ALIAS_THUNK_MODE",
+        "UEVR_SUBNAUTICA2_LIGHT_AFFECTS_VIEW_DIAG",
+        "UEVR_SUBNAUTICA2_LIGHT_AFFECTS_VIEW_MODE",
+        "UEVR_SUBNAUTICA2_VISIBLE_LIGHT_INFOS_COPY_MODE",
+        "UEVR_SUBNAUTICA2_ENABLE_UWE_TRACE",
+        "UEVR_SUBNAUTICA2_ENABLE_UWE_FD0A50_DETAIL",
+        "UEVR_SUBNAUTICA2_FD0A50_RIGHT_OUT_FROM_LEFT",
+        "UEVR_SUBNAUTICA2_FOG_PATH_A",
+        "UEVR_SUBNAUTICA2_FOG_SWAP_SRC_HANDLE",
+        "UEVR_SUBNAUTICA2_FOG_SWAP_DST_HANDLE",
+        "UEVR_SUBNAUTICA2_FOG_SWAP_SRC_INDEX",
+        "UEVR_SUBNAUTICA2_FOG_SWAP_DST_INDEX",
+        "UEVR_SUBNAUTICA2_FOG_SWAP_SWEEP",
+        "UEVR_SUBNAUTICA2_FOG_SWAP_USE_UAV_TAG",
+    };
+
+    json env = json::array();
+    json active = json::array();
+    json active_mutations = json::array();
+    json active_safety = json::array();
+    json active_diagnostics = json::array();
+    json active_params = json::array();
+    json active_ui = json::array();
+
+    auto classify_active = [&](std::string_view name) {
+        if (name == "UEVR_HIDE_MENU_ON_STARTUP" || name == "UEVR_FORCE_MENU_CLOSED") {
+            active_ui.push_back(name);
+            return;
+        }
+        if (name.rfind("UEVR_SUBNAUTICA2_DISABLE_", 0) == 0) {
+            active_safety.push_back(name);
+            return;
+        }
+        if (string_in_list(name, {
+                "UEVR_SN2_FOG_SRV_REDIRECT_SLOTS",
+                "UEVR_SN2_TAIL_SRV_REPAIR_TARGET_CRC",
+                "UEVR_SN2_PSO3069_CAPTURE_MARK_FILE",
+                "UEVR_SUBNAUTICA2_FOG_SWAP_SRC_HANDLE",
+                "UEVR_SUBNAUTICA2_FOG_SWAP_DST_HANDLE",
+                "UEVR_SUBNAUTICA2_FOG_SWAP_SRC_INDEX",
+                "UEVR_SUBNAUTICA2_FOG_SWAP_DST_INDEX",
+            })) {
+            active_params.push_back(name);
+            return;
+        }
+        if (string_in_list(name, {
+                "UEVR_DIAG_CLEAN",
+                "UEVR_D3D12_STRIP_CACHED_PSO",
+                "UEVR_ENABLE_D3D12_GPU_TIMESTAMPS",
+                "UEVR_SN2_PSO3069_CAPTURE_NEXT",
+                "UEVR_SN2_BASEPASS_SNAPSHOT",
+                "UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_PER_VIEW_HOOK",
+                "UEVR_SUBNAUTICA2_FOG_ALIAS_THUNK_DIAG",
+                "UEVR_SUBNAUTICA2_LIGHT_AFFECTS_VIEW_DIAG",
+                "UEVR_SUBNAUTICA2_ENABLE_UWE_TRACE",
+                "UEVR_SUBNAUTICA2_ENABLE_UWE_FD0A50_DETAIL",
+            })) {
+            active_diagnostics.push_back(name);
+            return;
+        }
+        active_mutations.push_back(name);
+    };
+
+    for (const char* name : kNames) {
+        auto entry = env_entry_json(name);
+        if (entry.value("truthy", false)) {
+            active.push_back(name);
+            classify_active(name);
+        }
+        env.push_back(std::move(entry));
+    }
+
+    return {
+        {"entries", std::move(env)},
+        {"active_truthy_names", std::move(active)},
+        {"active_mutation_names", std::move(active_mutations)},
+        {"active_safety_names", std::move(active_safety)},
+        {"active_diagnostic_names", std::move(active_diagnostics)},
+        {"active_param_names", std::move(active_params)},
+        {"active_ui_names", std::move(active_ui)},
+    };
+}
+
 } // namespace
+
+extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_sn2_state_json() {
+    try {
+        json result{
+            {"available", true},
+            {"framework_ready", g_framework != nullptr && g_framework->is_ready()},
+            {"renderer", g_framework != nullptr
+                ? (g_framework->is_dx12() ? "D3D12" : (g_framework->is_dx11() ? "D3D11" : "Unknown"))
+                : "Unknown"},
+            {"persistent_dir", g_framework != nullptr ? Framework::get_persistent_dir().string() : std::string{}},
+            {"current_fog_view", sn2_get_current_fog_view()},
+            {"environment", sn2_env_snapshot_json()},
+            {"sn2_descriptor_maps", {
+                {"fog_srv_total", sn2_fog_srv_map::size()},
+                {"fog_srv_view0", sn2_fog_srv_map::count_by_view(0)},
+                {"fog_srv_view1", sn2_fog_srv_map::count_by_view(1)},
+                {"fog_srv_unknown", sn2_fog_srv_map::count_by_view(-1)},
+                {"fog_uav_total", sn2_fog_uav_map::size()},
+                {"fog_uav_view0", sn2_fog_uav_map::count_by_view(0)},
+                {"fog_uav_view1", sn2_fog_uav_map::count_by_view(1)},
+                {"fog_uav_unknown", sn2_fog_uav_map::count_by_view(-1)},
+                {"bindless_slot_total", sn2_bindless_slot_map::size()},
+                {"bindless_slot_view0", sn2_bindless_slot_map::count_by_view(0)},
+                {"bindless_slot_view1", sn2_bindless_slot_map::count_by_view(1)},
+                {"bindless_slot_unknown", sn2_bindless_slot_map::count_by_view(-1)},
+            }},
+        };
+
+        json hints = json::array();
+        const auto active_mutations = result["environment"]["active_mutation_names"];
+        if (active_mutations.is_array() && !active_mutations.empty()) {
+            hints.push_back("One or more SN2/UEVR diagnostic mutations are active. Confirm this is intentional before treating the run as a clean baseline.");
+        }
+        if (env_truthy(env_value_a("UEVR_D3D12_STRIP_CACHED_PSO"))) {
+            hints.push_back("Cached PSO stripping is active. This is useful for making stream PSOs substitutable, but it changes the PSO creation path.");
+        }
+        if (!env_truthy(env_value_a("UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_PER_VIEW_HOOK"))) {
+            hints.push_back("The volumetric-fog per-view hook is not enabled, so current_fog_view and fog SRV/UAV view tagging may stay stale or unknown.");
+        }
+        result["hints"] = std::move(hints);
+        return publish(std::move(result));
+    } catch (const std::exception& e) {
+        return publish(json{{"available", false}, {"error", e.what()}});
+    }
+}
 
 extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_eye_dump_json(
     int side, const char* out_path, int fmt

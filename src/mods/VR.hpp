@@ -8,11 +8,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <mutex>
 #include <optional>
 #include <stop_token>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -620,6 +622,24 @@ public:
     }
 
     bool is_native_stereo_fix_enabled() const {
+        static const bool hard_disabled = []() {
+            const char* raw = std::getenv("UEVR_DISABLE_NATIVE_STEREO_FIX");
+            if (raw == nullptr || raw[0] == '\0') {
+                raw = std::getenv("UEVR_SN2_DISABLE_NATIVE_STEREO_FIX");
+            }
+
+            if (raw == nullptr || raw[0] == '\0') {
+                return false;
+            }
+
+            const std::string_view value{raw};
+            return value != "0" && value != "false" && value != "FALSE" && value != "off" && value != "OFF";
+        }();
+
+        if (hard_disabled) {
+            return false;
+        }
+
         if (should_ignore_native_stereo_fix_for_avowed_sync()) {
             return false;
         }

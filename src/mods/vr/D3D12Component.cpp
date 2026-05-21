@@ -13,6 +13,7 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -43,6 +44,17 @@ namespace {
 constexpr auto FRAME_TIMING_LOG_INTERVAL = std::chrono::seconds(5);
 constexpr bool SHF_AUTO_MONO_CINEMATIC = true;
 constexpr bool SHF_AUTO_2D_SCREEN_FROM_MONO_CINEMATIC = true;
+
+bool sn2_env_truthy(const char* name) {
+    char value[32]{};
+    const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+    if (len == 0 || len >= sizeof(value)) {
+        return false;
+    }
+
+    std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
+    return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+}
 
 enum SwapchainRecreateReason : uint32_t {
     SWAPCHAIN_RECREATE_NONE = 0,
@@ -608,6 +620,10 @@ void D3D12Component::dump_native_stereo_backbuffer_once(
 
     auto vr = VR::get();
     if (vr == nullptr || !vr->is_native_stereo_fix_enabled() || vr->is_native_stereo_fix_same_pass_enabled()) {
+        return;
+    }
+
+    if (!sn2_env_truthy("UEVR_SN2_NATIVE_STEREO_DUMP_BACKBUFFER")) {
         return;
     }
 

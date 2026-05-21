@@ -1,0 +1,18 @@
+{
+  "name": "ue_lut_srv_redirect",
+  "description": "Redirect a sampled SRV handle from one descriptor/range index to another. Useful for right-eye LUT bugs where both eyes run the same shader but one eye samples the wrong post-process texture.",
+  "uevr_template": true,
+  "transforms": [
+    {
+      "kind": "redirect_handle",
+      "note": "DXIL createHandle resource_class 0 is SRV. Fill range/index from dxil-patch analysis_before.handles.",
+      "resource_class": "srv",
+      "from_range_id": 0,
+      "from_index": 0,
+      "to_range_id": 0,
+      "to_index": 0,
+      "required": true
+    }
+  ]
+}
+

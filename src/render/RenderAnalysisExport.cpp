@@ -48,6 +48,8 @@ const char* shader_stage_to_string(render::ShaderOverrideRegistry::Stage stage) 
         return "VS";
     case render::ShaderOverrideRegistry::Stage::Pixel:
         return "PS";
+    case render::ShaderOverrideRegistry::Stage::Geometry:
+        return "GS";
     case render::ShaderOverrideRegistry::Stage::Compute:
         return "CS";
     case render::ShaderOverrideRegistry::Stage::Amplification:
@@ -218,7 +220,8 @@ json to_json(const render::ShaderOverrideRegistry::D3D12PipelinePairInfo& pair) 
         {"pipeline_stream", pair.pipeline_stream},
         {"tracking_note", pair.tracking_note},
         {"vertex_shader", to_json(pair.vertex_shader)},
-        {"pixel_shader", to_json(pair.pixel_shader)}
+        {"pixel_shader", to_json(pair.pixel_shader)},
+        {"geometry_shader", to_json(pair.geometry_shader)}
     };
 }
 
@@ -246,8 +249,10 @@ json to_json(const render::ShaderOverrideRegistry::D3D12PsoAggregateInfo& aggreg
         {"tracking_note", aggregate.tracking_note},
         {"vs_hash", aggregate.vs_hash},
         {"ps_hash", aggregate.ps_hash},
+        {"gs_hash", aggregate.gs_hash},
         {"vs_override", aggregate.vs_override},
         {"ps_override", aggregate.ps_override},
+        {"gs_override", aggregate.gs_override},
         {"likely_targets", json::array()}
     };
 
@@ -415,7 +420,7 @@ RenderAnalysisExportResult RenderAnalysisExport::export_bundle(const RenderAnaly
 
         {
             std::ofstream csv{shader_pairs_csv_path, std::ios::binary | std::ios::trunc};
-            csv << "frame,first_seen_frame,last_seen_frame,hit_count,original_pso,bound_pso,pipeline_stream,tracking_note,vs_hash,ps_hash,vs_override,ps_override\n";
+            csv << "frame,first_seen_frame,last_seen_frame,hit_count,original_pso,bound_pso,pipeline_stream,tracking_note,vs_hash,ps_hash,gs_hash,vs_override,ps_override,gs_override\n";
             for (const auto& pair : input.shaders.distinct_d3d12_pairs) {
                 csv << pair.frame << ','
                     << pair.first_seen_frame << ','
@@ -427,14 +432,16 @@ RenderAnalysisExportResult RenderAnalysisExport::export_bundle(const RenderAnaly
                     << csv_escape(pair.tracking_note) << ','
                     << csv_escape(pair.vertex_shader.hash) << ','
                     << csv_escape(pair.pixel_shader.hash) << ','
+                    << csv_escape(pair.geometry_shader.hash) << ','
                     << csv_escape(pair.vertex_shader.override_name) << ','
-                    << csv_escape(pair.pixel_shader.override_name) << '\n';
+                    << csv_escape(pair.pixel_shader.override_name) << ','
+                    << csv_escape(pair.geometry_shader.override_name) << '\n';
             }
         }
 
         {
             std::ofstream csv{pso_profiler_csv_path, std::ios::binary | std::ios::trunc};
-            csv << "total_samples,sample_share,bind_count_with_known_targets,first_seen_frame,last_seen_frame,original_pso,last_bound_pso,pipeline_stream,tracking_note,vs_hash,ps_hash,vs_override,ps_override,top_render_target,top_depth_target,top_target_share\n";
+            csv << "total_samples,sample_share,bind_count_with_known_targets,first_seen_frame,last_seen_frame,original_pso,last_bound_pso,pipeline_stream,tracking_note,vs_hash,ps_hash,gs_hash,vs_override,ps_override,gs_override,top_render_target,top_depth_target,top_target_share\n";
             for (const auto& aggregate : input.shaders.d3d12_pso_aggregates) {
                 const auto* top_target = !aggregate.likely_targets.empty() ? &aggregate.likely_targets.front() : nullptr;
                 csv << aggregate.total_samples << ','
@@ -448,8 +455,10 @@ RenderAnalysisExportResult RenderAnalysisExport::export_bundle(const RenderAnaly
                     << csv_escape(aggregate.tracking_note) << ','
                     << csv_escape(aggregate.vs_hash) << ','
                     << csv_escape(aggregate.ps_hash) << ','
+                    << csv_escape(aggregate.gs_hash) << ','
                     << csv_escape(aggregate.vs_override) << ','
                     << csv_escape(aggregate.ps_override) << ','
+                    << csv_escape(aggregate.gs_override) << ','
                     << csv_escape(top_target != nullptr ? top_target->render_target_name : "") << ','
                     << csv_escape(top_target != nullptr ? top_target->depth_target_name : "") << ','
                     << (top_target != nullptr ? top_target->share : 0.0) << '\n';

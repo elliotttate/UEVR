@@ -97,6 +97,10 @@ private:
     bool m_sort_recent_dx12_pairs_by_hits{true};
     std::string m_selected_recent_dx12_pair_key{};
     std::string m_shader_export_status{};
+    std::optional<render::ShaderOverrideRegistry::D3D12ShaderBytecodeInspection> m_shader_bytecode_inspection{};
+    std::string m_shader_inspection_status{};
+    bool m_shader_inspection_disassemble{false};
+    int m_shader_inspection_disasm_limit{128 * 1024};
     bool m_pso_filter_overridden_only{false};
     bool m_pso_filter_stream_only{false};
     bool m_pso_filter_with_targets_only{false};

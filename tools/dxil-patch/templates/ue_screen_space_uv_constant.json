@@ -1,0 +1,17 @@
+{
+  "name": "ue_screen_space_uv_constant",
+  "description": "Replace a component extracted from a screen-space/view constants cbuffer load with a literal. This is a narrow escape hatch for UV scale/bias fixes once the exact load/result/component is known.",
+  "uevr_template": true,
+  "transforms": [
+    {
+      "kind": "replace_cbuffer_extract_literal",
+      "note": "Set load to the cbufferLoad result and component to 0..3 from the DXIL disassembly.",
+      "load": "%CBUFFER_LOAD_RESULT",
+      "component": 0,
+      "type": "f32",
+      "value": 0.0,
+      "required": true
+    }
+  ]
+}
+

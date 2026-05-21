@@ -56,6 +56,64 @@ struct ShaderRecoveredSourceInfo {
     std::string text{};
 };
 
+struct ShaderReflectionVariableInfo {
+    std::string name{};
+    uint32_t start_offset{};
+    uint32_t size{};
+    uint32_t flags{};
+    std::string type_name{};
+    std::string type_class{};
+    std::string type_kind{};
+    uint32_t rows{};
+    uint32_t columns{};
+    uint32_t elements{};
+    uint32_t members{};
+};
+
+struct ShaderReflectionConstantBufferInfo {
+    std::string name{};
+    std::string type{};
+    uint32_t size{};
+    std::vector<ShaderReflectionVariableInfo> variables{};
+};
+
+struct ShaderReflectionResourceBindingInfo {
+    std::string name{};
+    std::string type{};
+    std::string return_type{};
+    std::string dimension{};
+    uint32_t bind_point{};
+    uint32_t bind_count{};
+    uint32_t space{};
+    uint32_t flags{};
+};
+
+struct ShaderReflectionSignatureParamInfo {
+    std::string semantic_name{};
+    uint32_t semantic_index{};
+    uint32_t register_index{};
+    std::string system_value{};
+    std::string component_type{};
+    uint32_t mask{};
+    uint32_t read_write_mask{};
+    uint32_t stream{};
+};
+
+struct ShaderReflectionInfo {
+    bool ok{};
+    std::string error{};
+    std::string creator{};
+    uint32_t instruction_count{};
+    uint32_t constant_buffer_count{};
+    uint32_t bound_resource_count{};
+    uint32_t input_parameter_count{};
+    uint32_t output_parameter_count{};
+    std::vector<ShaderReflectionConstantBufferInfo> constant_buffers{};
+    std::vector<ShaderReflectionResourceBindingInfo> bound_resources{};
+    std::vector<ShaderReflectionSignatureParamInfo> input_parameters{};
+    std::vector<ShaderReflectionSignatureParamInfo> output_parameters{};
+};
+
 struct ShaderBytecodeInspection {
     bool ok{};
     bool container{};
@@ -69,6 +127,7 @@ struct ShaderBytecodeInspection {
     std::vector<ShaderContainerChunkInfo> chunks{};
     std::string disassembly{};
     std::vector<ShaderRecoveredSourceInfo> recovered_sources{};
+    ShaderReflectionInfo reflection{};
 };
 
 struct ShaderContainerEdit {

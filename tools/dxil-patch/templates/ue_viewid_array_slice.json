@@ -1,0 +1,22 @@
+{
+  "name": "ue_viewid_array_slice",
+  "description": "Scaffold for SV_ViewID / SV_RenderTargetArrayIndex fixes. The current text transform path can verify and patch known IR text; use this when a shader already has the relevant intrinsic/output and only needs a small rewrite.",
+  "uevr_template": true,
+  "transforms": [
+    {
+      "kind": "require_regex",
+      "note": "Confirm the shader contains view/render-target-array plumbing before applying a hand-authored replacement.",
+      "find": "(SV_ViewID|RenderTargetArrayIndex|dx\\.op\\.viewID|dx\\.op\\.storeOutput)",
+      "required": false
+    },
+    {
+      "kind": "replace_regex",
+      "note": "Fill with a specific, validated before/after IR rewrite from the disassembly.",
+      "find": "__FILL_WITH_EXACT_DXIL_REGEX__",
+      "replace": "__FILL_WITH_REPLACEMENT_IR__",
+      "count": 1,
+      "required": false
+    }
+  ]
+}
+

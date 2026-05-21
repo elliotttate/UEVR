@@ -40,6 +40,8 @@ UEVR_RENDER_CAPI const char* uevr_render_diag_shader_bytecode_json(
     int disassemble,
     int max_disassembly_chars);
 UEVR_RENDER_CAPI const char* uevr_render_diag_hunter_capture_active_override_stub(int stage);
+UEVR_RENDER_CAPI const char* uevr_render_diag_hunter_highlight_hash_json(const char* hash, int enabled);
+UEVR_RENDER_CAPI const char* uevr_render_diag_hunter_skip_eye_hash_json(const char* hash, int eye, int enabled);
 UEVR_RENDER_CAPI const char* uevr_render_diag_preview_info_json();
 UEVR_RENDER_CAPI const char* uevr_render_diag_context_json();
 
@@ -142,6 +144,11 @@ UEVR_RENDER_CAPI const char* uevr_render_diag_frame_timing_json();
 UEVR_RENDER_CAPI const char* uevr_render_diag_eye_pixel_sample_json(
     int side, int sample_w, int sample_h);
 
+// CPU readback of an eye-relative region. sample_x/y are relative to the
+// resolved eye region, not the full texture. Values are clamped.
+UEVR_RENDER_CAPI const char* uevr_render_diag_eye_region_sample_json(
+    int side, int sample_x, int sample_y, int sample_w, int sample_h);
+
 // Save the current-frame eye texture to disk. fmt: 0=PNG, 1=JPG (smaller,
 // best for LLM context), 2=BMP. out_path may be NULL to auto-pick under
 // <persistent_dir>/render_inspector/eye_dumps/<timestamp>_<side>.<ext>.
@@ -161,5 +168,10 @@ UEVR_RENDER_CAPI const char* uevr_render_diag_set_stereo_trace_enabled(int enabl
 // as Left/Right/Full/Multi/Unknown), OMSetRenderTargets, and ResourceBarrier.
 // reset=1 zeroes counters after reading. Returns total + per-bucket counts.
 UEVR_RENDER_CAPI const char* uevr_render_diag_stereo_trace_json(int reset);
+
+// Subnautica 2 targeted diagnostics. Returns the active SN2/UEVR render-test
+// environment, key hook/map counters, and enough run-state to tell whether a
+// test is clean or contaminated by an older WIP mutation.
+UEVR_RENDER_CAPI const char* uevr_render_diag_sn2_state_json();
 
 } // extern "C"

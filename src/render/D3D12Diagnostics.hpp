@@ -86,11 +86,30 @@ public:
         uint32_t root_parameter{};
         uint32_t descriptor_index{};
         uintptr_t descriptor_cpu{};
+        uintptr_t descriptor_source_cpu{};
+        uint64_t descriptor_source_frame{};
         uintptr_t resource{};
         std::string descriptor_type{};
         uint64_t producer_frame{};
         uint64_t producer_draw{};
         uintptr_t producer_pso{};
+        uintptr_t producer_command_list{};
+        std::string producer_kind{};
+        uintptr_t producer_descriptor{};
+        uint32_t producer_target_index{};
+        int32_t producer_eye_bucket{-1};
+    };
+
+    struct ResourceProducerSnapshot {
+        uint64_t frame{};
+        uint64_t draw_index{};
+        uintptr_t pipeline_state{};
+        uintptr_t command_list{};
+        std::string kind{};
+        uintptr_t descriptor{};
+        uint32_t target_index{};
+        int32_t eye_bucket{-1};
+        std::string name{};
     };
 
     struct BindingEvent {
@@ -110,6 +129,21 @@ public:
         std::string message{};
     };
 
+    struct PipelineCacheEvent {
+        uint64_t frame{};
+        std::string source{};
+        std::string action{};
+        uintptr_t device{};
+        uintptr_t library{};
+        uintptr_t pipeline_state{};
+        std::string name{};
+        uint64_t cached_blob_size{};
+        bool has_cached_pso{};
+        bool stripped_cached_pso{};
+        uint32_t result{};
+        std::string note{};
+    };
+
     struct RootBindEvent {
         uint64_t frame{};
         uint64_t sequence{};
@@ -125,6 +159,22 @@ public:
         uint64_t value_hash{};
     };
 
+    struct ResourceWriteInfo {
+        uint32_t target_index{};
+        uintptr_t descriptor{};
+        uintptr_t resource{};
+        std::string name{};
+        std::string kind{};
+        uint64_t prior_producer_frame{};
+        uint64_t prior_producer_draw{};
+        uintptr_t prior_producer_pso{};
+        uintptr_t prior_producer_command_list{};
+        std::string prior_producer_kind{};
+        uintptr_t prior_producer_descriptor{};
+        uint32_t prior_producer_target_index{};
+        int32_t prior_producer_eye_bucket{-1};
+    };
+
     struct DrawEvent {
         uint64_t frame{};
         uint64_t draw_index{};
@@ -134,16 +184,37 @@ public:
         uintptr_t pipeline_state{};
         uintptr_t root_signature{};
         int32_t eye_bucket{-1};
+        bool executed{true};
+        bool has_viewport{};
+        float viewport_top_left_x{};
+        float viewport_top_left_y{};
+        float viewport_width{};
+        float viewport_height{};
+        uint32_t viewport_count{};
+        bool has_scissor{};
+        int32_t scissor_left{};
+        int32_t scissor_top{};
+        int32_t scissor_right{};
+        int32_t scissor_bottom{};
+        uint32_t scissor_count{};
         uint32_t arg0{};
         uint32_t arg1{};
         uint32_t arg2{};
         int32_t arg3{};
         uint32_t arg4{};
+        // For copy_buffer_region the byte offsets are 64-bit and don't fit in
+        // the subresource-sized arg0/arg1 slots; they're recorded here instead.
+        // 0 for non-buffer copies.
+        uint64_t copy_dst_byte_offset{};
+        uint64_t copy_src_byte_offset{};
+        uint64_t copy_byte_count{};
         uintptr_t rtv0{};
         uintptr_t rtv0_resource{};
         uint64_t prior_rtv0_producer_frame{};
         uint64_t prior_rtv0_producer_draw{};
         uintptr_t prior_rtv0_producer_pso{};
+        std::vector<ResourceWriteInfo> render_target_writes{};
+        std::vector<ResourceWriteInfo> uav_writes{};
         RootSlotArray graphics_root_descriptor_tables{};
         RootSlotArray compute_root_descriptor_tables{};
         RootSlotArray graphics_root_cbvs{};
@@ -211,6 +282,7 @@ public:
         std::vector<RootBindEvent> recent_root_binds{};
         std::vector<DrawEvent> recent_draw_events{};
         std::vector<GpuTimingInfo> gpu_timings{};
+        std::vector<PipelineCacheEvent> recent_pipeline_cache_events{};
         std::vector<BarrierEvent> recent_barriers{};
         std::vector<WarningEvent> recent_warnings{};
     };
@@ -306,6 +378,15 @@ public:
         const D3D12_RESOURCE_BARRIER* barriers
     );
 
+    void record_rtv_write(
+        std::string_view source,
+        uintptr_t command_list,
+        uintptr_t pipeline_state,
+        int32_t eye_bucket,
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+        std::string_view kind
+    );
+
     void record_rtv_bind(
         std::string_view source,
         uint32_t rtv_count,
@@ -331,7 +412,21 @@ public:
         std::string_view kind,
         uintptr_t command_list,
         uintptr_t pipeline_state,
+        uintptr_t root_signature,
         int32_t eye_bucket,
+        bool executed,
+        bool has_viewport,
+        float viewport_top_left_x,
+        float viewport_top_left_y,
+        float viewport_width,
+        float viewport_height,
+        uint32_t viewport_count,
+        bool has_scissor,
+        int32_t scissor_left,
+        int32_t scissor_top,
+        int32_t scissor_right,
+        int32_t scissor_bottom,
+        uint32_t scissor_count,
         uint32_t arg0,
         uint32_t arg1,
         uint32_t arg2,
@@ -355,11 +450,36 @@ public:
         const std::vector<DescriptorReadInfo>& descriptor_reads
     );
 
+    void record_resource_copy(
+        std::string_view source,
+        std::string_view kind,
+        uintptr_t command_list,
+        uintptr_t dst_resource,
+        uintptr_t src_resource,
+        uint32_t dst_subresource,
+        uint32_t src_subresource,
+        uint64_t byte_count,
+        uint32_t width,
+        uint32_t height,
+        uint32_t depth,
+        uint64_t dst_byte_offset = 0,
+        uint64_t src_byte_offset = 0
+    );
+
+    void record_extra_descriptor_read(
+        std::string_view source,
+        uintptr_t command_list,
+        uintptr_t pipeline_state,
+        DescriptorReadInfo read
+    );
+
     std::optional<DescriptorReadInfo> resolve_descriptor_read(
         uint32_t root_parameter,
         uint32_t descriptor_index,
         D3D12_CPU_DESCRIPTOR_HANDLE descriptor
     ) const;
+
+    std::optional<ResourceProducerSnapshot> last_resource_producer(uintptr_t resource) const;
 
     void record_gpu_timing_sample(
         std::string_view source,
@@ -368,8 +488,24 @@ public:
         double milliseconds
     );
 
+    void record_pipeline_cache_event(
+        std::string_view source,
+        std::string_view action,
+        uintptr_t device,
+        uintptr_t library,
+        uintptr_t pipeline_state,
+        std::string_view name,
+        uint64_t cached_blob_size,
+        bool has_cached_pso,
+        bool stripped_cached_pso,
+        uint32_t result,
+        std::string_view note = {}
+    );
+
     Snapshot snapshot() const;
     std::optional<CurrentBindContext> current_bind_context() const;
+    std::optional<RootSignatureInfo> root_signature_for_pipeline(uintptr_t pipeline_state) const;
+    std::optional<RootSignatureInfo> root_signature(uintptr_t root_signature) const;
     void reset();
 
 private:
@@ -388,6 +524,8 @@ private:
 
     struct DescriptorInfo {
         uintptr_t handle{};
+        uintptr_t source_handle{};
+        uint64_t source_frame{};
         uintptr_t resource{};
         std::string name{};
         std::string source{};
@@ -401,6 +539,11 @@ private:
         uint64_t draw_index{};
         uintptr_t pipeline_state{};
         uintptr_t command_list{};
+        std::string kind{};
+        uintptr_t descriptor{};
+        uint32_t target_index{};
+        int32_t eye_bucket{-1};
+        std::string name{};
     };
 
     struct GpuTimingAggregate {
@@ -432,6 +575,7 @@ private:
     std::vector<BindingEvent> m_recent_bindings{};
     std::vector<RootBindEvent> m_recent_root_binds{};
     std::vector<DrawEvent> m_recent_draw_events{};
+    std::vector<PipelineCacheEvent> m_recent_pipeline_cache_events{};
     std::vector<BarrierEvent> m_recent_barriers{};
     std::vector<WarningEvent> m_recent_warnings{};
     std::optional<CurrentBindContext> m_current_bind_context{};

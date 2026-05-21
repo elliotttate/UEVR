@@ -103,6 +103,7 @@ std::string make_d3d12_pair_key(const render::ShaderOverrideRegistry::D3D12Pipel
        << pair.bound_pipeline_state << ':'
        << pair.vertex_shader.hash << ':'
        << pair.pixel_shader.hash << ':'
+       << pair.geometry_shader.hash << ':'
        << pair.tracking_note;
     return ss.str();
 }
@@ -113,6 +114,7 @@ std::string make_d3d12_pso_key(const render::ShaderOverrideRegistry::D3D12PsoAgg
        << aggregate.original_pso << ':'
        << aggregate.vs_hash << ':'
        << aggregate.ps_hash << ':'
+       << aggregate.gs_hash << ':'
        << static_cast<uint32_t>(aggregate.pipeline_stream) << ':'
        << aggregate.tracking_note;
     return ss.str();
@@ -313,6 +315,7 @@ const char* shader_stage_label(render::ShaderOverrideRegistry::Stage stage) {
     switch (stage) {
     case render::ShaderOverrideRegistry::Stage::Vertex: return "VS";
     case render::ShaderOverrideRegistry::Stage::Pixel: return "PS";
+    case render::ShaderOverrideRegistry::Stage::Geometry: return "GS";
     case render::ShaderOverrideRegistry::Stage::Compute: return "CS";
     case render::ShaderOverrideRegistry::Stage::Amplification: return "AS";
     case render::ShaderOverrideRegistry::Stage::Mesh: return "MS";
@@ -356,7 +359,197 @@ void draw_d3d12_pair_summary(const render::ShaderOverrideRegistry::D3D12Pipeline
         ImGui::TableHeadersRow();
         draw_bound_shader_table_row(pair.vertex_shader);
         draw_bound_shader_table_row(pair.pixel_shader);
+        draw_bound_shader_table_row(pair.geometry_shader);
         ImGui::EndTable();
+    }
+}
+
+void draw_shader_bytecode_inspection(const render::ShaderOverrideRegistry::D3D12ShaderBytecodeInspection& inspection) {
+    if (!inspection.found) {
+        ImGui::TextWrapped("%s", inspection.bytecode.error.empty()
+            ? "No tracked shader bytecode matched the requested hash."
+            : inspection.bytecode.error.c_str());
+        return;
+    }
+
+    const auto& bytecode = inspection.bytecode;
+    ImGui::Text("Stage: %s", inspection.matched_stage.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
+    ImGui::Text("PSO: %s", format_pointer_hex(inspection.pipeline_state).c_str());
+    ImGui::Text("Container: %s | Hash: %s | Size: %u",
+        bytecode.container_kind.empty() ? "-" : bytecode.container_kind.c_str(),
+        bytecode.container_hash.empty() ? "-" : bytecode.container_hash.c_str(),
+        bytecode.bytecode_size);
+    if (!bytecode.error.empty()) {
+        ImGui::TextWrapped("Status: %s", bytecode.error.c_str());
+    }
+
+    if (ImGui::TreeNode("Chunks")) {
+        if (bytecode.chunks.empty()) {
+            ImGui::TextUnformatted("-");
+        } else if (ImGui::BeginTable("ShaderBytecodeChunks", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("FourCC");
+            ImGui::TableSetupColumn("Offset");
+            ImGui::TableSetupColumn("Size");
+            ImGui::TableHeadersRow();
+            for (const auto& chunk : bytecode.chunks) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(chunk.fourcc.c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("%u", chunk.offset);
+                ImGui::TableNextColumn();
+                ImGui::Text("%u", chunk.size);
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Reflection")) {
+        const auto& refl = bytecode.reflection;
+        ImGui::Text("OK: %s", refl.ok ? "yes" : "no");
+        if (!refl.error.empty()) {
+            ImGui::TextWrapped("Error: %s", refl.error.c_str());
+        }
+        if (!refl.creator.empty()) {
+            ImGui::TextWrapped("Creator: %s", refl.creator.c_str());
+        }
+        ImGui::Text("Instructions: %u | CBs: %u | Resources: %u | Inputs: %u | Outputs: %u",
+            refl.instruction_count,
+            refl.constant_buffer_count,
+            refl.bound_resource_count,
+            refl.input_parameter_count,
+            refl.output_parameter_count);
+
+        if (!refl.constant_buffers.empty() && ImGui::TreeNode("Constant Buffers")) {
+            for (const auto& cbuffer : refl.constant_buffers) {
+                if (ImGui::TreeNode(cbuffer.name.empty() ? "(unnamed cbuffer)" : cbuffer.name.c_str())) {
+                    ImGui::Text("Type: %s | Size: %u", cbuffer.type.c_str(), cbuffer.size);
+                    if (ImGui::BeginTable("ShaderReflectionCBufferVars", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                        ImGui::TableSetupColumn("Name");
+                        ImGui::TableSetupColumn("Offset");
+                        ImGui::TableSetupColumn("Size");
+                        ImGui::TableSetupColumn("Kind");
+                        ImGui::TableSetupColumn("Shape");
+                        ImGui::TableSetupColumn("Members");
+                        ImGui::TableHeadersRow();
+                        for (const auto& variable : cbuffer.variables) {
+                            ImGui::TableNextRow();
+                            ImGui::TableNextColumn();
+                            ImGui::TextWrapped("%s", variable.name.c_str());
+                            ImGui::TableNextColumn();
+                            ImGui::Text("%u", variable.start_offset);
+                            ImGui::TableNextColumn();
+                            ImGui::Text("%u", variable.size);
+                            ImGui::TableNextColumn();
+                            ImGui::TextWrapped("%s/%s", variable.type_class.c_str(), variable.type_kind.c_str());
+                            ImGui::TableNextColumn();
+                            ImGui::Text("%ux%u[%u]", variable.rows, variable.columns, variable.elements);
+                            ImGui::TableNextColumn();
+                            ImGui::Text("%u", variable.members);
+                        }
+                        ImGui::EndTable();
+                    }
+                    ImGui::TreePop();
+                }
+            }
+            ImGui::TreePop();
+        }
+
+        if (!refl.bound_resources.empty() && ImGui::TreeNode("Bound Resources")) {
+            if (ImGui::BeginTable("ShaderReflectionResources", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("Name");
+                ImGui::TableSetupColumn("Type");
+                ImGui::TableSetupColumn("Bind");
+                ImGui::TableSetupColumn("Count");
+                ImGui::TableSetupColumn("Space");
+                ImGui::TableSetupColumn("Dimension");
+                ImGui::TableSetupColumn("Return");
+                ImGui::TableHeadersRow();
+                for (const auto& resource : refl.bound_resources) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextWrapped("%s", resource.name.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(resource.type.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", resource.bind_point);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", resource.bind_count);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", resource.space);
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(resource.dimension.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(resource.return_type.c_str());
+                }
+                ImGui::EndTable();
+            }
+            ImGui::TreePop();
+        }
+
+        if ((!refl.input_parameters.empty() || !refl.output_parameters.empty()) && ImGui::TreeNode("Signatures")) {
+            auto draw_signature_table = [](const char* table_id, const std::vector<render::ShaderReflectionSignatureParamInfo>& params) {
+                if (ImGui::BeginTable(table_id, 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                    ImGui::TableSetupColumn("Semantic");
+                    ImGui::TableSetupColumn("Index");
+                    ImGui::TableSetupColumn("Register");
+                    ImGui::TableSetupColumn("System");
+                    ImGui::TableSetupColumn("Type");
+                    ImGui::TableSetupColumn("Mask");
+                    ImGui::TableHeadersRow();
+                    for (const auto& param : params) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::TextWrapped("%s", param.semantic_name.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%u", param.semantic_index);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%u", param.register_index);
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(param.system_value.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(param.component_type.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::Text("0x%X", param.mask);
+                    }
+                    ImGui::EndTable();
+                }
+            };
+            if (!refl.input_parameters.empty()) {
+                ImGui::TextUnformatted("Inputs");
+                draw_signature_table("ShaderReflectionInputs", refl.input_parameters);
+            }
+            if (!refl.output_parameters.empty()) {
+                ImGui::TextUnformatted("Outputs");
+                draw_signature_table("ShaderReflectionOutputs", refl.output_parameters);
+            }
+            ImGui::TreePop();
+        }
+
+        ImGui::TreePop();
+    }
+
+    if (!bytecode.recovered_sources.empty() && ImGui::TreeNode("Recovered Sources")) {
+        for (const auto& source : bytecode.recovered_sources) {
+            if (ImGui::TreeNode(source.name.empty() ? "(unnamed source)" : source.name.c_str())) {
+                ImGui::BeginChild("RecoveredSourceText", ImVec2(0.0f, 220.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
+                ImGui::TextUnformatted(source.text.c_str(), source.text.c_str() + source.text.size());
+                ImGui::EndChild();
+                ImGui::TreePop();
+            }
+        }
+        ImGui::TreePop();
+    }
+
+    if (!bytecode.disassembly.empty() && ImGui::TreeNode("Disassembly")) {
+        ImGui::BeginChild("ShaderDisassemblyText", ImVec2(0.0f, 320.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::TextUnformatted(bytecode.disassembly.c_str(), bytecode.disassembly.c_str() + bytecode.disassembly.size());
+        ImGui::EndChild();
+        ImGui::TreePop();
     }
 }
 
@@ -378,6 +571,7 @@ void draw_d3d12_pso_summary(const render::ShaderOverrideRegistry::D3D12PsoAggreg
     ImGui::TextWrapped("Tracking: %s", aggregate.tracking_note.empty() ? "-" : aggregate.tracking_note.c_str());
     ImGui::TextWrapped("VS: %s", aggregate.vs_hash.empty() ? "-" : aggregate.vs_hash.c_str());
     ImGui::TextWrapped("PS: %s", aggregate.ps_hash.empty() ? "-" : aggregate.ps_hash.c_str());
+    ImGui::TextWrapped("GS: %s", aggregate.gs_hash.empty() ? "-" : aggregate.gs_hash.c_str());
     std::string override_summary{};
     if (!aggregate.vs_override.empty()) {
         override_summary += "VS:";
@@ -389,6 +583,13 @@ void draw_d3d12_pso_summary(const render::ShaderOverrideRegistry::D3D12PsoAggreg
         }
         override_summary += "PS:";
         override_summary += aggregate.ps_override;
+    }
+    if (!aggregate.gs_override.empty()) {
+        if (!override_summary.empty()) {
+            override_summary += " | ";
+        }
+        override_summary += "GS:";
+        override_summary += aggregate.gs_override;
     }
     ImGui::TextWrapped("Overrides: %s", override_summary.empty() ? "None" : override_summary.c_str());
 
@@ -642,6 +843,16 @@ void RenderInspector::service_shader_hunter_autotest() {
 void RenderInspector::on_present() {
     if (g_framework == nullptr || !g_framework->is_ready()) {
         return;
+    }
+
+    static bool s_env_force_initialized = false;
+    if (!s_env_force_initialized) {
+        s_env_force_initialized = true;
+        if (env_flag_enabled("UEVR_ENABLE_D3D12_DIAGNOSTICS") ||
+            env_flag_enabled("UEVR_FORCE_D3D12_DIAGNOSTICS")) {
+            set_force_d3d12_diagnostics(true);
+            spdlog::info("[RenderInspector] forcing D3D12 diagnostics from environment");
+        }
     }
 
     service_shader_hunter_autotest();
@@ -1155,7 +1366,7 @@ void RenderInspector::draw_dx12_diagnostics() {
             ImGuiTableFlags_ScrollY |
             ImGuiTableFlags_SizingStretchProp;
 
-        if (ImGui::BeginTable("DX12DrawEventTable", 9, draw_table_flags, ImVec2(0.0f, 220.0f))) {
+        if (ImGui::BeginTable("DX12DrawEventTable", 11, draw_table_flags, ImVec2(0.0f, 220.0f))) {
             ImGui::TableSetupColumn("Frame");
             ImGui::TableSetupColumn("Draw");
             ImGui::TableSetupColumn("Eye");
@@ -1163,6 +1374,8 @@ void RenderInspector::draw_dx12_diagnostics() {
             ImGui::TableSetupColumn("PSO");
             ImGui::TableSetupColumn("Root Sig");
             ImGui::TableSetupColumn("RTV0");
+            ImGui::TableSetupColumn("RT Writes");
+            ImGui::TableSetupColumn("UAV Writes");
             ImGui::TableSetupColumn("Reads");
             ImGui::TableSetupColumn("Producer");
             ImGui::TableHeadersRow();
@@ -1189,10 +1402,25 @@ void RenderInspector::draw_dx12_diagnostics() {
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(abbreviate_for_table(format_pointer_hex(event.rtv0_resource != 0 ? event.rtv0_resource : event.rtv0)).c_str());
                 ImGui::TableNextColumn();
+                ImGui::Text("%zu", event.render_target_writes.size());
+                ImGui::TableNextColumn();
+                ImGui::Text("%zu", event.uav_writes.size());
+                ImGui::TableNextColumn();
                 ImGui::Text("%zu", event.descriptor_reads.size());
                 ImGui::TableNextColumn();
-                if (event.prior_rtv0_producer_draw != 0) {
+                if (!event.render_target_writes.empty() &&
+                    event.render_target_writes.front().prior_producer_draw != 0) {
+                    const auto& prior = event.render_target_writes.front();
+                    ImGui::Text("%s draw %" PRIu64,
+                        prior.prior_producer_kind.empty() ? "write" : prior.prior_producer_kind.c_str(),
+                        prior.prior_producer_draw);
+                } else if (event.prior_rtv0_producer_draw != 0) {
                     ImGui::Text("draw %" PRIu64, event.prior_rtv0_producer_draw);
+                } else if (!event.descriptor_reads.empty() && event.descriptor_reads.front().producer_draw != 0) {
+                    const auto& producer = event.descriptor_reads.front();
+                    ImGui::Text("%s draw %" PRIu64,
+                        producer.producer_kind.empty() ? "read-producer" : producer.producer_kind.c_str(),
+                        producer.producer_draw);
                 } else {
                     ImGui::TextUnformatted("-");
                 }
@@ -1312,7 +1540,7 @@ void RenderInspector::draw_pso_profiler() {
     aggregates.reserve(shader_snapshot.d3d12_pso_aggregates.size());
 
     for (const auto& aggregate : shader_snapshot.d3d12_pso_aggregates) {
-        const auto overridden = !aggregate.vs_override.empty() || !aggregate.ps_override.empty();
+        const auto overridden = !aggregate.vs_override.empty() || !aggregate.ps_override.empty() || !aggregate.gs_override.empty();
         const auto has_targets = !aggregate.likely_targets.empty();
         const auto has_warning = !aggregate.tracking_note.empty();
 
@@ -1366,7 +1594,7 @@ void RenderInspector::draw_pso_profiler() {
         ImGuiTableFlags_Resizable |
         ImGuiTableFlags_SizingStretchProp;
 
-    if (ImGui::BeginTable("D3D12PsoProfilerTable", 12, table_flags, ImVec2(0.0f, 320.0f))) {
+    if (ImGui::BeginTable("D3D12PsoProfilerTable", 13, table_flags, ImVec2(0.0f, 320.0f))) {
         ImGui::TableSetupColumn("View");
         ImGui::TableSetupColumn("Hits");
         ImGui::TableSetupColumn("Share");
@@ -1374,6 +1602,7 @@ void RenderInspector::draw_pso_profiler() {
         ImGui::TableSetupColumn("Bound PSO");
         ImGui::TableSetupColumn("VS");
         ImGui::TableSetupColumn("PS");
+        ImGui::TableSetupColumn("GS");
         ImGui::TableSetupColumn("RT");
         ImGui::TableSetupColumn("Depth");
         ImGui::TableSetupColumn("Stream");
@@ -1410,6 +1639,8 @@ void RenderInspector::draw_pso_profiler() {
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(aggregate.ps_hash.empty() ? "-" : abbreviate_for_table(aggregate.ps_hash).c_str());
             ImGui::TableNextColumn();
+            ImGui::TextUnformatted(aggregate.gs_hash.empty() ? "-" : abbreviate_for_table(aggregate.gs_hash).c_str());
+            ImGui::TableNextColumn();
             ImGui::TextWrapped("%s", aggregate.likely_targets.empty() ? "-" : aggregate.likely_targets.front().render_target_name.c_str());
             ImGui::TableNextColumn();
             ImGui::TextWrapped("%s", aggregate.likely_targets.empty() ? "-" : aggregate.likely_targets.front().depth_target_name.c_str());
@@ -1430,6 +1661,13 @@ void RenderInspector::draw_pso_profiler() {
                 }
                 override_summary += "PS:";
                 override_summary += aggregate.ps_override;
+            }
+            if (!aggregate.gs_override.empty()) {
+                if (!override_summary.empty()) {
+                    override_summary += " | ";
+                }
+                override_summary += "GS:";
+                override_summary += aggregate.gs_override;
             }
             ImGui::TextWrapped("%s", override_summary.empty() ? "None" : override_summary.c_str());
         }
@@ -1485,6 +1723,22 @@ void RenderInspector::draw_shaders() {
         render::ShaderOverrideRegistry::get().request_reload();
         render::ShaderOverrideRegistry::get().on_present(*g_framework);
         m_shader_editor_status = std::string{"Saved and reloaded: "} + m_shader_editor_path.data();
+    };
+
+    auto inspect_dx12_shader = [&](const char* stage, const std::string& hash) {
+        if (hash.empty()) {
+            m_shader_inspection_status = "No shader hash available for inspection.";
+            return;
+        }
+
+        m_shader_bytecode_inspection = render::ShaderOverrideRegistry::get().inspect_d3d12_shader_bytecode(
+            stage,
+            hash,
+            m_shader_inspection_disassemble,
+            static_cast<size_t>(std::max(4096, m_shader_inspection_disasm_limit)));
+        m_shader_inspection_status = m_shader_bytecode_inspection->found
+            ? (std::string{"Inspected "} + stage + " " + hash)
+            : (std::string{"No tracked bytecode for "} + stage + " " + hash);
     };
 
     ImGui::Text("Frame: %" PRIu64, snapshot.frame);
@@ -1636,6 +1890,18 @@ void RenderInspector::draw_shaders() {
                 format_pointer_hex(m_displayed_dx12_pair->original_pipeline_state).c_str(),
                 format_pointer_hex(m_displayed_dx12_pair->bound_pipeline_state).c_str()
             );
+
+            if (m_displayed_dx12_pair->vertex_shader.known) {
+                if (ImGui::SmallButton("Inspect Current VS")) {
+                    inspect_dx12_shader("vs", m_displayed_dx12_pair->vertex_shader.hash);
+                }
+                ImGui::SameLine();
+            }
+            if (m_displayed_dx12_pair->pixel_shader.known) {
+                if (ImGui::SmallButton("Inspect Current PS")) {
+                    inspect_dx12_shader("ps", m_displayed_dx12_pair->pixel_shader.hash);
+                }
+            }
         }
     }
 
@@ -1754,6 +2020,33 @@ void RenderInspector::draw_shaders() {
             ImGui::Separator();
             ImGui::TextUnformatted("Selected DX12 pair details");
             draw_d3d12_pair_summary(*selected_pair);
+            if (selected_pair->vertex_shader.known) {
+                if (ImGui::SmallButton("Inspect Selected VS")) {
+                    inspect_dx12_shader("vs", selected_pair->vertex_shader.hash);
+                }
+                ImGui::SameLine();
+            }
+            if (selected_pair->pixel_shader.known) {
+                if (ImGui::SmallButton("Inspect Selected PS")) {
+                    inspect_dx12_shader("ps", selected_pair->pixel_shader.hash);
+                }
+            }
+        }
+    }
+
+    if (g_framework->is_dx12() && ImGui::CollapsingHeader("Shader Bytecode Inspection")) {
+        ImGui::Checkbox("Include disassembly", &m_shader_inspection_disassemble);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(180.0f);
+        ImGui::DragInt("Disassembly limit", &m_shader_inspection_disasm_limit, 4096.0f, 4096, 2 * 1024 * 1024);
+        m_shader_inspection_disasm_limit = std::clamp(m_shader_inspection_disasm_limit, 4096, 2 * 1024 * 1024);
+        if (!m_shader_inspection_status.empty()) {
+            ImGui::TextWrapped("%s", m_shader_inspection_status.c_str());
+        }
+        if (m_shader_bytecode_inspection.has_value()) {
+            draw_shader_bytecode_inspection(*m_shader_bytecode_inspection);
+        } else {
+            ImGui::TextUnformatted("Select Inspect Current/Selected VS or PS from a DX12 shader table.");
         }
     }
 
@@ -1765,7 +2058,7 @@ void RenderInspector::draw_shaders() {
             ImGuiTableFlags_Resizable |
             ImGuiTableFlags_SizingStretchProp;
 
-        if (ImGui::BeginTable("ShaderOverrideTable", 10, table_flags, ImVec2(0.0f, 280.0f))) {
+        if (ImGui::BeginTable("ShaderOverrideTable", 11, table_flags, ImVec2(0.0f, 280.0f))) {
             ImGui::TableSetupColumn("Name");
             ImGui::TableSetupColumn("Backend");
             ImGui::TableSetupColumn("Stage");
@@ -1774,6 +2067,7 @@ void RenderInspector::draw_shaders() {
             ImGui::TableSetupColumn("Compiler");
             ImGui::TableSetupColumn("Generation");
             ImGui::TableSetupColumn("Kind");
+            ImGui::TableSetupColumn("Eye Payloads");
             ImGui::TableSetupColumn("Source");
             ImGui::TableSetupColumn("Notes");
             ImGui::TableHeadersRow();
@@ -1797,6 +2091,23 @@ void RenderInspector::draw_shaders() {
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(entry.source_kind.empty() ? "-" : entry.source_kind.c_str());
                 ImGui::TableNextColumn();
+                std::string eye_payloads{};
+                if (entry.has_left_payload) {
+                    eye_payloads += "L:";
+                    eye_payloads += entry.left_source_kind.empty() ? "payload" : entry.left_source_kind;
+                }
+                if (entry.has_right_payload) {
+                    if (!eye_payloads.empty()) {
+                        eye_payloads += " | ";
+                    }
+                    eye_payloads += "R:";
+                    eye_payloads += entry.right_source_kind.empty() ? "payload" : entry.right_source_kind;
+                }
+                if (eye_payloads.empty() && entry.per_eye_variants) {
+                    eye_payloads = "PSO variants";
+                }
+                ImGui::TextWrapped("%s", eye_payloads.empty() ? "-" : eye_payloads.c_str());
+                ImGui::TableNextColumn();
                 ImGui::TextWrapped("%s", entry.source_path.c_str());
                 if (entry.source_kind == "hlsl" && !entry.source_path.empty()) {
                     const auto edit_label = std::string{"Edit##shader_editor_"} + entry.key;
@@ -1812,6 +2123,9 @@ void RenderInspector::draw_shaders() {
                 }
                 if (!entry.enabled) {
                     note += " | Disabled";
+                }
+                if (entry.per_eye_variants && !entry.has_left_payload && !entry.has_right_payload) {
+                    note += " | per-eye PSO";
                 }
                 if (!entry.last_error.empty()) {
                     note += " | ";

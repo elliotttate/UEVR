@@ -377,6 +377,9 @@ public:
     void attempt_hook_subnautica2_render_underwater_fog();
     void attempt_hook_subnautica2_setup_volumetric_fog_ub();
     void attempt_hook_subnautica2_lightscat_store_midhook();
+    void attempt_hook_subnautica2_volumetric_fog_param_trace();
+    void attempt_hook_subnautica2_fog_alias_thunk();
+    void attempt_hook_subnautica2_light_affects_view();
     void attempt_hook_subnautica2_try_add_mesh_batch_probe();
     void attempt_hook_subnautica2_setup_fog_uniform_params();
     void attempt_hook_subnautica2_basepass_pso_select();
@@ -616,6 +619,19 @@ private:
     static void subnautica2_render_underwater_fog_hook(void* scene_renderer, FRDGBuilder* graph_builder, void* scene_without_water_textures, void* scene_textures);
     static void subnautica2_setup_volumetric_fog_ub_hook(void* view_info, void* view_uniform_shader_parameters);
     static void subnautica2_lightscat_store_midhook(safetyhook::Context& ctx);
+    static void subnautica2_volfog_param_trace_FCFD20(safetyhook::Context& ctx);
+    static void subnautica2_volfog_param_trace_FD0A50(safetyhook::Context& ctx);
+    static void subnautica2_volfog_param_trace_FB53B0(safetyhook::Context& ctx);
+    static void subnautica2_volfog_param_trace_FB5320(safetyhook::Context& ctx);
+    static void subnautica2_volfog_param_trace_FB5270(safetyhook::Context& ctx);
+    static void subnautica2_fog_alias_thunk_hook(
+        void* graph_builder,
+        void* scene_renderer,
+        void* view_info,
+        void* arg4,
+        uint32_t arg5,
+        uint8_t arg6);
+    static uint8_t subnautica2_light_affects_view_hook(void* light_scene_info, void* view_info, uint8_t flag);
     static void subnautica2_try_add_mesh_batch_probe_midhook(safetyhook::Context& ctx);
     static void subnautica2_setup_fog_uniform_params_hook(void* graph_builder, void* view_info, void* fog_uniform_params, bool a4);
     static void subnautica2_uwe_trace_hook_45F890(safetyhook::Context& ctx);
@@ -624,6 +640,7 @@ private:
     static void subnautica2_uwe_trace_hook_576140(safetyhook::Context& ctx);
     static void subnautica2_uwe_trace_hook_FD6170(safetyhook::Context& ctx);
     static void subnautica2_uwe_trace_hook_FD0A50(safetyhook::Context& ctx);
+    static void subnautica2_uwe_fd0a50_detail_hook(void* graph_builder, void* view_info, void* scene, void* integration_data, void** out_texture_ref);
     static void subnautica2_uwelit_hook_506DC20(safetyhook::Context& ctx);
     static void subnautica2_uwelit_hook_5BF08A6(safetyhook::Context& ctx);
     static void subnautica2_uwelit_hook_5D638D1(safetyhook::Context& ctx);
@@ -708,6 +725,13 @@ private:
     safetyhook::InlineHook m_subnautica2_render_underwater_fog_hook{};
     safetyhook::InlineHook m_subnautica2_setup_volumetric_fog_ub_hook{};
     safetyhook::MidHook m_subnautica2_lightscat_store_midhook{};
+    safetyhook::MidHook m_subnautica2_volfog_param_trace_FCFD20{};
+    safetyhook::MidHook m_subnautica2_volfog_param_trace_FD0A50{};
+    safetyhook::MidHook m_subnautica2_volfog_param_trace_FB53B0{};
+    safetyhook::MidHook m_subnautica2_volfog_param_trace_FB5320{};
+    safetyhook::MidHook m_subnautica2_volfog_param_trace_FB5270{};
+    safetyhook::InlineHook m_subnautica2_fog_alias_thunk_hook{};
+    safetyhook::InlineHook m_subnautica2_light_affects_view_hook{};
     safetyhook::MidHook m_subnautica2_try_add_mesh_batch_probe{};
     safetyhook::InlineHook m_subnautica2_setup_fog_uniform_params_hook{};
     safetyhook::MidHook m_subnautica2_uwe_trace_hook_45F890{};
@@ -716,6 +740,7 @@ private:
     safetyhook::MidHook m_subnautica2_uwe_trace_hook_576140{};
     safetyhook::MidHook m_subnautica2_uwe_trace_hook_FD6170{};
     safetyhook::MidHook m_subnautica2_uwe_trace_hook_FD0A50{};
+    safetyhook::InlineHook m_subnautica2_uwe_fd0a50_detail_hook{};
     safetyhook::MidHook m_subnautica2_uwelit_hook_506DC20{};
     safetyhook::MidHook m_subnautica2_uwelit_hook_5BF08A6{};
     safetyhook::MidHook m_subnautica2_uwelit_hook_5D638D1{};
@@ -814,6 +839,9 @@ private:
     bool m_attempted_hook_subnautica2_render_underwater_fog{false};
     bool m_attempted_hook_subnautica2_setup_volumetric_fog_ub{false};
     bool m_attempted_hook_subnautica2_lightscat_store_midhook{false};
+    bool m_attempted_hook_subnautica2_volumetric_fog_param_trace{false};
+    bool m_attempted_hook_subnautica2_fog_alias_thunk{false};
+    bool m_attempted_hook_subnautica2_light_affects_view{false};
     bool m_attempted_hook_subnautica2_try_add_mesh_batch_probe{false};
     bool m_attempted_hook_subnautica2_setup_fog_uniform_params{false};
     bool m_attempted_hook_subnautica2_uwe_trace{false};

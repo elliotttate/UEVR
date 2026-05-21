@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <regex>
@@ -135,6 +137,7 @@ struct Options {
     std::filesystem::path report{};
     std::filesystem::path copy_parts_from{};
     std::filesystem::path dxc_path{};
+    std::string chunk_fourcc{"SHEX"};
     bool copy_root_signature{true};
     bool copy_all_non_dxil_parts{};
     bool validate{true};
@@ -226,6 +229,256 @@ std::string lower_ascii(std::string value) {
         return static_cast<char>(std::tolower(c));
     });
     return value;
+}
+
+uint32_t read_u32_le(const std::vector<uint8_t>& bytes, size_t offset) {
+    uint32_t value{};
+    if (offset + sizeof(value) <= bytes.size()) {
+        std::memcpy(&value, bytes.data() + offset, sizeof(value));
+    }
+    return value;
+}
+
+void write_u32_le(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
+    if (offset + sizeof(value) <= bytes.size()) {
+        std::memcpy(bytes.data() + offset, &value, sizeof(value));
+    }
+}
+
+std::string fourcc_at(const std::vector<uint8_t>& bytes, size_t offset) {
+    if (offset + 4 > bytes.size()) {
+        return {};
+    }
+    return std::string{
+        static_cast<char>(bytes[offset + 0]),
+        static_cast<char>(bytes[offset + 1]),
+        static_cast<char>(bytes[offset + 2]),
+        static_cast<char>(bytes[offset + 3])
+    };
+}
+
+std::string hex_u32(uint32_t value) {
+    std::ostringstream ss{};
+    ss << "0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << value;
+    return ss.str();
+}
+
+struct DxbcChunkSpan {
+    std::string fourcc{};
+    size_t chunk_offset{};
+    size_t data_offset{};
+    size_t size{};
+};
+
+std::optional<DxbcChunkSpan> find_dxbc_chunk(const std::vector<uint8_t>& bytes, std::string_view preferred_fourcc, std::string& error) {
+    if (bytes.size() < 32 || std::memcmp(bytes.data(), "DXBC", 4) != 0) {
+        error = "input is not a DXBC/DXIL container";
+        return std::nullopt;
+    }
+
+    const auto chunk_count = read_u32_le(bytes, 28);
+    std::optional<DxbcChunkSpan> first_shader_chunk{};
+    std::vector<std::string> chunk_names{};
+    for (uint32_t i = 0; i < chunk_count; ++i) {
+        const size_t table_offset = 32ull + static_cast<size_t>(i) * sizeof(uint32_t);
+        if (table_offset + sizeof(uint32_t) > bytes.size()) {
+            error = "DXBC chunk table is truncated";
+            return std::nullopt;
+        }
+
+        const auto chunk_offset = static_cast<size_t>(read_u32_le(bytes, table_offset));
+        if (chunk_offset + 8 > bytes.size()) {
+            error = "DXBC chunk offset points outside the container";
+            return std::nullopt;
+        }
+
+        DxbcChunkSpan span{};
+        span.fourcc = fourcc_at(bytes, chunk_offset);
+        chunk_names.push_back(span.fourcc);
+        span.chunk_offset = chunk_offset;
+        span.data_offset = chunk_offset + 8;
+        span.size = read_u32_le(bytes, chunk_offset + 4);
+        if (span.data_offset + span.size > bytes.size()) {
+            error = "DXBC chunk payload points outside the container";
+            return std::nullopt;
+        }
+
+        if (span.fourcc == preferred_fourcc) {
+            return span;
+        }
+
+        if (!first_shader_chunk.has_value() && (span.fourcc == "SHEX" || span.fourcc == "SHDR")) {
+            first_shader_chunk = span;
+        }
+    }
+
+    if (first_shader_chunk.has_value() && preferred_fourcc.empty()) {
+        return first_shader_chunk;
+    }
+
+    std::ostringstream chunk_list{};
+    for (size_t i = 0; i < chunk_names.size(); ++i) {
+        if (i != 0) {
+            chunk_list << ", ";
+        }
+        chunk_list << chunk_names[i];
+    }
+
+    const bool has_dxil_chunk = std::find(chunk_names.begin(), chunk_names.end(), "DXIL") != chunk_names.end();
+    error = "DXBC SM4/SM5 shader token chunk not found: " +
+        std::string{preferred_fourcc.empty() ? "SHEX/SHDR" : preferred_fourcc} +
+        ". Container chunks: " + (chunk_names.empty() ? std::string{"(none)"} : chunk_list.str()) +
+        (has_dxil_chunk
+            ? ". This is a DXIL container; use disasm/patch/transform instead of dxbc-tokens."
+            : ". This container has no tokenized SM4/SM5 shader chunk.");
+    return std::nullopt;
+}
+
+bool dxbc_tokens_to_json(const std::filesystem::path& input, std::string_view preferred_fourcc, json& report, std::string& error) {
+    std::vector<uint8_t> bytes{};
+    if (!read_file(input, bytes, error)) {
+        return false;
+    }
+
+    auto chunk = find_dxbc_chunk(bytes, preferred_fourcc, error);
+    if (!chunk.has_value()) {
+        return false;
+    }
+
+    const size_t token_count = chunk->size / sizeof(uint32_t);
+    json tokens = json::array();
+    for (size_t i = 0; i < token_count; ++i) {
+        const auto value = read_u32_le(bytes, chunk->data_offset + i * sizeof(uint32_t));
+        json token{
+            {"index", i},
+            {"offset", chunk->data_offset + i * sizeof(uint32_t)},
+            {"value", hex_u32(value)}
+        };
+
+        if (i >= 2) {
+            token["opcode"] = value & 0x7ffu;
+            token["length"] = (value >> 24) & 0x7fu;
+            token["extended"] = (value & 0x80000000u) != 0;
+        } else {
+            token["role"] = i == 0 ? "version" : "program_length";
+        }
+
+        tokens.push_back(std::move(token));
+    }
+
+    report["container"] = "DXBC";
+    report["chunk"] = {
+        {"fourcc", chunk->fourcc},
+        {"chunk_offset", chunk->chunk_offset},
+        {"data_offset", chunk->data_offset},
+        {"size", chunk->size},
+        {"token_count", token_count}
+    };
+    report["tokens"] = std::move(tokens);
+    return true;
+}
+
+std::optional<uint32_t> json_u32_value(const json& value) {
+    try {
+        if (value.is_number_unsigned()) {
+            return value.get<uint32_t>();
+        }
+        if (value.is_number_integer()) {
+            const auto signed_value = value.get<int64_t>();
+            if (signed_value < 0 || signed_value > UINT32_MAX) {
+                return std::nullopt;
+            }
+            return static_cast<uint32_t>(signed_value);
+        }
+        if (value.is_string()) {
+            auto text = value.get<std::string>();
+            int base = 10;
+            if (text.rfind("0x", 0) == 0 || text.rfind("0X", 0) == 0) {
+                text = text.substr(2);
+                base = 16;
+            }
+            return static_cast<uint32_t>(std::stoul(text, nullptr, base));
+        }
+    } catch (...) {
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+bool patch_dxbc_tokens(const std::filesystem::path& input, const std::filesystem::path& patch_path, const std::filesystem::path& output, json& report, std::string& error) {
+    std::vector<uint8_t> bytes{};
+    if (!read_file(input, bytes, error)) {
+        return false;
+    }
+
+    std::string patch_text{};
+    if (!read_text(patch_path, patch_text, error)) {
+        return false;
+    }
+
+    json patch{};
+    try {
+        patch = json::parse(patch_text);
+    } catch (const std::exception& e) {
+        error = std::string{"failed to parse DXBC token patch JSON: "} + e.what();
+        return false;
+    }
+
+    const auto chunk_fourcc = patch.value("chunk", std::string{"SHEX"});
+    auto chunk = find_dxbc_chunk(bytes, chunk_fourcc, error);
+    if (!chunk.has_value()) {
+        return false;
+    }
+
+    json edits = patch.contains("tokens") ? patch.at("tokens") : patch.value("edits", json::array());
+    if (!edits.is_array()) {
+        error = "DXBC token patch requires edits[] or tokens[]";
+        return false;
+    }
+
+    const size_t token_count = chunk->size / sizeof(uint32_t);
+    json applied = json::array();
+    for (const auto& edit : edits) {
+        if (!edit.contains("index") || !edit.contains("value")) {
+            error = "DXBC token edit requires index and value";
+            return false;
+        }
+
+        const auto index = edit.at("index").get<size_t>();
+        if (index >= token_count) {
+            error = "DXBC token edit index is outside the token stream";
+            return false;
+        }
+
+        const auto value = json_u32_value(edit.at("value"));
+        if (!value.has_value()) {
+            error = "DXBC token edit value is not a valid uint32";
+            return false;
+        }
+
+        const size_t offset = chunk->data_offset + index * sizeof(uint32_t);
+        const auto old_value = read_u32_le(bytes, offset);
+        write_u32_le(bytes, offset, *value);
+        applied.push_back({
+            {"index", index},
+            {"offset", offset},
+            {"old_value", hex_u32(old_value)},
+            {"new_value", hex_u32(*value)}
+        });
+    }
+
+    if (!write_file(output, bytes.data(), bytes.size(), error)) {
+        return false;
+    }
+
+    report["chunk"] = {
+        {"fourcc", chunk->fourcc},
+        {"data_offset", chunk->data_offset},
+        {"token_count", token_count}
+    };
+    report["applied_edits"] = std::move(applied);
+    report["warning"] = "DXBC token patching is raw SM4/SM5 token editing. It does not rebuild semantic declarations or prove the edited token stream is valid.";
+    return true;
 }
 
 std::optional<int> resource_class_value(std::string_view value) {
@@ -1233,6 +1486,8 @@ void usage() {
         << "  dxil-patch asm <input.ll> -o <output.dxbc> [--copy-parts-from <original.dxbc>] [--no-validate]\n"
         << "  dxil-patch patch <input.dxbc> <patch.json> -o <output.dxbc> [--report <report.json>]\n"
         << "  dxil-patch transform <input.dxbc> <transform.json> -o <output.dxbc> [--report <report.json>]\n"
+        << "  dxil-patch dxbc-tokens <input.dxbc> -o <tokens.json> [--chunk SHEX|SHDR]\n"
+        << "  dxil-patch dxbc-token-patch <input.dxbc> <patch.json> -o <output.dxbc> [--report <report.json>]\n"
         << "  dxil-patch validate <input.dxbc>\n";
 }
 
@@ -1245,7 +1500,7 @@ bool parse_args(int argc, char** argv, Options& options) {
     options.input = widen(argv[2]);
     int i = 3;
 
-    if (options.command == "patch" || options.command == "transform") {
+    if (options.command == "patch" || options.command == "transform" || options.command == "dxbc-token-patch") {
         if (argc < 4) {
             return false;
         }
@@ -1271,6 +1526,9 @@ bool parse_args(int argc, char** argv, Options& options) {
             if (!take_path(options.copy_parts_from)) return false;
         } else if (arg == "--dxc-path") {
             if (!take_path(options.dxc_path)) return false;
+        } else if (arg == "--chunk") {
+            if (i + 1 >= argc) return false;
+            options.chunk_fourcc = argv[++i];
         } else if (arg == "--copy-all-parts") {
             options.copy_all_non_dxil_parts = true;
         } else if (arg == "--no-copy-root-signature") {
@@ -1282,7 +1540,13 @@ bool parse_args(int argc, char** argv, Options& options) {
         }
     }
 
-    if ((options.command == "disasm" || options.command == "asm" || options.command == "patch" || options.command == "transform") && options.output.empty()) {
+    if ((options.command == "disasm" ||
+         options.command == "asm" ||
+         options.command == "patch" ||
+         options.command == "transform" ||
+         options.command == "dxbc-tokens" ||
+         options.command == "dxbc-token-patch") &&
+        options.output.empty()) {
         return false;
     }
 
@@ -1290,6 +1554,8 @@ bool parse_args(int argc, char** argv, Options& options) {
            options.command == "asm" ||
            options.command == "patch" ||
            options.command == "transform" ||
+           options.command == "dxbc-tokens" ||
+           options.command == "dxbc-token-patch" ||
            options.command == "validate";
 }
 } // namespace
@@ -1308,14 +1574,23 @@ int main(int argc, char** argv) {
         {"output", options.output.string()},
     };
 
+    const bool needs_dxc =
+        options.command == "disasm" ||
+        options.command == "asm" ||
+        options.command == "patch" ||
+        options.command == "transform" ||
+        options.command == "validate";
+
     DxcRuntime dxc{};
-    if (!dxc.load(options.dxc_path)) {
-        report["error"] = dxc.error;
-        write_report_if_requested(options, report);
-        std::cerr << dxc.error << "\n";
-        return 1;
+    if (needs_dxc) {
+        if (!dxc.load(options.dxc_path)) {
+            report["error"] = dxc.error;
+            write_report_if_requested(options, report);
+            std::cerr << dxc.error << "\n";
+            return 1;
+        }
+        report["dxcompiler"] = dxc.loaded_from.string();
     }
-    report["dxcompiler"] = dxc.loaded_from.string();
 
     std::string error{};
     bool ok = false;
@@ -1347,6 +1622,12 @@ int main(int argc, char** argv) {
              assemble_text(dxc, text, options.copy_parts_from, options.copy_root_signature, options.copy_all_non_dxil_parts, options.validate, assembled, error) &&
              blob_to_file(assembled.Get(), options.output, error);
         report["transform"] = options.patch.string();
+    } else if (options.command == "dxbc-tokens") {
+        ok = dxbc_tokens_to_json(options.input, options.chunk_fourcc, report, error) &&
+             write_text(options.output, report.dump(2), error);
+    } else if (options.command == "dxbc-token-patch") {
+        ok = patch_dxbc_tokens(options.input, options.patch, options.output, report, error);
+        report["patch"] = options.patch.string();
     } else if (options.command == "validate") {
         std::vector<uint8_t> bytes{};
         ComPtr<IDxcBlobEncoding> blob{};

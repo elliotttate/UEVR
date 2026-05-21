@@ -2,6 +2,32 @@
 
 #include "FrameworkConfig.hpp"
 
+#include <cctype>
+#include <cstdlib>
+#include <string>
+
+namespace {
+bool env_flag_enabled(const char* name) {
+    const auto* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    std::string lower{};
+    lower.reserve(8);
+    for (const char* p = value; *p != '\0' && lower.size() < 16; ++p) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*p))));
+    }
+
+    return lower != "0" &&
+           lower != "false" &&
+           lower != "no" &&
+           lower != "off" &&
+           lower != "disable" &&
+           lower != "disabled";
+}
+}
+
 std::shared_ptr<FrameworkConfig>& FrameworkConfig::get() {
      static std::shared_ptr<FrameworkConfig> instance{std::make_shared<FrameworkConfig>()};
      return instance;
@@ -58,7 +84,10 @@ void FrameworkConfig::on_config_load(const utility::Config& cfg, bool set_defaul
         option.config_load(cfg, set_defaults);
     }
 
-    if (m_remember_menu_state->value()) {
+    if (env_flag_enabled("UEVR_HIDE_MENU_ON_STARTUP") || env_flag_enabled("UEVR_FORCE_MENU_CLOSED")) {
+        m_menu_open->value() = false;
+        g_framework->set_draw_ui(false, false);
+    } else if (m_remember_menu_state->value()) {
         g_framework->set_draw_ui(m_menu_open->value(), false);
     }
     

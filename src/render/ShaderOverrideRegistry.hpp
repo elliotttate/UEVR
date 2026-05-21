@@ -31,6 +31,7 @@ public:
     enum class Stage : uint8_t {
         Vertex,
         Pixel,
+        Geometry,
         Compute,
         Amplification,
         Mesh,
@@ -43,6 +44,7 @@ public:
         DxilTextPatch,
         ContainerPatch,
         DxilTransform,
+        DxilSemanticTransform,
     };
 
     enum class EyeTarget : uint8_t {
@@ -69,6 +71,7 @@ public:
         uintptr_t original_pointer{};
         uintptr_t bound_pointer{};
         std::string hash{};
+        uint32_t crc32{};
         bool override_active{};
         std::string override_name{};
         std::string note{};
@@ -91,6 +94,10 @@ public:
         bool apply_supported{};
         bool from_profile_dir{};
         bool per_eye_variants{};
+        bool has_left_payload{};
+        bool has_right_payload{};
+        std::string left_source_kind{};
+        std::string right_source_kind{};
         uint64_t generation{};
         std::string status{};
         std::string compiler{};
@@ -126,6 +133,7 @@ public:
         std::string tracking_note{};
         BoundShaderInfo vertex_shader{};
         BoundShaderInfo pixel_shader{};
+        BoundShaderInfo geometry_shader{};
     };
 
     struct PsoRenderUsageInfo {
@@ -149,8 +157,13 @@ public:
         std::string tracking_note{};
         std::string vs_hash{};
         std::string ps_hash{};
+        std::string gs_hash{};
+        uint32_t vs_crc32{};
+        uint32_t ps_crc32{};
+        uint32_t gs_crc32{};
         std::string vs_override{};
         std::string ps_override{};
+        std::string gs_override{};
         std::vector<PsoRenderUsageInfo> likely_targets{};
     };
 
@@ -179,6 +192,7 @@ public:
         std::string requested_hash{};
         std::string matched_stage{};
         uintptr_t pipeline_state{};
+        uintptr_t root_signature{};
         ShaderBytecodeInspection bytecode{};
     };
 
@@ -334,6 +348,7 @@ public:
     // Returns the PS CRC32 for the PSO at `pso_pointer`, or 0 if not tracked.
     // Used by the D3D12 cb0-swap hook to gate on specific shader fingerprints.
     uint32_t d3d12_pso_pixel_crc32(uintptr_t pso_pointer) const;
+    uint32_t d3d12_pso_geometry_crc32(uintptr_t pso_pointer) const;
     uint32_t d3d12_pso_compute_crc32(uintptr_t pso_pointer) const;
     void hunter_record_set_pipeline_state(void* command_list, void* original_pso);
     // Extended variant: caller passes the current eye bucket (0 Unknown, 1
@@ -360,6 +375,10 @@ public:
     static ShaderOverrideRegistry& get();
 
     void on_present(Framework& framework);
+    // D3D12 can start seeing PSO creation/bind events before the Framework
+    // present loop is fully initialized. Startup diagnostics and headless
+    // shader probes need manifests loaded by then, not only on on_present().
+    void scan_override_directories_now();
     void set_inspector_tracking_enabled(bool enabled);
     bool should_track_d3d11_shaders() const;
     bool should_track_d3d12_pipelines() const;
@@ -390,6 +409,7 @@ public:
     ID3D12PipelineState* resolve_d3d12_pipeline_state(ID3D12PipelineState* pipeline_state);
     ID3D12PipelineState* resolve_d3d12_pipeline_state_for_eye(ID3D12PipelineState* pipeline_state, int eye_bucket);
     void note_d3d12_pipeline_state_bound(ID3D12PipelineState* original_pipeline_state, ID3D12PipelineState* bound_pipeline_state);
+    bool is_d3d12_pipeline_state_tracked(uintptr_t pipeline_state) const;
     std::optional<D3D12CbvBindOverride> resolve_d3d12_cbv_bind_override(
         bool graphics,
         uintptr_t pipeline_state,
@@ -437,6 +457,23 @@ private:
         std::filesystem::file_time_type source_write_time{};
         std::filesystem::file_time_type bytecode_write_time{};
         std::filesystem::file_time_type patch_write_time{};
+        struct EyePayload {
+            bool present{};
+            OverrideSourceKind source_kind{OverrideSourceKind::Bytecode};
+            std::filesystem::path bytecode_path{};
+            std::filesystem::path patch_path{};
+            std::filesystem::path cached_bytecode_path{};
+            std::vector<ShaderTextPatch> dxil_text_patches{};
+            std::vector<ShaderContainerEdit> container_edits{};
+            std::vector<uint8_t> compiled_bytecode{};
+            std::string compiled_original_hash{};
+            std::string status{};
+            std::string last_error{};
+            std::filesystem::file_time_type bytecode_write_time{};
+            std::filesystem::file_time_type patch_write_time{};
+        };
+        EyePayload left_payload{};
+        EyePayload right_payload{};
     };
 
     struct D3D11ShaderRecord {
@@ -512,11 +549,13 @@ private:
         uintptr_t pipeline_state_pointer{};
         std::string vertex_hash{};
         std::string pixel_hash{};
+        std::string geometry_hash{};
         std::string compute_hash{};
         std::string amplification_hash{};
         std::string mesh_hash{};
         uint32_t vertex_crc32{};
         uint32_t pixel_crc32{};
+        uint32_t geometry_crc32{};
         uint32_t compute_crc32{};
         uint32_t amplification_crc32{};
         uint32_t mesh_crc32{};
@@ -528,6 +567,7 @@ private:
         bool override_active{};
         std::string vertex_override_name{};
         std::string pixel_override_name{};
+        std::string geometry_override_name{};
         std::string compute_override_name{};
         std::string amplification_override_name{};
         std::string mesh_override_name{};
@@ -580,8 +620,13 @@ private:
         std::string tracking_note{};
         std::string vs_hash{};
         std::string ps_hash{};
+        std::string gs_hash{};
+        uint32_t vs_crc32{};
+        uint32_t ps_crc32{};
+        uint32_t gs_crc32{};
         std::string vs_override{};
         std::string ps_override{};
+        std::string gs_override{};
         uint64_t total_samples{};
         uint64_t bind_count_with_known_targets{};
         uint64_t first_seen_frame{};

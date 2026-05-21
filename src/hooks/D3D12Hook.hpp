@@ -275,6 +275,7 @@ protected:
     std::vector<std::unique_ptr<PointerHook>> m_create_command_list_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_command_list1_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_command_signature_hooks{};
+    std::vector<std::unique_ptr<PointerHook>> m_create_pipeline_library_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_pipeline_state_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_root_signature_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_constant_buffer_view_hooks{};
@@ -284,6 +285,7 @@ protected:
     std::vector<std::unique_ptr<PointerHook>> m_create_unordered_access_view_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_copy_descriptors_simple_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_copy_descriptors_hooks{};
+    std::vector<std::unique_ptr<PointerHook>> m_pipeline_library_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_set_pipeline_state_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_command_list_diagnostic_hooks{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_graphics_pipeline_state_hook_lookup{};
@@ -291,6 +293,7 @@ protected:
     std::unordered_map<uintptr_t, PointerHook*> m_create_command_list_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_command_list1_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_command_signature_hook_lookup{};
+    std::unordered_map<uintptr_t, PointerHook*> m_create_pipeline_library_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_pipeline_state_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_root_signature_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_constant_buffer_view_hook_lookup{};
@@ -300,9 +303,12 @@ protected:
     std::unordered_map<uintptr_t, PointerHook*> m_create_unordered_access_view_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_copy_descriptors_simple_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_copy_descriptors_hook_lookup{};
+    std::unordered_map<uintptr_t, PointerHook*> m_pipeline_library_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_set_pipeline_state_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_command_list_diagnostic_hook_lookup{};
     std::mutex m_command_list_hook_mutex{};
+    std::mutex m_pipeline_library_hook_mutex{};
+    std::unordered_set<uintptr_t> m_pipeline_library_slots{};
     std::unordered_set<uintptr_t> m_set_pipeline_state_slots{};
     std::unordered_set<uintptr_t> m_command_list_diagnostic_slots{};
     std::unique_ptr<VtableHook> m_swapchain_hook{};
@@ -323,7 +329,11 @@ protected:
     static HRESULT WINAPI create_command_list(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* command_allocator, ID3D12PipelineState* initial_state, REFIID riid, void** command_list);
     static HRESULT WINAPI create_command_list1(ID3D12Device4* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags, REFIID riid, void** command_list);
     static HRESULT WINAPI create_command_signature(ID3D12Device* device, const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* root_signature, REFIID riid, void** command_signature);
+    static HRESULT WINAPI create_pipeline_library(ID3D12Device1* device, const void* library_blob, SIZE_T blob_length, REFIID riid, void** pipeline_library);
     static HRESULT WINAPI create_pipeline_state(ID3D12Device2* device, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid, void** pipeline_state);
+    static HRESULT WINAPI pipeline_library_store_pipeline(ID3D12PipelineLibrary* library, LPCWSTR name, ID3D12PipelineState* pipeline_state);
+    static HRESULT WINAPI pipeline_library_load_graphics_pipeline(ID3D12PipelineLibrary* library, LPCWSTR name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** pipeline_state);
+    static HRESULT WINAPI pipeline_library_load_compute_pipeline(ID3D12PipelineLibrary* library, LPCWSTR name, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** pipeline_state);
     static HRESULT WINAPI create_root_signature(ID3D12Device* device, UINT node_mask, const void* blob, SIZE_T blob_length_in_bytes, REFIID riid, void** root_signature);
     static void WINAPI create_constant_buffer_view(ID3D12Device* device, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
     static void WINAPI create_render_target_view(ID3D12Device* device, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
@@ -334,13 +344,20 @@ protected:
     static HRESULT WINAPI reset_command_list(ID3D12GraphicsCommandList* command_list, ID3D12CommandAllocator* allocator, ID3D12PipelineState* initial_state);
     static void WINAPI clear_state(ID3D12GraphicsCommandList* command_list, ID3D12PipelineState* pipeline_state);
     static void WINAPI set_pipeline_state(ID3D12GraphicsCommandList* command_list, ID3D12PipelineState* pipeline_state);
+    static void WINAPI set_compute_root_signature(ID3D12GraphicsCommandList* command_list, ID3D12RootSignature* root_signature);
+    static void WINAPI set_graphics_root_signature(ID3D12GraphicsCommandList* command_list, ID3D12RootSignature* root_signature);
     static void WINAPI draw_instanced(ID3D12GraphicsCommandList* command_list, UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex_location, UINT start_instance_location);
     static void WINAPI draw_indexed_instanced(ID3D12GraphicsCommandList* command_list, UINT index_count_per_instance, UINT instance_count, UINT start_index_location, INT base_vertex_location, UINT start_instance_location);
     static void WINAPI dispatch(ID3D12GraphicsCommandList* command_list, UINT thread_group_count_x, UINT thread_group_count_y, UINT thread_group_count_z);
+    static void WINAPI copy_buffer_region(ID3D12GraphicsCommandList* command_list, ID3D12Resource* dst_buffer, UINT64 dst_offset, ID3D12Resource* src_buffer, UINT64 src_offset, UINT64 num_bytes);
+    static void WINAPI copy_texture_region(ID3D12GraphicsCommandList* command_list, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT dst_x, UINT dst_y, UINT dst_z, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* src_box);
+    static void WINAPI copy_resource(ID3D12GraphicsCommandList* command_list, ID3D12Resource* dst_resource, ID3D12Resource* src_resource);
+    static void WINAPI resolve_subresource(ID3D12GraphicsCommandList* command_list, ID3D12Resource* dst_resource, UINT dst_subresource, ID3D12Resource* src_resource, UINT src_subresource, DXGI_FORMAT format);
     static void WINAPI execute_bundle(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList* bundle);
     static void WINAPI execute_indirect(ID3D12GraphicsCommandList* command_list, ID3D12CommandSignature* command_signature, UINT max_command_count, ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset, ID3D12Resource* count_buffer, UINT64 count_buffer_offset);
     static void WINAPI dispatch_mesh(ID3D12GraphicsCommandList6* command_list, UINT thread_group_count_x, UINT thread_group_count_y, UINT thread_group_count_z);
     static void WINAPI rs_set_viewports(ID3D12GraphicsCommandList* command_list, UINT num_viewports, const D3D12_VIEWPORT* viewports);
+    static void WINAPI rs_set_scissor_rects(ID3D12GraphicsCommandList* command_list, UINT num_rects, const D3D12_RECT* rects);
     static void WINAPI om_set_render_targets(ID3D12GraphicsCommandList* command_list, UINT num_render_target_descriptors, const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors, BOOL rts_single_handle_to_descriptor_range, const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor);
     static void WINAPI clear_render_target_view(ID3D12GraphicsCommandList* command_list, D3D12_CPU_DESCRIPTOR_HANDLE render_target_view, const FLOAT color_rgba[4], UINT num_rects, const D3D12_RECT* rects);
     static void WINAPI resource_barrier(ID3D12GraphicsCommandList* command_list, UINT num_barriers, const D3D12_RESOURCE_BARRIER* barriers);
@@ -371,7 +388,9 @@ protected:
     PointerHook* find_create_command_list_hook(void* slot) const;
     PointerHook* find_create_command_list1_hook(void* slot) const;
     PointerHook* find_create_command_signature_hook(void* slot) const;
+    PointerHook* find_create_pipeline_library_hook(void* slot) const;
     PointerHook* find_create_pipeline_state_hook(void* slot) const;
+    PointerHook* find_pipeline_library_hook(void* slot) const;
     PointerHook* find_create_root_signature_hook(void* slot) const;
     PointerHook* find_create_constant_buffer_view_hook(void* slot) const;
     PointerHook* find_create_render_target_view_hook(void* slot) const;
@@ -382,6 +401,7 @@ protected:
     PointerHook* find_copy_descriptors_hook(void* slot) const;
     PointerHook* find_set_pipeline_state_hook(void* slot) const;
     PointerHook* find_command_list_diagnostic_hook(void* slot) const;
+    void install_pipeline_library_hooks(ID3D12PipelineLibrary* pipeline_library);
     void install_command_list_hooks(ID3D12GraphicsCommandList* command_list);
     void install_command_list_hooks_from_unknown(IUnknown* command_list);
 };
