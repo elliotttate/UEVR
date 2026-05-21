@@ -639,6 +639,30 @@ bool subnautica2_disable_water_state_sync() {
     return disabled;
 }
 
+uint32_t subnautica2_water_state_sync_mask() {
+    // Bit 0: underwater depth + water intersection.
+    // Bit 1: fog-render flags at FViewInfo+0x11E8..0x11ED.
+    // Bit 2: BasePass gate byte at FViewInfo+0x11D9.
+    // Bit 3: BasePass key dword at FViewInfo+0x24CC. This is unsafe to
+    // mirror by default; keep it as an explicit crash-repro/bisect bit only.
+    // When UEVR_SUBNAUTICA2_ENABLE_WATER_STATE_SYNC=1 and this is unset,
+    // enable only the fields that survived the split stability tests.
+    static const uint32_t result = []() {
+        wchar_t value[32]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_WATER_STATE_SYNC_MASK", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return 0x7u;
+        }
+
+        wchar_t* end = nullptr;
+        const auto parsed = wcstoul(value, &end, 0);
+        return end != value ? static_cast<uint32_t>(parsed) : 0u;
+    }();
+
+    return result;
+}
+
 bool subnautica2_disable_compose_volumetric_view_rect_fix() {
     if (subnautica2_diag_clean_mode()) return true;
     // Default ENABLED. SN2's ComposeVolumetricRenderTargetOverScene reads
@@ -2384,9 +2408,15 @@ static std::atomic<int32_t> g_subnautica2_fog_ub_handle_offset{-1};
 
 void subnautica2_sync_native_stereo_water_state(sdk::FSceneViewFamily& view_family, uint32_t frame_count) {
     auto& vr = VR::get();
+    const auto sync_mask = subnautica2_water_state_sync_mask();
+    const bool sync_water_values = (sync_mask & 0x1u) != 0;
+    const bool sync_fog_flags = (sync_mask & 0x2u) != 0;
+    const bool sync_basepass_gate = (sync_mask & 0x4u) != 0;
+    const bool sync_basepass_key = (sync_mask & 0x8u) != 0;
 
     if (!subnautica2_is_current_game() ||
         subnautica2_disable_water_state_sync() ||
+        sync_mask == 0 ||
         !vr->is_hmd_active() ||
         !vr->is_native_stereo_fix_enabled() ||
         vr->is_native_stereo_fix_same_pass_enabled())
@@ -2409,7 +2439,7 @@ void subnautica2_sync_native_stereo_water_state(sdk::FSceneViewFamily& view_fami
             <= REQUIRED_READ_RANGE,
         "fog-render flag block must be covered by sync read range");
 
-    if (IsBadReadPtr(primary_view, REQUIRED_READ_RANGE)) {
+    if (!is_readable_process_range((uintptr_t)primary_view, REQUIRED_READ_RANGE)) {
         return;
     }
 
@@ -2438,7 +2468,8 @@ void subnautica2_sync_native_stereo_water_state(sdk::FSceneViewFamily& view_fami
         auto secondary_view = (uint8_t*)views->data[i];
 
         if (secondary_view == nullptr ||
-            IsBadReadPtr(secondary_view, REQUIRED_READ_RANGE))
+            !is_readable_process_range((uintptr_t)secondary_view, REQUIRED_READ_RANGE) ||
+            !is_writable_process_range((uintptr_t)secondary_view, REQUIRED_READ_RANGE))
         {
             continue;
         }
@@ -2449,18 +2480,20 @@ void subnautica2_sync_native_stereo_water_state(sdk::FSceneViewFamily& view_fami
             continue;
         }
 
-        auto& secondary_depth = *(float*)(secondary_view + SUBNAUTICA2_SCENEVIEW_UNDERWATER_DEPTH_OFFSET);
-        auto& secondary_intersection = *(uint8_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_WATER_INTERSECTION_OFFSET);
-        const auto before_depth = secondary_depth;
-        const auto before_intersection = secondary_intersection;
+        if (sync_water_values) {
+            auto& secondary_depth = *(float*)(secondary_view + SUBNAUTICA2_SCENEVIEW_UNDERWATER_DEPTH_OFFSET);
+            auto& secondary_intersection = *(uint8_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_WATER_INTERSECTION_OFFSET);
+            const auto before_depth = secondary_depth;
+            const auto before_intersection = secondary_intersection;
 
-        secondary_depth = primary_depth;
-        secondary_intersection = primary_intersection;
+            secondary_depth = primary_depth;
+            secondary_intersection = primary_intersection;
 
-        if (log_count < sync_log_max && (before_depth != primary_depth || before_intersection != primary_intersection)) {
-            SPDLOG_INFO("[Subnautica2][NativeStereoFix] Synced water state frame={} view={} primary(depth={}, intersection={}) secondary_before(depth={}, intersection={})",
-                frame_count, i, primary_depth, primary_intersection, before_depth, before_intersection);
-            ++log_count;
+            if (log_count < sync_log_max && (before_depth != primary_depth || before_intersection != primary_intersection)) {
+                SPDLOG_INFO("[Subnautica2][NativeStereoFix] Synced water state frame={} view={} mask=0x{:x} primary(depth={}, intersection={}) secondary_before(depth={}, intersection={})",
+                    frame_count, i, sync_mask, primary_depth, primary_intersection, before_depth, before_intersection);
+                ++log_count;
+            }
         }
 
         // Sync the per-view fog-render bool block (0x11E8..0x11ED). These
@@ -2469,23 +2502,25 @@ void subnautica2_sync_native_stereo_water_state(sdk::FSceneViewFamily& view_fami
         // it -- different shader compile keys for identical geometry). The
         // existing post-ctor zeroing only touches 0x11F3..0x11F7, so this
         // block was diverging between eyes and selecting different shaders.
-        uint8_t* secondary_fog_flags_ptr = secondary_view + SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_START_OFFSET;
-        uint8_t before_fog_flags[SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE];
-        memcpy(before_fog_flags, secondary_fog_flags_ptr, SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE);
+        if (sync_fog_flags) {
+            uint8_t* secondary_fog_flags_ptr = secondary_view + SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_START_OFFSET;
+            uint8_t before_fog_flags[SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE];
+            memcpy(before_fog_flags, secondary_fog_flags_ptr, SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE);
 
-        const bool fog_flags_differ =
-            memcmp(before_fog_flags, primary_fog_flags, SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE) != 0;
+            const bool fog_flags_differ =
+                memcmp(before_fog_flags, primary_fog_flags, SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE) != 0;
 
-        memcpy(secondary_fog_flags_ptr, primary_fog_flags, SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE);
+            memcpy(secondary_fog_flags_ptr, primary_fog_flags, SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAGS_SIZE);
 
-        if (fog_log_count < sync_log_max && fog_flags_differ) {
-            SPDLOG_INFO("[Subnautica2][NativeStereoFix] Synced fog-render flags frame={} view={} primary=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] secondary_before=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
-                frame_count, i,
-                primary_fog_flags[0], primary_fog_flags[1], primary_fog_flags[2],
-                primary_fog_flags[3], primary_fog_flags[4], primary_fog_flags[5],
-                before_fog_flags[0], before_fog_flags[1], before_fog_flags[2],
-                before_fog_flags[3], before_fog_flags[4], before_fog_flags[5]);
-            ++fog_log_count;
+            if (fog_log_count < sync_log_max && fog_flags_differ) {
+                SPDLOG_INFO("[Subnautica2][NativeStereoFix] Synced fog-render flags frame={} view={} mask=0x{:x} primary=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] secondary_before=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                    frame_count, i, sync_mask,
+                    primary_fog_flags[0], primary_fog_flags[1], primary_fog_flags[2],
+                    primary_fog_flags[3], primary_fog_flags[4], primary_fog_flags[5],
+                    before_fog_flags[0], before_fog_flags[1], before_fog_flags[2],
+                    before_fog_flags[3], before_fog_flags[4], before_fog_flags[5]);
+                ++fog_log_count;
+            }
         }
 
         // Sync the FBasePassMeshProcessor-feeding per-view fields. The
@@ -2498,24 +2533,31 @@ void subnautica2_sync_native_stereo_water_state(sdk::FSceneViewFamily& view_fami
         // entire range around 0x11D9..0x11FF (catches any byte gate adjacent
         // to FOG_RENDER_FLAGS) AND 0x24C8..0x24CF (catches VISIBILITY_FLAGS
         // and BASEPASS_KEY_DWORD).
-        auto& secondary_basepass_gate = *(uint8_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_BASEPASS_GATE_BYTE_OFFSET);
-        auto& secondary_basepass_key = *(uint32_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_BASEPASS_KEY_DWORD_OFFSET);
-        const auto before_basepass_gate = secondary_basepass_gate;
-        const auto before_basepass_key = secondary_basepass_key;
+        if (sync_basepass_gate || sync_basepass_key) {
+            auto& secondary_basepass_gate = *(uint8_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_BASEPASS_GATE_BYTE_OFFSET);
+            auto& secondary_basepass_key = *(uint32_t*)(secondary_view + SUBNAUTICA2_SCENEVIEW_BASEPASS_KEY_DWORD_OFFSET);
+            const auto before_basepass_gate = secondary_basepass_gate;
+            const auto before_basepass_key = secondary_basepass_key;
 
-        const bool basepass_state_differs =
-            before_basepass_gate != primary_basepass_gate ||
-            before_basepass_key != primary_basepass_key;
+            if (sync_basepass_gate) {
+                secondary_basepass_gate = primary_basepass_gate;
+            }
 
-        secondary_basepass_gate = primary_basepass_gate;
-        secondary_basepass_key = primary_basepass_key;
+            if (sync_basepass_key) {
+                secondary_basepass_key = primary_basepass_key;
+            }
 
-        if (basepass_log_count < sync_log_max && basepass_state_differs) {
-            SPDLOG_INFO("[Subnautica2][NativeStereoFix] Synced BasePass state frame={} view={} primary(gate=0x{:02x} key=0x{:08x}) secondary_before(gate=0x{:02x} key=0x{:08x})",
-                frame_count, i,
-                primary_basepass_gate, primary_basepass_key,
-                before_basepass_gate, before_basepass_key);
-            ++basepass_log_count;
+            const bool basepass_state_differs =
+                (sync_basepass_gate && before_basepass_gate != primary_basepass_gate) ||
+                (sync_basepass_key && before_basepass_key != primary_basepass_key);
+
+            if (basepass_log_count < sync_log_max && basepass_state_differs) {
+                SPDLOG_INFO("[Subnautica2][NativeStereoFix] Synced BasePass state frame={} view={} mask=0x{:x} primary(gate=0x{:02x} key=0x{:08x}) secondary_before(gate=0x{:02x} key=0x{:08x})",
+                    frame_count, i, sync_mask,
+                    primary_basepass_gate, primary_basepass_key,
+                    before_basepass_gate, before_basepass_key);
+                ++basepass_log_count;
+            }
         }
 
     }
