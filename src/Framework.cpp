@@ -2399,7 +2399,7 @@ void Framework::deinit_d3d11() {
 
 bool Framework::init_d3d12() {
     deinit_d3d12();
-    
+
     auto device = m_d3d12_hook->get_device();
 
     spdlog::info("[D3D12] Creating command allocator...");
