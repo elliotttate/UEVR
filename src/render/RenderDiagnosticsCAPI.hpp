@@ -119,6 +119,42 @@ UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_launch_ui();
 // to leave unchanged. Returns JSON {ok, template, error}.
 UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_set_capture_template(const char* path_template);
 
+// Internal API — used by Framework startup to proactively load and configure
+// renderdoc.dll if present (and optionally load it from disk if not). Mirrors
+// the PIX bootstrap pattern: returns whether the DLL was preloaded by the
+// launcher (capture safety) or LoadLibrary'd late (degraded mode).
+struct UevrRenderDocBootstrapResult {
+    void* module;            // HMODULE for renderdoc.dll
+    bool  was_preloaded;     // true if renderdoc.dll was in the process before UEVR ran
+    bool  api_loaded;        // true if RENDERDOC_GetAPI succeeded
+    int   api_version_major;
+    int   api_version_minor;
+    int   api_version_patch;
+};
+
+// Proactively load renderdoc.dll if not already loaded, then initialize the
+// in-app API. Skips load if UEVR_DISABLE_RENDERDOC_BOOTSTRAP=1 or if Nsight
+// mode is active (Nsight and RenderDoc can both work but PIX is the exclusive
+// one). Logs status via spdlog. Safe to call multiple times.
+UEVR_RENDER_CAPI UevrRenderDocBootstrapResult uevr_renderdoc_bootstrap();
+
+// Returns true iff the API is currently loaded.
+UEVR_RENDER_CAPI bool uevr_renderdoc_is_api_loaded();
+
+// Trigger a wildcard capture (StartFrameCapture+sleep+EndFrameCapture).
+// Returns true if EndFrameCapture returned nonzero (capture written).
+// No JSON wrapping — for use from Framework / hotkey paths.
+UEVR_RENDER_CAPI bool uevr_renderdoc_capture_wildcard();
+
+// Start the sentinel-file watcher for triggering captures from outside the
+// process. Writes a thread that polls `%TEMP%/uevr_renderdoc_capture.req`
+// every 250ms. File format:
+//   line 1: capture file template path (optional — empty = use default)
+//   line 2: "frames=N" (optional, default 1)
+// On detection: SetCaptureFilePathTemplate(template) then capture N frames.
+// Stops automatically on process exit.
+UEVR_RENDER_CAPI void uevr_renderdoc_start_capture_watcher();
+
 // ── VR mod state, cvars, frame timing, eye pixel sampling/dumps ──────
 
 // Snapshot of VR-mod state most relevant to render bugs: stereo on/off,

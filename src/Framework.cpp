@@ -35,6 +35,7 @@
 #include "LicenseStrings.hpp"
 #include "mods/FrameworkConfig.hpp"
 #include "render/D3D12Diagnostics.hpp"
+#include "render/RenderDiagnosticsCAPI.hpp"
 #include "DumperMode.hpp"
 #include "ProfilerMode.hpp"
 #include "Framework.hpp"
@@ -603,6 +604,28 @@ Framework::Framework(HMODULE framework_module)
     // WinPixGpuCapturer.dll detours D3D12 in a way that breaks Nsight
     // Graphics' capture path, so Nsight mode short-circuits PIX bootstrap.
     // See ProfilerMode.hpp.
+    // RenderDoc integration — proactively load renderdoc.dll if present (or
+    // LoadLibrary it from standard paths) and initialize the in-app API.
+    // Works alongside PIX and Nsight (RenderDoc hooks D3D12 the same way PIX
+    // does so PIX-mode skips RenderDoc bootstrap too).
+    {
+        auto rd_result = uevr_renderdoc_bootstrap();
+        if (rd_result.api_loaded) {
+            spdlog::info("[RenderDoc] integration READY: v{}.{}.{} (preloaded={})",
+                         rd_result.api_version_major, rd_result.api_version_minor,
+                         rd_result.api_version_patch, rd_result.was_preloaded);
+            // Start the sentinel-file watcher so external processes can
+            // trigger captures by writing to %TEMP%/uevr_renderdoc_capture.req
+            uevr_renderdoc_start_capture_watcher();
+            if (!rd_result.was_preloaded) {
+                spdlog::warn("[RenderDoc] capture_safe=DEGRADED: renderdoc.dll was LoadLibrary'd "
+                             "after D3D12CreateDevice. Status/UI queries work, but live captures "
+                             "may be incomplete. For full capture: relaunch via "
+                             "`renderdoccmd capture --opt-hook-children` then inject UEVR.");
+            }
+        }
+    }
+
     if (uevr::is_nsight_mode()) {
         spdlog::info("[Profiler] Nsight mode active — skipping PIX bootstrap so NVIDIA Nsight can attach cleanly.");
     } else if (auto pix = try_load_pix_gpu_capturer(); pix.module != nullptr) {

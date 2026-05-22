@@ -2075,6 +2075,194 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_set_capture_t
     }
 }
 
+// ── Proactive bootstrap (called from Framework::Framework) ───────────
+
+extern "C" UEVR_RENDER_CAPI UevrRenderDocBootstrapResult uevr_renderdoc_bootstrap() {
+    UevrRenderDocBootstrapResult r{};
+
+    // Bail if the user explicitly disabled the bootstrap.
+    {
+        wchar_t buf[8]{};
+        if (GetEnvironmentVariableW(L"UEVR_DISABLE_RENDERDOC_BOOTSTRAP", buf,
+                                      (DWORD)std::size(buf)) > 0 && buf[0] == L'1') {
+            spdlog::info("[RenderDoc] bootstrap skipped (UEVR_DISABLE_RENDERDOC_BOOTSTRAP=1)");
+            return r;
+        }
+    }
+
+    // Check if already loaded (most common case — launched via
+    // `renderdoccmd capture --opt-hook-children` so DLL is in the process
+    // before UEVR ever ran).
+    HMODULE mod = GetModuleHandleA("renderdoc.dll");
+    if (mod != nullptr) {
+        r.was_preloaded = true;
+        spdlog::info("[RenderDoc] preloaded by launcher: 0x{:x}",
+                     reinterpret_cast<uintptr_t>(mod));
+    } else {
+        // Try LoadLibrary as a fallback. This works for analysis-API queries
+        // (status / num_captures / launch UI) but capture itself will likely
+        // fail because D3D12 was created before our hooks could install.
+        // Search PATH first, then standard install locations.
+        const wchar_t* search_paths[] = {
+            L"renderdoc.dll",
+            L"C:\\Program Files\\RenderDoc\\renderdoc.dll",
+            // Our fork's dev build path:
+            L"E:\\Github\\renderdoc\\x64\\Development\\renderdoc.dll",
+            L"E:\\Github\\renderdoc\\x64\\Release\\renderdoc.dll",
+            nullptr,
+        };
+        for (auto* p = search_paths; *p != nullptr; ++p) {
+            mod = LoadLibraryW(*p);
+            if (mod != nullptr) {
+                spdlog::warn("[RenderDoc] late-loaded from {} — capture safety: DEGRADED "
+                             "(D3D12 device was already created before our hooks could install). "
+                             "Status/UI queries still work. For full capture, relaunch via "
+                             "`renderdoccmd capture --opt-hook-children`.",
+                             std::string{reinterpret_cast<const char*>(*p),
+                                          wcslen(*p)});
+                break;
+            }
+        }
+        if (mod == nullptr) {
+            spdlog::info("[RenderDoc] not loaded — capture/diagnostics unavailable. "
+                         "To enable: launch via `renderdoccmd capture --opt-hook-children` "
+                         "or install RenderDoc to C:\\Program Files\\RenderDoc\\");
+            return r;
+        }
+    }
+    r.module = static_cast<void*>(mod);
+
+    // Initialize the in-app API via the existing rdoc() lazy path.
+    auto* api = rdoc();
+    if (api == nullptr) {
+        spdlog::warn("[RenderDoc] DLL present but RENDERDOC_GetAPI did not return a compatible API");
+        return r;
+    }
+    r.api_loaded = true;
+    api->GetAPIVersion(&r.api_version_major, &r.api_version_minor, &r.api_version_patch);
+    spdlog::info("[RenderDoc] API ready: v{}.{}.{}  (preloaded={})",
+                 r.api_version_major, r.api_version_minor, r.api_version_patch,
+                 r.was_preloaded);
+
+    // Set a default capture template under %TEMP% if the user hasn't set one
+    // (so triggers from the watcher have a known landing place).
+    if (const char* existing = api->GetCaptureFilePathTemplate(); existing == nullptr || *existing == '\0') {
+        wchar_t temp[MAX_PATH]{};
+        if (GetTempPathW(MAX_PATH, temp) > 0) {
+            wchar_t pathw[MAX_PATH + 64]{};
+            SYSTEMTIME st{};
+            GetLocalTime(&st);
+            swprintf_s(pathw, L"%suevr_renderdoc_%04d%02d%02d_%02d%02d%02d",
+                        temp, st.wYear, st.wMonth, st.wDay,
+                        st.wHour, st.wMinute, st.wSecond);
+            // Convert wchar -> UTF-8 ASCII (paths are ASCII-safe in %TEMP%)
+            char patha[MAX_PATH + 64]{};
+            for (size_t i = 0; pathw[i] != 0 && i < std::size(patha) - 1; ++i) {
+                patha[i] = static_cast<char>(pathw[i]);
+            }
+            api->SetCaptureFilePathTemplate(patha);
+            spdlog::info("[RenderDoc] capture template set to: {}", patha);
+        }
+    }
+    return r;
+}
+
+extern "C" UEVR_RENDER_CAPI bool uevr_renderdoc_is_api_loaded() {
+    return rdoc() != nullptr;
+}
+
+extern "C" UEVR_RENDER_CAPI bool uevr_renderdoc_capture_wildcard() {
+    auto* api = rdoc();
+    if (api == nullptr) return false;
+    api->StartFrameCapture(nullptr, nullptr);
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    return api->EndFrameCapture(nullptr, nullptr) != 0;
+}
+
+namespace {
+std::thread g_renderdoc_watcher_thread{};
+std::atomic<bool> g_renderdoc_watcher_stop{false};
+std::atomic<bool> g_renderdoc_watcher_started{false};
+
+void renderdoc_capture_watcher_loop() {
+    namespace fs = std::filesystem;
+    wchar_t tempw[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, tempw) == 0) {
+        spdlog::warn("[RenderDoc] watcher: GetTempPathW failed");
+        return;
+    }
+    fs::path sentinel = fs::path{tempw} / L"uevr_renderdoc_capture.req";
+    spdlog::info("[RenderDoc] watcher: polling {} every 250ms", sentinel.string());
+
+    while (!g_renderdoc_watcher_stop.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        std::error_code ec;
+        if (!fs::exists(sentinel, ec)) continue;
+
+        // Read + consume the sentinel atomically.
+        std::string content;
+        try {
+            std::ifstream f(sentinel);
+            std::stringstream ss; ss << f.rdbuf();
+            content = ss.str();
+        } catch (...) {
+            // ignore
+        }
+        fs::remove(sentinel, ec);
+
+        // Parse the sentinel.
+        std::string capture_template;
+        int frames = 1;
+        {
+            std::istringstream iss(content);
+            std::string line;
+            int line_no = 0;
+            while (std::getline(iss, line)) {
+                // trim CR/whitespace
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+                    line.pop_back();
+                ++line_no;
+                if (line_no == 1) {
+                    capture_template = std::move(line);
+                } else if (line.rfind("frames=", 0) == 0) {
+                    try { frames = std::max(1, std::stoi(line.substr(7))); } catch (...) {}
+                }
+            }
+        }
+
+        auto* api = rdoc();
+        if (api == nullptr) {
+            spdlog::warn("[RenderDoc] watcher: trigger received but API not loaded");
+            continue;
+        }
+        if (!capture_template.empty()) {
+            api->SetCaptureFilePathTemplate(capture_template.c_str());
+            spdlog::info("[RenderDoc] watcher: capture template -> {}", capture_template);
+        }
+        if (frames > 1) {
+            api->TriggerMultiFrameCapture(static_cast<uint32_t>(frames));
+            spdlog::info("[RenderDoc] watcher: triggered {} frames", frames);
+        } else {
+            // Wildcard works even when no window/device pair has been explicitly selected
+            api->StartFrameCapture(nullptr, nullptr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            const bool ended = api->EndFrameCapture(nullptr, nullptr) != 0;
+            spdlog::info("[RenderDoc] watcher: wildcard capture ended={}", ended);
+        }
+    }
+}
+} // namespace
+
+extern "C" UEVR_RENDER_CAPI void uevr_renderdoc_start_capture_watcher() {
+    bool expected = false;
+    if (!g_renderdoc_watcher_started.compare_exchange_strong(expected, true)) {
+        return; // already started
+    }
+    g_renderdoc_watcher_stop.store(false);
+    g_renderdoc_watcher_thread = std::thread{renderdoc_capture_watcher_loop};
+    g_renderdoc_watcher_thread.detach();
+}
+
 // ── VR mod state probe ───────────────────────────────────────────────
 
 extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_vr_state_json() {
