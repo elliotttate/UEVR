@@ -241,8 +241,8 @@ $env:UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS = '1'
 <h3>Path A — Verify mirror allocation is alias-safe</h3>
 <p>Sn2UweFogMirrorHook uses <code>CreateCommittedResource</code> which should allocate from a fresh heap. But the underlying GPU VA could still alias with the original. Nsight Graphics has a memory layout view that can confirm/deny. If aliased, switch to <code>ID3D12Heap</code> with explicit size + alignment that guarantees no overlap with game-owned heaps.</p>
 
-<h3>Path B — Wire consumer SRV redirect</h3>
-<p>The code exists at <code>D3D12Hook.cpp:sn2_try_begin_consumer_srv_redirect</code> but is gated by <code>UEVR_SN2_CONSUMER_SRV_REDIRECT=1</code> which we never enabled. With FixRules now working, this could work even WITH the aliasing — the consumer would explicitly read from mirror's CPU descriptor handle, bypassing the original's binding. Needs combined with a working producer-side write to mirror.</p>
+<h3>Path B — Wire consumer SRV redirect <span class="tag no">BLOCKED</span></h3>
+<p>The code exists at <code>D3D12Hook.cpp:sn2_try_begin_consumer_srv_redirect</code> but is gated by <code>UEVR_SN2_CONSUMER_SRV_REDIRECT=1</code>. Tested live in M4 (Phase SS): <strong>game hung/no-response after 2 frames</strong>. Only 1 redirect fired before stall. The per-draw 21+ heap iteration is likely the deadlock cause. Path B requires significant refactor of the consumer redirect code before retry.</p>
 
 <h3>Path C — DXIL VoxelizePS patch</h3>
 <p>Modify VoxelizePS to be eye-aware: read eye index from CB, compute matrices per-eye, output to right slice for right eye / left slice for left eye. Eliminates the need for the dup mechanism entirely. Bigger work (DXIL editor needed) but architecturally cleanest.</p>
