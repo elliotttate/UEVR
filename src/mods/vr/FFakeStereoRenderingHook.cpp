@@ -84,6 +84,10 @@ uint32_t g_frame_count{};
 // midhook). Used by the fog descriptor swap to pick which pool entry to
 // copy into view 1's basepass binding.
 std::atomic<uintptr_t> g_subnautica2_view0_lightscat{0};
+std::atomic<uint64_t> g_subnautica2_water_context_id{0};
+std::atomic<uintptr_t> g_subnautica2_water_context_views{0};
+std::atomic<uintptr_t> g_subnautica2_water_context_color{0};
+std::atomic<uintptr_t> g_subnautica2_water_context_depth{0};
 
 namespace {
 bool is_readable_process_range(uintptr_t address, size_t size);
@@ -1135,6 +1139,22 @@ bool subnautica2_disable_underwater_fog_view_data_fix() {
     return result;
 }
 
+bool subnautica2_force_underwater_fog_per_view() {
+    if (subnautica2_diag_clean_mode()) return false;
+    static const bool result = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SUBNAUTICA2_FORCE_UNDERWATER_FOG_PER_VIEW", value, (DWORD)std::size(value));
+
+        if (len == 0 || len >= std::size(value)) {
+            return false;
+        }
+
+        return value[0] != L'\0' && value[0] != L'0' && value[0] != L'f' && value[0] != L'F';
+    }();
+
+    return result;
+}
+
 bool subnautica2_disable_render_fog_view_rect_fix() {
     if (subnautica2_diag_clean_mode()) return true;
     static const bool result = []() {
@@ -1261,6 +1281,13 @@ constexpr uintptr_t SUBNAUTICA2_COMPOSE_VOLUMETRIC_OVER_SCENE_RVA = 0x2FFB190;
 constexpr uintptr_t SUBNAUTICA2_RENDER_FOG_WRAPPER_RVA = 0x26F7F90;
 constexpr uintptr_t SUBNAUTICA2_RENDER_FOG_PASS_RVA = 0x26EF210;
 constexpr uintptr_t SUBNAUTICA2_RENDER_UNDERWATER_FOG_RVA = 0x26F9B40;
+// RenderUnderWaterFog's per-view fog-in-water loop normally skips the loop body
+// when view+0x11EC is true and the scene gate byte resolves false. In -emulatestereo
+// this suppresses the secondary eye's water fog producer. NOP the secondary JZ:
+//   1426F9C4F 0F 84 E9 03 00 00  jz loc_1426FA03E
+constexpr uintptr_t SUBNAUTICA2_RENDER_UNDERWATER_FOG_PER_VIEW_GUARD_RVA = 0x26F9C4F;
+constexpr uintptr_t SUBNAUTICA2_RENDER_UNDERWATER_FOG_GUARD_PROCEED_RVA = 0x26F9C55;
+constexpr uintptr_t SUBNAUTICA2_RENDER_UNDERWATER_FOG_BUILD_BLOCK_RVA = 0x26F9C70;
 // Tiny thunk called from RenderFog before the real per-view fog handler:
 //   view->IntegratedLightScattering = source_view->IntegratedLightScattering
 //   view->IntegratedLightExtinction = source_view->IntegratedLightExtinction
@@ -2078,11 +2105,17 @@ bool subnautica2_patch_scene_without_water_views(
 
     static std::atomic<uint64_t> logged_calls{0};
     const auto count = logged_calls.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t water_context_id = count + 1;
+    g_subnautica2_water_context_id.store(water_context_id, std::memory_order_relaxed);
+    g_subnautica2_water_context_views.store((uintptr_t)views_data, std::memory_order_relaxed);
+    g_subnautica2_water_context_color.store(color_texture, std::memory_order_relaxed);
+    g_subnautica2_water_context_depth.store(depth_texture, std::memory_order_relaxed);
     const auto log_max = sn2_scene_without_water_log_max();
     if (count < log_max) {
         SPDLOG_INFO(
-            "[Subnautica2][SceneWithoutWater] {} call={} renderer_views={} count={}/{} water_views={} count={}/{} color={:x} depth={:x} refraction={} downsample={} full_rect={} {} {} {} patched={} mismatch={}",
+            "[Subnautica2][SceneWithoutWater] {} water_ctx={} call={} renderer_views={} count={}/{} water_views={} count={}/{} color={:x} depth={:x} refraction={} downsample={} full_rect={} {} {} {} patched={} mismatch={}",
             source,
+            water_context_id,
             count + 1,
             (uintptr_t)views_data,
             views_count,
@@ -2108,8 +2141,9 @@ bool subnautica2_patch_scene_without_water_views(
             const auto& current = water_views[eye];
 
             SPDLOG_INFO(
-                "[Subnautica2][SceneWithoutWater] {} eye={} view={:x} pass={} stereo_index={} primary_index={} fog_flag={} instanced={} singlepass={} multiviewport={} mobile_multiview={} bind_instanced_ub={} underwater_depth={} water_intersection={} init_rect={} {} {} {} runtime_rect={} {} {} {} current_rect={} {} {} {} current_uv={:.6f} {:.6f} {:.6f} {:.6f} expected_valid={} expected_rect={} {} {} {} expected_uv={:.6f} {:.6f} {:.6f} {:.6f}",
+                "[Subnautica2][SceneWithoutWater] {} water_ctx={} eye={} view={:x} pass={} stereo_index={} primary_index={} fog_flag={} instanced={} singlepass={} multiviewport={} mobile_multiview={} bind_instanced_ub={} underwater_depth={} water_intersection={} init_rect={} {} {} {} runtime_rect={} {} {} {} current_rect={} {} {} {} current_uv={:.6f} {:.6f} {:.6f} {:.6f} expected_valid={} expected_rect={} {} {} {} expected_uv={:.6f} {:.6f} {:.6f} {:.6f}",
                 source,
+                water_context_id,
                 eye,
                 (uintptr_t)view,
                 *(uint32_t*)(view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET),
@@ -5821,6 +5855,132 @@ void FFakeStereoRenderingHook::attempt_hook_subnautica2_render_fog_pass() {
         subnautica2_disable_render_fog_view_rect_fix() ? "disabled" : "enabled");
 }
 
+static bool subnautica2_apply_underwater_fog_per_view_guard_patch(uintptr_t exe_base) {
+    if (!subnautica2_force_underwater_fog_per_view()) {
+        return false;
+    }
+
+    static std::atomic<bool> attempted{false};
+    static std::atomic<bool> applied{false};
+    bool expected_attempted = false;
+    if (!attempted.compare_exchange_strong(expected_attempted, true)) {
+        return applied.load(std::memory_order_relaxed);
+    }
+
+    const auto patch_target = exe_base + SUBNAUTICA2_RENDER_UNDERWATER_FOG_PER_VIEW_GUARD_RVA;
+    if (exe_base == 0 || !is_executable_process_range(patch_target, 6)) {
+        SPDLOG_WARN("[Subnautica2][UnderwaterFogPerView] Cannot patch guard; bad target {:x}", patch_target);
+        return false;
+    }
+
+    constexpr uint8_t original_bytes[] = {0x0F, 0x84, 0xE9, 0x03, 0x00, 0x00};
+    constexpr uint8_t patched_bytes[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+
+    if (std::memcmp((void*)patch_target, patched_bytes, sizeof(patched_bytes)) == 0) {
+        applied.store(true, std::memory_order_relaxed);
+        SPDLOG_WARN("[Subnautica2][UnderwaterFogPerView] guard already patched at {:x}", patch_target);
+        return true;
+    }
+
+    if (std::memcmp((void*)patch_target, original_bytes, sizeof(original_bytes)) != 0) {
+        uint8_t actual[sizeof(original_bytes)]{};
+        std::memcpy(actual, (void*)patch_target, sizeof(actual));
+        SPDLOG_WARN(
+            "[Subnautica2][UnderwaterFogPerView] guard bytes mismatch at {:x}; expected 0F 84 E9 03 00 00, got {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}; skipping",
+            patch_target,
+            actual[0], actual[1], actual[2], actual[3], actual[4], actual[5]);
+        return false;
+    }
+
+    DWORD old_protect = 0;
+    if (!VirtualProtect((void*)patch_target, sizeof(patched_bytes), PAGE_EXECUTE_READWRITE, &old_protect)) {
+        SPDLOG_WARN("[Subnautica2][UnderwaterFogPerView] VirtualProtect failed at {:x}", patch_target);
+        return false;
+    }
+
+    std::memcpy((void*)patch_target, patched_bytes, sizeof(patched_bytes));
+
+    DWORD ignored = 0;
+    VirtualProtect((void*)patch_target, sizeof(patched_bytes), old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), (void*)patch_target, sizeof(patched_bytes));
+
+    applied.store(true, std::memory_order_relaxed);
+    SPDLOG_WARN(
+        "[Subnautica2][UnderwaterFogPerView] applied 6-byte NOP at {:x} (RVA 0x{:x}); RenderUnderWaterFog no longer skips view body on view+0x11EC/scene-gate failure",
+        patch_target,
+        SUBNAUTICA2_RENDER_UNDERWATER_FOG_PER_VIEW_GUARD_RVA);
+    return true;
+}
+
+static void subnautica2_log_underwater_fog_loop_point(const char* tag, safetyhook::Context& ctx) {
+    static std::atomic<uint64_t> logged{0};
+    const auto n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 96 && (n % 600) != 0) {
+        return;
+    }
+
+    const auto view = (uintptr_t)ctx.r14;
+    if (view == 0 || !is_readable_process_range(view, SUBNAUTICA2_SCENEVIEW_STRIDE)) {
+        SPDLOG_WARN(
+            "[Subnautica2][UnderwaterFogLoop] {} n={} bad_view=0x{:x} rcx={} rdx=0x{:x} r8=0x{:x} r12=0x{:x} r15=0x{:x}",
+            tag,
+            n + 1,
+            view,
+            (uint32_t)ctx.rcx,
+            ctx.rdx,
+            ctx.r8,
+            ctx.r12,
+            ctx.r15);
+        return;
+    }
+
+    const auto* runtime_view_rect = (const int32_t*)(view + SUBNAUTICA2_SCENEVIEW_RUNTIME_VIEW_RECT_OFFSET);
+    const auto pass = *(uint32_t*)(view + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+    const auto stereo_index = *(int32_t*)(view + SUBNAUTICA2_SCENEVIEW_STEREO_VIEW_INDEX_OFFSET);
+    const auto primary_index = *(int32_t*)(view + SUBNAUTICA2_SCENEVIEW_PRIMARY_VIEW_INDEX_OFFSET);
+    const auto fog_gate_mem = *(uint8_t*)(view + SUBNAUTICA2_SCENEVIEW_FOG_RENDER_FLAG_OFFSET);
+    const auto underwater_depth = *(float*)(view + SUBNAUTICA2_SCENEVIEW_UNDERWATER_DEPTH_OFFSET);
+    const auto water_intersection = *(uint8_t*)(view + SUBNAUTICA2_SCENEVIEW_WATER_INTERSECTION_OFFSET);
+    const auto local_fog = *(uintptr_t*)(view + SUBNAUTICA2_SCENEVIEW_LOCAL_FOG_VOLUME_VIEW_DATA_OFFSET);
+    const auto cached_view_uniform = *(uintptr_t*)(view + SUBNAUTICA2_SCENEVIEW_CACHED_VIEW_UNIFORM_OFFSET);
+    const auto shader_map = *(uintptr_t*)(view + SUBNAUTICA2_SCENEVIEW_SHADER_MAP_OFFSET);
+
+    SPDLOG_WARN(
+        "[Subnautica2][UnderwaterFogLoop] {} n={} loop_idx={} view=0x{:x} pass={} stereo_index={} primary_index={} sil_gate=0x{:02x} dil_scene=0x{:02x} mem_gate=0x{:02x} depth={:.4f} water_intersection={} rect={} {} {} {} local_fog=0x{:x} cached_ub=0x{:x} shader_map=0x{:x} rdx=0x{:x} r8=0x{:x} r12=0x{:x} r15=0x{:x} rbx=0x{:x}",
+        tag,
+        n + 1,
+        (uint32_t)ctx.rcx,
+        view,
+        pass,
+        stereo_index,
+        primary_index,
+        (uint32_t)(ctx.rsi & 0xFF),
+        (uint32_t)(ctx.rdi & 0xFF),
+        (uint32_t)fog_gate_mem,
+        underwater_depth,
+        (uint32_t)water_intersection,
+        runtime_view_rect[0],
+        runtime_view_rect[1],
+        runtime_view_rect[2],
+        runtime_view_rect[3],
+        local_fog,
+        cached_view_uniform,
+        shader_map,
+        ctx.rdx,
+        ctx.r8,
+        ctx.r12,
+        ctx.r15,
+        ctx.rbx);
+}
+
+void FFakeStereoRenderingHook::subnautica2_underwater_fog_guard_proceed_midhook(safetyhook::Context& ctx) {
+    subnautica2_log_underwater_fog_loop_point("guard_proceed", ctx);
+}
+
+void FFakeStereoRenderingHook::subnautica2_underwater_fog_build_block_midhook(safetyhook::Context& ctx) {
+    subnautica2_log_underwater_fog_loop_point("build_block", ctx);
+}
+
 void FFakeStereoRenderingHook::attempt_hook_subnautica2_render_underwater_fog() {
     if (m_attempted_hook_subnautica2_render_underwater_fog) {
         return;
@@ -5850,6 +6010,46 @@ void FFakeStereoRenderingHook::attempt_hook_subnautica2_render_underwater_fog() 
     if (std::memcmp((void*)target, expected_prologue, sizeof(expected_prologue)) != 0) {
         SPDLOG_WARN("[Subnautica2][UnderwaterFog] RenderUnderWaterFog prologue mismatch at {:x}; skipping hook for this build", target);
         return;
+    }
+
+    subnautica2_apply_underwater_fog_per_view_guard_patch(exe_base);
+
+    if (subnautica2_force_underwater_fog_per_view()) {
+        const auto guard_proceed_target = exe_base + SUBNAUTICA2_RENDER_UNDERWATER_FOG_GUARD_PROCEED_RVA;
+        constexpr uint8_t expected_guard_proceed[] = {
+            0x41, 0x0F, 0x2F, 0xBE, 0x00, 0x12, 0x00, 0x00, // comiss xmm7, [r14+1200h]
+        };
+        if (is_executable_process_range(guard_proceed_target, sizeof(expected_guard_proceed)) &&
+            std::memcmp((void*)guard_proceed_target, expected_guard_proceed, sizeof(expected_guard_proceed)) == 0)
+        {
+            m_subnautica2_underwater_fog_guard_proceed_midhook = safetyhook::create_mid(
+                (void*)guard_proceed_target,
+                &FFakeStereoRenderingHook::subnautica2_underwater_fog_guard_proceed_midhook);
+            SPDLOG_WARN(
+                "[Subnautica2][UnderwaterFogLoop] guard_proceed midhook {} at {:x}",
+                m_subnautica2_underwater_fog_guard_proceed_midhook ? "installed" : "failed",
+                guard_proceed_target);
+        } else {
+            SPDLOG_WARN("[Subnautica2][UnderwaterFogLoop] guard_proceed bytes mismatch at {:x}; skipping", guard_proceed_target);
+        }
+
+        const auto build_block_target = exe_base + SUBNAUTICA2_RENDER_UNDERWATER_FOG_BUILD_BLOCK_RVA;
+        constexpr uint8_t expected_build_block[] = {
+            0x49, 0x8B, 0xB4, 0x24, 0xC0, 0x00, 0x00, 0x00, // mov rsi, [r12+0C0h]
+        };
+        if (is_executable_process_range(build_block_target, sizeof(expected_build_block)) &&
+            std::memcmp((void*)build_block_target, expected_build_block, sizeof(expected_build_block)) == 0)
+        {
+            m_subnautica2_underwater_fog_build_block_midhook = safetyhook::create_mid(
+                (void*)build_block_target,
+                &FFakeStereoRenderingHook::subnautica2_underwater_fog_build_block_midhook);
+            SPDLOG_WARN(
+                "[Subnautica2][UnderwaterFogLoop] build_block midhook {} at {:x}",
+                m_subnautica2_underwater_fog_build_block_midhook ? "installed" : "failed",
+                build_block_target);
+        } else {
+            SPDLOG_WARN("[Subnautica2][UnderwaterFogLoop] build_block bytes mismatch at {:x}; skipping", build_block_target);
+        }
     }
 
     m_subnautica2_render_underwater_fog_hook = safetyhook::create_inline(

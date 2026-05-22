@@ -30,6 +30,25 @@
 #include "Sn2DrawLogV2.hpp"
 #include "Sn2OverlayUI.hpp"
 #include "Sn2RDGPassHook.hpp"
+#include "Sn2BindingAnalyzer.hpp"
+#include "Sn2CbDumper.hpp"
+#include "Sn2FrameCppExport.hpp"
+#include "Sn2MagicInk.hpp"
+#include "Sn2PsoBytecodeDumper.hpp"
+#include "Sn2RightCbSynth.hpp"
+#include "Sn2RtDiff.hpp"
+#include "Sn2EyeScreenshot.hpp"
+#include "Sn2FrameCapture.hpp"
+#include "Sn2ResourceReadback.hpp"
+#include "Sn2FixRuleEngine.hpp"
+#include "Sn2UweFogComputeDupHook.hpp"
+#include "Sn2UweFogMirrorHook.hpp"
+#include "Sn2DebugColorOverride.hpp"
+#include "Sn2WaterBasepassDupHook.hpp"
+#include "Sn2RootSigDumpHook.hpp"
+#include "Sn2MissingPassDiffHook.hpp"
+#include "Sn2DupConfigFile.hpp"
+#include "Sn2LayeredDiagsHook.hpp"
 
 static D3D12Hook* g_d3d12_hook = nullptr;
 
@@ -38,6 +57,10 @@ static D3D12Hook* g_d3d12_hook = nullptr;
 // fog descriptor swap to identify "view 0's currently-correct fog texture"
 // when choosing a pool entry to mirror into view 1's basepass binding.
 extern std::atomic<uintptr_t> g_subnautica2_view0_lightscat;
+extern std::atomic<uint64_t> g_subnautica2_water_context_id;
+extern std::atomic<uintptr_t> g_subnautica2_water_context_views;
+extern std::atomic<uintptr_t> g_subnautica2_water_context_color;
+extern std::atomic<uintptr_t> g_subnautica2_water_context_depth;
 extern "C" void uevr_sn2_try_install_early_volumetric_fog_per_view_hook();
 extern "C" void uevr_sn2_install_render_hooks();
 
@@ -60,6 +83,7 @@ constexpr size_t CREATE_GRAPHICS_PIPELINE_STATE_VTABLE_INDEX = 10;
 constexpr size_t CREATE_COMPUTE_PIPELINE_STATE_VTABLE_INDEX = 11;
 constexpr size_t CREATE_COMMAND_LIST_VTABLE_INDEX = 12;
 constexpr size_t CREATE_ROOT_SIGNATURE_VTABLE_INDEX = 16;
+constexpr size_t CREATE_DESCRIPTOR_HEAP_VTABLE_INDEX = 14;
 constexpr size_t CREATE_COMMAND_SIGNATURE_VTABLE_INDEX = 41;
 constexpr size_t CREATE_PIPELINE_LIBRARY_VTABLE_INDEX = 44;
 constexpr size_t CREATE_PIPELINE_STATE_VTABLE_INDEX = 47;
@@ -180,6 +204,10 @@ struct CommandListCorrelationState {
     // === Eye-Diff fingerprints (captured on bind, read at draw) ===
     StereoTraceBucket last_viewport_bucket = StereoTraceBucket::Unknown;
     uint64_t last_rtv0_handle = 0;                  // CPU descriptor handle of RTV slot 0
+    std::array<uint64_t, 8> last_rtv_handles{};     // Full MRT array, slots 0..7 (0 means unbound)
+    uint8_t last_rtv_count = 0;                     // Number of slots populated in last_rtv_handles
+    uint64_t last_dsv_handle = 0;                   // CPU descriptor handle of DSV bound by last OMSetRenderTargets (0 = none)
+    bool has_dsv = false;                           // Whether last OMSetRenderTargets supplied a DSV
     uint64_t last_graphics_root_desc_table0 = 0;    // GPU descriptor handle of root parameter 0 (graphics)
     RootSlotArray last_graphics_root_desc_tables{}; // Root descriptor-table GPU handles by root parameter index.
     RootSlotArray last_compute_root_desc_tables{};
@@ -222,6 +250,7 @@ struct Sn2CopyRectScratchScope {
     ID3D12DescriptorHeap* restore_cbv_srv_uav_heap = nullptr;
     ID3D12DescriptorHeap* restore_sampler_heap = nullptr;
     CommandListCorrelationState::RootSlotArray restore_graphics_tables{};
+    CommandListCorrelationState::RootSlotArray active_graphics_tables{};
     UINT active_redirect_root = UINT_MAX;
     uint64_t active_graphics_table0 = 0;
     uint64_t active_graphics_table2 = 0;
@@ -251,6 +280,7 @@ struct Sn2Pso3069CbvScope {
     bool active = false;
     ID3D12GraphicsCommandList* command_list = nullptr;
     CommandListCorrelationState::RootSlotArray restore_cbvs{};
+    CommandListCorrelationState::RootSlotArray active_cbvs{};
     std::array<bool, 16> restore_root{};
 
     Sn2Pso3069CbvScope() = default;
@@ -259,6 +289,54 @@ struct Sn2Pso3069CbvScope {
     ~Sn2Pso3069CbvScope();
 
     void restore();
+};
+
+// 2026-05-22: Magenta-PS debug-color override scope. Substitute the bound
+// PSO with a magenta-output replacement around a single draw, then restore.
+// Visualizes exactly which pixels a given PS touches.
+struct Sn2DebugColorScope {
+    bool active = false;
+    ID3D12GraphicsCommandList* command_list = nullptr;
+    ID3D12PipelineState* restore_pso = nullptr;
+
+    Sn2DebugColorScope() = default;
+    Sn2DebugColorScope(const Sn2DebugColorScope&) = delete;
+    Sn2DebugColorScope& operator=(const Sn2DebugColorScope&) = delete;
+    ~Sn2DebugColorScope() { restore(); }
+
+    void restore() {
+        if (!active) return;
+        if (command_list != nullptr && restore_pso != nullptr) {
+            command_list->SetPipelineState(restore_pso);
+        }
+        active = false;
+    }
+};
+
+// 2026-05-22: Right-eye consumer SRV redirect. At right-eye draws of the SLW
+// water-material PS (CRC 0x37558DE4), if the bound SRV table contains an SRV
+// referencing a mirrored fog volume, substitute the slot with the mirror's SRV
+// so the right eye reads its own (right-projected) fog data instead of the
+// LEFT-projected original volume.
+struct Sn2ConsumerSrvRedirectScope {
+    bool active = false;
+    ID3D12GraphicsCommandList* command_list = nullptr;
+    UINT root_param = UINT_MAX;
+    uint64_t restore_table_gpu = 0;
+
+    Sn2ConsumerSrvRedirectScope() = default;
+    Sn2ConsumerSrvRedirectScope(const Sn2ConsumerSrvRedirectScope&) = delete;
+    Sn2ConsumerSrvRedirectScope& operator=(const Sn2ConsumerSrvRedirectScope&) = delete;
+    ~Sn2ConsumerSrvRedirectScope() { restore(); }
+
+    void restore() {
+        if (!active) return;
+        if (command_list != nullptr && root_param != UINT_MAX && restore_table_gpu != 0) {
+            D3D12_GPU_DESCRIPTOR_HANDLE h{restore_table_gpu};
+            command_list->SetGraphicsRootDescriptorTable(root_param, h);
+        }
+        active = false;
+    }
 };
 
 int sn2_copyrect_table_mode();
@@ -275,6 +353,10 @@ static bool sn2_begin_water_chain_scratch_table(
     const CommandListCorrelationState& state,
     Sn2CopyRectScratchScope& scope);
 static bool sn2_begin_water_chain_cbv_override(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2Pso3069CbvScope& scope);
+static bool sn2_begin_water_chain_viewcb_patch(
     ID3D12GraphicsCommandList* command_list,
     const CommandListCorrelationState& state,
     Sn2Pso3069CbvScope& scope);
@@ -316,12 +398,50 @@ static void sn2_log_render_name_pso3069(
 static void sn2_log_water_chain_draw(
     ID3D12GraphicsCommandList* command_list,
     const CommandListCorrelationState& state,
+    const Sn2CopyRectScratchScope* water_chain_scope,
+    const Sn2Pso3069CbvScope* water_chain_cbv_scope,
     const char* draw_kind,
     UINT a,
     UINT b,
     UINT c,
     INT d,
     UINT e);
+static void sn2_log_zero_dispatch(
+    const CommandListCorrelationState& state,
+    uint32_t cs_crc,
+    UINT x,
+    UINT y,
+    UINT z,
+    const char* call_kind);
+static bool sn2_repair_direct_zero_dispatch(
+    const CommandListCorrelationState& state,
+    uint32_t cs_crc,
+    UINT& x,
+    UINT& y,
+    UINT& z);
+static void sn2_log_water_candidate_draw(
+    const CommandListCorrelationState& state,
+    const char* draw_kind,
+    UINT a,
+    UINT b,
+    UINT c,
+    INT d,
+    UINT e);
+static bool sn2_should_skip_water_chain_draw(
+    const CommandListCorrelationState& state,
+    const char* draw_kind);
+static uint64_t sn2_water_chain_rt_diff_pair_id(
+    const CommandListCorrelationState& state,
+    const char* draw_kind);
+static void sn2_capture_water_chain_rtv_phase(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    uint64_t pair_id,
+    const char* phase);
+static void sn2_capture_water_chain_inputs(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    const Sn2CopyRectScratchScope* water_chain_scope);
 
 // 2026-05-17 night: SN2 sky-atmosphere PSO fingerprint.
 // Set at CreateGraphicsPipelineState time when we scan the PS bytecode
@@ -458,6 +578,46 @@ bool sn2_water_chain_slot_log_enabled() {
     return enabled;
 }
 
+bool sn2_water_candidate_log_enabled() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_WATER_CANDIDATE_LOG");
+    return enabled;
+}
+
+int sn2_water_candidate_log_max_rows() {
+    static const int rows = std::max(0, env_int_a("UEVR_SN2_WATER_CANDIDATE_LOG_MAX_ROWS", 400));
+    return rows;
+}
+
+bool sn2_zero_dispatch_log_enabled() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_ZERO_DISPATCH_LOG");
+    return enabled;
+}
+
+bool sn2_zero_dispatch_log_include_nonzero() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_ZERO_DISPATCH_LOG_NONZERO");
+    return enabled;
+}
+
+int sn2_zero_dispatch_log_max_rows() {
+    static const int rows = std::max(0, env_int_a("UEVR_SN2_ZERO_DISPATCH_LOG_MAX_ROWS", 512));
+    return rows;
+}
+
+bool sn2_direct_dispatch_mirror_enabled() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_DIRECT_DISPATCH_MIRROR");
+    return enabled;
+}
+
+bool sn2_direct_dispatch_mirror_repair_unknown_enabled() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_DIRECT_DISPATCH_MIRROR_REPAIR_UNKNOWN");
+    return enabled;
+}
+
+int sn2_direct_dispatch_mirror_max_rows() {
+    static const int rows = std::max(0, env_int_a("UEVR_SN2_DIRECT_DISPATCH_MIRROR_MAX_ROWS", 128));
+    return rows;
+}
+
 bool sn2_copyrect_diag_enabled() {
     static const bool enabled =
         sn2_diag_clean_enabled() ||
@@ -499,7 +659,7 @@ int sn2_fog_srv_redirect_mode() {
         char* end = nullptr;
         const long parsed = std::strtol(value, &end, 10);
         if (end != value) {
-            return std::clamp(static_cast<int>(parsed), 0, 2);
+            return std::clamp(static_cast<int>(parsed), 0, 3);
         }
 
         return 1;
@@ -666,6 +826,42 @@ bool sn2_fog_srv_redirect_relaxed() {
     return relaxed;
 }
 
+// Forward decl — defined at ~line 938.
+std::unordered_set<uint32_t> sn2_parse_u32_set_env(const char* env_name, int base);
+
+// NOTE: UEVR already has `sn2_upload_buf_map::gpu_va_to_cpu(gpu_va, size)`
+// — see ~line 5269. Use that directly for in-place CBV byte writes.
+
+// Consumer PS CRC whitelist for fog/TLV SRV redirect.
+//
+// Defaults to the historical pso3069 (0x166DBA88) plus the two MainPS variants
+// (0x8733F2E0 = MainPS_1b3cb1a890626439, 0xFEDC00F9 = MainPS_3ad1579d0b20dfc8)
+// that consume the 4-cascade TranslucentLightingVolume at root[0] slots 3/4/5/6
+// — identified 2026-05-22 as the actual visible-bug surface (NOT the fog 3D
+// volumes the previous pso3069-only redirect targeted).
+//
+// Overrideable via env UEVR_SN2_FOG_CONSUMER_PS_CRCS (comma-sep hex list).
+const std::unordered_set<uint32_t>& sn2_fog_consumer_ps_crcs() {
+    static const std::unordered_set<uint32_t> crcs = []() -> std::unordered_set<uint32_t> {
+        const auto raw = env_value_a("UEVR_SN2_FOG_CONSUMER_PS_CRCS");
+        if (raw != "(unset)" && !raw.empty()) {
+            return sn2_parse_u32_set_env("UEVR_SN2_FOG_CONSUMER_PS_CRCS", 16);
+        }
+        return std::unordered_set<uint32_t>{
+            0x166DBA88u,
+            0x8733F2E0u,
+            0xFEDC00F9u,
+        };
+    }();
+    return crcs;
+}
+
+inline bool sn2_fog_consumer_ps_crc_match(uint32_t ps_crc) {
+    if (ps_crc == 0) return false;
+    const auto& s = sn2_fog_consumer_ps_crcs();
+    return s.count(ps_crc) != 0;
+}
+
 int sn2_water_chain_redirect_mode() {
     static const int mode = std::clamp(env_int_a("UEVR_SN2_WATER_CHAIN_REDIRECT", 0), 0, 1);
     return mode;
@@ -720,6 +916,10 @@ bool sn2_water_chain_cbv_redirect_marker_ready() {
     return sn2_env_marker_file_ready("UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MARK_FILE");
 }
 
+bool sn2_water_chain_viewcb_patch_marker_ready() {
+    return sn2_env_marker_file_ready("UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MARK_FILE");
+}
+
 int sn2_water_chain_redirect_max_total() {
     static const int max_total = std::max(0, env_int_a("UEVR_SN2_WATER_CHAIN_REDIRECT_MAX_TOTAL", 0));
     return max_total;
@@ -743,6 +943,223 @@ int sn2_water_chain_cbv_redirect_max_total() {
 int sn2_water_chain_cbv_redirect_max_per_frame_per_pso() {
     static const int max_per_frame = std::max(0, env_int_a("UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MAX_PER_FRAME_PER_PSO", 0));
     return max_per_frame;
+}
+
+int sn2_water_chain_viewcb_patch_mode() {
+    // 1: copy View rows 148 and 151 from left into the right-eye View CBV clone.
+    // 2: copy only View row 148.
+    // 3: force View[148].xy to 0 in the right-eye clone, preserving all other rows.
+    static const int mode = std::clamp(env_int_a("UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH", 0), 0, 3);
+    return mode;
+}
+
+int sn2_water_chain_viewcb_patch_max_total() {
+    static const int max_total = std::max(0, env_int_a("UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MAX_TOTAL", 0));
+    return max_total;
+}
+
+int sn2_water_chain_viewcb_patch_max_per_frame_per_pso() {
+    static const int max_per_frame = std::max(0, env_int_a("UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MAX_PER_FRAME_PER_PSO", 0));
+    return max_per_frame;
+}
+
+bool sn2_water_chain_skip_enabled() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_WATER_CHAIN_SKIP");
+    return enabled;
+}
+
+int sn2_parse_eye_filter_env(const char* name, int fallback) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') {
+        return fallback;
+    }
+    std::string_view v{raw};
+    if (v == "left" || v == "LEFT" || v == "l" || v == "L" || v == "0") {
+        return 0;
+    }
+    if (v == "right" || v == "RIGHT" || v == "r" || v == "R" || v == "1") {
+        return 1;
+    }
+    if (v == "both" || v == "BOTH" || v == "all" || v == "ALL" || v == "*") {
+        return -1;
+    }
+    return fallback;
+}
+
+int sn2_water_chain_skip_eye_filter() {
+    static const int eye = []() -> int {
+        return sn2_parse_eye_filter_env("UEVR_SN2_WATER_CHAIN_SKIP_EYE", 1);
+    }();
+    return eye;
+}
+
+int sn2_water_chain_rt_diff_eye_filter() {
+    static const int eye = []() -> int {
+        return sn2_parse_eye_filter_env("UEVR_SN2_WATER_CHAIN_RT_DIFF_EYE", -1);
+    }();
+    return eye;
+}
+
+int sn2_water_chain_input_dump_eye_filter() {
+    static const int eye = []() -> int {
+        return sn2_parse_eye_filter_env("UEVR_SN2_WATER_CHAIN_INPUT_DUMP_EYE", -1);
+    }();
+    return eye;
+}
+
+std::unordered_set<uint32_t> sn2_parse_u32_set_env(const char* env_name, int base) {
+    std::unordered_set<uint32_t> out{};
+    const char* p = std::getenv(env_name);
+    if (p == nullptr || p[0] == '\0') {
+        return out;
+    }
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t' || *p == ',' || *p == ';' || *p == '|') {
+            ++p;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(p, &end, base);
+        if (end != p) {
+            out.insert(static_cast<uint32_t>(parsed));
+            p = end;
+            continue;
+        }
+        while (*p != '\0' && *p != ',' && *p != ';' && *p != '|') {
+            ++p;
+        }
+    }
+    return out;
+}
+
+const std::unordered_set<uint32_t>& sn2_direct_dispatch_mirror_crc_allowlist() {
+    static const auto crcs = sn2_parse_u32_set_env("UEVR_SN2_DIRECT_DISPATCH_MIRROR_CRCS", 16);
+    return crcs;
+}
+
+const std::unordered_set<uint32_t>& sn2_water_chain_skip_ordinals() {
+    static const auto ordinals = sn2_parse_u32_set_env("UEVR_SN2_WATER_CHAIN_SKIP_ORDINALS", 10);
+    return ordinals;
+}
+
+uint64_t sn2_water_chain_next_ordinal(uint32_t ps_crc, int view_id) {
+    static std::mutex s_mutex;
+    static uint64_t s_frame = UINT64_MAX;
+    static std::unordered_map<std::string, uint64_t> s_counts;
+
+    const uint64_t frame = sn2_draw_log_v2::current_frame();
+    const std::string key = fmt::format("{:08x}:{}", ps_crc, view_id);
+    std::scoped_lock _{s_mutex};
+    if (s_frame != frame) {
+        s_frame = frame;
+        s_counts.clear();
+    }
+    auto& count = s_counts[key];
+    ++count;
+    return count;
+}
+
+bool sn2_water_chain_rt_diff_enabled() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_WATER_CHAIN_RT_DIFF");
+    return enabled;
+}
+
+int sn2_water_chain_rt_diff_max_captures() {
+    static const int max = std::max(0, env_int_a("UEVR_SN2_WATER_CHAIN_RT_DIFF_MAX_CAPTURES", 32));
+    return max;
+}
+
+bool sn2_water_chain_input_dump_enabled() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_WATER_CHAIN_INPUT_DUMP");
+    return enabled;
+}
+
+int sn2_water_chain_input_dump_max_captures() {
+    static const int max = std::max(0, env_int_a("UEVR_SN2_WATER_CHAIN_INPUT_DUMP_MAX_CAPTURES", 64));
+    return max;
+}
+
+bool sn2_pso_allowed_by_env(const char* env_name, uint32_t ps_crc, bool default_all) {
+    const char* raw = std::getenv(env_name);
+    if (raw == nullptr || raw[0] == '\0') {
+        return default_all;
+    }
+    std::string_view value{raw};
+    if (value == "all" || value == "ALL" || value == "*") {
+        return true;
+    }
+    const auto set = sn2_parse_u32_set_env(env_name, 16);
+    return set.find(ps_crc) != set.end();
+}
+
+bool sn2_water_chain_rt_diff_pso_allowed(uint32_t ps_crc) {
+    return sn2_pso_allowed_by_env("UEVR_SN2_WATER_CHAIN_RT_DIFF_PSOS", ps_crc, true);
+}
+
+bool sn2_water_chain_input_dump_pso_allowed(uint32_t ps_crc) {
+    return sn2_pso_allowed_by_env("UEVR_SN2_WATER_CHAIN_INPUT_DUMP_PSOS", ps_crc, true);
+}
+
+int sn2_water_chain_rt_diff_ordinal_filter() {
+    static const int ordinal = env_int_a("UEVR_SN2_WATER_CHAIN_RT_DIFF_ORDINAL", 0);
+    return ordinal;
+}
+
+int sn2_water_chain_input_dump_ordinal_filter() {
+    static const int ordinal = env_int_a("UEVR_SN2_WATER_CHAIN_INPUT_DUMP_ORDINAL", 0);
+    return ordinal;
+}
+
+struct Sn2WaterChainPsoFilter {
+    bool all = true;
+    std::unordered_set<uint32_t> psos{};
+};
+
+const Sn2WaterChainPsoFilter& sn2_water_chain_skip_pso_filter() {
+    static const Sn2WaterChainPsoFilter filter = []() {
+        Sn2WaterChainPsoFilter out{};
+        const char* raw = std::getenv("UEVR_SN2_WATER_CHAIN_SKIP_PSOS");
+        if (raw == nullptr || raw[0] == '\0') {
+            out.all = true;
+            return out;
+        }
+
+        std::string_view value{raw};
+        if (value == "all" || value == "ALL" || value == "*") {
+            out.all = true;
+            return out;
+        }
+
+        out.all = false;
+        const char* p = raw;
+        while (*p != '\0') {
+            while (*p == ' ' || *p == '\t' || *p == ',' || *p == ';' || *p == '|') {
+                ++p;
+            }
+            if (*p == '\0') {
+                break;
+            }
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(p, &end, 16);
+            if (end != p) {
+                out.psos.insert(static_cast<uint32_t>(parsed));
+                p = end;
+                continue;
+            }
+            while (*p != '\0' && *p != ',' && *p != ';' && *p != '|') {
+                ++p;
+            }
+        }
+        return out;
+    }();
+    return filter;
+}
+
+int sn2_water_chain_skip_log_max_rows() {
+    static const int rows = std::max(0, env_int_a("UEVR_SN2_WATER_CHAIN_SKIP_LOG_MAX_ROWS", 128));
+    return rows;
 }
 
 const std::array<bool, 16>& sn2_water_chain_cbv_redirect_roots() {
@@ -837,7 +1254,19 @@ bool sn2_upload_buffer_tracking_enabled() {
         sn2_copyrect_diag_enabled() ||
         sn2_pso3069_diag_enabled() ||
         env_flag_enabled_a("UEVR_SN2_MAP_UPLOAD_ON_CREATE") ||
-        env_flag_enabled_a("UEVR_SN2_CB0_DIAG");
+        env_flag_enabled_a("UEVR_SN2_CB0_DIAG") ||
+        // UWE Fog mirror infrastructure (P1+P2) needs the
+        // CreateCommittedResource / CreatePlacedResource vtable hook to fire.
+        env_flag_enabled_a("UEVR_SN2_UWE_FOG_MIRROR") ||
+        // Binding analyzer needs the create-resource hook to populate the
+        // gpu_va → resource map for CBV decode. Check via GetEnvironmentVariableW
+        // since the env value is a path (may exceed env_flag_enabled_a's 32-char
+        // buffer).
+        (GetEnvironmentVariableW(L"UEVR_SN2_BINDING_ANALYZER_JSON", nullptr, 0) > 0) ||
+        // CB content dumper + right-CB synthesizer need the same gpu_va → cpu
+        // mapping to read donor bytes / dump CBV content.
+        (GetEnvironmentVariableW(L"UEVR_SN2_CB_DUMP_DIR", nullptr, 0) > 0) ||
+        env_flag_enabled_a("UEVR_SN2_RIGHT_CB_SYNTH");
     return enabled;
 }
 
@@ -986,6 +1415,12 @@ namespace sn2_upload_buf_map {
     // Once installed, every newly created UPLOAD heap buffer is Map'd immediately
     // and registered in our tracking, so the inline cb0 patcher can find it.
     bool install_device_hook(ID3D12Device* device);
+    // 2026-05-22: GPU_VA → (resource, byte_offset) lookup. Mirrors RenderDoc's
+    // WrappedID3D12Resource::GetResIDFromAddr — gives us a stable identity for
+    // a CBV binding regardless of which memory pool the buffer lives in.
+    // Returns true on hit.
+    bool resolve_va(D3D12_GPU_VIRTUAL_ADDRESS gpu_va,
+                    ID3D12Resource*& out_resource, uint64_t& out_offset);
 }
 namespace sn2_fixed_cb0 {
     // Lazily creates a 512-byte UPLOAD heap buffer with view-0's correct cb0
@@ -998,6 +1433,11 @@ namespace sn2_descriptor_registry {
     void record_cbv(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE cpu);
     void record_srv(ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE cpu);
     void record_uav(ID3D12Resource* resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE cpu);
+    ID3D12Resource* lookup_resource_by_cpu_ptr(SIZE_T cpu_ptr);
+    ID3D12Resource* lookup_resource_by_cpu_ptr_or_hash(SIZE_T cpu_ptr);
+    size_t registry_size();
+    size_t count_entries_in_range(SIZE_T cpu_base, SIZE_T size_bytes);
+    void sample_cpu_ptrs(SIZE_T* out, size_t max_n, size_t& out_count);
 }
 namespace sn2_command_signature_registry {
     struct ArgumentInfo {
@@ -1824,6 +2264,7 @@ bool D3D12Hook::hook() {
         std::unordered_set<uintptr_t> create_pipeline_library_slots{};
         std::unordered_set<uintptr_t> pipeline_state_stream_slots{};
         std::unordered_set<uintptr_t> root_signature_slots{};
+        std::unordered_set<uintptr_t> create_descriptor_heap_slots{};
         std::unordered_set<uintptr_t> constant_buffer_view_slots{};
         std::unordered_set<uintptr_t> render_target_view_slots{};
         std::unordered_set<uintptr_t> depth_stencil_view_slots{};
@@ -1868,6 +2309,19 @@ bool D3D12Hook::hook() {
             m_create_root_signature_hooks,
             m_create_root_signature_hook_lookup,
             root_signature_slots
+        );
+
+        // 2026-05-22: hook CreateDescriptorHeap so we catch every CBV/SRV/UAV
+        // heap at creation time. Per-CL SetDescriptorHeaps capture misses heaps
+        // bound on cmdlists whose vtable subclass we didn't hook (root cause
+        // of right-eye 0x37558DE4 root 1 NO_REGISTERED_HEAP).
+        add_unique_pointer_hook(
+            device,
+            CREATE_DESCRIPTOR_HEAP_VTABLE_INDEX,
+            reinterpret_cast<void*>(&D3D12Hook::create_descriptor_heap),
+            m_create_descriptor_heap_hooks,
+            m_create_descriptor_heap_hook_lookup,
+            create_descriptor_heap_slots
         );
 
         Microsoft::WRL::ComPtr<ID3D12Device1> device1{};
@@ -1949,6 +2403,15 @@ bool D3D12Hook::hook() {
                 m_create_root_signature_hooks,
                 m_create_root_signature_hook_lookup,
                 root_signature_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                CREATE_DESCRIPTOR_HEAP_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::create_descriptor_heap),
+                m_create_descriptor_heap_hooks,
+                m_create_descriptor_heap_hook_lookup,
+                create_descriptor_heap_slots
             );
 
             add_unique_pointer_hook(
@@ -2087,7 +2550,7 @@ bool D3D12Hook::hook() {
             auto read = [](const char* name) {
                 return env_value_a(name);
             };
-            spdlog::info("[D3D12] Env vars: UEVR_DISABLE_SN2_HOOKS={} | UEVR_DISABLE_NATIVE_STEREO_FIX={} | UEVR_SN2_DISABLE_NATIVE_STEREO_FIX={} | UEVR_SN2_DIAG_CLEAN={} | UEVR_SN2_DIAG_STRICT={} | UEVR_SN2_PSO3069_DIAG={} | UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS={} | UEVR_ENABLE_D3D12_DESCRIPTOR_TABLE_HOOK={} | UEVR_SUBNAUTICA2_ENABLE_FOG_COMPUTE_BIND_HOOK={} | UEVR_SN2_EI_DIAG={} | UEVR_SN2_PSO3069_CAPTURE_MARK_FILE={} | UEVR_SN2_FOG_SRV_REDIRECT={} | UEVR_SN2_FOG_SRV_REDIRECT_ROOT={} | UEVR_SN2_FOG_SRV_REDIRECT_SLOTS={} | UEVR_SN2_FOG_SRV_REDIRECT_RELAXED={} | UEVR_SN2_PSO3069_CB_REDIRECT={} | UEVR_SN2_PSO3069_CB_REDIRECT_ROOTS={} | UEVR_SN2_WATER_CHAIN_REDIRECT={} | UEVR_SN2_WATER_CHAIN_REDIRECT_INCLUDE_PSO3069={} | UEVR_SN2_WATER_CHAIN_REDIRECT_MARK_FILE={} | UEVR_SN2_WATER_CHAIN_REDIRECT_MAX_TOTAL={} | UEVR_SN2_WATER_CHAIN_REDIRECT_MAX_PER_FRAME_PER_PSO={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_ROOTS={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MARK_FILE={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MAX_TOTAL={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MAX_PER_FRAME_PER_PSO={} | UEVR_DXC_PATH={} | UEVR_SHADER_HUNTER_PRETRACK={} | UEVR_SHADER_HUNTER_SUPPRESSION_BLOCKLIST={} | UEVR_SHADER_HUNTER_SKIP_LEFT_ONLY={} | UEVR_SHADER_HUNTER_SKIP_RIGHT_ONLY={} | UEVR_SN2_SKYATMOS_CB_REDIRECT={} | UEVR_SN2_SKYATMOS_CB_REDIRECT_ROOTS={}",
+            spdlog::info("[D3D12] Env vars: UEVR_DISABLE_SN2_HOOKS={} | UEVR_DISABLE_NATIVE_STEREO_FIX={} | UEVR_SN2_DISABLE_NATIVE_STEREO_FIX={} | UEVR_SN2_DIAG_CLEAN={} | UEVR_SN2_DIAG_STRICT={} | UEVR_SN2_PSO3069_DIAG={} | UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS={} | UEVR_ENABLE_D3D12_DESCRIPTOR_TABLE_HOOK={} | UEVR_SUBNAUTICA2_ENABLE_FOG_COMPUTE_BIND_HOOK={} | UEVR_SN2_EI_DIAG={} | UEVR_SN2_PSO3069_CAPTURE_MARK_FILE={} | UEVR_SN2_FOG_SRV_REDIRECT={} | UEVR_SN2_FOG_SRV_REDIRECT_ROOT={} | UEVR_SN2_FOG_SRV_REDIRECT_SLOTS={} | UEVR_SN2_FOG_SRV_REDIRECT_RELAXED={} | UEVR_SN2_PSO3069_CB_REDIRECT={} | UEVR_SN2_PSO3069_CB_REDIRECT_ROOTS={} | UEVR_SN2_WATER_CHAIN_REDIRECT={} | UEVR_SN2_WATER_CHAIN_REDIRECT_INCLUDE_PSO3069={} | UEVR_SN2_WATER_CHAIN_REDIRECT_MARK_FILE={} | UEVR_SN2_WATER_CHAIN_REDIRECT_MAX_TOTAL={} | UEVR_SN2_WATER_CHAIN_REDIRECT_MAX_PER_FRAME_PER_PSO={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_ROOTS={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MARK_FILE={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MAX_TOTAL={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MAX_PER_FRAME_PER_PSO={} | UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH={} | UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MARK_FILE={} | UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MAX_TOTAL={} | UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MAX_PER_FRAME_PER_PSO={} | UEVR_DXC_PATH={} | UEVR_SHADER_HUNTER_PRETRACK={} | UEVR_SHADER_HUNTER_SUPPRESSION_BLOCKLIST={} | UEVR_SHADER_HUNTER_SKIP_LEFT_ONLY={} | UEVR_SHADER_HUNTER_SKIP_RIGHT_ONLY={} | UEVR_SN2_SKYATMOS_CB_REDIRECT={} | UEVR_SN2_SKYATMOS_CB_REDIRECT_ROOTS={}",
                 read("UEVR_DISABLE_SN2_HOOKS"),
                 read("UEVR_DISABLE_NATIVE_STEREO_FIX"),
                 read("UEVR_SN2_DISABLE_NATIVE_STEREO_FIX"),
@@ -2115,6 +2578,10 @@ bool D3D12Hook::hook() {
                 read("UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MARK_FILE"),
                 read("UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MAX_TOTAL"),
                 read("UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MAX_PER_FRAME_PER_PSO"),
+                read("UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH"),
+                read("UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MARK_FILE"),
+                read("UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MAX_TOTAL"),
+                read("UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MAX_PER_FRAME_PER_PSO"),
                 read("UEVR_DXC_PATH"),
                 read("UEVR_SHADER_HUNTER_PRETRACK"),
                 read("UEVR_SHADER_HUNTER_SUPPRESSION_BLOCKLIST"),
@@ -2748,6 +3215,13 @@ PointerHook* D3D12Hook::find_create_root_signature_hook(void* slot) const {
     return m_create_root_signature_hooks.empty() ? nullptr : m_create_root_signature_hooks.front().get();
 }
 
+PointerHook* D3D12Hook::find_create_descriptor_heap_hook(void* slot) const {
+    if (const auto it = m_create_descriptor_heap_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_create_descriptor_heap_hook_lookup.end()) {
+        return it->second;
+    }
+    return m_create_descriptor_heap_hooks.empty() ? nullptr : m_create_descriptor_heap_hooks.front().get();
+}
+
 PointerHook* D3D12Hook::find_create_constant_buffer_view_hook(void* slot) const {
     if (const auto it = m_create_constant_buffer_view_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_create_constant_buffer_view_hook_lookup.end()) {
         return it->second;
@@ -3325,10 +3799,31 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
     return result;
 }
 
+// Accessor used by Sn2EyeScreenshot to submit its own CL on the same queue
+// the game's swapchain Present runs against.
+extern "C" ID3D12CommandQueue* sn2_eye_screenshot_get_command_queue() {
+    auto* d3d12 = g_d3d12_hook;
+    return d3d12 != nullptr ? d3d12->get_command_queue() : nullptr;
+}
+
 HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags) {
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
     sn2_draw_log_v2::on_present();
+    sn2_root_sig_dump::on_present();
+    sn2_missing_pass_diff::on_present();
+    sn2_resource_binding_ledger::on_present();
+    sn2_binding_analyzer::on_present();
+    sn2_frame_cpp_export::on_present();
+    sn2_rt_diff::on_present();
+    sn2_view_cb_content_dumper::on_present();
+    sn2_eye_screenshot::on_present(swap_chain);
+    {
+        static std::atomic<uint64_t> fc_frame{0};
+        sn2_frame_capture::on_present(fc_frame.fetch_add(1, std::memory_order_relaxed));
+    }
+    sn2_resource_readback::on_present();
+    sn2_fix_rules::refresh_rules();
     return D3D12Hook::present_internal(swap_chain, sync_interval, flags, nullptr, false);
 }
 
@@ -3336,6 +3831,20 @@ HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain3* swap_chain, UINT sync_interv
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
     sn2_draw_log_v2::on_present();
+    sn2_root_sig_dump::on_present();
+    sn2_missing_pass_diff::on_present();
+    sn2_resource_binding_ledger::on_present();
+    sn2_binding_analyzer::on_present();
+    sn2_frame_cpp_export::on_present();
+    sn2_rt_diff::on_present();
+    sn2_view_cb_content_dumper::on_present();
+    sn2_eye_screenshot::on_present(swap_chain);
+    {
+        static std::atomic<uint64_t> fc_frame{0};
+        sn2_frame_capture::on_present(fc_frame.fetch_add(1, std::memory_order_relaxed));
+    }
+    sn2_resource_readback::on_present();
+    sn2_fix_rules::refresh_rules();
     return D3D12Hook::present_internal(swap_chain, sync_interval, flags, params, true);
 }
 
@@ -3506,13 +4015,23 @@ HRESULT WINAPI D3D12Hook::create_graphics_pipeline_state(
     }
 
     const auto result = original(device, call_desc, riid, pipeline_state);
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_holder{};
+    if (SUCCEEDED(result) && pipeline_state != nullptr && *pipeline_state != nullptr) {
+        auto* unk = reinterpret_cast<IUnknown*>(*pipeline_state);
+        unk->QueryInterface(IID_PPV_ARGS(&pso_holder));
+    }
+    auto* pso = pso_holder.Get();
+    if (pso == nullptr && SUCCEEDED(result) && pipeline_state != nullptr &&
+        *pipeline_state != nullptr && riid == __uuidof(ID3D12PipelineState)) {
+        pso = static_cast<ID3D12PipelineState*>(*pipeline_state);
+    }
 
     render::D3D12Diagnostics::get().record_pipeline_cache_event(
         "D3D12Hook::CreateGraphicsPipelineState",
         "create_graphics_pso_result",
         reinterpret_cast<uintptr_t>(device),
         0,
-        (SUCCEEDED(result) && pipeline_state != nullptr) ? reinterpret_cast<uintptr_t>(*pipeline_state) : 0,
+        reinterpret_cast<uintptr_t>(pso),
         {},
         0,
         false,
@@ -3522,28 +4041,38 @@ HRESULT WINAPI D3D12Hook::create_graphics_pipeline_state(
 
     auto& shader_registry = render::ShaderOverrideRegistry::get();
     if (shader_registry.should_record_d3d12_pipeline_creations() &&
-        SUCCEEDED(result) &&
-        pipeline_state != nullptr &&
-        *pipeline_state != nullptr &&
-        riid == __uuidof(ID3D12PipelineState) &&
+        pso != nullptr &&
         desc != nullptr) {
         shader_registry.register_d3d12_graphics_pipeline_state_creation(
             device,
-            static_cast<ID3D12PipelineState*>(*pipeline_state),
+            pso,
             desc
         );
     }
 
-    if (SUCCEEDED(result) &&
-        pipeline_state != nullptr &&
-        *pipeline_state != nullptr &&
-        riid == __uuidof(ID3D12PipelineState) &&
+    if (pso != nullptr &&
         desc != nullptr &&
         desc->pRootSignature != nullptr) {
         render::D3D12Diagnostics::get().register_pipeline_root_signature(
             "D3D12Hook::CreateGraphicsPipelineState",
-            static_cast<ID3D12PipelineState*>(*pipeline_state),
+            pso,
             desc->pRootSignature);
+    }
+
+    // 2026-05-22: PSO bytecode dumper — dump PS/VS/GS bytecode to disk if
+    // UEVR_SN2_PSO_BYTECODE_DIR is set. Files can then be reflected with dxc
+    // to learn authoritative root-signature parameter semantics.
+    if (sn2_pso_bytecode_dumper::env_enabled() && pso != nullptr && desc != nullptr) {
+        const uint32_t ps_crc = shader_registry.d3d12_pso_pixel_crc32(
+            reinterpret_cast<uintptr_t>(pso));
+        sn2_pso_bytecode_dumper::on_create_graphics_pso(desc, ps_crc, 0 /* vs_crc unavailable */);
+    }
+
+    // 2026-05-22: Cache the original desc so Sn2DebugColorOverride can clone
+    // it into a magenta-PS replacement on demand. Cost is one map insert +
+    // bytecode copies (only when the env-enable flag is set).
+    if (sn2_debug_color::env_enabled() && pso != nullptr && desc != nullptr) {
+        sn2_debug_color::note_create_graphics_pso(desc, pso);
     }
 
     // 2026-05-17 night: SN2 sky-atmosphere PSO fingerprint by entry-name scan.
@@ -3551,9 +4080,7 @@ HRESULT WINAPI D3D12Hook::create_graphics_pipeline_state(
     // memmem-style scan for the known unique name pins the exact PSO* we
     // want to gate cb-redirects on.
     if (is_subnautica2_process() &&
-        SUCCEEDED(result) &&
-        pipeline_state != nullptr && *pipeline_state != nullptr &&
-        riid == __uuidof(ID3D12PipelineState) &&
+        pso != nullptr &&
         desc != nullptr &&
         desc->PS.pShaderBytecode != nullptr && desc->PS.BytecodeLength > 0 &&
         g_sky_atmos_pso.load(std::memory_order_relaxed) == nullptr) {
@@ -3564,7 +4091,6 @@ HRESULT WINAPI D3D12Hook::create_graphics_pipeline_state(
         if (blen >= name_len) {
             for (size_t i = 0; i + name_len <= blen; ++i) {
                 if (bytes[i] == 'R' && memcmp(bytes + i, kSkyAtmosName, name_len) == 0) {
-                    auto* pso = static_cast<ID3D12PipelineState*>(*pipeline_state);
                     g_sky_atmos_pso.store(pso, std::memory_order_relaxed);
                     SPDLOG_WARN("[SN2-SkyAtmosFix] FINGERPRINTED RenderSkyAtmosphereRayMarchingPS PSO=0x{:x}",
                                 (uint64_t)pso);
@@ -3593,13 +4119,23 @@ HRESULT WINAPI D3D12Hook::create_compute_pipeline_state(
     }
 
     const auto result = original(device, desc, riid, pipeline_state);
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_holder{};
+    if (SUCCEEDED(result) && pipeline_state != nullptr && *pipeline_state != nullptr) {
+        auto* unk = reinterpret_cast<IUnknown*>(*pipeline_state);
+        unk->QueryInterface(IID_PPV_ARGS(&pso_holder));
+    }
+    auto* pso = pso_holder.Get();
+    if (pso == nullptr && SUCCEEDED(result) && pipeline_state != nullptr &&
+        *pipeline_state != nullptr && riid == __uuidof(ID3D12PipelineState)) {
+        pso = static_cast<ID3D12PipelineState*>(*pipeline_state);
+    }
 
     render::D3D12Diagnostics::get().record_pipeline_cache_event(
         "D3D12Hook::CreateComputePipelineState",
         "create_compute_pso_result",
         reinterpret_cast<uintptr_t>(device),
         0,
-        (SUCCEEDED(result) && pipeline_state != nullptr) ? reinterpret_cast<uintptr_t>(*pipeline_state) : 0,
+        reinterpret_cast<uintptr_t>(pso),
         {},
         0,
         false,
@@ -3608,28 +4144,28 @@ HRESULT WINAPI D3D12Hook::create_compute_pipeline_state(
         "compute PSO creation observed through CreateComputePipelineState");
 
     auto& shader_registry = render::ShaderOverrideRegistry::get();
+    // 2026-05-22: PSO bytecode dumper (compute path).
+    if (sn2_pso_bytecode_dumper::env_enabled() && pso != nullptr && desc != nullptr) {
+        const uint32_t cs_crc = shader_registry.d3d12_pso_compute_crc32(
+            reinterpret_cast<uintptr_t>(pso));
+        sn2_pso_bytecode_dumper::on_create_compute_pso(desc, cs_crc);
+    }
     if (shader_registry.should_record_d3d12_pipeline_creations() &&
-        SUCCEEDED(result) &&
-        pipeline_state != nullptr &&
-        *pipeline_state != nullptr &&
-        riid == __uuidof(ID3D12PipelineState) &&
+        pso != nullptr &&
         desc != nullptr) {
         shader_registry.register_d3d12_compute_pipeline_state_creation(
             device,
-            static_cast<ID3D12PipelineState*>(*pipeline_state),
+            pso,
             desc
         );
     }
 
-    if (SUCCEEDED(result) &&
-        pipeline_state != nullptr &&
-        *pipeline_state != nullptr &&
-        riid == __uuidof(ID3D12PipelineState) &&
+    if (pso != nullptr &&
         desc != nullptr &&
         desc->pRootSignature != nullptr) {
         render::D3D12Diagnostics::get().register_pipeline_root_signature(
             "D3D12Hook::CreateComputePipelineState",
-            static_cast<ID3D12PipelineState*>(*pipeline_state),
+            pso,
             desc->pRootSignature);
     }
 
@@ -4012,9 +4548,19 @@ HRESULT WINAPI D3D12Hook::create_pipeline_state(
     }
 
     const auto result = original(device, call_desc, riid, pipeline_state);
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_holder{};
+    if (SUCCEEDED(result) && pipeline_state != nullptr && *pipeline_state != nullptr) {
+        auto* unk = reinterpret_cast<IUnknown*>(*pipeline_state);
+        unk->QueryInterface(IID_PPV_ARGS(&pso_holder));
+    }
+    auto* pso = pso_holder.Get();
+    if (pso == nullptr && SUCCEEDED(result) && pipeline_state != nullptr &&
+        *pipeline_state != nullptr && riid == __uuidof(ID3D12PipelineState)) {
+        pso = static_cast<ID3D12PipelineState*>(*pipeline_state);
+    }
     if (did_substitute || did_strip_cached_pso) {
         SPDLOG_WARN("[D3D12-PSOStreamPatch] post-call substituted={} stripped_cached={} hr=0x{:08x} pso={:p}",
-            did_substitute, did_strip_cached_pso, (uint32_t)result, pipeline_state != nullptr ? *pipeline_state : nullptr);
+            did_substitute, did_strip_cached_pso, (uint32_t)result, static_cast<void*>(pso));
     }
 
     render::D3D12Diagnostics::get().record_pipeline_cache_event(
@@ -4022,7 +4568,7 @@ HRESULT WINAPI D3D12Hook::create_pipeline_state(
         saw_cached_pso ? "create_pipeline_state_result" : "create_pipeline_state_stream_result",
         reinterpret_cast<uintptr_t>(device),
         0,
-        (SUCCEEDED(result) && pipeline_state != nullptr) ? reinterpret_cast<uintptr_t>(*pipeline_state) : 0,
+        reinterpret_cast<uintptr_t>(pso),
         {},
         cached_blob_size,
         saw_cached_pso,
@@ -4032,27 +4578,21 @@ HRESULT WINAPI D3D12Hook::create_pipeline_state(
 
     auto& shader_registry = render::ShaderOverrideRegistry::get();
     if (shader_registry.should_record_d3d12_pipeline_creations() &&
-        SUCCEEDED(result) &&
-        pipeline_state != nullptr &&
-        *pipeline_state != nullptr &&
-        riid == __uuidof(ID3D12PipelineState) &&
+        pso != nullptr &&
         desc != nullptr) {
         shader_registry.register_d3d12_pipeline_state_stream_creation(
             device,
-            static_cast<ID3D12PipelineState*>(*pipeline_state),
+            pso,
             desc
         );
     }
 
-    if (SUCCEEDED(result) &&
-        pipeline_state != nullptr &&
-        *pipeline_state != nullptr &&
-        riid == __uuidof(ID3D12PipelineState) &&
+    if (pso != nullptr &&
         desc != nullptr) {
         if (auto* root_signature = d3d12_root_signature_from_pipeline_stream(desc); root_signature != nullptr) {
             render::D3D12Diagnostics::get().register_pipeline_root_signature(
                 "D3D12Hook::CreatePipelineState",
-                static_cast<ID3D12PipelineState*>(*pipeline_state),
+                pso,
                 root_signature);
         }
     }
@@ -4061,9 +4601,7 @@ HRESULT WINAPI D3D12Hook::create_pipeline_state(
     // SN2 uses D3D12_PIPELINE_STATE_STREAM_DESC. Parse the stream to extract
     // PS bytecode, then memmem-scan for entry name "RenderSkyAtmosphereRayMarchingPS".
     if (is_subnautica2_process() &&
-        SUCCEEDED(result) &&
-        pipeline_state != nullptr && *pipeline_state != nullptr &&
-        riid == __uuidof(ID3D12PipelineState) &&
+        pso != nullptr &&
         desc != nullptr && desc->pPipelineStateSubobjectStream != nullptr &&
         desc->SizeInBytes > 0 &&
         g_sky_atmos_pso.load(std::memory_order_relaxed) == nullptr) {
@@ -4117,7 +4655,6 @@ HRESULT WINAPI D3D12Hook::create_pipeline_state(
                     if (blen >= name_len) {
                         for (size_t i = 0; i + name_len <= blen; ++i) {
                             if (bytes[i] == 'R' && memcmp(bytes + i, kSkyAtmosName, name_len) == 0) {
-                                auto* pso = static_cast<ID3D12PipelineState*>(*pipeline_state);
                                 g_sky_atmos_pso.store(pso, std::memory_order_relaxed);
                                 SPDLOG_WARN("[SN2-SkyAtmosFix] FINGERPRINTED (stream) RenderSkyAtmosphereRayMarchingPS PSO=0x{:x}",
                                             (uint64_t)pso);
@@ -4939,6 +5476,24 @@ namespace sn2_upload_buf_map {
         return nullptr;
     }
 
+    // 2026-05-22 — GPU_VA → (resource, offset) for any tracked upload buffer.
+    // Pool-agnostic identity for CBV bindings (mirrors RenderDoc's
+    // WrappedID3D12Resource::GetResIDFromAddr).
+    bool resolve_va(D3D12_GPU_VIRTUAL_ADDRESS gpu_va,
+                    ID3D12Resource*& out_resource, uint64_t& out_offset) {
+        if (gpu_va == 0) return false;
+        std::scoped_lock _{g_mutex};
+        for (const auto& e : g_entries) {
+            if (e.res == nullptr || e.size == 0) continue;
+            if (gpu_va >= e.gpu_va_base && gpu_va < e.gpu_va_base + e.size) {
+                out_resource = e.res;
+                out_offset = gpu_va - e.gpu_va_base;
+                return true;
+            }
+        }
+        return false;
+    }
+
     // SEH-safe helper. CORRECT cb0 row 30/31 bug signature, derived from
     // direct byte dump of view 1's broken cb0 (sky_event3714_rp2_cb0.bin):
     //
@@ -5095,6 +5650,24 @@ namespace sn2_upload_buf_map {
                 // All ID3D12Resource instances share the same vtable.
                 install_map_hook(res);
 
+                // 2026-05-22: Eagerly register the buffer in g_entries with
+                // cpu_ptr=nullptr so resolve_va() can find it for VA→resource
+                // decode even before Map_Hook ever fires. The cpu_ptr field
+                // gets populated later by Map_Hook when the engine maps it.
+                {
+                    D3D12_GPU_VIRTUAL_ADDRESS va = res->GetGPUVirtualAddress();
+                    if (va != 0) {
+                        std::scoped_lock _{g_mutex};
+                        bool dup = false;
+                        for (auto& e : g_entries) {
+                            if (e.res == res) { dup = true; break; }
+                        }
+                        if (!dup) {
+                            g_entries.push_back({res, va, desc->Width, nullptr});
+                        }
+                    }
+                }
+
                 // DON'T call Map() ourselves — it interferes with UE5's ring-buffer
                 // allocator (caused "Failed to get back buffer" errors in test).
                 // The Map vtable hook installed above will catch the engine's own
@@ -5119,6 +5692,52 @@ namespace sn2_upload_buf_map {
                 if (idx < 16 || (idx % 200) == 0) {
                     SPDLOG_WARN("[SN2-CreateRes] hooked CreateCommittedResource #{} size=0x{:x}",
                                 idx + 1, desc->Width);
+                }
+            }
+
+            // === UWE Fog mirror allocation (P1 + P2) ===
+            // Skip when we're inside our own mirror creation (prevents
+            // infinite recursion when the mirror's desc also matches).
+            if (sn2_uwe_fog_mirror::env_enabled() &&
+                !sn2_uwe_fog_mirror::in_mirror_create()) {
+                // Diagnostic: tally every texture creation (UAV or not) so we
+                // can confirm the hook is reaching texture-create calls at all.
+                if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+                    static std::atomic<uint64_t> ntex{0};
+                    const auto tn = ntex.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (tn <= 16 || (tn % 256) == 0) {
+                        SPDLOG_INFO(
+                            "[SN2-UweFogMirror-Trace] tex_create#{} dim={}x{}x{} fmt={} flags=0x{:x} dim_kind={}",
+                            tn,
+                            static_cast<unsigned>(desc->Width),
+                            static_cast<unsigned>(desc->Height),
+                            static_cast<unsigned>(desc->DepthOrArraySize),
+                            static_cast<unsigned>(desc->Format),
+                            static_cast<unsigned>(desc->Flags),
+                            static_cast<unsigned>(desc->Dimension));
+                    }
+                }
+
+                if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                    sn2_uwe_fog_mirror::matches_uwe_fog_signature(*desc))
+                {
+                    auto* game_res = reinterpret_cast<ID3D12Resource*>(*ppv);
+                    const auto* mirror = sn2_uwe_fog_mirror::create_mirror_for(self, game_res, *desc);
+                    if (mirror != nullptr) {
+                        static std::atomic<uint64_t> ncand{0};
+                        const auto cn = ncand.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (cn <= 32 || (cn % 64) == 0) {
+                            SPDLOG_WARN(
+                                "[SN2-UweFogMirror] committed-candidate#{} game=0x{:x} dim={}x{}x{} fmt={} flags=0x{:x} mirror_ready=1",
+                                cn,
+                                reinterpret_cast<uintptr_t>(game_res),
+                                static_cast<unsigned>(desc->Width),
+                                static_cast<unsigned>(desc->Height),
+                                static_cast<unsigned>(desc->DepthOrArraySize),
+                                static_cast<unsigned>(desc->Format),
+                                static_cast<unsigned>(desc->Flags));
+                        }
+                    }
                 }
             }
         }
@@ -5168,6 +5787,44 @@ namespace sn2_upload_buf_map {
                     SPDLOG_WARN("[SN2-CreatePlacedRes] hooked CreatePlacedResource #{} offset=0x{:x} size=0x{:x}",
                                 idx + 1, heap_offset, desc->Width);
                 }
+            }
+
+            // === UWE Fog mirror allocation (P1+P2) — placed-resource path ===
+            // UE5 commonly uses CreatePlacedResource for transient pool textures
+            // (fog volumes, render targets). Same detection logic as committed.
+            if (sn2_uwe_fog_mirror::env_enabled() &&
+                desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                sn2_uwe_fog_mirror::matches_uwe_fog_signature(*desc))
+            {
+                auto* game_res = reinterpret_cast<ID3D12Resource*>(*ppv);
+                const auto* mirror = sn2_uwe_fog_mirror::create_mirror_for(self, game_res, *desc);
+                if (mirror != nullptr) {
+                    static std::atomic<uint64_t> ncand{0};
+                    const auto cn = ncand.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (cn <= 32 || (cn % 64) == 0) {
+                        SPDLOG_WARN(
+                            "[SN2-UweFogMirror] placed-candidate#{} game=0x{:x} dim={}x{}x{} fmt={} flags=0x{:x} mirror_ready=1",
+                            cn,
+                            reinterpret_cast<uintptr_t>(game_res),
+                            static_cast<unsigned>(desc->Width),
+                            static_cast<unsigned>(desc->Height),
+                            static_cast<unsigned>(desc->DepthOrArraySize),
+                            static_cast<unsigned>(desc->Format),
+                            static_cast<unsigned>(desc->Flags));
+                    }
+                }
+            }
+
+            // === Aliasing-bucket tracker (Approach C) ====================
+            // Track (heap, offset) buckets so aliased placed resources can
+            // share a single shadow allocation. Only runs when both UWE_FOG_MIRROR
+            // and ALIAS_SRV_REDIRECT envs are on.
+            if (sn2_uwe_fog_mirror::env_enabled() &&
+                sn2_uwe_fog_mirror::env_alias_redirect_enabled() &&
+                desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+            {
+                auto* game_res = reinterpret_cast<ID3D12Resource*>(*ppv);
+                sn2_uwe_fog_mirror::register_placed(self, game_res, heap, heap_offset, *desc);
             }
         }
         return hr;
@@ -5750,7 +6407,7 @@ namespace sn2_indirect_arg_inject {
 // (fence-gated, drained per Present), we write the pixels to PPM (P6) on
 // disk: C:\Users\ellio\AppData\Local\Temp\sn2_rt_<tag>_<frame>.ppm.
 namespace sn2_rt_snapshot {
-    constexpr size_t NUM_SLOTS = 8;
+    constexpr size_t NUM_SLOTS = 32;
     constexpr size_t SLOT_BYTES = 8 * 1024 * 1024;  // 8 MB/slot; enough for 1280×720 RGBA + alignment
     constexpr size_t TOTAL_SIZE = NUM_SLOTS * SLOT_BYTES;
 
@@ -5779,7 +6436,11 @@ namespace sn2_rt_snapshot {
 
     static const bool g_enabled = []() {
         const char* env = std::getenv("UEVR_SN2_RT_SNAPSHOT");
-        return env != nullptr && env[0] != '\0' && env[0] != '0';
+        const char* water_diff = std::getenv("UEVR_SN2_WATER_CHAIN_RT_DIFF");
+        const char* input_dump = std::getenv("UEVR_SN2_WATER_CHAIN_INPUT_DUMP");
+        return (env != nullptr && env[0] != '\0' && env[0] != '0') ||
+            (water_diff != nullptr && water_diff[0] != '\0' && water_diff[0] != '0') ||
+            (input_dump != nullptr && input_dump[0] != '\0' && input_dump[0] != '0');
     }();
     bool enabled() { return g_enabled; }
 
@@ -5851,7 +6512,10 @@ namespace sn2_rt_snapshot {
         if (!g_initialized || cl == nullptr || src_tex == nullptr) return UINT64_MAX;
 
         const D3D12_RESOURCE_DESC desc = src_tex->GetDesc();
-        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return UINT64_MAX;
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+            return UINT64_MAX;
+        }
 
         const uint32_t bpp = bpp_for_format(desc.Format);
         if (bpp == 0) return UINT64_MAX;  // unsupported format
@@ -5875,6 +6539,9 @@ namespace sn2_rt_snapshot {
         dst_loc.PlacedFootprint.Footprint.Format = desc.Format;
         dst_loc.PlacedFootprint.Footprint.Width = static_cast<UINT>(desc.Width);
         dst_loc.PlacedFootprint.Footprint.Height = desc.Height;
+        // For 3D textures this captures z-slice 0 only. That is enough to
+        // identify left/right resource content mismatches without dumping a
+        // whole froxel volume from a hot draw hook.
         dst_loc.PlacedFootprint.Footprint.Depth = 1;
         dst_loc.PlacedFootprint.Footprint.RowPitch = row_pitch;
 
@@ -5894,7 +6561,18 @@ namespace sn2_rt_snapshot {
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
             cl->ResourceBarrier(1, &barrier);
         }
-        cl->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+        D3D12_BOX src_box{};
+        D3D12_BOX* src_box_ptr = nullptr;
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+            src_box.left = 0;
+            src_box.top = 0;
+            src_box.front = 0;
+            src_box.right = static_cast<UINT>(desc.Width);
+            src_box.bottom = desc.Height;
+            src_box.back = 1;
+            src_box_ptr = &src_box;
+        }
+        cl->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, src_box_ptr);
         if (need_barrier) {
             std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
             cl->ResourceBarrier(1, &barrier);
@@ -6285,6 +6963,8 @@ namespace sn2_descriptor_registry {
     static std::mutex g_mutex;
     static std::unordered_map<SIZE_T, Entry> g_by_cpu;
     static std::unordered_map<uint64_t, Entry> g_by_descriptor_hash;
+    // Forward declarations for internal helpers referenced before definition.
+    uint64_t descriptor_memory_hash(D3D12_CPU_DESCRIPTOR_HANDLE cpu);
     static std::atomic<uint64_t> g_generation{0};
 
     bool enabled() {
@@ -6292,7 +6972,71 @@ namespace sn2_descriptor_registry {
             sn2_copyrect_diag_enabled() ||
             sn2_fog_compute_diag_enabled() ||
             sn2_fog_srv_redirect_mode() != 0 ||
-            sn2_tail_srv_repair_mode() != 0;
+            sn2_tail_srv_repair_mode() != 0 ||
+            // UWE fog mirror P3 needs the cpu-handle → resource lookup.
+            env_flag_enabled_a("UEVR_SN2_UWE_FOG_MIRROR");
+    }
+
+    // Public lookup so the UWE fog mirror dispatch redirect (P3) can resolve
+    // "what game resource is at this descriptor slot" — needed to identify
+    // the bound UAV and look up its mirror.
+    ID3D12Resource* lookup_resource_by_cpu_ptr(SIZE_T cpu_ptr) {
+        if (cpu_ptr == 0) return nullptr;
+        std::scoped_lock _{g_mutex};
+        const auto it = g_by_cpu.find(cpu_ptr);
+        if (it == g_by_cpu.end()) return nullptr;
+        return it->second.resource;
+    }
+
+    // 2026-05-22: Hash-fallback lookup. Bindless heap slots get their content
+    // by CopyDescriptorsSimple from a staging heap; the 32-byte descriptor at
+    // dst matches src exactly. If g_by_cpu[dst] has no entry (record_copy
+    // missed it), the same bytes still hash to the same value as the staging
+    // SRV's entry — so g_by_descriptor_hash can resolve resource.
+    ID3D12Resource* lookup_resource_by_cpu_ptr_or_hash(SIZE_T cpu_ptr) {
+        if (cpu_ptr == 0) return nullptr;
+        {
+            std::scoped_lock _{g_mutex};
+            const auto it = g_by_cpu.find(cpu_ptr);
+            if (it != g_by_cpu.end()) return it->second.resource;
+        }
+        // Compute hash from bytes at cpu_ptr; lock-free read, range-checked.
+        D3D12_CPU_DESCRIPTOR_HANDLE h{cpu_ptr};
+        const uint64_t hash = descriptor_memory_hash(h);
+        if (hash == 0) return nullptr;
+        std::scoped_lock _{g_mutex};
+        const auto it = g_by_descriptor_hash.find(hash);
+        if (it == g_by_descriptor_hash.end()) return nullptr;
+        return it->second.resource;
+    }
+
+    size_t registry_size() {
+        std::scoped_lock _{g_mutex};
+        return g_by_cpu.size();
+    }
+
+    // Count entries whose CPU handle falls inside [cpu_base, cpu_base + size_bytes).
+    // Used to determine whether record_copy is populating bindless slots or only
+    // staging-heap slots.
+    size_t count_entries_in_range(SIZE_T cpu_base, SIZE_T size_bytes) {
+        std::scoped_lock _{g_mutex};
+        size_t n = 0;
+        const SIZE_T cpu_end = cpu_base + size_bytes;
+        for (const auto& [k, _v] : g_by_cpu) {
+            if (k >= cpu_base && k < cpu_end) ++n;
+        }
+        return n;
+    }
+
+    // Get up to N CPU pointers in the registry — for sampling whether they
+    // cluster in staging vs bindless heaps.
+    void sample_cpu_ptrs(SIZE_T* out, size_t max_n, size_t& out_count) {
+        std::scoped_lock _{g_mutex};
+        out_count = 0;
+        for (const auto& [k, _v] : g_by_cpu) {
+            if (out_count >= max_n) break;
+            out[out_count++] = k;
+        }
     }
 
     uint64_t fnv1a64(const void* data, size_t size) {
@@ -6832,6 +7576,14 @@ void WINAPI D3D12Hook::copy_descriptors(
 
             sn2_bindless_slot_map::record(dst, src);
             sn2_draw_log_v2::slot_lifetime::on_write(static_cast<uint64_t>(dst.ptr));
+            // Propagate batched copies to the descriptor registry so the
+            // UWE fog mirror's lookup_resource_by_cpu_ptr can resolve game
+            // resources bound to bindless slots. UE5 uses this batched
+            // variant for per-frame bindless heap updates — without this
+            // propagation, the registry only knows about staging-heap slots.
+            if (sn2_descriptor_registry::enabled()) {
+                sn2_descriptor_registry::record_copy(dst, src);
+            }
 
             ++dst_within;
             ++src_within;
@@ -7052,6 +7804,61 @@ inline void update_cmdlist_rtv0(ID3D12GraphicsCommandList* cl, const D3D12_CPU_D
     if (cl == nullptr || rtv0 == nullptr) return;
     std::scoped_lock _{g_cmdlist_state_mutex};
     g_cmdlist_state_map[cl].last_rtv0_handle = static_cast<uint64_t>(rtv0->ptr);
+}
+
+inline UINT sn2_rtv_descriptor_stride(ID3D12GraphicsCommandList* cl) {
+    if (cl == nullptr) return 0;
+    Microsoft::WRL::ComPtr<ID3D12Device> device{};
+    if (FAILED(cl->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
+        return 0;
+    }
+    return device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+}
+
+// Capture the full MRT array set by OMSetRenderTargets. When single_handle is
+// true, RTV[0] is the start of a contiguous descriptor range; use the device RTV
+// stride to reconstruct slot 1..N so slot 6 stays visible in diagnostic logs.
+inline void update_cmdlist_rtv_array(
+    ID3D12GraphicsCommandList* cl,
+    UINT num,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs,
+    bool single_handle,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* dsv = nullptr)
+{
+    if (cl == nullptr) return;
+    const UINT rtv_stride = single_handle ? sn2_rtv_descriptor_stride(cl) : 0;
+    std::scoped_lock _{g_cmdlist_state_mutex};
+    auto& s = g_cmdlist_state_map[cl];
+    s.last_rtv_handles.fill(0);
+    // 2026-05-22: Capture DSV alongside RTVs so right-eye dup OMSetRenderTargets
+    // calls can preserve depth-stencil binding (was nullptr → suspected freeze cause).
+    if (dsv != nullptr) {
+        s.last_dsv_handle = static_cast<uint64_t>(dsv->ptr);
+        s.has_dsv = (dsv->ptr != 0);
+    } else {
+        s.last_dsv_handle = 0;
+        s.has_dsv = false;
+    }
+    if (rtvs == nullptr || num == 0) {
+        s.last_rtv_count = 0;
+        return;
+    }
+    const UINT cap_slots = std::min<UINT>(num, static_cast<UINT>(s.last_rtv_handles.size()));
+    if (single_handle) {
+        const uint64_t base = static_cast<uint64_t>(rtvs[0].ptr);
+        if (rtv_stride != 0) {
+            for (UINT i = 0; i < cap_slots; ++i) {
+                s.last_rtv_handles[i] = base + (static_cast<uint64_t>(i) * rtv_stride);
+            }
+        } else {
+            s.last_rtv_handles[0] = base;
+        }
+    } else {
+        for (UINT i = 0; i < cap_slots; ++i) {
+            s.last_rtv_handles[i] = static_cast<uint64_t>(rtvs[i].ptr);
+        }
+    }
+    s.last_rtv_count = static_cast<uint8_t>(cap_slots);
 }
 
 inline uint64_t fnv1a64_bytes(const void* data, size_t size) {
@@ -7658,6 +8465,57 @@ struct BindlessHeapState {
 };
 thread_local BindlessHeapState tls_bindless_heap{};
 
+// 2026-05-22: Global registry of every CBV_SRV_UAV heap seen via
+// SetDescriptorHeaps. UE5 binds multiple bindless heaps over a session — some
+// command lists use a different heap than the most-recent tls_bindless_heap.
+// The consumer scan (right-eye 0x37558DE4) needs to resolve table_gpu against
+// ANY registered heap, not just the per-thread current one.
+struct BindlessHeapRegistry {
+    std::mutex mu;
+    std::vector<BindlessHeapState> heaps;
+
+    void note(const BindlessHeapState& s) {
+        if (s.heap == nullptr) return;
+        std::scoped_lock _{mu};
+        for (auto& h : heaps) {
+            if (h.heap == s.heap) {
+                // Refresh in case heap was destroyed and re-created at same ptr.
+                h = s;
+                return;
+            }
+        }
+        heaps.push_back(s);
+    }
+
+    // Try to resolve a GPU pointer to (cpu_base + offset_bytes) by finding
+    // the registered heap whose [gpu_base, gpu_base + stride*capacity) covers it.
+    bool resolve(uint64_t gpu_ptr, SIZE_T& out_cpu_ptr, UINT& out_stride) {
+        if (gpu_ptr == 0) return false;
+        std::scoped_lock _{mu};
+        for (const auto& h : heaps) {
+            if (h.gpu_base == 0 || h.stride == 0 || h.num_descriptors == 0) continue;
+            const uint64_t end = h.gpu_base + static_cast<uint64_t>(h.stride) * h.num_descriptors;
+            if (gpu_ptr >= h.gpu_base && gpu_ptr < end) {
+                const uint64_t off = gpu_ptr - h.gpu_base;
+                out_cpu_ptr = h.cpu_base + static_cast<SIZE_T>(off);
+                out_stride = h.stride;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    size_t count() {
+        std::scoped_lock _{mu};
+        return heaps.size();
+    }
+};
+
+inline BindlessHeapRegistry& bindless_heap_registry() {
+    static BindlessHeapRegistry r;
+    return r;
+}
+
 struct SamplerHeapState {
     ID3D12DescriptorHeap* heap{nullptr};
     SIZE_T  cpu_base{0};
@@ -8039,6 +8897,57 @@ inline void clear_cmdlist_state(ID3D12GraphicsCommandList* cl) {
     g_cmdlist_state_map.erase(cl);
 }
 } // namespace
+
+// 2026-05-22: Hook ID3D12Device::CreateDescriptorHeap. Registers every
+// CBV/SRV/UAV heap as soon as it is created — solves the
+// NO_REGISTERED_HEAP misses we got from the per-CL SetDescriptorHeaps
+// capture path (which missed heaps bound on cmdlists whose vtable subclass
+// we did not hook).
+HRESULT WINAPI D3D12Hook::create_descriptor_heap(
+    ID3D12Device* device,
+    const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+    REFIID riid,
+    void** heap
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = device != nullptr ? &(*(void***)device)[CREATE_DESCRIPTOR_HEAP_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_create_descriptor_heap_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::create_descriptor_heap)*>() : nullptr;
+
+    if (original == nullptr) {
+        return E_FAIL;
+    }
+
+    const HRESULT hr = original(device, desc, riid, heap);
+    if (SUCCEEDED(hr) && heap != nullptr && *heap != nullptr && desc != nullptr &&
+        desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+    {
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_iface{};
+        auto* unknown = reinterpret_cast<IUnknown*>(*heap);
+        if (unknown != nullptr && SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&heap_iface)))) {
+            BindlessHeapState s{};
+            s.heap = heap_iface.Get();
+            s.cpu_base = heap_iface->GetCPUDescriptorHandleForHeapStart().ptr;
+            s.gpu_base = heap_iface->GetGPUDescriptorHandleForHeapStart().ptr;
+            s.stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            s.num_descriptors = desc->NumDescriptors;
+            bindless_heap_registry().note(s);
+
+            static std::atomic<uint64_t> n{0};
+            const auto idx = n.fetch_add(1, std::memory_order_relaxed);
+            if (idx < 32) {
+                SPDLOG_WARN(
+                    "[D3D12-CreateDescriptorHeap] heap={:p} cpu_base=0x{:x} gpu_base=0x{:x} stride={} num_desc={} flags=0x{:x} registry_total={}",
+                    (void*)heap_iface.Get(),
+                    static_cast<uint64_t>(s.cpu_base), s.gpu_base, s.stride,
+                    desc->NumDescriptors,
+                    static_cast<unsigned>(desc->Flags),
+                    bindless_heap_registry().count());
+            }
+        }
+    }
+    return hr;
+}
 
 static void sn2_log_pso3069_draw_snapshot(
     ID3D12GraphicsCommandList* command_list,
@@ -8495,6 +9404,902 @@ static void sn2_try_duplicate_fog_voxelize_right(
     }
 }
 
+// 2026-05-22: Consumer SRV redirect. On right-eye draws of the SLW water-
+// material PS (CRC 0x37558DE4), the bound graphics descriptor table contains
+// an SRV for the IntegratedLightScattering 3D volume — the volume the
+// VoxelizePS producer wrote with LEFT-eye projection. Both eyes share this
+// volume natively, so right eye samples LEFT-projected fog with right-eye
+// matrices → wrong tint. Producer side (sn2_try_duplicate_slw_basepass_right)
+// now writes a parallel mirror with right-eye projection. This function
+// closes the chain: when consumer draws on the right eye, swap the SRV slot
+// pointing at the original volume to point at the mirror.
+//
+// Returns true if a redirect was applied (scope.active set).
+//
+// Gated by:
+//   - UEVR_SN2_CONSUMER_SRV_REDIRECT=1
+//   - sn2_uwe_fog_mirror::env_enabled() (mirrors must be populated)
+//   - right-eye viewport bucket
+//   - PS CRC in target set (0x37558DE4 by default; comma list via env)
+static uint32_t sn2_consumer_srv_redirect_target_crc(uint32_t fallback) {
+    static const uint32_t v = []() -> uint32_t {
+        const char* s = std::getenv("UEVR_SN2_CONSUMER_SRV_REDIRECT_PS_CRC");
+        if (s == nullptr || s[0] == 0) {
+            // default: SLW PS 0x37558DE4 per sn2_fog_chain_definitive_2026_05_22.md
+            return 0x37558DE4u;
+        }
+        return static_cast<uint32_t>(std::strtoul(s, nullptr, 0));
+    }();
+    return v != 0 ? v : fallback;
+}
+
+static bool sn2_consumer_srv_redirect_env_enabled() {
+    static const bool e = []() {
+        const char* v = std::getenv("UEVR_SN2_CONSUMER_SRV_REDIRECT");
+        return v && v[0] && v[0] != '0';
+    }();
+    return e;
+}
+
+static bool sn2_try_begin_consumer_srv_redirect(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2ConsumerSrvRedirectScope& scope)
+{
+    if (!sn2_consumer_srv_redirect_env_enabled()) return false;
+    if (!sn2_uwe_fog_mirror::env_enabled()) return false;
+    if (command_list == nullptr || state.current_pso == nullptr) return false;
+    // Only right-eye draws.
+    if (state.last_viewport_bucket != StereoTraceBucket::Right) return false;
+
+    auto& reg = render::ShaderOverrideRegistry::get();
+    const uint32_t ps_crc = reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso));
+    const uint32_t target_crc = sn2_consumer_srv_redirect_target_crc(0x37558DE4u);
+    if (ps_crc != target_crc) return false;
+
+    // 2026-05-22: don't gate on tls_bindless_heap — registry handles multi-heap.
+    if (bindless_heap_registry().count() == 0) return false;
+
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (dev == nullptr || !sn2_uwe_fog_mirror::ensure_scratch_heap(dev)) {
+        return false;
+    }
+
+    // 2026-05-22: kSearch widened 64 → 256.
+    constexpr UINT kSearch = 256;
+
+    // Find first bound graphics root descriptor table whose window contains a
+    // descriptor pointing at a mirrored resource. Resolves table_gpu against
+    // ALL registered bindless heaps (not just the per-thread current one) —
+    // UE5 uses multiple heaps and the consumer's root 1 was in a different
+    // heap than tls_bindless_heap.
+    int found_root = -1;
+    int found_slot = -1;
+    const sn2_uwe_fog_mirror::Mirror* found_mirror = nullptr;
+    uint64_t found_table_gpu = 0;
+    UINT found_stride = 0;
+    const size_t num_tables = state.last_graphics_root_desc_tables.size();
+    for (size_t ti = 0; ti < num_tables && found_root < 0; ++ti) {
+        const uint64_t table_gpu = state.last_graphics_root_desc_tables[ti];
+        if (table_gpu == 0) continue;
+        SIZE_T cpu_base = 0;
+        UINT this_stride = 0;
+        if (!bindless_heap_registry().resolve(table_gpu, cpu_base, this_stride)) continue;
+        for (UINT i = 0; i < kSearch; ++i) {
+            const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(i) * this_stride;
+            ID3D12Resource* res = sn2_descriptor_registry::lookup_resource_by_cpu_ptr_or_hash(slot_cpu);
+            if (res == nullptr) continue;
+            const auto* m = sn2_uwe_fog_mirror::registry().find(res);
+            if (m == nullptr || m->srv_cpu.ptr == 0) continue;
+            found_root = static_cast<int>(ti);
+            found_slot = static_cast<int>(i);
+            found_mirror = m;
+            found_table_gpu = table_gpu;
+            found_stride = this_stride;
+            break;
+        }
+    }
+    (void)found_stride;  // currently unused outside scan
+    if (found_root < 0 || found_mirror == nullptr) {
+        // Diagnostic: log periodically that we saw the target PS but had no
+        // mirrored SRV in any table (mirror registry empty? wrong shape match?).
+        // Also dump first 8 non-null resources across all tables so we can see
+        // what the consumer is actually bound to.
+        static std::atomic<uint64_t> miss{0};
+        const auto n = miss.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 600) == 0) {
+            const size_t reg_sz = sn2_descriptor_registry::registry_size();
+            // Heap is huge — sample a large range to see if record_copy is
+            // populating any bindless-heap entries.
+            const size_t bindless_range_count = sn2_descriptor_registry::count_entries_in_range(
+                tls_bindless_heap.cpu_base, 0x10000000u);  // 256 MB
+            SPDLOG_INFO("[SN2-ConsumerSrv] right-eye 0x{:08x} draw#{} — no mirrored SRV found in {} tables (registry_size={}, bindless_range_entries={}, registered_heaps={}, tls cpu_base=0x{:x} gpu_base=0x{:x} stride={})",
+                ps_crc, n, num_tables, reg_sz, bindless_range_count,
+                bindless_heap_registry().count(),
+                static_cast<uintptr_t>(tls_bindless_heap.cpu_base),
+                tls_bindless_heap.gpu_base,
+                tls_bindless_heap.stride);
+            // Dump ALL registered heaps so we can see ranges.
+            {
+                std::scoped_lock _{bindless_heap_registry().mu};
+                int hi = 0;
+                for (const auto& h : bindless_heap_registry().heaps) {
+                    SPDLOG_INFO("[SN2-ConsumerSrv-Heap] #{} heap={:p} cpu_base=0x{:x} gpu_base=0x{:x} stride={} num_desc={} end_gpu=0x{:x}",
+                        hi, (void*)h.heap,
+                        static_cast<uintptr_t>(h.cpu_base),
+                        h.gpu_base, h.stride, h.num_descriptors,
+                        h.gpu_base + static_cast<uint64_t>(h.stride) * h.num_descriptors);
+                    ++hi;
+                }
+            }
+            // Summarise each table — resolve via registry (multi-heap aware).
+            for (size_t ti = 0; ti < num_tables; ++ti) {
+                const uint64_t table_gpu = state.last_graphics_root_desc_tables[ti];
+                if (table_gpu == 0) continue;
+                SIZE_T cpu_base = 0;
+                UINT this_stride = 0;
+                if (!bindless_heap_registry().resolve(table_gpu, cpu_base, this_stride)) {
+                    SPDLOG_INFO("[SN2-ConsumerSrv-Tbl] root={} table_gpu=0x{:x} NO_REGISTERED_HEAP (registry={} heaps)",
+                        ti, table_gpu, bindless_heap_registry().count());
+                    continue;
+                }
+                int slots_with_res = 0;
+                for (UINT i = 0; i < kSearch; ++i) {
+                    const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(i) * this_stride;
+                    ID3D12Resource* res = sn2_descriptor_registry::lookup_resource_by_cpu_ptr_or_hash(slot_cpu);
+                    if (res == nullptr) continue;
+                    auto rdesc = res->GetDesc();
+                    const bool in_mirror = sn2_uwe_fog_mirror::registry().find(res) != nullptr;
+                    SPDLOG_INFO("[SN2-ConsumerSrv-Dump] root={} slot={} res=0x{:x} dim={}x{}x{} fmt={} flags=0x{:x} dimkind={} mirror={}",
+                        ti, i, reinterpret_cast<uintptr_t>(res),
+                        static_cast<unsigned>(rdesc.Width), static_cast<unsigned>(rdesc.Height),
+                        static_cast<unsigned>(rdesc.DepthOrArraySize),
+                        static_cast<unsigned>(rdesc.Format),
+                        static_cast<unsigned>(rdesc.Flags),
+                        static_cast<unsigned>(rdesc.Dimension),
+                        in_mirror ? "YES" : "no");
+                    ++slots_with_res;
+                    if (slots_with_res >= 32) break;
+                }
+                if (slots_with_res == 0) {
+                    SPDLOG_INFO("[SN2-ConsumerSrv-Tbl] root={} table_gpu=0x{:x} cpu_base=0x{:x} stride={} — 0 tracked resources in first {} slots",
+                        ti, table_gpu, static_cast<uintptr_t>(cpu_base), this_stride, kSearch);
+                }
+            }
+            // Also dump root CBVs / root SRVs that may bind the volume directly.
+            for (size_t ri = 0; ri < state.last_graphics_root_srv.size() && ri < 16; ++ri) {
+                const uint64_t sv = state.last_graphics_root_srv[ri];
+                if (sv != 0) {
+                    SPDLOG_INFO("[SN2-ConsumerSrv-RootSrv] root={} gpu_va=0x{:x}", ri, sv);
+                }
+            }
+            // Walk first 5 mirrors and look up if any has a registered SRV entry.
+            // This tells us whether mirrored resources show up in the registry at
+            // all (independent of the consumer's specific binding).
+            {
+                int shown = 0;
+                std::scoped_lock _{sn2_uwe_fog_mirror::registry().mu};
+                for (const auto& [game_ptr, mirror] : sn2_uwe_fog_mirror::registry().map) {
+                    if (shown >= 5) break;
+                    sn2_descriptor_registry::Entry e{};
+                    const bool found = sn2_descriptor_registry::lookup_srv_by_resource(game_ptr, e);
+                    SPDLOG_INFO("[SN2-ConsumerSrv-MirrorLookup] mirror#{} game=0x{:x} dim={}x{}x{} fmt={} srv_in_registry={} cpu_handle=0x{:x}",
+                        shown, reinterpret_cast<uintptr_t>(game_ptr),
+                        static_cast<unsigned>(mirror.desc.Width),
+                        static_cast<unsigned>(mirror.desc.Height),
+                        static_cast<unsigned>(mirror.desc.DepthOrArraySize),
+                        static_cast<unsigned>(mirror.desc.Format),
+                        found ? "YES" : "no",
+                        found ? static_cast<uintptr_t>(e.cpu_handle.ptr) : 0u);
+                    ++shown;
+                }
+            }
+        }
+        return false;
+    }
+
+    const UINT scratch_base = sn2_uwe_fog_mirror::alloc_scratch_range(kSearch);
+    if (scratch_base == UINT32_MAX) return false;
+
+    auto& sh = sn2_uwe_fog_mirror::scratch_heap();
+    const auto sc_cpu = sh.heap->GetCPUDescriptorHandleForHeapStart();
+    const auto sc_gpu = sh.heap->GetGPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE scratch_cpu_base{
+        sc_cpu.ptr + static_cast<SIZE_T>(scratch_base) * sh.descriptor_size};
+    D3D12_GPU_DESCRIPTOR_HANDLE scratch_gpu_base{
+        sc_gpu.ptr + static_cast<UINT64>(scratch_base) * sh.descriptor_size};
+
+    const uint64_t off2 = found_table_gpu - tls_bindless_heap.gpu_base;
+    D3D12_CPU_DESCRIPTOR_HANDLE src_base{
+        tls_bindless_heap.cpu_base + static_cast<SIZE_T>(off2)};
+    dev->CopyDescriptorsSimple(kSearch, scratch_cpu_base, src_base,
+                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE patch_slot{
+        scratch_cpu_base.ptr + static_cast<SIZE_T>(found_slot) * sh.descriptor_size};
+    dev->CopyDescriptorsSimple(1, patch_slot, found_mirror->srv_cpu,
+                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE bind_h{scratch_gpu_base.ptr};
+    command_list->SetGraphicsRootDescriptorTable(static_cast<UINT>(found_root), bind_h);
+
+    scope.active = true;
+    scope.command_list = command_list;
+    scope.root_param = static_cast<UINT>(found_root);
+    scope.restore_table_gpu = found_table_gpu;
+
+    static std::atomic<uint64_t> redir{0};
+    const auto n = redir.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 16 || (n % 600) == 0) {
+        SPDLOG_WARN("[SN2-ConsumerSrv] right-eye 0x{:08x} redirect#{} root={} slot={} "
+            "orig_table=0x{:x} → mirror_srv=0x{:x}",
+            ps_crc, n, found_root, found_slot, found_table_gpu, found_mirror->srv_gpu.ptr);
+    }
+    return true;
+}
+
+// Duplicate a LEFT-eye water-material basepass draw for the right eye.
+// Counterpart of sn2_try_duplicate_fog_voxelize_right (above) but for the
+// SLW basepass MRT slot 6 fill chain. See Sn2WaterBasepassDupHook.hpp for
+// the rationale and call-site context.
+static void sn2_try_duplicate_slw_basepass_right(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2DrawIndexedInstancedFn original,
+    UINT index_count_per_instance,
+    UINT instance_count,
+    UINT start_index_location,
+    INT base_vertex_location,
+    UINT start_instance_location
+) {
+    // Either gate must be on; permissive logger doesn't require dup-enabled.
+    const bool dup_enabled = sn2_water_basepass_dup::env_enabled();
+    const bool log_all_7mrt_left = sn2_water_basepass_dup::log_7mrt_left_enabled();
+    if (!dup_enabled && !log_all_7mrt_left) {
+        return;
+    }
+    if (command_list == nullptr ||
+        original == nullptr ||
+        state.current_pso == nullptr ||
+        !state.has_viewport ||
+        state.viewport_count != 1 ||
+        state.viewport_width <= 0.0f ||
+        state.viewport_height <= 0.0f) {
+        return;
+    }
+
+    // Only LEFT-eye draws — we duplicate them onto the right viewport.
+    if (state.last_viewport_bucket != StereoTraceBucket::Left) {
+        return;
+    }
+
+    auto& registry = render::ShaderOverrideRegistry::get();
+    const uint32_t ps_crc = registry.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso));
+
+    // 2026-05-22: Diagnostic probe for specific PSes — log every entry to the
+    // dup function so we can see exactly which gate is blocking. Env-gated to
+    // avoid log spam. Set UEVR_SN2_DUP_TRACE_CRCS=0x13b00f0c,... to enable.
+    {
+        static const std::unordered_set<uint32_t> trace_crcs = []() {
+            std::unordered_set<uint32_t> out;
+            char buf[1024]{};
+            const auto len = GetEnvironmentVariableA("UEVR_SN2_DUP_TRACE_CRCS", buf, sizeof(buf));
+            if (len == 0 || len >= sizeof(buf)) return out;
+            std::string s{buf, len};
+            size_t pos = 0;
+            while (pos < s.size()) {
+                while (pos < s.size() && (s[pos] == ',' || s[pos] == ' ')) ++pos;
+                if (pos >= s.size()) break;
+                size_t end = pos;
+                while (end < s.size() && s[end] != ',' && s[end] != ' ') ++end;
+                std::string tok = s.substr(pos, end - pos);
+                if (!tok.empty()) {
+                    char* tail = nullptr;
+                    const auto v = std::strtoul(tok.c_str(), &tail, 0);
+                    if (tail != tok.c_str()) out.insert(static_cast<uint32_t>(v));
+                }
+                pos = end;
+            }
+            return out;
+        }();
+        if (!trace_crcs.empty() && trace_crcs.find(ps_crc) != trace_crcs.end()) {
+            static std::atomic<uint64_t> trace_seq{0};
+            const auto tn = trace_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (tn <= 32 || (tn % 100) == 0) {
+                SPDLOG_WARN(
+                    "[SN2-DupTrace] entry#{} ps_crc=0x{:08x} pso=0x{:x} "
+                    "vp_bucket={} rtv_count={} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) "
+                    "root_cbv[3]=0x{:x} root_cbv[4]=0x{:x} root_cbv[5]=0x{:x} "
+                    "root_cbv[6]=0x{:x} root_cbv[7]=0x{:x} root_cbv[8]=0x{:x} "
+                    "root_cbv[10]=0x{:x}",
+                    tn, ps_crc,
+                    reinterpret_cast<uintptr_t>(state.current_pso),
+                    static_cast<int>(state.last_viewport_bucket),
+                    static_cast<unsigned>(state.last_rtv_count),
+                    state.viewport0.TopLeftX, state.viewport0.TopLeftY,
+                    state.viewport0.Width, state.viewport0.Height,
+                    state.last_graphics_root_cbv[3],
+                    state.last_graphics_root_cbv[4],
+                    state.last_graphics_root_cbv[5],
+                    state.last_graphics_root_cbv[6],
+                    state.last_graphics_root_cbv[7],
+                    state.last_graphics_root_cbv[8],
+                    state.last_graphics_root_cbv[10]);
+            }
+        }
+    }
+
+    // 2026-05-22: Unique-CRC-per-eye probe. Gated by UEVR_SN2_LEFT_ONLY_PROBE=1.
+    // Logs each PS CRC the FIRST time it fires per eye, so we can identify
+    // LEFT-only CRCs in the live binary without polluting the log.
+    static const bool left_only_probe = []() {
+        const char* v = std::getenv("UEVR_SN2_LEFT_ONLY_PROBE");
+        return v && v[0] && v[0] != '0';
+    }();
+    if (left_only_probe && ps_crc != 0) {
+        static std::mutex probe_mu;
+        static std::unordered_set<uint32_t> seen_left;
+        static std::unordered_set<uint32_t> seen_right;
+        const bool is_left = state.last_viewport_bucket == StereoTraceBucket::Left;
+        const bool is_right = state.last_viewport_bucket == StereoTraceBucket::Right;
+        if (is_left || is_right) {
+            bool log_it = false;
+            {
+                std::scoped_lock _{probe_mu};
+                auto& target = is_left ? seen_left : seen_right;
+                if (target.insert(ps_crc).second) log_it = true;
+            }
+            if (log_it) {
+                SPDLOG_WARN(
+                    "[SN2-LeftOnlyProbe] new ps_crc=0x{:08x} eye={} rtv_count={} vp_w={:.0f} pso=0x{:x} idx={}",
+                    ps_crc, is_left ? "LEFT" : "RIGHT",
+                    static_cast<unsigned>(state.last_rtv_count),
+                    state.viewport0.Width,
+                    reinterpret_cast<uintptr_t>(state.current_pso),
+                    index_count_per_instance);
+            }
+        }
+    }
+
+    // Permissive logger: capture EVERY LEFT-eye draw with >= 4 MRTs, since the
+    // basepass MRT count varies by resolution / permutation in the live binary.
+    // The May 21 capture had 7 RTVs; live sessions may use different layouts.
+    if (log_all_7mrt_left) {
+        if (state.last_rtv_count >= 4) {
+            static std::atomic<uint64_t> log_seq{0};
+            const auto n = log_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 512 || (n % 1200) == 0) {
+                const auto& rtvs = state.last_rtv_handles;
+                SPDLOG_WARN(
+                    "[SN2-WaterBasepassProbe] seq={} ps_crc=0x{:08x} pso=0x{:x} "
+                    "vp=({:.0f},{:.0f},{:.0f}x{:.0f}) rtv_count={} "
+                    "slot0=0x{:x} slot1=0x{:x} slot2=0x{:x} slot3=0x{:x} "
+                    "slot4=0x{:x} slot5=0x{:x} slot6=0x{:x} slot7=0x{:x} "
+                    "idx={} inst={}",
+                    n,
+                    ps_crc,
+                    reinterpret_cast<uintptr_t>(state.current_pso),
+                    state.viewport0.TopLeftX, state.viewport0.TopLeftY,
+                    state.viewport0.Width, state.viewport0.Height,
+                    static_cast<unsigned>(state.last_rtv_count),
+                    rtvs[0], rtvs[1], rtvs[2], rtvs[3],
+                    rtvs[4], rtvs[5], rtvs[6], rtvs[7],
+                    index_count_per_instance,
+                    instance_count);
+            }
+        } else if (state.last_rtv_count > 0) {
+            // Also surface a low-frequency hint about MRT-count distribution
+            // so we know whether the SLW basepass is using 1/2/3 RTVs instead
+            // of the expected 4+.
+            static std::atomic<uint64_t> low_mrt_seq{0};
+            const auto n = low_mrt_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 16 || (n % 6000) == 0) {
+                SPDLOG_INFO(
+                    "[SN2-WaterBasepassProbe-LowMRT] seq={} ps_crc=0x{:08x} rtv_count={} vp=({:.0f},{:.0f},{:.0f}x{:.0f})",
+                    n, ps_crc, static_cast<unsigned>(state.last_rtv_count),
+                    state.viewport0.TopLeftX, state.viewport0.TopLeftY,
+                    state.viewport0.Width, state.viewport0.Height);
+            }
+        }
+    }
+
+    // Dup mode disabled? Done after logging.
+    if (!dup_enabled) {
+        return;
+    }
+
+    // Three paths:
+    //   (a) Water-basepass set + 7-MRT check (original semantics)
+    //   (b) Any-MRT env set (UEVR_SN2_DUP_ANY_MRT_PS_CRCS) — duplicates regardless
+    //       of MRT count. Used for single-MRT LEFT-only mesh draws to scene
+    //       color (e.g. PS CRC 0x13b00f0c = MainPS 088d809abc158998).
+    //   (c) JSON config file (UEVR_SN2_DUP_CONFIG_FILE) — per-PSO entry with
+    //       optional per-CRC view_cb_roots + mode override.
+    const bool is_water_basepass = sn2_water_basepass_dup::is_water_basepass_ps_crc(ps_crc);
+    const bool is_any_mrt = sn2_water_basepass_dup::is_any_mrt_dup_ps_crc(ps_crc);
+    const bool is_config_entry = sn2_dup_config::has_entry(ps_crc);
+    // Trace which gate filters target CRCs.
+    {
+        static const std::unordered_set<uint32_t> trace_crcs2 = []() {
+            std::unordered_set<uint32_t> out;
+            char buf[1024]{};
+            const auto len = GetEnvironmentVariableA("UEVR_SN2_DUP_TRACE_CRCS", buf, sizeof(buf));
+            if (len == 0 || len >= sizeof(buf)) return out;
+            std::string s{buf, len};
+            size_t pos = 0;
+            while (pos < s.size()) {
+                while (pos < s.size() && (s[pos] == ',' || s[pos] == ' ')) ++pos;
+                if (pos >= s.size()) break;
+                size_t end = pos;
+                while (end < s.size() && s[end] != ',' && s[end] != ' ') ++end;
+                std::string tok = s.substr(pos, end - pos);
+                if (!tok.empty()) {
+                    char* tail = nullptr;
+                    const auto v = std::strtoul(tok.c_str(), &tail, 0);
+                    if (tail != tok.c_str()) out.insert(static_cast<uint32_t>(v));
+                }
+                pos = end;
+            }
+            return out;
+        }();
+        if (!trace_crcs2.empty() && trace_crcs2.find(ps_crc) != trace_crcs2.end()) {
+            static std::atomic<uint64_t> seq2{0};
+            const auto sn = seq2.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (sn <= 16 || (sn % 500) == 0) {
+                SPDLOG_WARN(
+                    "[SN2-DupTrace2] gates ps_crc=0x{:08x} water={} any_mrt={} cfg={} mode={} rtv_count={}",
+                    ps_crc,
+                    is_water_basepass ? 1 : 0,
+                    is_any_mrt ? 1 : 0,
+                    is_config_entry ? 1 : 0,
+                    static_cast<int>(sn2_dup_config::mode_for(ps_crc)),
+                    static_cast<unsigned>(state.last_rtv_count));
+            }
+        }
+    }
+    if (!is_water_basepass && !is_any_mrt && !is_config_entry) {
+        return;
+    }
+    if (sn2_dup_config::mode_for(ps_crc) == sn2_dup_config::DupMode::Skip) {
+        return;
+    }
+    if (is_water_basepass && !is_any_mrt && !is_config_entry && state.last_rtv_count != 7) {
+        return;
+    }
+
+    // Snapshot LEFT View CBVs at each configured root. Prefer the per-PSO
+    // roots from the JSON config; otherwise fall back to the env/default
+    // {4,6} list. Compute right-eye equivalents by adding the View-CB offset
+    // delta. If any LEFT CBV is 0, we can't compute the right one — skip
+    // the duplicate.
+    auto view_roots = sn2_dup_config::view_cb_roots_for(ps_crc);
+    auto dup_mode = sn2_dup_config::mode_for(ps_crc);
+
+    // Phase FF: consult FixRuleEngine for declarative overrides (hot-reloaded).
+    // A rule that matches (ps_crc, eye_bucket) overrides the static dup_cfg.
+    // Dup function always targets right-eye redirects, so eye_bucket = 2 (Right).
+    const int fix_rule_eye = static_cast<int>(StereoTraceBucket::Right);
+    if (const auto* rule = sn2_fix_rules::find_rule(ps_crc, fix_rule_eye)) {
+        if (!rule->cb_swaps.empty()) {
+            // First CbSwap determines the mode + root list.
+            const auto& first = rule->cb_swaps.front();
+            if (first.op == sn2_fix_rules::CbOp::SwapToSynth) {
+                dup_mode = sn2_dup_config::DupMode::SynthesizeRightCb;
+            } else if (first.op == sn2_fix_rules::CbOp::SwapToDelta) {
+                dup_mode = sn2_dup_config::DupMode::ViewCbOnly;
+            }
+            // Build the root list from the rule.
+            std::vector<uint32_t> rule_roots;
+            rule_roots.reserve(rule->cb_swaps.size());
+            for (const auto& s : rule->cb_swaps) {
+                rule_roots.push_back(s.root);
+            }
+            view_roots = rule_roots;
+            static std::atomic<uint64_t> rseq{0};
+            const auto n = rseq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || (n % 600) == 0) {
+                SPDLOG_WARN("[SN2-FixRules] #{} applying rule: ps_crc=0x{:08x} eye={} "
+                            "mode={} roots={}",
+                            n, ps_crc, fix_rule_eye,
+                            (first.op == sn2_fix_rules::CbOp::SwapToSynth ? "synth_right_cb"
+                             : first.op == sn2_fix_rules::CbOp::SwapToDelta ? "view_cb_only" : "?"),
+                            rule_roots.size());
+            }
+        }
+    }
+    struct ViewRootSwap {
+        UINT root_param;
+        uint64_t left_va;
+        uint64_t right_va;
+    };
+    std::array<ViewRootSwap, 8> swaps{};
+    size_t swap_count = 0;
+    // 2026-05-22: For SynthesizeRightCb mode, the right_va is the donor
+    // snapshot's GPU_VA — same buffer for every PSO in this mode, regardless
+    // of pool layout. No delta arithmetic → no crashes.
+    const D3D12_GPU_VIRTUAL_ADDRESS synth_right_va =
+        (dup_mode == sn2_dup_config::DupMode::SynthesizeRightCb)
+            ? sn2_right_cb_synth::get_right_va() : 0;
+    for (uint32_t root : view_roots) {
+        if (root >= state.last_graphics_root_cbv.size()) continue;
+        const uint64_t lv = state.last_graphics_root_cbv[root];
+        if (lv == 0) continue;
+        uint64_t rv = 0;
+        if (dup_mode == sn2_dup_config::DupMode::SynthesizeRightCb) {
+            if (synth_right_va == 0) continue;  // donor not yet snapshotted
+            rv = synth_right_va;
+        } else {
+            rv = sn2_water_basepass_dup::compute_right_view_va(lv);
+        }
+        if (rv == 0) continue;
+        if (swap_count >= swaps.size()) break;
+        swaps[swap_count++] = {static_cast<UINT>(root), lv, rv};
+    }
+    if (swap_count == 0) {
+        static std::atomic<uint64_t> miss{0};
+        const auto n = miss.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 1000) == 0) {
+            SPDLOG_INFO("[SN2-WaterBasepassDup] skip pso={:p} ps_crc=0x{:08x} — no View CBV at configured roots (#{} skips)",
+                state.current_pso, ps_crc, n);
+        }
+        return;
+    }
+
+    // For 3D-texture-writer PSes (like VoxelizePS), don't shift the viewport
+    // — they write to 3D textures where the "viewport" is a slice address,
+    // not a stereo split. Only swap View CB so the GS projects from right-eye.
+    const bool no_viewport_shift = sn2_water_basepass_dup::is_no_viewport_shift_ps_crc(ps_crc);
+
+    // Compute the right-eye viewport (mirror right of left), or keep LEFT's.
+    D3D12_VIEWPORT right_viewport = state.viewport0;
+    if (!no_viewport_shift) {
+        right_viewport.TopLeftX = state.viewport0.TopLeftX + state.viewport0.Width;
+    }
+    if (right_viewport.Width <= 0.0f || right_viewport.Height <= 0.0f) {
+        return;
+    }
+
+    D3D12_RECT right_scissor{};
+    const bool use_scissor = state.has_scissor && state.scissor_count == 1;
+    if (use_scissor) {
+        const auto dx = no_viewport_shift
+            ? 0L
+            : static_cast<LONG>(right_viewport.TopLeftX - state.viewport0.TopLeftX);
+        right_scissor = state.scissor0;
+        right_scissor.left += dx;
+        right_scissor.right += dx;
+    }
+
+    static std::atomic<uint64_t> dup_count{0};
+    const auto n = dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (static_cast<int>(n) <= sn2_water_basepass_dup::log_max_rows() || (n % 600) == 0) {
+        SPDLOG_WARN(
+            "[SN2-WaterBasepassDup] dup#{} pso=0x{:x} ps_crc=0x{:08x} "
+            "vp L=({:.0f},{:.0f},{:.0f}x{:.0f}) R=({:.0f},{:.0f},{:.0f}x{:.0f}) "
+            "swaps={} root0={} L0=0x{:x}→R0=0x{:x} delta={} idx={} inst={}",
+            n,
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            ps_crc,
+            state.viewport0.TopLeftX, state.viewport0.TopLeftY,
+            state.viewport0.Width, state.viewport0.Height,
+            right_viewport.TopLeftX, right_viewport.TopLeftY,
+            right_viewport.Width, right_viewport.Height,
+            static_cast<int>(swap_count),
+            swaps[0].root_param,
+            swaps[0].left_va,
+            swaps[0].right_va,
+            sn2_water_basepass_dup::view_cb_offset_delta(),
+            index_count_per_instance,
+            instance_count);
+    }
+
+    // Apply right-eye state. ViewCbOnly mode skips the viewport+scissor swap
+    // (used for passes that don't render geometry to a per-eye region but do
+    // need the View matrices to match the right eye — e.g. compute-driven
+    // post-process invocations re-issued for the right eye).
+    // SynthesizeRightCb (donor-snapshot mode) targets producers that write to
+    // 3D volumes via GS — those don't viewport-split. Treat it like ViewCbOnly.
+    const bool shift_viewport =
+        (dup_mode != sn2_dup_config::DupMode::ViewCbOnly) &&
+        (dup_mode != sn2_dup_config::DupMode::SynthesizeRightCb);
+    if (shift_viewport) {
+        command_list->RSSetViewports(1, &right_viewport);
+        if (use_scissor) {
+            command_list->RSSetScissorRects(1, &right_scissor);
+        }
+    }
+    for (size_t i = 0; i < swap_count; ++i) {
+        command_list->SetGraphicsRootConstantBufferView(
+            swaps[i].root_param,
+            static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(swaps[i].right_va));
+    }
+
+    // 2026-05-22 Stage V1+V2 — graphics UAV redirect with expanded diagnostics.
+    UINT uav_redirect_root = UINT_MAX;
+    uint64_t uav_redirect_orig_table_gpu = 0;
+    if (dup_mode == sn2_dup_config::DupMode::SynthesizeRightCb &&
+        sn2_uwe_fog_mirror::env_enabled() &&
+        tls_bindless_heap.cpu_base != 0 &&
+        tls_bindless_heap.gpu_base != 0 &&
+        tls_bindless_heap.stride != 0)
+    {
+        ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+        if (dev != nullptr && sn2_uwe_fog_mirror::ensure_scratch_heap(dev)) {
+            const UINT stride = tls_bindless_heap.stride;
+            constexpr UINT kSearch = 64;  // V2: expand to 64 slots
+            // V1: diagnostic — dump first non-null resource per table for analysis.
+            static std::atomic<uint64_t> diag_seq{0};
+            const auto diag_n = diag_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            const bool diag_log = (diag_n <= 8 || (diag_n % 300) == 0);
+            if (diag_log) {
+                // V3: Also dump RTV bindings — VoxelizePS may write via RTV
+                // to 3D texture slices (rendered via GS expansion), NOT via UAV.
+                const auto& rtvs = state.last_rtv_handles;
+                ID3D12Resource* rtv_res[8]{};
+                const UINT rtv_n = static_cast<UINT>(state.last_rtv_count) < 8u ? static_cast<UINT>(state.last_rtv_count) : 8u;
+                for (UINT i = 0; i < rtv_n; ++i) {
+                    rtv_res[i] = sn2_rt_snapshot::lookup_rtv(rtvs[i]);
+                }
+                SPDLOG_WARN("[SN2-GfxRtvScan] seq#{} ps_crc=0x{:08x} rtv_count={} "
+                    "slot0={:p} slot1={:p} slot2={:p} slot3={:p} slot4={:p} slot5={:p} slot6={:p} slot7={:p}",
+                    diag_n, ps_crc, static_cast<unsigned>(state.last_rtv_count),
+                    (void*)rtv_res[0], (void*)rtv_res[1], (void*)rtv_res[2], (void*)rtv_res[3],
+                    (void*)rtv_res[4], (void*)rtv_res[5], (void*)rtv_res[6], (void*)rtv_res[7]);
+                // V3b: dump dimensions of each RTV resource so we know what to mirror.
+                for (UINT i = 0; i < rtv_n; ++i) {
+                    if (rtv_res[i] == nullptr) continue;
+                    const auto rdesc = rtv_res[i]->GetDesc();
+                    SPDLOG_WARN("[SN2-GfxRtvDims] seq#{} rtv slot {} res=0x{:x} dim={}x{}x{} fmt={} flags=0x{:x} type={}",
+                        diag_n, i, reinterpret_cast<uintptr_t>(rtv_res[i]),
+                        static_cast<unsigned>(rdesc.Width), static_cast<unsigned>(rdesc.Height),
+                        static_cast<unsigned>(rdesc.DepthOrArraySize),
+                        static_cast<unsigned>(rdesc.Format),
+                        static_cast<unsigned>(rdesc.Flags),
+                        static_cast<unsigned>(rdesc.Dimension));
+                }
+                // Check if any RTV resource is in the mirror registry.
+                for (UINT i = 0; i < rtv_n; ++i) {
+                    if (rtv_res[i] != nullptr) {
+                        const auto* m = sn2_uwe_fog_mirror::registry().find(rtv_res[i]);
+                        if (m != nullptr) {
+                            SPDLOG_WARN("[SN2-GfxRtvScan] HIT: rtv slot {} resource 0x{:x} HAS MIRROR (mirror_ptr=0x{:x})",
+                                i, reinterpret_cast<uintptr_t>(rtv_res[i]),
+                                reinterpret_cast<uintptr_t>(m->resource.Get()));
+                        }
+                    }
+                }
+            }
+            if (diag_log) {
+                const size_t num_tables_dbg = state.last_graphics_root_desc_tables.size();
+                for (size_t ti = 0; ti < num_tables_dbg; ++ti) {
+                    const uint64_t tg = state.last_graphics_root_desc_tables[ti];
+                    if (tg == 0) continue;
+                    if (tg < tls_bindless_heap.gpu_base) continue;
+                    const uint64_t off = tg - tls_bindless_heap.gpu_base;
+                    const SIZE_T cpu_base_dbg = tls_bindless_heap.cpu_base + static_cast<SIZE_T>(off);
+                    ID3D12Resource* first_res[8]{};
+                    for (UINT i = 0; i < 8; ++i) {
+                        const SIZE_T slot_cpu = cpu_base_dbg + static_cast<SIZE_T>(i) * stride;
+                        first_res[i] = sn2_descriptor_registry::lookup_resource_by_cpu_ptr(slot_cpu);
+                    }
+                    SPDLOG_WARN(
+                        "[SN2-GfxUavScan] seq#{} ps_crc=0x{:08x} root={} table_gpu=0x{:x} "
+                        "slot0={:p} slot1={:p} slot2={:p} slot3={:p} slot4={:p} slot5={:p} slot6={:p} slot7={:p}",
+                        diag_n, ps_crc, ti, tg,
+                        (void*)first_res[0], (void*)first_res[1], (void*)first_res[2], (void*)first_res[3],
+                        (void*)first_res[4], (void*)first_res[5], (void*)first_res[6], (void*)first_res[7]);
+                }
+            }
+            // Find first root descriptor table with a mirrored resource.
+            int found_root = -1;
+            int found_slot = -1;
+            const sn2_uwe_fog_mirror::Mirror* found_mirror = nullptr;
+            uint64_t found_table_gpu = 0;
+            const size_t num_tables = state.last_graphics_root_desc_tables.size();
+            for (size_t ti = 0; ti < num_tables && found_root < 0; ++ti) {
+                const uint64_t table_gpu = state.last_graphics_root_desc_tables[ti];
+                if (table_gpu == 0 || table_gpu < tls_bindless_heap.gpu_base) continue;
+                const uint64_t off = table_gpu - tls_bindless_heap.gpu_base;
+                const SIZE_T cpu_base = tls_bindless_heap.cpu_base + static_cast<SIZE_T>(off);
+                for (UINT i = 0; i < kSearch; ++i) {
+                    const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(i) * stride;
+                    ID3D12Resource* res = sn2_descriptor_registry::lookup_resource_by_cpu_ptr(slot_cpu);
+                    if (res == nullptr) continue;
+                    const auto* m = sn2_uwe_fog_mirror::registry().find(res);
+                    if (m == nullptr) continue;
+                    found_root = static_cast<int>(ti);
+                    found_slot = static_cast<int>(i);
+                    found_mirror = m;
+                    found_table_gpu = table_gpu;
+                    break;
+                }
+            }
+            if (found_root >= 0 && found_mirror != nullptr) {
+                const UINT scratch_base = sn2_uwe_fog_mirror::alloc_scratch_range(kSearch);
+                if (scratch_base != UINT32_MAX) {
+                    auto& sh = sn2_uwe_fog_mirror::scratch_heap();
+                    const auto sc_cpu = sh.heap->GetCPUDescriptorHandleForHeapStart();
+                    const auto sc_gpu = sh.heap->GetGPUDescriptorHandleForHeapStart();
+                    D3D12_CPU_DESCRIPTOR_HANDLE scratch_cpu_base{
+                        sc_cpu.ptr + static_cast<SIZE_T>(scratch_base) * sh.descriptor_size};
+                    D3D12_GPU_DESCRIPTOR_HANDLE scratch_gpu_base{
+                        sc_gpu.ptr + static_cast<UINT64>(scratch_base) * sh.descriptor_size};
+                    // Copy game's window into scratch.
+                    const uint64_t off2 = found_table_gpu - tls_bindless_heap.gpu_base;
+                    D3D12_CPU_DESCRIPTOR_HANDLE src_base{
+                        tls_bindless_heap.cpu_base + static_cast<SIZE_T>(off2)};
+                    dev->CopyDescriptorsSimple(kSearch, scratch_cpu_base, src_base,
+                                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    // Patch slot with mirror UAV.
+                    D3D12_CPU_DESCRIPTOR_HANDLE patch_slot{
+                        scratch_cpu_base.ptr + static_cast<SIZE_T>(found_slot) * sh.descriptor_size};
+                    dev->CopyDescriptorsSimple(1, patch_slot, found_mirror->uav_cpu,
+                                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    D3D12_GPU_DESCRIPTOR_HANDLE bind_h{scratch_gpu_base.ptr};
+                    command_list->SetGraphicsRootDescriptorTable(static_cast<UINT>(found_root), bind_h);
+                    uav_redirect_root = static_cast<UINT>(found_root);
+                    uav_redirect_orig_table_gpu = found_table_gpu;
+                    static std::atomic<uint64_t> uav_seq{0};
+                    const auto n = uav_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= 16 || (n % 600) == 0) {
+                        SPDLOG_WARN("[SN2-GfxUavRedirect] #{} ps_crc=0x{:08x} root={} slot={} mirror_uav_gpu=0x{:x}",
+                                    n, ps_crc, found_root, found_slot, found_mirror->uav_gpu.ptr);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2026-05-22 Stage V4 — graphics RTV redirect (for VoxelizePS).
+    // VoxelizePS writes to a 3D volume via RTV slots (rasterizer to slice via
+    // GS). The mirror infra now allocates parallel 3D resources for these
+    // (54×30×48 R11G11B10F). Here we substitute the RTV bindings with mirror
+    // RTVs before re-issuing the right-eye dup. Lazy RTV creation: first dup
+    // that hits a given mirror creates the RTV in our RTV heap, caches it.
+    static std::mutex rtv_cache_mu;
+    static std::unordered_map<ID3D12Resource*, D3D12_CPU_DESCRIPTOR_HANDLE> mirror_rtv_cache;
+    bool rtv_redirect_applied = false;
+    D3D12_CPU_DESCRIPTOR_HANDLE orig_rtv_handles_cpu[8]{};
+    UINT orig_rtv_count = 0;
+    if (dup_mode == sn2_dup_config::DupMode::SynthesizeRightCb &&
+        sn2_uwe_fog_mirror::env_enabled() &&
+        state.last_rtv_count > 0 && state.last_rtv_count <= 8)
+    {
+        ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+        if (dev != nullptr && sn2_uwe_fog_mirror::ensure_mirror_rtv_heap(dev)) {
+            D3D12_CPU_DESCRIPTOR_HANDLE new_rtvs[8]{};
+            bool any_substituted = false;
+            for (UINT i = 0; i < state.last_rtv_count; ++i) {
+                const uint64_t handle = state.last_rtv_handles[i];
+                D3D12_CPU_DESCRIPTOR_HANDLE orig_h{};
+                orig_h.ptr = static_cast<SIZE_T>(handle);
+                orig_rtv_handles_cpu[i] = orig_h;
+                new_rtvs[i] = orig_h;
+                if (handle == 0) continue;
+                ID3D12Resource* res = sn2_rt_snapshot::lookup_rtv(handle);
+                if (res == nullptr) continue;
+                const auto* m = sn2_uwe_fog_mirror::registry().find(res);
+                if (m == nullptr || m->resource == nullptr) continue;
+                // Lazy: get/create mirror RTV for this resource.
+                D3D12_CPU_DESCRIPTOR_HANDLE mirror_rtv_cpu{};
+                {
+                    std::scoped_lock _{rtv_cache_mu};
+                    auto it = mirror_rtv_cache.find(m->resource.Get());
+                    if (it != mirror_rtv_cache.end()) {
+                        mirror_rtv_cpu = it->second;
+                    } else if (mirror_rtv_cache.size() >= 256u) {
+                        // 2026-05-22: Cap cache. RTV heap is 1024 but practical
+                        // unique fog resources should stay <256. Hitting cap
+                        // means churn — log once, then skip new entries to
+                        // avoid heap exhaustion + log spam.
+                        static std::atomic<bool> cap_logged{false};
+                        if (!cap_logged.exchange(true, std::memory_order_relaxed)) {
+                            SPDLOG_WARN("[SN2-GfxRtvRedirect] mirror_rtv_cache cap reached (256). New mirrors will not be redirected.");
+                        }
+                    } else {
+                        const UINT idx = sn2_uwe_fog_mirror::alloc_rtv_slot();
+                        if (idx != UINT32_MAX) {
+                            auto& rh = sn2_uwe_fog_mirror::mirror_rtv_heap();
+                            const auto base = rh.heap->GetCPUDescriptorHandleForHeapStart();
+                            mirror_rtv_cpu.ptr = base.ptr + static_cast<SIZE_T>(idx) * rh.descriptor_size;
+                            // Build RTV desc for 3D texture, full WSize coverage.
+                            const auto& rd = m->desc;
+                            D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{};
+                            rtv_desc.Format = rd.Format;
+                            if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                                rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+                                rtv_desc.Texture3D.MipSlice = 0;
+                                rtv_desc.Texture3D.FirstWSlice = 0;
+                                rtv_desc.Texture3D.WSize = static_cast<UINT>(rd.DepthOrArraySize);
+                            } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+                                rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                                rtv_desc.Texture2D.MipSlice = 0;
+                            }
+                            dev->CreateRenderTargetView(m->resource.Get(), &rtv_desc, mirror_rtv_cpu);
+                            mirror_rtv_cache[m->resource.Get()] = mirror_rtv_cpu;
+                            SPDLOG_WARN("[SN2-GfxRtvRedirect] created mirror RTV for resource 0x{:x} fmt={} dim={}x{}x{}",
+                                reinterpret_cast<uintptr_t>(m->resource.Get()),
+                                static_cast<unsigned>(rd.Format),
+                                static_cast<unsigned>(rd.Width),
+                                static_cast<unsigned>(rd.Height),
+                                static_cast<unsigned>(rd.DepthOrArraySize));
+                        }
+                    }
+                }
+                if (mirror_rtv_cpu.ptr != 0) {
+                    new_rtvs[i] = mirror_rtv_cpu;
+                    any_substituted = true;
+                    static std::atomic<uint64_t> redir_seq{0};
+                    const auto n = redir_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= 16 || (n % 600) == 0) {
+                        SPDLOG_WARN("[SN2-GfxRtvRedirect] #{} slot {} orig=0x{:x} → mirror=0x{:x}",
+                                    n, i, static_cast<uintptr_t>(orig_h.ptr),
+                                    static_cast<uintptr_t>(mirror_rtv_cpu.ptr));
+                    }
+                }
+            }
+            if (any_substituted) {
+                orig_rtv_count = state.last_rtv_count;
+                // 2026-05-22: Preserve game's DSV binding if it had one. Passing
+                // nullptr DSV blindly was the suspected freeze cause — game's
+                // depth state was getting silently dropped on every dup, and
+                // GPU state coherence eventually broke. We now thread the DSV
+                // captured by the OMSetRenderTargets hook.
+                D3D12_CPU_DESCRIPTOR_HANDLE dsv_h{};
+                D3D12_CPU_DESCRIPTOR_HANDLE* dsv_ptr = nullptr;
+                if (state.has_dsv && state.last_dsv_handle != 0) {
+                    dsv_h.ptr = static_cast<SIZE_T>(state.last_dsv_handle);
+                    dsv_ptr = &dsv_h;
+                }
+                command_list->OMSetRenderTargets(orig_rtv_count, new_rtvs, FALSE, dsv_ptr);
+                rtv_redirect_applied = true;
+            }
+        }
+    }
+
+    // Re-issue the draw.
+    original(
+        command_list,
+        index_count_per_instance,
+        instance_count,
+        start_index_location,
+        base_vertex_location,
+        start_instance_location);
+
+    // Restore RTV bindings.
+    if (rtv_redirect_applied && orig_rtv_count > 0) {
+        // 2026-05-22: Restore game's DSV too. The OMSetRenderTargets hook
+        // captured it; threading it through here means the game's depth state
+        // matches what it had before our redirect — no silent DSV reset.
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv_h{};
+        D3D12_CPU_DESCRIPTOR_HANDLE* dsv_ptr = nullptr;
+        if (state.has_dsv && state.last_dsv_handle != 0) {
+            dsv_h.ptr = static_cast<SIZE_T>(state.last_dsv_handle);
+            dsv_ptr = &dsv_h;
+        }
+        command_list->OMSetRenderTargets(orig_rtv_count, orig_rtv_handles_cpu, FALSE, dsv_ptr);
+    }
+
+    // Restore game's original descriptor table at the redirected root.
+    if (uav_redirect_root != UINT_MAX && uav_redirect_orig_table_gpu != 0) {
+        D3D12_GPU_DESCRIPTOR_HANDLE restore{uav_redirect_orig_table_gpu};
+        command_list->SetGraphicsRootDescriptorTable(uav_redirect_root, restore);
+    }
+
+    // Restore LEFT state.
+    if (shift_viewport) {
+        command_list->RSSetViewports(1, &state.viewport0);
+        if (use_scissor) {
+            command_list->RSSetScissorRects(1, &state.scissor0);
+        }
+    }
+    for (size_t i = 0; i < swap_count; ++i) {
+        command_list->SetGraphicsRootConstantBufferView(
+            swaps[i].root_param,
+            static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(swaps[i].left_va));
+    }
+}
+
 void WINAPI D3D12Hook::draw_instanced(
     ID3D12GraphicsCommandList* command_list,
     UINT vertex_count_per_instance,
@@ -8525,6 +10330,10 @@ void WINAPI D3D12Hook::draw_instanced(
     // Read per-CL state once for both eye-diff and per-eye-skip decisions.
     const auto s = (command_list != nullptr) ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
     const int eye_bucket = static_cast<int>(s.last_viewport_bucket);
+    if (sn2_missing_pass_diff::env_enabled() && s.current_pso != nullptr) {
+        const uint32_t ps_crc_for_diff = reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s.current_pso));
+        sn2_missing_pass_diff::record(ps_crc_for_diff, eye_bucket, 'P');
+    }
     const bool upstream_skip = sn2_should_skip_upstream_perturbation(s, "draw");
     const bool sky_skip = sn2_should_skip_right_sky_atmos(s);
     const bool per_eye_skip = s.current_pso != nullptr &&
@@ -8564,6 +10373,14 @@ void WINAPI D3D12Hook::draw_instanced(
         start_vertex_location,
         0,
         start_instance_location);
+    sn2_log_water_candidate_draw(
+        s,
+        "DrawInstanced",
+        vertex_count_per_instance,
+        instance_count,
+        start_vertex_location,
+        0,
+        start_instance_location);
     sn2_capture_pass_rtv(command_list, s);
     if (upstream_skip) {
         reg.hunter_inc_draw_skipped();
@@ -8583,6 +10400,10 @@ void WINAPI D3D12Hook::draw_instanced(
         reg.hunter_inc_draw_skipped();
         return;
     }
+    if (sn2_should_skip_water_chain_draw(s, "DrawInstanced")) {
+        reg.hunter_inc_draw_skipped();
+        return;
+    }
 
     apply_per_eye_pso_variant(command_list, s);
 
@@ -8595,6 +10416,10 @@ void WINAPI D3D12Hook::draw_instanced(
         sn2_begin_water_chain_scratch_table(command_list, s, water_chain_scope);
         Sn2Pso3069CbvScope water_chain_cbv_scope{};
         sn2_begin_water_chain_cbv_override(command_list, s, water_chain_cbv_scope);
+        Sn2Pso3069CbvScope water_chain_viewcb_scope{};
+        sn2_begin_water_chain_viewcb_patch(command_list, s, water_chain_viewcb_scope);
+        const Sn2Pso3069CbvScope* water_chain_effective_cbv_scope =
+            water_chain_viewcb_scope.active ? &water_chain_viewcb_scope : &water_chain_cbv_scope;
         sn2_log_render_name_pso3069(
             command_list,
             s,
@@ -8610,12 +10435,17 @@ void WINAPI D3D12Hook::draw_instanced(
         sn2_log_water_chain_draw(
             command_list,
             s,
+            &water_chain_scope,
+            water_chain_effective_cbv_scope,
             "DrawInstanced",
             vertex_count_per_instance,
             instance_count,
             start_vertex_location,
             0,
             start_instance_location);
+        const uint64_t water_rt_pair = sn2_water_chain_rt_diff_pair_id(s, "DrawInstanced");
+        sn2_capture_water_chain_rtv_phase(command_list, s, water_rt_pair, "pre");
+        sn2_capture_water_chain_inputs(command_list, s, &water_chain_scope);
         Sn2CopyRectCbvScope copyrect_cbv_scope{};
         sn2_begin_copyrect_cbv_override(command_list, s, copyrect_cbv_scope);
         Sn2CopyRectScratchScope copyrect_scope{};
@@ -8623,10 +10453,12 @@ void WINAPI D3D12Hook::draw_instanced(
         const auto timing = gpu_timestamp_timing::begin(command_list, "draw", s);
         original(command_list, vertex_count_per_instance, instance_count, start_vertex_location, start_instance_location);
         gpu_timestamp_timing::end(command_list, timing);
+        sn2_capture_water_chain_rtv_phase(command_list, s, water_rt_pair, "post");
         sn2_note_draw_output_for_copyrect_fix(s);
         sn2_note_copyrect_post_draw_output(command_list, s);
         copyrect_scope.restore();
         copyrect_cbv_scope.restore();
+        water_chain_viewcb_scope.restore();
         water_chain_cbv_scope.restore();
         water_chain_scope.restore();
         pso3069_cbv_scope.restore();
@@ -8661,6 +10493,10 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
     reg2.hunter_inc_draw_indexed_hit();
     const auto s2 = (command_list != nullptr) ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
     const int eye_bucket2 = static_cast<int>(s2.last_viewport_bucket);
+    if (sn2_missing_pass_diff::env_enabled() && s2.current_pso != nullptr) {
+        const uint32_t ps_crc_for_diff = reg2.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso));
+        sn2_missing_pass_diff::record(ps_crc_for_diff, eye_bucket2, 'P');
+    }
     const bool upstream_skip = sn2_should_skip_upstream_perturbation(s2, "draw_indexed");
     const bool sky_skip = sn2_should_skip_right_sky_atmos(s2);
     const bool per_eye_skip = s2.current_pso != nullptr &&
@@ -8699,6 +10535,14 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         start_index_location,
         base_vertex_location,
         start_instance_location);
+    sn2_log_water_candidate_draw(
+        s2,
+        "DrawIndexedInstanced",
+        index_count_per_instance,
+        instance_count,
+        start_index_location,
+        base_vertex_location,
+        start_instance_location);
     sn2_capture_pass_rtv(command_list, s2);
     if (upstream_skip) {
         reg2.hunter_inc_draw_indexed_skipped();
@@ -8716,6 +10560,53 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         reg2.hunter_inc_draw_indexed_skipped();
         return;
     }
+    if (sn2_should_skip_water_chain_draw(s2, "DrawIndexedInstanced")) {
+        reg2.hunter_inc_draw_indexed_skipped();
+        return;
+    }
+
+    // 2026-05-22 Magic Ink: live skip for binary-search PSO identification.
+    // Whatever screen region disappears identifies the PSO.
+    {
+        const uint32_t ps_crc_ink = (s2.current_pso != nullptr)
+            ? reg2.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso))
+            : 0;
+        if (ps_crc_ink != 0 && sn2_magic_ink::should_skip(ps_crc_ink, eye_bucket2)) {
+            static std::atomic<uint64_t> ink_skip{0};
+            const auto n = ink_skip.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 16 || (n % 600) == 0) {
+                SPDLOG_WARN("[SN2-MagicInk] skip #{} ps_crc=0x{:08x} eye={}",
+                            n, ps_crc_ink, eye_bucket2);
+            }
+            return;
+        }
+    }
+
+    // 2026-05-22 RT diff: tag scene-color RT writes per eye for L/R diff.
+    if (sn2_rt_diff::env_enabled() && s2.last_rtv_count > 0) {
+        // Best-effort: pick RTV slot 0 as "scene color" (UE5 basepass is MRT
+        // with slot 0 = SceneColor). Map handle → resource using the existing
+        // RTV map. We just need the resource pointer + eye bucket.
+        const uint64_t rtv0 = s2.last_rtv_handles[0];
+        if (rtv0 != 0) {
+            ID3D12Resource* res = sn2_rt_snapshot::lookup_rtv(rtv0);
+            if (res != nullptr) {
+                sn2_rt_diff::note_scene_color_write(command_list, res, eye_bucket2);
+            }
+        }
+    }
+
+    // 2026-05-22 Eye screenshot: cache latest scene-color RT pointer per eye
+    // so the file-trigger handler can capture both eyes on demand.
+    if (sn2_eye_screenshot::env_enabled() && s2.last_rtv_count > 0) {
+        const uint64_t rtv0 = s2.last_rtv_handles[0];
+        if (rtv0 != 0) {
+            ID3D12Resource* res = sn2_rt_snapshot::lookup_rtv(rtv0);
+            if (res != nullptr) {
+                sn2_eye_screenshot::note_scene_color_write(res, eye_bucket2);
+            }
+        }
+    }
 
     apply_per_eye_pso_variant(command_list, s2);
 
@@ -8728,6 +10619,10 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         sn2_begin_water_chain_scratch_table(command_list, s2, water_chain_scope);
         Sn2Pso3069CbvScope water_chain_cbv_scope{};
         sn2_begin_water_chain_cbv_override(command_list, s2, water_chain_cbv_scope);
+        Sn2Pso3069CbvScope water_chain_viewcb_scope{};
+        sn2_begin_water_chain_viewcb_patch(command_list, s2, water_chain_viewcb_scope);
+        const Sn2Pso3069CbvScope* water_chain_effective_cbv_scope =
+            water_chain_viewcb_scope.active ? &water_chain_viewcb_scope : &water_chain_cbv_scope;
         sn2_log_render_name_pso3069(
             command_list,
             s2,
@@ -8743,28 +10638,73 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         sn2_log_water_chain_draw(
             command_list,
             s2,
+            &water_chain_scope,
+            water_chain_effective_cbv_scope,
             "DrawIndexedInstanced",
             index_count_per_instance,
             instance_count,
             start_index_location,
             base_vertex_location,
             start_instance_location);
+        const uint64_t water_rt_pair = sn2_water_chain_rt_diff_pair_id(s2, "DrawIndexedInstanced");
+        sn2_capture_water_chain_rtv_phase(command_list, s2, water_rt_pair, "pre");
+        sn2_capture_water_chain_inputs(command_list, s2, &water_chain_scope);
         Sn2CopyRectCbvScope copyrect_cbv_scope{};
         sn2_begin_copyrect_cbv_override(command_list, s2, copyrect_cbv_scope);
         Sn2CopyRectScratchScope copyrect_scope{};
         sn2_begin_copyrect_scratch_table(command_list, s2, copyrect_scope);
+        // 2026-05-22: Consumer SRV redirect for right-eye SLW PS reads of the
+        // IntegratedLightScattering mirror volume. Fires only when right-eye
+        // draws the configured PS CRC (default 0x37558DE4). Scope dtor restores
+        // the original descriptor table after the draw.
+        Sn2ConsumerSrvRedirectScope consumer_srv_scope{};
+        sn2_try_begin_consumer_srv_redirect(command_list, s2, consumer_srv_scope);
+        // 2026-05-22: Debug color override (magenta PS swap) for visualizing
+        // exactly where a given PS CRC renders pixels. Enabled when
+        // UEVR_SN2_DEBUG_COLOR_OVERRIDE_FILE points at a file listing PS CRCs.
+        Sn2DebugColorScope debug_color_scope{};
+        if (sn2_debug_color::env_enabled() && s2.current_pso != nullptr) {
+            const uint32_t pscrc_dc = reg2.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso));
+            if (pscrc_dc != 0 && sn2_debug_color::should_override(pscrc_dc, eye_bucket2)) {
+                ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+                if (dev != nullptr) {
+                    auto* current_pso_ps = static_cast<ID3D12PipelineState*>(s2.current_pso);
+                    ID3D12PipelineState* replacement = sn2_debug_color::get_or_create_replacement(
+                        dev, current_pso_ps);
+                    if (replacement != nullptr) {
+                        command_list->SetPipelineState(replacement);
+                        debug_color_scope.active = true;
+                        debug_color_scope.command_list = command_list;
+                        debug_color_scope.restore_pso = current_pso_ps;
+                    }
+                }
+            }
+        }
         const auto timing = gpu_timestamp_timing::begin(command_list, "draw_indexed", s2);
         original(command_list, index_count_per_instance, instance_count, start_index_location, base_vertex_location, start_instance_location);
         gpu_timestamp_timing::end(command_list, timing);
+        sn2_capture_water_chain_rtv_phase(command_list, s2, water_rt_pair, "post");
         sn2_note_draw_output_for_copyrect_fix(s2);
         sn2_note_copyrect_post_draw_output(command_list, s2);
+        debug_color_scope.restore();
+        consumer_srv_scope.restore();
         copyrect_scope.restore();
         copyrect_cbv_scope.restore();
+        water_chain_viewcb_scope.restore();
         water_chain_cbv_scope.restore();
         water_chain_scope.restore();
         pso3069_cbv_scope.restore();
         pso3069_fog_scope.restore();
         sn2_try_duplicate_fog_voxelize_right(
+            command_list,
+            s2,
+            original,
+            index_count_per_instance,
+            instance_count,
+            start_index_location,
+            base_vertex_location,
+            start_instance_location);
+        sn2_try_duplicate_slw_basepass_right(
             command_list,
             s2,
             original,
@@ -8803,6 +10743,29 @@ void WINAPI D3D12Hook::dispatch(
     if (dispatch_state.current_pso != nullptr) {
         current_cs_crc = reg.d3d12_pso_compute_crc32(reinterpret_cast<uintptr_t>(dispatch_state.current_pso));
     }
+    if (sn2_missing_pass_diff::env_enabled() && current_cs_crc != 0) {
+        sn2_missing_pass_diff::record(
+            current_cs_crc,
+            static_cast<int>(dispatch_state.last_viewport_bucket),
+            'C');
+    }
+    sn2_log_zero_dispatch(
+        dispatch_state,
+        current_cs_crc,
+        thread_group_count_x,
+        thread_group_count_y,
+        thread_group_count_z,
+        "Dispatch");
+    UINT effective_thread_group_count_x = thread_group_count_x;
+    UINT effective_thread_group_count_y = thread_group_count_y;
+    UINT effective_thread_group_count_z = thread_group_count_z;
+    const bool mirrored_direct_dispatch = sn2_repair_direct_zero_dispatch(
+        dispatch_state,
+        current_cs_crc,
+        effective_thread_group_count_x,
+        effective_thread_group_count_y,
+        effective_thread_group_count_z);
+    (void)mirrored_direct_dispatch;
     // Record PSO -> RDG-pass-name mapping if an ExecutePass hook is currently
     // bracketing this dispatch (s_tls_current_rdg_pass set). Today the
     // ExecutePass hook isn't installed, so this is a no-op until it is — but
@@ -8815,9 +10778,9 @@ void WINAPI D3D12Hook::dispatch(
         command_list,
         dispatch_state,
         current_cs_crc,
-        thread_group_count_x,
-        thread_group_count_y,
-        thread_group_count_z);
+        effective_thread_group_count_x,
+        effective_thread_group_count_y,
+        effective_thread_group_count_z);
     const bool upstream_skip = sn2_should_skip_upstream_perturbation(dispatch_state, "dispatch");
     const bool per_eye_skip = command_list != nullptr &&
         dispatch_state.current_pso != nullptr &&
@@ -8830,9 +10793,9 @@ void WINAPI D3D12Hook::dispatch(
         "dispatch",
         command_list,
         dispatch_state,
-        thread_group_count_x,
-        thread_group_count_y,
-        thread_group_count_z,
+        effective_thread_group_count_x,
+        effective_thread_group_count_y,
+        effective_thread_group_count_z,
         0,
         0,
         original != nullptr && !upstream_skip && !per_eye_skip && !hunter_skip);
@@ -8861,17 +10824,454 @@ void WINAPI D3D12Hook::dispatch(
                 ? current_cs_crc
                 : reg.d3d12_pso_compute_crc32(reinterpret_cast<uintptr_t>(current_pso));
             sn2_compute_capture::capture_direct(command_list, current_pso, cs_crc,
-                thread_group_count_x, thread_group_count_y, thread_group_count_z, view_id);
+                effective_thread_group_count_x,
+                effective_thread_group_count_y,
+                effective_thread_group_count_z,
+                view_id);
+        }
+    }
+
+    // === Approach C: per-eye SRV redirect at right-eye UWE Fog consumer ===
+    // When the right-eye instance of a UWE Fog Reconstruct/Denoise/Resolve
+    // dispatch is about to read SRVs from an aliased fog volume (multiple
+    // resources sharing one heap+offset, last-published-wins memory), swap
+    // the affected SRV table entries to point at a per-bucket shadow SRV.
+    //
+    // Gated by UEVR_SN2_ALIAS_SRV_REDIRECT=1. Requires UEVR_SN2_UWE_FOG_MIRROR=1
+    // to populate the bucket registry first.
+    //
+    // The shadow currently mirrors only LEFT's data (no right-eye writer
+    // injected yet); this swap proves the SRV redirect mechanism works. The
+    // companion writer-side fix (re-dispatch with right-eye View CB into
+    // shadow) is the next step.
+    bool srv_redirect_applied = false;
+    UINT srv_redirect_root_index = 0;
+    uint64_t srv_redirect_orig_table_gpu = 0;
+    if (sn2_uwe_fog_compute_dup::g_dup_depth == 0 &&
+        command_list != nullptr &&
+        sn2_uwe_fog_mirror::env_alias_redirect_enabled() &&
+        current_cs_crc != 0 &&
+        sn2_uwe_fog_compute_dup::is_uwe_fog_cs_crc(current_cs_crc))
+    {
+        // Diagnostic: every time a UWE Fog CRC dispatch reaches the redirect
+        // gate, log the eye + table info. If we see this firing but no
+        // [SN2-AliasSrvRedirect] event, the resources in the table aren't
+        // bucket-shadowed.
+        if (sn2_uwe_fog_mirror::env_alias_redirect_log_enabled()) {
+            static std::atomic<uint64_t> reach_seq{0};
+            const auto rn = reach_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (rn <= 32 || (rn % 300) == 0) {
+                const auto rstate = read_cmdlist_state(command_list);
+                const int rview = cmdlist_view_id(rstate);
+                SPDLOG_WARN(
+                    "[SN2-AliasSrvRedirect-Gate] reach#{} cs_crc=0x{:08x} view_id={} root0_gpu=0x{:x} bindless_cpu_base=0x{:x} bindless_gpu_base=0x{:x}",
+                    rn, current_cs_crc, rview,
+                    rstate.last_compute_root_desc_tables[0],
+                    static_cast<uint64_t>(tls_bindless_heap.cpu_base),
+                    tls_bindless_heap.gpu_base);
+            }
+        }
+        const auto srv_state = read_cmdlist_state(command_list);
+        const int srv_view_id = cmdlist_view_id(srv_state);
+        // Diagnostic phase: allow slot scan regardless of view_id so we can
+        // see what's in the table. Actual SRV swap is still gated to view_id=1
+        // below.
+        if (tls_bindless_heap.cpu_base != 0 &&
+            tls_bindless_heap.gpu_base != 0 &&
+            tls_bindless_heap.stride != 0)
+        {
+            ID3D12Device* device_ptr = g_d3d12_hook != nullptr ? g_d3d12_hook->get_device() : nullptr;
+            if (device_ptr != nullptr) {
+                // UWE Fog consumer dispatches all have SRV table at root 0.
+                const uint64_t srv_table_gpu = srv_state.last_compute_root_desc_tables[0];
+                if (srv_table_gpu != 0 && srv_table_gpu >= tls_bindless_heap.gpu_base) {
+                    const uint64_t offset_in_heap = srv_table_gpu - tls_bindless_heap.gpu_base;
+                    const SIZE_T cpu_table_base = tls_bindless_heap.cpu_base + static_cast<SIZE_T>(offset_in_heap);
+                    const UINT stride = tls_bindless_heap.stride;
+
+                    // Detect bucket-shadowed resources in slots 0..15. Build
+                    // a list of (slot, shadow_srv_cpu) to patch.
+                    constexpr UINT kMaxSlots = 16;
+                    struct PatchEntry { UINT slot; D3D12_CPU_DESCRIPTOR_HANDLE shadow_src; };
+                    std::array<PatchEntry, kMaxSlots> patches{};
+                    UINT patch_count = 0;
+                    UINT non_null_count = 0;
+                    UINT in_registry_count = 0;
+                    ID3D12Resource* first_seen[8]{};
+                    for (UINT i = 0; i < kMaxSlots; ++i) {
+                        const SIZE_T slot_cpu = cpu_table_base + static_cast<SIZE_T>(i) * stride;
+                        ID3D12Resource* res = sn2_descriptor_registry::lookup_resource_by_cpu_ptr(slot_cpu);
+                        if (i < 8) first_seen[i] = res;
+                        if (res == nullptr) continue;
+                        ++non_null_count;
+                        const auto* shadow = sn2_uwe_fog_mirror::find_bucket_shadow(res);
+                        if (shadow == nullptr) continue;
+                        ++in_registry_count;
+                        patches[patch_count++] = {i, shadow->srv_cpu};
+                    }
+                    if (sn2_uwe_fog_mirror::env_alias_redirect_log_enabled() && patch_count == 0) {
+                        static std::atomic<uint64_t> miss_seq{0};
+                        const auto ms = miss_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (ms <= 32 || (ms % 600) == 0) {
+                            // Sample a few CPU ptrs in the registry so we can
+                            // diagnose whether they land in bindless or staging.
+                            SIZE_T sample[4]{};
+                            size_t sample_n = 0;
+                            sn2_descriptor_registry::sample_cpu_ptrs(sample, 4, sample_n);
+                            SPDLOG_INFO(
+                                "[SN2-AliasSrvRedirect-Miss] miss#{} cs_crc=0x{:08x} non_null={}/{} in_registry={}/{} "
+                                "reg_size={} cpu_table_base=0x{:x} stride={} sample=[0x{:x},0x{:x},0x{:x},0x{:x}] "
+                                "slot0={:p} slot1={:p} slot2={:p} slot3={:p} slot4={:p} slot5={:p} slot6={:p} slot7={:p}",
+                                ms, current_cs_crc, non_null_count, kMaxSlots, in_registry_count, kMaxSlots,
+                                sn2_descriptor_registry::registry_size(),
+                                static_cast<uint64_t>(cpu_table_base), stride,
+                                static_cast<uint64_t>(sample[0]), static_cast<uint64_t>(sample[1]),
+                                static_cast<uint64_t>(sample[2]), static_cast<uint64_t>(sample[3]),
+                                (void*)first_seen[0], (void*)first_seen[1], (void*)first_seen[2], (void*)first_seen[3],
+                                (void*)first_seen[4], (void*)first_seen[5], (void*)first_seen[6], (void*)first_seen[7]);
+                        }
+                    }
+
+                    if (patch_count > 0 && sn2_uwe_fog_mirror::ensure_scratch_heap(device_ptr)) {
+                        const UINT scratch_base = sn2_uwe_fog_mirror::alloc_scratch_range(kMaxSlots);
+                        if (scratch_base != UINT32_MAX) {
+                            auto& sh = sn2_uwe_fog_mirror::scratch_heap();
+                            const auto scratch_cpu_start = sh.heap->GetCPUDescriptorHandleForHeapStart();
+                            const auto scratch_gpu_start = sh.heap->GetGPUDescriptorHandleForHeapStart();
+                            D3D12_CPU_DESCRIPTOR_HANDLE scratch_cpu_base{};
+                            scratch_cpu_base.ptr = scratch_cpu_start.ptr + static_cast<SIZE_T>(scratch_base) * sh.descriptor_size;
+                            D3D12_GPU_DESCRIPTOR_HANDLE scratch_gpu_base_h{};
+                            scratch_gpu_base_h.ptr = scratch_gpu_start.ptr + static_cast<UINT64>(scratch_base) * sh.descriptor_size;
+
+                            // Copy the entire kMaxSlots-window of game's table.
+                            D3D12_CPU_DESCRIPTOR_HANDLE src_base{};
+                            src_base.ptr = cpu_table_base;
+                            device_ptr->CopyDescriptorsSimple(
+                                kMaxSlots, scratch_cpu_base, src_base,
+                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+                            // Patch each tracked slot with the shadow SRV.
+                            for (UINT p = 0; p < patch_count; ++p) {
+                                D3D12_CPU_DESCRIPTOR_HANDLE dst{};
+                                dst.ptr = scratch_cpu_base.ptr + static_cast<SIZE_T>(patches[p].slot) * sh.descriptor_size;
+                                device_ptr->CopyDescriptorsSimple(
+                                    1, dst, patches[p].shadow_src,
+                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                            }
+
+                            D3D12_GPU_DESCRIPTOR_HANDLE bind_h{};
+                            bind_h.ptr = scratch_gpu_base_h.ptr;
+                            command_list->SetComputeRootDescriptorTable(0, bind_h);
+                            srv_redirect_applied = true;
+                            srv_redirect_root_index = 0;
+                            srv_redirect_orig_table_gpu = srv_table_gpu;
+
+                            if (sn2_uwe_fog_mirror::env_alias_redirect_log_enabled()) {
+                                static std::atomic<uint64_t> sr_seq{0};
+                                const auto sn = sr_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                                if (sn <= 64 || (sn % 600) == 0) {
+                                    SPDLOG_WARN(
+                                        "[SN2-AliasSrvRedirect] seq={} cs_crc=0x{:08x} patches={} orig_table_gpu=0x{:x} scratch_gpu=0x{:x}",
+                                        sn, current_cs_crc, patch_count, srv_table_gpu, bind_h.ptr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     if (original != nullptr) {
         const auto timing = gpu_timestamp_timing::begin(command_list, "dispatch", dispatch_state);
-        original(command_list, thread_group_count_x, thread_group_count_y, thread_group_count_z);
+        original(command_list,
+            effective_thread_group_count_x,
+            effective_thread_group_count_y,
+            effective_thread_group_count_z);
         gpu_timestamp_timing::end(command_list, timing);
     }
 
+    // Restore game's original SRV table after right-eye redirect.
+    if (srv_redirect_applied && command_list != nullptr) {
+        D3D12_GPU_DESCRIPTOR_HANDLE restore{};
+        restore.ptr = srv_redirect_orig_table_gpu;
+        command_list->SetComputeRootDescriptorTable(srv_redirect_root_index, restore);
+    }
+
     sn2_fog_compute::try_replay_after_right_scatter(command_list, dispatch_state, current_cs_crc);
+
+    // === UWE Fog compute dispatch probe + duplicator ===
+    // Permissive logger fires on every compute dispatch when
+    // UEVR_SN2_UWE_FOG_COMPUTE_PROBE=1, so we can identify the live UWE fog
+    // CS CRC32s. Duplicator fires on configured CS CRCs when
+    // UEVR_SN2_DUPLICATE_UWE_FOG_COMPUTE_RIGHT=1.
+    if (sn2_uwe_fog_compute_dup::g_dup_depth == 0 && command_list != nullptr) {
+        const auto& dstate = dispatch_state;
+        const bool probe_on = sn2_uwe_fog_compute_dup::env_probe_enabled();
+        const bool dup_on = sn2_uwe_fog_compute_dup::env_dup_enabled();
+        if (probe_on || dup_on) {
+            if (probe_on) {
+                static std::atomic<uint64_t> probe_seq{0};
+                const auto n = probe_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 512 || (n % 3000) == 0) {
+                    SPDLOG_WARN(
+                        "[SN2-UweFogComputeProbe] seq={} cs_crc=0x{:08x} pso=0x{:x} root_sig=0x{:x} dim={}x{}x{} "
+                        "cbv0=0x{:x} cbv1=0x{:x} cbv2=0x{:x} cbv3=0x{:x} cbv4=0x{:x} cbv5=0x{:x} "
+                        "dt0=0x{:x} dt1=0x{:x} dt2=0x{:x} dt3=0x{:x}",
+                        n,
+                        current_cs_crc,
+                        reinterpret_cast<uintptr_t>(dstate.current_pso),
+                        dstate.last_compute_root_signature,
+                        effective_thread_group_count_x, effective_thread_group_count_y, effective_thread_group_count_z,
+                        dstate.last_compute_root_cbv[0],
+                        dstate.last_compute_root_cbv[1],
+                        dstate.last_compute_root_cbv[2],
+                        dstate.last_compute_root_cbv[3],
+                        dstate.last_compute_root_cbv[4],
+                        dstate.last_compute_root_cbv[5],
+                        dstate.last_compute_root_desc_tables[0],
+                        dstate.last_compute_root_desc_tables[1],
+                        dstate.last_compute_root_desc_tables[2],
+                        dstate.last_compute_root_desc_tables[3]);
+                }
+            }
+
+            if (dup_on &&
+                original != nullptr &&
+                current_cs_crc != 0 &&
+                sn2_uwe_fog_compute_dup::is_uwe_fog_cs_crc(current_cs_crc)) {
+                const auto& view_roots = sn2_uwe_fog_compute_dup::active_view_cb_roots();
+                struct ViewRootSwap {
+                    UINT root_param;
+                    uint64_t left_va;
+                    uint64_t right_va;
+                };
+                std::array<ViewRootSwap, 8> swaps{};
+                size_t swap_count = 0;
+                for (uint32_t root : view_roots) {
+                    if (root >= dstate.last_compute_root_cbv.size()) continue;
+                    const uint64_t lv = dstate.last_compute_root_cbv[root];
+                    if (lv == 0) continue;
+                    const uint64_t rv = sn2_uwe_fog_compute_dup::compute_right_view_va(lv);
+                    if (rv == 0) continue;
+                    if (swap_count >= swaps.size()) break;
+                    swaps[swap_count++] = {static_cast<UINT>(root), lv, rv};
+                }
+
+                if (swap_count > 0) {
+                    // === P3: UAV REDIRECT to mirror ===
+                    // Find which slot in the compute root 0 descriptor table
+                    // binds a UAV that we have a mirror for. If found, build a
+                    // scratch table with that slot replaced by mirror_uav.
+                    //
+                    // Without this redirect the dup writes to the SAME UAV the
+                    // original wrote to → corrupts left-eye output (proven in
+                    // the previous failed iteration).
+                    ID3D12Device* device = d3d12 != nullptr ? d3d12->get_device() : nullptr;
+                    int mirror_slot = -1;
+                    int mirror_root_table = -1;
+                    uint64_t found_game_table_gpu = 0;
+                    const sn2_uwe_fog_mirror::Mirror* mirror_entry = nullptr;
+                    uint64_t scratch_gpu_base = 0;
+                    ID3D12Resource* first_seen_resources[8]{};
+                    bool first_seen_mirrored[8]{};
+                    uint64_t probed_table_gpu = 0;
+
+                    if (device != nullptr &&
+                        sn2_uwe_fog_mirror::env_enabled() &&
+                        tls_bindless_heap.cpu_base != 0 &&
+                        tls_bindless_heap.gpu_base != 0 &&
+                        tls_bindless_heap.stride != 0)
+                    {
+                        const UINT stride = tls_bindless_heap.stride;
+                        const UINT search_count = 16;
+                        auto& reg = sn2_uwe_fog_mirror::registry();
+
+                        // Scan ALL root descriptor tables (typically 0..3 for compute).
+                        // Log each table's first non-null slot's resource desc so we
+                        // can see ALL tables' contents (not just first non-empty).
+                        const size_t num_tables = dstate.last_compute_root_desc_tables.size();
+                        ID3D12Resource* per_table_first[8]{};
+                        int per_table_first_slot[8]{};
+                        for (size_t ti = 0; ti < num_tables && mirror_slot < 0; ++ti) {
+                            const uint64_t game_table_gpu = dstate.last_compute_root_desc_tables[ti];
+                            if (game_table_gpu == 0) continue;
+                            if (game_table_gpu < tls_bindless_heap.gpu_base) continue;
+
+                            const uint64_t offset = game_table_gpu - tls_bindless_heap.gpu_base;
+                            const SIZE_T cpu_table_base = tls_bindless_heap.cpu_base + static_cast<SIZE_T>(offset);
+                            ID3D12Resource* local_seen[8]{};
+                            bool local_seen_mirrored[8]{};
+
+                            for (UINT i = 0; i < search_count; ++i) {
+                                const SIZE_T slot_cpu = cpu_table_base + static_cast<SIZE_T>(i) * stride;
+                                ID3D12Resource* res = sn2_descriptor_registry::lookup_resource_by_cpu_ptr(slot_cpu);
+                                if (i < 8) {
+                                    local_seen[i] = res;
+                                    local_seen_mirrored[i] = (res != nullptr && reg.has(res));
+                                }
+                                if (res == nullptr) continue;
+                                const auto* m = reg.find(res);
+                                if (m == nullptr) continue;
+                                mirror_slot = static_cast<int>(i);
+                                mirror_entry = m;
+                                mirror_root_table = static_cast<int>(ti);
+                                found_game_table_gpu = game_table_gpu;
+                                break;
+                            }
+
+                            // Capture the first non-empty table for the miss-diagnostic.
+                            if (probed_table_gpu == 0) {
+                                bool any = false;
+                                for (UINT i = 0; i < 8; ++i) { if (local_seen[i] != nullptr) { any = true; break; } }
+                                if (any || ti + 1 == num_tables) {
+                                    probed_table_gpu = game_table_gpu;
+                                    for (UINT i = 0; i < 8; ++i) {
+                                        first_seen_resources[i] = local_seen[i];
+                                        first_seen_mirrored[i] = local_seen_mirrored[i];
+                                    }
+                                }
+                            }
+                        }
+
+                        const uint64_t game_table_gpu = found_game_table_gpu != 0 ? found_game_table_gpu : probed_table_gpu;
+                        // Diagnostic: when we DON'T find a mirror, log what
+                        // IS bound in the first 8 slots — INCLUDING resource
+                        // desc (format + dims) so we can refine the signature.
+                        if (mirror_slot < 0) {
+                            static std::atomic<uint64_t> probe_seq{0};
+                            const auto pn = probe_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if (pn <= 32 || (pn % 600) == 0) {
+                                // Fetch desc for the first non-null resource
+                                // to understand what fog UAVs we're missing.
+                                for (UINT i = 0; i < 8; ++i) {
+                                    if (first_seen_resources[i] == nullptr) continue;
+                                    const auto desc = first_seen_resources[i]->GetDesc();
+                                    SPDLOG_INFO(
+                                        "[SN2-UweFogMirror-MissDesc] miss#{} slot={} ptr={:p} dim={}x{}x{} fmt={} flags=0x{:x} dim_kind={} mirrored={}",
+                                        pn, i, (void*)first_seen_resources[i],
+                                        static_cast<unsigned>(desc.Width),
+                                        static_cast<unsigned>(desc.Height),
+                                        static_cast<unsigned>(desc.DepthOrArraySize),
+                                        static_cast<unsigned>(desc.Format),
+                                        static_cast<unsigned>(desc.Flags),
+                                        static_cast<unsigned>(desc.Dimension),
+                                        first_seen_mirrored[i] ? "Y" : "N");
+                                }
+                                SPDLOG_INFO(
+                                    "[SN2-UweFogMirror-MissProbe] miss#{} cs_crc=0x{:08x} table_gpu=0x{:x} reg_size={} heap_gpu=0x{:x} heap_cpu=0x{:x} "
+                                    "slots=[0]={:p}/{} [1]={:p}/{} [2]={:p}/{} [3]={:p}/{} [4]={:p}/{} [5]={:p}/{} [6]={:p}/{} [7]={:p}/{}",
+                                    pn,
+                                    current_cs_crc,
+                                    game_table_gpu,
+                                    sn2_descriptor_registry::registry_size(),
+                                    tls_bindless_heap.gpu_base,
+                                    static_cast<uint64_t>(tls_bindless_heap.cpu_base),
+                                    (void*)first_seen_resources[0], first_seen_mirrored[0] ? "M" : (first_seen_resources[0] ? "G" : "-"),
+                                    (void*)first_seen_resources[1], first_seen_mirrored[1] ? "M" : (first_seen_resources[1] ? "G" : "-"),
+                                    (void*)first_seen_resources[2], first_seen_mirrored[2] ? "M" : (first_seen_resources[2] ? "G" : "-"),
+                                    (void*)first_seen_resources[3], first_seen_mirrored[3] ? "M" : (first_seen_resources[3] ? "G" : "-"),
+                                    (void*)first_seen_resources[4], first_seen_mirrored[4] ? "M" : (first_seen_resources[4] ? "G" : "-"),
+                                    (void*)first_seen_resources[5], first_seen_mirrored[5] ? "M" : (first_seen_resources[5] ? "G" : "-"),
+                                    (void*)first_seen_resources[6], first_seen_mirrored[6] ? "M" : (first_seen_resources[6] ? "G" : "-"),
+                                    (void*)first_seen_resources[7], first_seen_mirrored[7] ? "M" : (first_seen_resources[7] ? "G" : "-"));
+                            }
+                        }
+
+                        // If we found a mirror, build a scratch table.
+                        if (mirror_slot >= 0 && mirror_entry != nullptr && found_game_table_gpu != 0) {
+                            sn2_uwe_fog_mirror::ensure_scratch_heap(device);
+                            const UINT scratch_base = sn2_uwe_fog_mirror::alloc_scratch_range(search_count);
+                            if (scratch_base != UINT32_MAX) {
+                                auto& sh = sn2_uwe_fog_mirror::scratch_heap();
+                                const auto scratch_cpu_start = sh.heap->GetCPUDescriptorHandleForHeapStart();
+                                const auto scratch_gpu_start = sh.heap->GetGPUDescriptorHandleForHeapStart();
+                                D3D12_CPU_DESCRIPTOR_HANDLE scratch_cpu_base{};
+                                scratch_cpu_base.ptr = scratch_cpu_start.ptr + static_cast<SIZE_T>(scratch_base) * sh.descriptor_size;
+                                D3D12_GPU_DESCRIPTOR_HANDLE scratch_gpu_base_h{};
+                                scratch_gpu_base_h.ptr = scratch_gpu_start.ptr + static_cast<UINT64>(scratch_base) * sh.descriptor_size;
+
+                                // Compute CPU base for the FOUND table.
+                                const uint64_t found_offset = found_game_table_gpu - tls_bindless_heap.gpu_base;
+                                const SIZE_T found_cpu_table_base = tls_bindless_heap.cpu_base + static_cast<SIZE_T>(found_offset);
+
+                                // Copy game's full N-slot range to scratch.
+                                D3D12_CPU_DESCRIPTOR_HANDLE src_base{};
+                                src_base.ptr = found_cpu_table_base;
+                                device->CopyDescriptorsSimple(
+                                    search_count,
+                                    scratch_cpu_base,
+                                    src_base,
+                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+                                // Override the mirror slot with the mirror's UAV CPU desc.
+                                D3D12_CPU_DESCRIPTOR_HANDLE patch_slot{};
+                                patch_slot.ptr = scratch_cpu_base.ptr + static_cast<SIZE_T>(mirror_slot) * sh.descriptor_size;
+                                device->CopyDescriptorsSimple(
+                                    1,
+                                    patch_slot,
+                                    mirror_entry->uav_cpu,
+                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+                                scratch_gpu_base = scratch_gpu_base_h.ptr;
+                            }
+                        }
+                    }
+
+                    static std::atomic<uint64_t> dup_count{0};
+                    const auto n = dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (static_cast<int>(n) <= sn2_uwe_fog_compute_dup::log_max_rows() || (n % 600) == 0) {
+                        SPDLOG_WARN(
+                            "[SN2-UweFogComputeDup] dup#{} cs_crc=0x{:08x} swaps={} root0={} L0=0x{:x}→R0=0x{:x} delta={} dim={}x{}x{} mirror_slot={} scratch_gpu=0x{:x}",
+                            n,
+                            current_cs_crc,
+                            static_cast<int>(swap_count),
+                            swaps[0].root_param,
+                            swaps[0].left_va,
+                            swaps[0].right_va,
+                            sn2_uwe_fog_compute_dup::view_cb_offset_delta(),
+                            effective_thread_group_count_x,
+                            effective_thread_group_count_y,
+                            effective_thread_group_count_z,
+                            mirror_slot,
+                            scratch_gpu_base);
+                    }
+
+                    // Apply scratch table (if built) + right-eye CBVs.
+                    if (scratch_gpu_base != 0 && mirror_root_table >= 0) {
+                        D3D12_GPU_DESCRIPTOR_HANDLE h{};
+                        h.ptr = scratch_gpu_base;
+                        command_list->SetComputeRootDescriptorTable(static_cast<UINT>(mirror_root_table), h);
+                    }
+                    for (size_t i = 0; i < swap_count; ++i) {
+                        command_list->SetComputeRootConstantBufferView(
+                            swaps[i].root_param,
+                            static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(swaps[i].right_va));
+                    }
+
+                    ++sn2_uwe_fog_compute_dup::g_dup_depth;
+                    original(command_list,
+                        effective_thread_group_count_x,
+                        effective_thread_group_count_y,
+                        effective_thread_group_count_z);
+                    --sn2_uwe_fog_compute_dup::g_dup_depth;
+
+                    // Restore CBVs to left-eye.
+                    for (size_t i = 0; i < swap_count; ++i) {
+                        command_list->SetComputeRootConstantBufferView(
+                            swaps[i].root_param,
+                            static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(swaps[i].left_va));
+                    }
+                    // Restore game's descriptor table at the root we patched.
+                    if (scratch_gpu_base != 0 && found_game_table_gpu != 0 && mirror_root_table >= 0) {
+                        D3D12_GPU_DESCRIPTOR_HANDLE h{};
+                        h.ptr = found_game_table_gpu;
+                        command_list->SetComputeRootDescriptorTable(static_cast<UINT>(mirror_root_table), h);
+                    }
+                }
+            }
+        }
+    }
 }
 
 void WINAPI D3D12Hook::copy_buffer_region(
@@ -9354,6 +11754,13 @@ void WINAPI D3D12Hook::om_set_render_targets(
     if (num_render_target_descriptors > 0 && render_target_descriptors != nullptr) {
         update_cmdlist_rtv0(command_list, &render_target_descriptors[0]);
     }
+    // Full MRT array capture — needed to diagnose per-eye MRT-slot differences
+    // (e.g. SLW GBuffer slot 6 binding on right eye for resource 30085 lineage).
+    update_cmdlist_rtv_array(command_list,
+        num_render_target_descriptors,
+        render_target_descriptors,
+        rts_single_handle_to_descriptor_range != FALSE,
+        depth_stencil_descriptor);
 
     if (original != nullptr) {
         original(command_list, num_render_target_descriptors, render_target_descriptors, rts_single_handle_to_descriptor_range, depth_stencil_descriptor);
@@ -9414,6 +11821,58 @@ void WINAPI D3D12Hook::resource_barrier(
         "D3D12Hook::ResourceBarrier",
         num_barriers,
         barriers);
+
+    // Aliasing-barrier publish tracker. The placed-heap aliasing bug is the
+    // root cause of SN2's right-eye fog: per-eye 3D fog volumes are written
+    // correctly but UE5 aliasing barriers publish them at SHARED uids so the
+    // last-eye-to-publish wins. We need to record which resource gets
+    // published per eye per frame so a downstream SRV redirect can use the
+    // eye-appropriate alias.
+    if (env_flag_enabled_a("UEVR_SN2_ALIASING_LOG") && barriers != nullptr && num_barriers > 0) {
+        static std::atomic<uint64_t> alias_seq{0};
+        // Map view_id from command-list state.
+        int view_id = -1;
+        if (command_list != nullptr) {
+            std::scoped_lock _{g_cmdlist_state_mutex};
+            const auto it = g_cmdlist_state_map.find(command_list);
+            if (it != g_cmdlist_state_map.end()) {
+                view_id = cmdlist_view_id(it->second);
+            }
+        }
+        const auto log_max = []() {
+            char buf[16]{};
+            const auto len = GetEnvironmentVariableA("UEVR_SN2_ALIASING_LOG_MAX", buf, sizeof(buf));
+            if (len == 0 || len >= sizeof(buf)) return 256u;
+            return static_cast<unsigned>(std::max(0L, std::strtol(buf, nullptr, 10)));
+        }();
+        for (UINT i = 0; i < num_barriers; ++i) {
+            const auto& b = barriers[i];
+            if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_ALIASING) continue;
+            const auto n = alias_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n > log_max && (n % 600) != 0) continue;
+            ID3D12Resource* before = b.Aliasing.pResourceBefore;
+            ID3D12Resource* after = b.Aliasing.pResourceAfter;
+            D3D12_RESOURCE_DESC before_desc{};
+            D3D12_RESOURCE_DESC after_desc{};
+            if (before != nullptr) before_desc = before->GetDesc();
+            if (after != nullptr) after_desc = after->GetDesc();
+            SPDLOG_WARN(
+                "[SN2-Aliasing] seq={} view_id={} before={:p} ({}x{}x{} fmt={} dim={}) after={:p} ({}x{}x{} fmt={} dim={})",
+                n, view_id,
+                (void*)before,
+                before != nullptr ? static_cast<unsigned>(before_desc.Width) : 0u,
+                before != nullptr ? static_cast<unsigned>(before_desc.Height) : 0u,
+                before != nullptr ? static_cast<unsigned>(before_desc.DepthOrArraySize) : 0u,
+                before != nullptr ? static_cast<unsigned>(before_desc.Format) : 0u,
+                before != nullptr ? static_cast<unsigned>(before_desc.Dimension) : 0u,
+                (void*)after,
+                after != nullptr ? static_cast<unsigned>(after_desc.Width) : 0u,
+                after != nullptr ? static_cast<unsigned>(after_desc.Height) : 0u,
+                after != nullptr ? static_cast<unsigned>(after_desc.DepthOrArraySize) : 0u,
+                after != nullptr ? static_cast<unsigned>(after_desc.Format) : 0u,
+                after != nullptr ? static_cast<unsigned>(after_desc.Dimension) : 0u);
+        }
+    }
 
     if (original != nullptr) {
         original(command_list, num_barriers, barriers);
@@ -9621,6 +12080,53 @@ const char* sn2_eye_name(int view_id, StereoTraceBucket bucket) {
     case StereoTraceBucket::Multi: return "multi";
     default: return "unknown";
     }
+}
+
+struct Sn2BindingViewVote {
+    int inferred_view_id{-1};
+    int left_votes{0};
+    int right_votes{0};
+};
+
+static void sn2_vote_tracked_view(Sn2BindingViewVote& vote, const Sn2Pso3069SlotInfo& info) {
+    if (info.tracked_view_id == 0) {
+        ++vote.left_votes;
+    } else if (info.tracked_view_id == 1) {
+        ++vote.right_votes;
+    }
+}
+
+static Sn2BindingViewVote sn2_infer_compute_view_from_bound_descriptors(
+    const CommandListCorrelationState& state,
+    UINT max_slots_per_table = 12)
+{
+    Sn2BindingViewVote vote{};
+    for (size_t root = 0; root < state.last_compute_root_desc_tables.size(); ++root) {
+        const uint64_t base = state.last_compute_root_desc_tables[root];
+        if (base == 0) {
+            continue;
+        }
+        for (UINT slot = 0; slot < max_slots_per_table; ++slot) {
+            sn2_vote_tracked_view(vote, sn2_resolve_pso3069_slot(base, slot));
+        }
+    }
+
+    if (vote.left_votes > vote.right_votes) {
+        vote.inferred_view_id = 0;
+    } else if (vote.right_votes > vote.left_votes) {
+        vote.inferred_view_id = 1;
+    }
+    return vote;
+}
+
+static int sn2_compute_effective_view_id(
+    const CommandListCorrelationState& state,
+    const Sn2BindingViewVote& binding_vote)
+{
+    if (binding_vote.inferred_view_id != -1) {
+        return binding_vote.inferred_view_id;
+    }
+    return cmdlist_view_id(state);
 }
 
 namespace {
@@ -10556,12 +13062,34 @@ static bool sn2_pso3069_slot_vectors_compatible(
     return true;
 }
 
+// Approach C — per-resource bucket-shadow substitution mode for pso3069.
+// Replaces the LEFT-snapshot model with a direct per-slot resource lookup:
+//   for each redirect slot, find the resource bound there, look up its bucket
+//   shadow, substitute the shadow's SRV. No LEFT snapshot needed.
+// Returns true if it bound a scratch table (caller skips the legacy mode-2 path).
+static bool sn2_begin_pso3069_bucket_shadow_table(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2CopyRectScratchScope& scope);
+
 static bool sn2_begin_pso3069_fog_scratch_table(
     ID3D12GraphicsCommandList* command_list,
     const CommandListCorrelationState& state,
     Sn2CopyRectScratchScope& scope)
 {
-    if (sn2_fog_srv_redirect_mode() != 2 ||
+    // Mode 3 = bucket-shadow substitution (Approach C continuation). Tried
+    // before falling through to the legacy LEFT-snapshot mode 2.
+    const int mode_now = sn2_fog_srv_redirect_mode();
+    if (mode_now == 3 &&
+        sn2_uwe_fog_mirror::env_alias_redirect_enabled())
+    {
+        if (sn2_begin_pso3069_bucket_shadow_table(command_list, state, scope)) {
+            return true;
+        }
+        // Fall through to mode 2 logic for draws where bucket-shadow didn't apply.
+    }
+
+    if ((mode_now != 2 && mode_now != 3) ||
         command_list == nullptr ||
         state.current_pso == nullptr ||
         state.last_graphics_root_desc_table0 == 0 ||
@@ -10584,7 +13112,7 @@ static bool sn2_begin_pso3069_fog_scratch_table(
 
     const uintptr_t pso = reinterpret_cast<uintptr_t>(state.current_pso);
     const uint32_t ps_crc = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(pso);
-    if (ps_crc != 0x166DBA88u) {
+    if (!sn2_fog_consumer_ps_crc_match(ps_crc)) {
         return false;
     }
 
@@ -10843,6 +13371,401 @@ static bool sn2_begin_pso3069_fog_scratch_table(
     return true;
 }
 
+// Bucket-shadow substitution body — implements mode 3.
+//
+// For each fog-relevant redirect slot of the right-eye pso3069 draw, look up
+// the resource bound at that slot, find its bucket shadow via
+// sn2_uwe_fog_mirror::find_bucket_shadow, and substitute the shadow's SRV.
+// Builds a scratch CBV/SRV/UAV table with 128 descriptors (64 for root[0] +
+// 64 for root[2]). Returns true if at least one slot was successfully patched.
+static bool sn2_begin_pso3069_bucket_shadow_table(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2CopyRectScratchScope& scope)
+{
+    if (command_list == nullptr ||
+        state.current_pso == nullptr ||
+        state.last_graphics_root_desc_table0 == 0 ||
+        tls_bindless_heap.heap == nullptr ||
+        tls_bindless_heap.cpu_base == 0 ||
+        tls_bindless_heap.gpu_base == 0 ||
+        tls_bindless_heap.stride == 0) {
+        return false;
+    }
+
+    // pso3069 only.
+    const uintptr_t pso = reinterpret_cast<uintptr_t>(state.current_pso);
+    const uint32_t ps_crc = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(pso);
+    if (!sn2_fog_consumer_ps_crc_match(ps_crc)) return false;
+    const int view_id = cmdlist_view_id(state);
+
+    // LEFT-eye path: populate the bucket shadow with the LEFT-bound resource's
+    // contents via CopyResource. This makes the shadow hold the LEFT-eye fog
+    // data so that when RIGHT-eye SRV redirect fires, it reads valid data
+    // (same LEFT-source-over-RIGHT semantics as mode 2 but via shadow).
+    //
+    // We DON'T bind a scratch table on LEFT eye — let LEFT draw normally.
+    // Returns false so the legacy mode 2 path won't run for LEFT either.
+    if (view_id == 0) {
+        const UINT redirect_root_lc = sn2_fog_srv_redirect_root();
+        if (!sn2_pso3069_scratch_root_supported(redirect_root_lc)) return false;
+        const uint64_t t0_lc = state.last_graphics_root_desc_table0;
+        const uint64_t t2_lc = state.last_graphics_root_desc_tables[2];
+        const uint64_t scan_table_lc = redirect_root_lc == 2 ? t2_lc : t0_lc;
+        if (scan_table_lc == 0) return false;
+        // Use the configured redirect_slots whitelist — wider 64-slot scan
+        // was crashing the NVIDIA driver via barrier-state mismatches.
+        const auto& slots_lc = sn2_fog_srv_redirect_slots();
+
+        // Light-rate-limited copy: copy at most once per (slot, shadow) pair
+        // per ~100ms to keep cost bounded.
+        static std::unordered_map<ID3D12Resource*, uint64_t> last_copy_tick;
+        // Per-shadow current state tracking — initial shadow state is
+        // UNORDERED_ACCESS (mirror creation); after first copy it ends in
+        // NON_PIXEL_SHADER_RESOURCE|PIXEL_SHADER_RESOURCE.
+        static std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> shadow_state;
+        // Per-game-resource current state tracking — start undefined; after
+        // first observation transitions track our own bookkeeping. Lossy but
+        // safer than assuming PIXEL_SHADER_RESOURCE every frame.
+        static std::unordered_set<ID3D12Resource*> seen_src;
+        static std::mutex copy_mu;
+        const uint64_t now = GetTickCount64();
+
+        for (UINT slot : slots_lc) {
+            const auto info = sn2_resolve_pso3069_slot(scan_table_lc, slot);
+            ID3D12Resource* src = info.resource;
+            if (src == nullptr) continue;
+            const auto* shadow = sn2_uwe_fog_mirror::find_bucket_shadow(src);
+            if (shadow == nullptr || shadow->resource == nullptr) continue;
+            if (src == shadow->resource.Get()) continue;  // sanity
+
+            // Skip if shape mismatch (CopyResource requires identical descs).
+            const auto src_desc = src->GetDesc();
+            const auto shd_desc = shadow->resource->GetDesc();
+            if (src_desc.Dimension != shd_desc.Dimension ||
+                src_desc.Width != shd_desc.Width ||
+                src_desc.Height != shd_desc.Height ||
+                src_desc.DepthOrArraySize != shd_desc.DepthOrArraySize ||
+                src_desc.Format != shd_desc.Format) {
+                continue;
+            }
+
+            {
+                std::scoped_lock _{copy_mu};
+                auto it = last_copy_tick.find(shadow->resource.Get());
+                if (it != last_copy_tick.end() && (now - it->second) < 100) continue;
+                last_copy_tick[shadow->resource.Get()] = now;
+            }
+
+            // Per-resource state tracking. Shadow starts in UAV state (mirror
+            // creation); after first round it's in SRR. Game resources are
+            // assumed in SRR state when sampled by basepass.
+            D3D12_RESOURCE_STATES shadow_before;
+            {
+                std::scoped_lock _{copy_mu};
+                auto it = shadow_state.find(shadow->resource.Get());
+                if (it == shadow_state.end()) {
+                    shadow_before = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                } else {
+                    shadow_before = it->second;
+                }
+            }
+            const D3D12_RESOURCE_STATES src_srv_state =
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+            // Only emit barriers when actually different. Avoids invalid
+            // same-state transitions that the validation layer rejects.
+            std::vector<D3D12_RESOURCE_BARRIER> pre_barriers;
+            pre_barriers.reserve(2);
+            if (src_srv_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+                D3D12_RESOURCE_BARRIER b{};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = src;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = src_srv_state;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                pre_barriers.push_back(b);
+            }
+            if (shadow_before != D3D12_RESOURCE_STATE_COPY_DEST) {
+                D3D12_RESOURCE_BARRIER b{};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = shadow->resource.Get();
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = shadow_before;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                pre_barriers.push_back(b);
+            }
+            if (!pre_barriers.empty()) {
+                command_list->ResourceBarrier(static_cast<UINT>(pre_barriers.size()), pre_barriers.data());
+            }
+
+            command_list->CopyResource(shadow->resource.Get(), src);
+
+            std::vector<D3D12_RESOURCE_BARRIER> post_barriers;
+            post_barriers.reserve(2);
+            {
+                D3D12_RESOURCE_BARRIER b{};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = src;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                b.Transition.StateAfter = src_srv_state;
+                post_barriers.push_back(b);
+            }
+            {
+                D3D12_RESOURCE_BARRIER b{};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = shadow->resource.Get();
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                b.Transition.StateAfter = src_srv_state;
+                post_barriers.push_back(b);
+            }
+            command_list->ResourceBarrier(static_cast<UINT>(post_barriers.size()), post_barriers.data());
+
+            // Track the shadow's new state for next iteration.
+            {
+                std::scoped_lock _{copy_mu};
+                shadow_state[shadow->resource.Get()] = src_srv_state;
+            }
+
+            static std::atomic<uint64_t> copy_seq{0};
+            const auto cn = copy_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (sn2_uwe_fog_mirror::env_alias_redirect_log_enabled() &&
+                (cn <= 32 || (cn % 600) == 0)) {
+                SPDLOG_WARN(
+                    "[SN2-BucketShadow-Copy] seq={} slot={} src={:p} shadow={:p} dim={}x{}x{} fmt={}",
+                    cn, slot, (void*)src, (void*)shadow->resource.Get(),
+                    static_cast<unsigned>(src_desc.Width),
+                    static_cast<unsigned>(src_desc.Height),
+                    static_cast<unsigned>(src_desc.DepthOrArraySize),
+                    static_cast<unsigned>(src_desc.Format));
+            }
+        }
+        return false;  // never bind scratch on LEFT eye
+    }
+
+    if (view_id != 1) return false;
+
+    const UINT redirect_root = sn2_fog_srv_redirect_root();
+    if (!sn2_pso3069_scratch_root_supported(redirect_root)) return false;
+
+    const uint64_t table0_gpu = state.last_graphics_root_desc_table0;
+    const uint64_t table2_gpu = state.last_graphics_root_desc_tables[2];
+    if (table0_gpu < tls_bindless_heap.gpu_base) return false;
+    if (table2_gpu != 0 && table2_gpu < tls_bindless_heap.gpu_base) return false;
+
+    const uint64_t heap_bytes =
+        static_cast<uint64_t>(tls_bindless_heap.num_descriptors) * tls_bindless_heap.stride;
+    const uint64_t table0_off = table0_gpu - tls_bindless_heap.gpu_base;
+    const uint64_t table2_off = table2_gpu != 0 ? table2_gpu - tls_bindless_heap.gpu_base : 0;
+    const uint64_t table_bytes = 64ull * tls_bindless_heap.stride;
+    if (table0_off + table_bytes > heap_bytes) return false;
+    if (table2_gpu != 0 && table2_off + table_bytes > heap_bytes) return false;
+
+    // Use configured slot whitelist (matches LEFT-eye copy path).
+    const auto& redirect_slots = sn2_fog_srv_redirect_slots();
+    if (redirect_slots.empty()) return false;
+
+    // Discover patchable slots: at each redirect slot, look up the bound
+    // resource, then find_bucket_shadow. Skip slots without a shadow.
+    struct ShadowPatch {
+        UINT slot;
+        D3D12_CPU_DESCRIPTOR_HANDLE shadow_srv;
+        ID3D12Resource* game_res;
+    };
+    constexpr UINT kMaxSlots = 64;
+    std::vector<ShadowPatch> patches;
+    patches.reserve(kMaxSlots);
+
+    // Pick the source table to scan based on redirect_root (0 or 2).
+    const uint64_t scan_table_off = redirect_root == 2 ? table2_off : table0_off;
+    if (redirect_root == 2 && table2_gpu == 0) return false;
+    const SIZE_T scan_cpu_base =
+        tls_bindless_heap.cpu_base + static_cast<SIZE_T>(scan_table_off);
+    const uint64_t scan_table_gpu = redirect_root == 2 ? table2_gpu : table0_gpu;
+
+    for (UINT slot : redirect_slots) {
+        // Use the same multi-path resolver mode 2 uses (handles cases where
+        // CPU-direct lookup misses but descriptor-hash / bindless-slot-map / diag hit).
+        const auto info = sn2_resolve_pso3069_slot(scan_table_gpu, slot);
+        ID3D12Resource* res = info.resource;
+        if (res == nullptr) continue;
+        const auto* shadow = sn2_uwe_fog_mirror::find_bucket_shadow(res);
+        if (shadow == nullptr) continue;
+        patches.push_back({slot, shadow->srv_cpu, res});
+    }
+
+    if (patches.empty()) {
+        static std::atomic<uint64_t> no_patches{0};
+        const auto n = no_patches.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 32 || (n % 600) == 0) {
+            if (sn2_uwe_fog_mirror::env_alias_redirect_log_enabled()) {
+                // For each redirect slot, log what resource is bound and its shape.
+                for (UINT slot : redirect_slots) {
+                    const auto info = sn2_resolve_pso3069_slot(scan_table_gpu, slot);
+                    ID3D12Resource* res = info.resource;
+                    if (res == nullptr) {
+                        SPDLOG_INFO(
+                            "[SN2-BucketShadow-NoMatch-Slot] seq={} slot={} res=NULL match={}",
+                            n, slot, info.descriptor_match);
+                        continue;
+                    }
+                    const auto desc = res->GetDesc();
+                    const bool has_shadow = sn2_uwe_fog_mirror::find_bucket_shadow(res) != nullptr;
+                    SPDLOG_INFO(
+                        "[SN2-BucketShadow-NoMatch-Slot] seq={} slot={} res={:p} dim={}x{}x{} fmt={} flags=0x{:x} dim_kind={} has_shadow={} match={}",
+                        n, slot, (void*)res,
+                        static_cast<unsigned>(desc.Width),
+                        static_cast<unsigned>(desc.Height),
+                        static_cast<unsigned>(desc.DepthOrArraySize),
+                        static_cast<unsigned>(desc.Format),
+                        static_cast<unsigned>(desc.Flags),
+                        static_cast<unsigned>(desc.Dimension),
+                        has_shadow ? 1 : 0,
+                        info.descriptor_match);
+                }
+                SPDLOG_INFO(
+                    "[SN2-BucketShadow-NoMatch] seq={} ps_crc=0x{:08x} table0_gpu=0x{:x} table2_gpu=0x{:x} redirect_root={} slots_checked={}",
+                    n, ps_crc, table0_gpu, table2_gpu, redirect_root, redirect_slots.size());
+            }
+        }
+        return false;
+    }
+
+    auto* d3d12 = g_d3d12_hook;
+    ID3D12Device* device = d3d12 != nullptr ? d3d12->get_device() : nullptr;
+    if (device == nullptr) return false;
+
+    ID3D12DescriptorHeap* scratch_heap = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE scratch_cpu{};
+    D3D12_GPU_DESCRIPTOR_HANDLE scratch_gpu{};
+    if (!sn2_copyrect_scratch_heap::allocate(
+            device,
+            &scratch_heap,
+            &scratch_cpu,
+            &scratch_gpu,
+            sn2_copyrect_scratch_heap::k_pso3069_fog_descriptor_count) ||
+        scratch_heap == nullptr ||
+        scratch_cpu.ptr == 0 ||
+        scratch_gpu.ptr == 0) {
+        return false;
+    }
+
+    const SIZE_T stride = tls_bindless_heap.stride;
+
+    // Copy game's root[0] (64 descriptors).
+    D3D12_CPU_DESCRIPTOR_HANDLE table0_cpu{
+        static_cast<SIZE_T>(tls_bindless_heap.cpu_base + table0_off)};
+    device->CopyDescriptorsSimple(
+        64, scratch_cpu, table0_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    // Copy game's root[2] (64 more) if present.
+    if (table2_gpu != 0) {
+        D3D12_CPU_DESCRIPTOR_HANDLE table2_cpu{
+            static_cast<SIZE_T>(tls_bindless_heap.cpu_base + table2_off)};
+        D3D12_CPU_DESCRIPTOR_HANDLE scratch_table2_cpu{
+            scratch_cpu.ptr + static_cast<SIZE_T>(64ull * stride)};
+        device->CopyDescriptorsSimple(
+            64, scratch_table2_cpu, table2_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+
+    // DEBUG RED MODE: clear each shadow with bright red before binding so we
+    // can VERIFY the redirect actually reaches visible pixels. If right eye
+    // turns red anywhere fog samples are taken, the mechanism is correct and
+    // we just need real data in the shadow.
+    const bool debug_red = env_flag_enabled_a("UEVR_SN2_FOG_DEBUG_RED");
+    if (debug_red) {
+        for (const auto& patch : patches) {
+            // Find the Mirror struct for this resource to get the UAV CPU/GPU.
+            const auto* shadow_mirror = sn2_uwe_fog_mirror::find_bucket_shadow(patch.game_res);
+            if (shadow_mirror == nullptr || shadow_mirror->resource == nullptr) continue;
+            // Transition shadow: NON_PIXEL_SHADER_RESOURCE → UNORDERED_ACCESS,
+            // ClearUAV, then back to NON_PIXEL_SHADER_RESOURCE for SRV read.
+            D3D12_RESOURCE_BARRIER to_uav{};
+            to_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            to_uav.Transition.pResource = shadow_mirror->resource.Get();
+            to_uav.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            to_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            to_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            command_list->ResourceBarrier(1, &to_uav);
+
+            const float red[4] = {10.0f, 0.0f, 0.0f, 1.0f};
+            command_list->ClearUnorderedAccessViewFloat(
+                shadow_mirror->uav_gpu,
+                shadow_mirror->uav_cpu,
+                shadow_mirror->resource.Get(),
+                red, 0, nullptr);
+
+            D3D12_RESOURCE_BARRIER to_srv{};
+            to_srv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            to_srv.Transition.pResource = shadow_mirror->resource.Get();
+            to_srv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            to_srv.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            command_list->ResourceBarrier(1, &to_srv);
+        }
+    }
+
+    // Patch each tracked slot with its bucket-shadow SRV.
+    for (const auto& patch : patches) {
+        const uint64_t scratch_slot = sn2_pso3069_scratch_table_base_slot(redirect_root) + patch.slot;
+        D3D12_CPU_DESCRIPTOR_HANDLE dst{
+            scratch_cpu.ptr + static_cast<SIZE_T>(scratch_slot * stride)};
+        device->CopyDescriptorsSimple(1, dst, patch.shadow_srv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+
+    scope.active = true;
+    scope.command_list = command_list;
+    scope.restore_cbv_srv_uav_heap = tls_bindless_heap.heap;
+    scope.restore_sampler_heap = tls_sampler_heap.heap;
+    scope.restore_graphics_tables = state.last_graphics_root_desc_tables;
+    scope.active_redirect_root = redirect_root;
+    scope.active_graphics_table0 = static_cast<uint64_t>(scratch_gpu.ptr);
+    scope.active_graphics_table2 = table2_gpu != 0 ? static_cast<uint64_t>(scratch_gpu.ptr + 64ull * stride) : 0;
+
+    ID3D12DescriptorHeap* heaps[2]{scratch_heap, tls_sampler_heap.heap};
+    UINT heap_count = tls_sampler_heap.heap != nullptr ? 2u : 1u;
+
+    ++g_sn2_descriptor_table_rebind_depth;
+    command_list->SetDescriptorHeaps(heap_count, heaps);
+    command_list->SetGraphicsRootDescriptorTable(0, scratch_gpu);
+    if (state.last_graphics_root_desc_tables[1] != 0) {
+        D3D12_GPU_DESCRIPTOR_HANDLE sampler0{};
+        sampler0.ptr = static_cast<UINT64>(state.last_graphics_root_desc_tables[1]);
+        command_list->SetGraphicsRootDescriptorTable(1, sampler0);
+    }
+    if (table2_gpu != 0) {
+        D3D12_GPU_DESCRIPTOR_HANDLE scratch_table2_gpu{};
+        scratch_table2_gpu.ptr = scratch_gpu.ptr + 64ull * stride;
+        command_list->SetGraphicsRootDescriptorTable(2, scratch_table2_gpu);
+    }
+    if (state.last_graphics_root_desc_tables[3] != 0) {
+        D3D12_GPU_DESCRIPTOR_HANDLE sampler1{};
+        sampler1.ptr = static_cast<UINT64>(state.last_graphics_root_desc_tables[3]);
+        command_list->SetGraphicsRootDescriptorTable(3, sampler1);
+    }
+    --g_sn2_descriptor_table_rebind_depth;
+
+    static std::atomic<uint64_t> bs_seq{0};
+    const auto n = bs_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 64 || (n % 300) == 0) {
+        SPDLOG_WARN(
+            "[SN2-BucketShadow] right pso3069 scratch root={} table0=0x{:x}->0x{:x} table2=0x{:x} patches={} count={}",
+            redirect_root, table0_gpu, static_cast<uint64_t>(scratch_gpu.ptr),
+            table2_gpu, patches.size(), n);
+        for (const auto& patch : patches) {
+            SPDLOG_WARN(
+                "[SN2-BucketShadow-Slot] slot={} game_res={:p} shadow_srv=0x{:x}",
+                patch.slot, (void*)patch.game_res,
+                static_cast<uint64_t>(patch.shadow_srv.ptr));
+        }
+    }
+
+    return true;
+}
+
 struct Sn2WaterChainRedirectSpec {
     uint32_t ps_crc{};
     const char* name{};
@@ -10855,9 +13778,17 @@ struct Sn2WaterChainRedirectSpec {
 };
 
 static const Sn2WaterChainRedirectSpec* sn2_water_chain_redirect_spec(uint32_t ps_crc) {
-    static constexpr UINT slots_pso3069[] = {8, 9};
+    // pso3069 reads the same sparse-volume pair that later overlay passes
+    // consume, plus the shared VBuffer pair at t8/t9. Redirect all four
+    // right-eye inputs as one unit; redirecting only t8/t9 leaves the sparse
+    // page/atlas path on the right-eye resources.
+    static constexpr UINT slots_pso3069[] = {6, 7, 8, 9};
     static constexpr UINT slots_8733f2e0[] = {7, 8};
-    static constexpr UINT slots_fedc00f9[] = {9, 10};
+    // OverlayB has the shared VBuffer pair at t9/t10, plus two additional
+    // per-eye inputs at t7/t8 in the Nsight 2025 capture. Leaving t7/t8 on the
+    // right-eye resources can preserve the white/desert layer even when the
+    // common VBuffer pair is redirected.
+    static constexpr UINT slots_fedc00f9[] = {7, 8, 9, 10};
     static constexpr UINT slots_8568e000[] = {5};
     static constexpr UINT slots_4a4eb78c[] = {3, 4};
 
@@ -10891,6 +13822,75 @@ static std::string sn2_uint_list_label(const UINT* values, size_t count) {
         label += std::to_string(values[i]);
     }
     return label.empty() ? "(none)" : label;
+}
+
+static UINT sn2_water_chain_pixel_cbv_root_base(uint32_t ps_crc) {
+    // RS 198 (OverlayA/B) and RS 273 (OverlayD) place pixel cb0 at root 5
+    // because root 2 is a Pixel UAV table and roots 3/4 are vertex tables.
+    // RS 217 (pso3069) and RS 232 (OverlayC) place pixel cb0 at root 4.
+    switch (ps_crc) {
+    case 0x8733F2E0u:
+    case 0xFEDC00F9u:
+    case 0x4A4EB78Cu:
+        return 5;
+    default:
+        return 4;
+    }
+}
+
+static bool sn2_should_skip_water_chain_draw(
+    const CommandListCorrelationState& state,
+    const char* draw_kind)
+{
+    if (!sn2_water_chain_skip_enabled() || state.current_pso == nullptr) {
+        return false;
+    }
+
+    const uintptr_t pso = reinterpret_cast<uintptr_t>(state.current_pso);
+    const uint32_t ps_crc = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(pso);
+    const auto* spec = sn2_water_chain_redirect_spec(ps_crc);
+    if (spec == nullptr) {
+        return false;
+    }
+
+    const auto& filter = sn2_water_chain_skip_pso_filter();
+    if (!filter.all && filter.psos.find(ps_crc) == filter.psos.end()) {
+        return false;
+    }
+
+    const int view_id = cmdlist_view_id(state);
+    const int eye_filter = sn2_water_chain_skip_eye_filter();
+    if (eye_filter >= 0 && view_id != eye_filter) {
+        return false;
+    }
+    const uint64_t ordinal = sn2_water_chain_next_ordinal(ps_crc, view_id);
+    const auto& ordinals = sn2_water_chain_skip_ordinals();
+    if (!ordinals.empty() && ordinals.find(static_cast<uint32_t>(ordinal)) == ordinals.end()) {
+        return false;
+    }
+
+    static std::atomic<uint64_t> seq{0};
+    const auto n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int max_rows = sn2_water_chain_skip_log_max_rows();
+    if (max_rows <= 0 || n <= static_cast<uint64_t>(max_rows) || (n % 300) == 0) {
+        SPDLOG_WARN(
+            "[SN2-WaterChainSkip] seq={} ordinal={} name={} kind={} eye={} view_id={} ps_crc=0x{:08x} "
+            "pso={:p} vp=({:.1f},{:.1f},{:.1f},{:.1f}) rtv0=0x{:x}",
+            n,
+            ordinal,
+            spec->name,
+            draw_kind != nullptr ? draw_kind : "(unknown)",
+            sn2_eye_name(view_id, state.last_viewport_bucket),
+            view_id,
+            ps_crc,
+            state.current_pso,
+            state.viewport_top_left_x,
+            state.viewport_top_left_y,
+            state.viewport_width,
+            state.viewport_height,
+            state.last_rtv0_handle);
+    }
+    return true;
 }
 
 static bool sn2_root_table_range_in_bindless_heap(uint64_t table_gpu, UINT descriptor_count = 64) {
@@ -11127,12 +14127,20 @@ static bool sn2_begin_water_chain_scratch_table(
     scope.restore_cbv_srv_uav_heap = tls_bindless_heap.heap;
     scope.restore_sampler_heap = tls_sampler_heap.heap;
     scope.restore_graphics_tables = state.last_graphics_root_desc_tables;
+    scope.active_graphics_tables = state.last_graphics_root_desc_tables;
     scope.active_redirect_root = 0;
     scope.active_graphics_table0 = static_cast<uint64_t>(scratch_gpu.ptr);
     scope.active_graphics_table2 =
         spec->cbv_srv_uav_table_root_count > 1
             ? static_cast<uint64_t>(scratch_gpu.ptr + 64ull * stride)
             : 0;
+    for (size_t i = 0; i < spec->cbv_srv_uav_table_root_count; ++i) {
+        const UINT root = spec->cbv_srv_uav_table_roots[i];
+        if (root < scope.active_graphics_tables.size()) {
+            scope.active_graphics_tables[root] =
+                static_cast<uint64_t>(scratch_gpu.ptr + 64ull * i * stride);
+        }
+    }
 
     ID3D12DescriptorHeap* heaps[2]{scratch_heap, tls_sampler_heap.heap};
     UINT heap_count = tls_sampler_heap.heap != nullptr ? 2u : 1u;
@@ -11311,6 +14319,7 @@ static bool sn2_begin_water_chain_cbv_override(
         }
 
         scope.restore_cbvs[i] = restore_cbvs[i];
+        scope.active_cbvs[i] = replacement_cbvs[i];
         scope.restore_root[i] = true;
         command_list->SetGraphicsRootConstantBufferView(i, replacement_cbvs[i]);
     }
@@ -11345,6 +14354,255 @@ static bool sn2_begin_water_chain_cbv_override(
     return true;
 }
 
+static bool sn2_begin_water_chain_viewcb_patch(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2Pso3069CbvScope& scope)
+{
+    const int mode = sn2_water_chain_viewcb_patch_mode();
+    if (mode == 0 ||
+        command_list == nullptr ||
+        state.current_pso == nullptr ||
+        !sn2_water_chain_viewcb_patch_marker_ready() ||
+        g_sn2_water_chain_cbv_rebind_depth != 0) {
+        return false;
+    }
+
+    static constexpr size_t k_view_cb_size = 10240;
+    static constexpr UINT k_view_rect_row = 148;
+    static constexpr UINT k_buffer_scale_row = 151;
+    static constexpr size_t k_view_rect_off = static_cast<size_t>(k_view_rect_row) * 16u;
+    static constexpr size_t k_buffer_scale_off = static_cast<size_t>(k_buffer_scale_row) * 16u;
+    static constexpr size_t k_min_left_read = k_buffer_scale_off + 16u;
+
+    const uintptr_t pso = reinterpret_cast<uintptr_t>(state.current_pso);
+    const uint32_t ps_crc = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(pso);
+    const auto* spec = sn2_water_chain_redirect_spec(ps_crc);
+    const char* name = spec != nullptr ? spec->name : "Water.UnknownPipelineStream";
+
+    const auto plausible_view_cbv = [](D3D12_GPU_VIRTUAL_ADDRESS va) -> bool {
+        if (va == 0) {
+            return false;
+        }
+        uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, k_view_cb_size);
+        if (cpu == nullptr) {
+            return false;
+        }
+
+        float row148[4]{};
+        float row151[4]{};
+        std::memcpy(row148, cpu + k_view_rect_off, sizeof(row148));
+        std::memcpy(row151, cpu + k_buffer_scale_off, sizeof(row151));
+
+        const auto sane = [](float v, float min_v, float max_v) {
+            return v == v && v >= min_v && v <= max_v;
+        };
+        return sane(row148[0], -16384.0f, 16384.0f) &&
+            sane(row148[1], -16384.0f, 16384.0f) &&
+            sane(row151[2], 0.0f, 16.0f) &&
+            sane(row151[3], 0.0f, 16.0f) &&
+            (row151[2] > 0.0f || row151[3] > 0.0f);
+    };
+
+    UINT cb_root = UINT_MAX;
+    if (spec != nullptr) {
+        cb_root = sn2_water_chain_pixel_cbv_root_base(ps_crc);
+    } else {
+        // Pipeline-stream PSOs can be invisible to the shader registry in SN2.
+        // In that case, restrict the fallback to water-context draws and find
+        // the first root CBV that looks like a full FViewUniformShaderParameters
+        // upload buffer. This keeps the patch tied to the same draw family as
+        // the water-candidate logger without relying on PS CRC availability.
+        if (g_subnautica2_water_context_id.load(std::memory_order_relaxed) == 0) {
+            return false;
+        }
+        static constexpr UINT fallback_roots[] = {4, 5, 6, 7};
+        for (const UINT root : fallback_roots) {
+            if (root < state.last_graphics_root_cbv.size() &&
+                plausible_view_cbv(static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(state.last_graphics_root_cbv[root]))) {
+                cb_root = root;
+                break;
+            }
+        }
+    }
+
+    if (cb_root == UINT_MAX || cb_root >= state.last_graphics_root_cbv.size()) {
+        return false;
+    }
+
+    const uint64_t class_key = ps_crc != 0
+        ? static_cast<uint64_t>(ps_crc)
+        : (0x8000000000000000ull ^ static_cast<uint64_t>(pso) ^ (static_cast<uint64_t>(cb_root) << 56));
+
+    struct LeftViewRowsSnapshot {
+        std::array<uint8_t, 16> row148{};
+        std::array<uint8_t, 16> row151{};
+        uint64_t source_va{};
+        uint64_t seq{};
+        bool valid{};
+    };
+    struct RightPatchLimiter {
+        uint64_t total{};
+        uint64_t frame{};
+        uint64_t frame_count{};
+    };
+
+    static std::mutex s_mutex;
+    static std::unordered_map<uint64_t, LeftViewRowsSnapshot> s_left_by_key{};
+    static std::unordered_map<uint64_t, RightPatchLimiter> s_right_limiter_by_key{};
+    static std::atomic<uint64_t> s_left_seq{0};
+    static std::atomic<uint64_t> s_apply_count{0};
+    static std::atomic<uint64_t> s_fail_count{0};
+
+    const int view_id = cmdlist_view_id(state);
+    const auto cb_va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(state.last_graphics_root_cbv[cb_root]);
+    if (cb_va == 0) {
+        return false;
+    }
+
+    if (view_id == 0) {
+        uint8_t* left_cpu = sn2_upload_buf_map::gpu_va_to_cpu(cb_va, k_min_left_read);
+        if (left_cpu == nullptr) {
+            return false;
+        }
+
+        LeftViewRowsSnapshot snap{};
+        std::memcpy(snap.row148.data(), left_cpu + k_view_rect_off, snap.row148.size());
+        std::memcpy(snap.row151.data(), left_cpu + k_buffer_scale_off, snap.row151.size());
+        snap.source_va = cb_va;
+        snap.seq = s_left_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        snap.valid = true;
+
+        std::scoped_lock _{s_mutex};
+        s_left_by_key[class_key] = snap;
+        return false;
+    }
+
+    if (view_id != 1) {
+        return false;
+    }
+
+    LeftViewRowsSnapshot left{};
+    if (mode != 3) {
+        std::scoped_lock _{s_mutex};
+        const auto it = s_left_by_key.find(class_key);
+        if (it == s_left_by_key.end() || !it->second.valid) {
+            return false;
+        }
+        left = it->second;
+    }
+
+    const int max_total = sn2_water_chain_viewcb_patch_max_total();
+    const int max_per_frame_per_pso = sn2_water_chain_viewcb_patch_max_per_frame_per_pso();
+    const uint64_t cur_frame = sn2_draw_log_v2::current_frame();
+    {
+        std::scoped_lock _{s_mutex};
+        auto& limiter = s_right_limiter_by_key[class_key];
+        if (max_per_frame_per_pso > 0 && limiter.frame != cur_frame) {
+            limiter.frame = cur_frame;
+            limiter.frame_count = 0;
+        }
+        if (max_total > 0 && limiter.total >= static_cast<uint64_t>(max_total)) {
+            return false;
+        }
+        if (max_per_frame_per_pso > 0 && limiter.frame_count >= static_cast<uint64_t>(max_per_frame_per_pso)) {
+            return false;
+        }
+        ++limiter.total;
+        ++limiter.frame_count;
+    }
+
+    uint8_t* right_cpu = sn2_upload_buf_map::gpu_va_to_cpu(cb_va, k_view_cb_size);
+    if (right_cpu == nullptr) {
+        const auto fc = s_fail_count.fetch_add(1, std::memory_order_relaxed);
+        if (fc < 16 || (fc % 300) == 0) {
+            SPDLOG_WARN(
+                "[SN2-WaterViewCB] right name={} ps_crc=0x{:08x} root={} va=0x{:x} mode={} no CPU mapping for {} bytes fail_count={}",
+                name,
+                ps_crc,
+                cb_root,
+                static_cast<uint64_t>(cb_va),
+                mode,
+                k_view_cb_size,
+                fc + 1);
+        }
+        return false;
+    }
+
+    std::vector<uint8_t> patched(k_view_cb_size);
+    std::memcpy(patched.data(), right_cpu, patched.size());
+
+    if (mode == 1 || mode == 2) {
+        std::memcpy(patched.data() + k_view_rect_off, left.row148.data(), left.row148.size());
+    }
+    if (mode == 1) {
+        std::memcpy(patched.data() + k_buffer_scale_off, left.row151.data(), left.row151.size());
+    }
+    if (mode == 3) {
+        float zero_xy[2]{0.0f, 0.0f};
+        std::memcpy(patched.data() + k_view_rect_off, zero_xy, sizeof(zero_xy));
+    }
+
+    auto* d3d12 = g_d3d12_hook;
+    ID3D12Device* device = d3d12 != nullptr ? d3d12->get_device() : nullptr;
+    if (device == nullptr) {
+        return false;
+    }
+
+    const auto n = s_apply_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const std::string upload_name = fmt::format(
+        "sn2_water_viewcb_patch_{:016x}_{}_{}",
+        class_key,
+        cur_frame,
+        n);
+    const auto patched_va = bind_override_uploads::get_or_create(device, upload_name, patched);
+    if (patched_va == 0) {
+        return false;
+    }
+
+    scope.active = true;
+    scope.command_list = command_list;
+    scope.restore_cbvs[cb_root] = cb_va;
+    scope.active_cbvs[cb_root] = patched_va;
+    scope.restore_root[cb_root] = true;
+
+    ++g_sn2_water_chain_cbv_rebind_depth;
+    command_list->SetGraphicsRootConstantBufferView(cb_root, patched_va);
+    --g_sn2_water_chain_cbv_rebind_depth;
+
+    if (n <= 96 || (n % 300) == 0) {
+        const auto read_floats = [](const uint8_t* ptr) {
+            std::array<float, 4> out{};
+            std::memcpy(out.data(), ptr, sizeof(float) * out.size());
+            return out;
+        };
+        const auto r148_before = read_floats(right_cpu + k_view_rect_off);
+        const auto r151_before = read_floats(right_cpu + k_buffer_scale_off);
+        const auto r148_after = read_floats(patched.data() + k_view_rect_off);
+        const auto r151_after = read_floats(patched.data() + k_buffer_scale_off);
+        SPDLOG_WARN(
+            "[SN2-WaterViewCB] right name={} ps_crc=0x{:08x} root={} mode={} "
+            "cb=0x{:x}->0x{:x} left_cb=0x{:x} left_seq={} count={} "
+            "row148 ({:.3f},{:.3f},{:.3f},{:.3f})->({:.3f},{:.3f},{:.3f},{:.3f}) "
+            "row151 ({:.6f},{:.6f},{:.6f},{:.6f})->({:.6f},{:.6f},{:.6f},{:.6f})",
+            name,
+            ps_crc,
+            cb_root,
+            mode,
+            static_cast<uint64_t>(cb_va),
+            static_cast<uint64_t>(patched_va),
+            left.source_va,
+            left.seq,
+            n,
+            r148_before[0], r148_before[1], r148_before[2], r148_before[3],
+            r148_after[0], r148_after[1], r148_after[2], r148_after[3],
+            r151_before[0], r151_before[1], r151_before[2], r151_before[3],
+            r151_after[0], r151_after[1], r151_after[2], r151_after[3]);
+    }
+
+    return true;
+}
+
 static bool sn2_begin_pso3069_cbv_override(
     ID3D12GraphicsCommandList* command_list,
     const CommandListCorrelationState& state,
@@ -11359,7 +14617,7 @@ static bool sn2_begin_pso3069_cbv_override(
 
     const uintptr_t pso = reinterpret_cast<uintptr_t>(state.current_pso);
     const uint32_t ps_crc = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(pso);
-    if (ps_crc != 0x166DBA88u) {
+    if (!sn2_fog_consumer_ps_crc_match(ps_crc)) {
         return false;
     }
 
@@ -11418,6 +14676,7 @@ static bool sn2_begin_pso3069_cbv_override(
         }
 
         scope.restore_cbvs[i] = right_va;
+        scope.active_cbvs[i] = left_va;
         scope.restore_root[i] = true;
         command_list->SetGraphicsRootConstantBufferView(i, left_va);
         any = true;
@@ -11487,6 +14746,311 @@ static const char* sn2_pso3069_semantic_slot_name(UINT root, UINT slot) {
     return "unknown";
 }
 
+static const char* sn2_water_chain_semantic_slot_name(uint32_t ps_crc, UINT root, UINT slot) {
+    if (ps_crc == 0x166DBA88u) {
+        return sn2_pso3069_semantic_slot_name(root, slot);
+    }
+    if (root != 0) {
+        return "unknown";
+    }
+    switch (ps_crc) {
+    case 0x8733F2E0u:
+        switch (slot) {
+        case 1: return "SkyAtmosLUT_A";
+        case 2: return "SkyAtmosLUT_B";
+        case 3: return "IntegratedLightScattering_0";
+        case 4: return "IntegratedLightScattering_1";
+        case 5: return "IntegratedLightScattering_2";
+        case 6: return "IntegratedLightScattering_3";
+        case 7: return "VBufferA_PerEye";
+        case 8: return "VBufferB_PerEye";
+        default: return "OverlayA_Other";
+        }
+    case 0xFEDC00F9u:
+        switch (slot) {
+        case 1: return "SkyAtmosLUT_A";
+        case 2: return "SkyAtmosLUT_B";
+        case 3: return "IntegratedLightScattering_0";
+        case 4: return "IntegratedLightScattering_1";
+        case 5: return "IntegratedLightScattering_2";
+        case 6: return "IntegratedLightScattering_3";
+        case 7: return "VSMPageTable_PerEye";
+        case 8: return "SkySceneLUT_PerEye";
+        case 9: return "VBufferA_PerEye";
+        case 10: return "VBufferB_PerEye";
+        default: return "OverlayB_Other";
+        }
+    case 0x8568E000u:
+        switch (slot) {
+        case 0: return "SkyAtmosLUT_A";
+        case 1: return "SkyAtmosLUT_B";
+        case 2: return "SceneDepth";
+        case 3: return "IntegratedLightScattering_0";
+        case 4: return "IntegratedLightScattering_1";
+        case 5: return "VBufferA_PerEye";
+        default: return "OverlayC_Other";
+        }
+    case 0x4A4EB78Cu:
+        switch (slot) {
+        case 1: return "SkyAtmosLUT_A";
+        case 2: return "SkyAtmosLUT_B";
+        case 3: return "VBufferA_PerEye";
+        case 4: return "VBufferB_PerEye";
+        default: return "OverlayD_Other";
+        }
+    default:
+        return "unknown";
+    }
+}
+
+static bool sn2_water_chain_state_matches_capture_filter(
+    const CommandListCorrelationState& state,
+    uint32_t* out_ps_crc,
+    const Sn2WaterChainRedirectSpec** out_spec,
+    int* out_view_id)
+{
+    if (state.current_pso == nullptr) {
+        return false;
+    }
+    const uintptr_t pso = reinterpret_cast<uintptr_t>(state.current_pso);
+    const uint32_t ps_crc = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(pso);
+    const auto* spec = sn2_water_chain_redirect_spec(ps_crc);
+    if (spec == nullptr) {
+        return false;
+    }
+    const int view_id = cmdlist_view_id(state);
+    if (out_ps_crc != nullptr) {
+        *out_ps_crc = ps_crc;
+    }
+    if (out_spec != nullptr) {
+        *out_spec = spec;
+    }
+    if (out_view_id != nullptr) {
+        *out_view_id = view_id;
+    }
+    return true;
+}
+
+static uint64_t sn2_water_chain_rt_diff_pair_id(
+    const CommandListCorrelationState& state,
+    const char* draw_kind)
+{
+    if (!sn2_water_chain_rt_diff_enabled() || !sn2_rt_snapshot::initialized()) {
+        return 0;
+    }
+
+    uint32_t ps_crc = 0;
+    const Sn2WaterChainRedirectSpec* spec = nullptr;
+    int view_id = -1;
+    if (!sn2_water_chain_state_matches_capture_filter(state, &ps_crc, &spec, &view_id) ||
+        !sn2_water_chain_rt_diff_pso_allowed(ps_crc)) {
+        return 0;
+    }
+
+    const int eye_filter = sn2_water_chain_rt_diff_eye_filter();
+    if (eye_filter >= 0 && view_id != eye_filter) {
+        return 0;
+    }
+
+    static std::mutex s_mutex;
+    static uint64_t s_frame = UINT64_MAX;
+    static std::unordered_map<std::string, uint64_t> s_ordinals;
+    static uint64_t s_pairs = 0;
+
+    const uint64_t frame = sn2_draw_log_v2::current_frame();
+    const std::string key = fmt::format("{:08x}:{}", ps_crc, view_id);
+    uint64_t ordinal = 0;
+    uint64_t pair = 0;
+    {
+        std::scoped_lock _{s_mutex};
+        if (s_frame != frame) {
+            s_frame = frame;
+            s_ordinals.clear();
+        }
+        ordinal = ++s_ordinals[key];
+        const int ordinal_filter = sn2_water_chain_rt_diff_ordinal_filter();
+        if (ordinal_filter > 0 && ordinal != static_cast<uint64_t>(ordinal_filter)) {
+            return 0;
+        }
+        const int max_pairs = sn2_water_chain_rt_diff_max_captures();
+        if (max_pairs > 0 && s_pairs >= static_cast<uint64_t>(max_pairs)) {
+            return 0;
+        }
+        pair = ++s_pairs;
+    }
+
+    SPDLOG_WARN(
+        "[SN2-WaterRTDiff] armed pair={} ordinal={} frame={} name={} kind={} eye={} view_id={} ps_crc=0x{:08x} rtv0=0x{:x}",
+        pair,
+        ordinal,
+        frame,
+        spec != nullptr ? spec->name : "(unknown)",
+        draw_kind != nullptr ? draw_kind : "(unknown)",
+        sn2_eye_name(view_id, state.last_viewport_bucket),
+        view_id,
+        ps_crc,
+        state.last_rtv0_handle);
+    return pair;
+}
+
+static void sn2_capture_water_chain_rtv_phase(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    uint64_t pair_id,
+    const char* phase)
+{
+    if (pair_id == 0 || command_list == nullptr || state.last_rtv0_handle == 0) {
+        return;
+    }
+    uint32_t ps_crc = 0;
+    const Sn2WaterChainRedirectSpec* spec = nullptr;
+    int view_id = -1;
+    if (!sn2_water_chain_state_matches_capture_filter(state, &ps_crc, &spec, &view_id)) {
+        return;
+    }
+    ID3D12Resource* rtv_res = sn2_rt_snapshot::lookup_rtv(state.last_rtv0_handle);
+    if (rtv_res == nullptr) {
+        return;
+    }
+    const char eye = view_id == 0 ? 'L' : (view_id == 1 ? 'R' : 'U');
+    char tag[64]{};
+    std::snprintf(
+        tag,
+        sizeof(tag),
+        "WRT-%08x-%c-p%llu-%s",
+        ps_crc,
+        eye,
+        static_cast<unsigned long long>(pair_id),
+        phase != nullptr ? phase : "?");
+    const auto slot = sn2_rt_snapshot::schedule_capture(
+        command_list,
+        rtv_res,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        tag);
+    SPDLOG_WARN(
+        "[SN2-WaterRTDiff] pair={} phase={} slot={} name={} eye={} view_id={} ps_crc=0x{:08x} tag={} rtv0=0x{:x}",
+        pair_id,
+        phase != nullptr ? phase : "?",
+        slot == UINT64_MAX ? -1 : static_cast<int64_t>(slot),
+        spec != nullptr ? spec->name : "(unknown)",
+        sn2_eye_name(view_id, state.last_viewport_bucket),
+        view_id,
+        ps_crc,
+        tag,
+        state.last_rtv0_handle);
+}
+
+static void sn2_capture_water_chain_inputs(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    const Sn2CopyRectScratchScope* water_chain_scope)
+{
+    if (!sn2_water_chain_input_dump_enabled() ||
+        !sn2_rt_snapshot::initialized() ||
+        command_list == nullptr) {
+        return;
+    }
+
+    uint32_t ps_crc = 0;
+    const Sn2WaterChainRedirectSpec* spec = nullptr;
+    int view_id = -1;
+    if (!sn2_water_chain_state_matches_capture_filter(state, &ps_crc, &spec, &view_id) ||
+        !sn2_water_chain_input_dump_pso_allowed(ps_crc)) {
+        return;
+    }
+    const int eye_filter = sn2_water_chain_input_dump_eye_filter();
+    if (eye_filter >= 0 && view_id != eye_filter) {
+        return;
+    }
+
+    static std::mutex s_mutex;
+    static uint64_t s_frame = UINT64_MAX;
+    static std::unordered_map<std::string, uint64_t> s_ordinals;
+    static uint64_t s_captures = 0;
+
+    const uint64_t frame = sn2_draw_log_v2::current_frame();
+    const std::string key = fmt::format("{:08x}:{}", ps_crc, view_id);
+    uint64_t ordinal = 0;
+    {
+        std::scoped_lock _{s_mutex};
+        if (s_frame != frame) {
+            s_frame = frame;
+            s_ordinals.clear();
+        }
+        ordinal = ++s_ordinals[key];
+        const int ordinal_filter = sn2_water_chain_input_dump_ordinal_filter();
+        if (ordinal_filter > 0 && ordinal != static_cast<uint64_t>(ordinal_filter)) {
+            return;
+        }
+    }
+
+    const uint64_t root0 =
+        water_chain_scope != nullptr &&
+        water_chain_scope->active &&
+        !water_chain_scope->active_graphics_tables.empty() &&
+        water_chain_scope->active_graphics_tables[0] != 0
+            ? water_chain_scope->active_graphics_tables[0]
+            : sn2_graphics_root_table_gpu(state, 0);
+    if (root0 == 0) {
+        return;
+    }
+
+    const char eye = view_id == 0 ? 'L' : (view_id == 1 ? 'R' : 'U');
+    for (size_t i = 0; i < spec->slot_count; ++i) {
+        const UINT slot = spec->slots[i];
+        const auto info = sn2_resolve_pso3069_slot(root0, slot);
+        if (info.resource == nullptr ||
+            (info.dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+             info.dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)) {
+            continue;
+        }
+
+        uint64_t capture_index = 0;
+        {
+            std::scoped_lock _{s_mutex};
+            const int max_captures = sn2_water_chain_input_dump_max_captures();
+            if (max_captures > 0 && s_captures >= static_cast<uint64_t>(max_captures)) {
+                return;
+            }
+            capture_index = ++s_captures;
+        }
+
+        char tag[64]{};
+        std::snprintf(
+            tag,
+            sizeof(tag),
+            "WIN-%08x-%c-s%u-n%llu",
+            ps_crc,
+            eye,
+            slot,
+            static_cast<unsigned long long>(capture_index));
+        const auto snap_slot = sn2_rt_snapshot::schedule_capture(
+            command_list,
+            info.resource,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            tag);
+        SPDLOG_WARN(
+            "[SN2-WaterInputDump] capture={} ordinal={} snap_slot={} name={} eye={} view_id={} ps_crc=0x{:08x} "
+            "bind=t{} semantic={} res={:p} dim={} size={}x{}x{} hash=0x{:016x} tag={}",
+            capture_index,
+            ordinal,
+            snap_slot == UINT64_MAX ? -1 : static_cast<int64_t>(snap_slot),
+            spec->name,
+            sn2_eye_name(view_id, state.last_viewport_bucket),
+            view_id,
+            ps_crc,
+            slot,
+            sn2_water_chain_semantic_slot_name(ps_crc, 0, slot),
+            static_cast<void*>(info.resource),
+            static_cast<int>(info.dimension),
+            info.width,
+            info.height,
+            info.depth_or_array,
+            info.desc_hash,
+            tag);
+    }
+}
+
 static std::string sn2_pso3069_semantic_slot_token(
     UINT root,
     UINT slot,
@@ -11504,6 +15068,10 @@ static std::string sn2_pso3069_semantic_slot_token(
         info.width,
         info.height,
         info.depth_or_array);
+}
+
+static uintptr_t sn2_rtv_resource_ptr(uint64_t cpu_handle) {
+    return reinterpret_cast<uintptr_t>(sn2_rt_snapshot::lookup_rtv(cpu_handle));
 }
 
 static void sn2_log_render_name_pso3069(
@@ -11585,6 +15153,32 @@ static void sn2_log_render_name_pso3069(
         sn2_pso3069_semantic_slot_token(2, 0, r2_vla),
         sn2_pso3069_semantic_slot_token(2, 1, r2_vlb),
         sn2_pso3069_semantic_slot_token(2, 2, r2_vol));
+
+    // MRT-array companion row — answers "what's bound to MRT slot 6 (the SLW
+    // GBuffer auxiliary slot, e.g. ResourceId::30085 in the May 16 RDC)
+    // per draw + per eye". Joined to the [SN2-RenderName] row on `seq`.
+    {
+        const auto& rtvs = state.last_rtv_handles;
+        SPDLOG_WARN(
+            "[SN2-RenderName-MRT] seq={} eye={} view_id={} ps_crc=0x{:08x} count={} "
+            "slot0=0x{:x}/res0x{:x} slot1=0x{:x}/res0x{:x} "
+            "slot2=0x{:x}/res0x{:x} slot3=0x{:x}/res0x{:x} "
+            "slot4=0x{:x}/res0x{:x} slot5=0x{:x}/res0x{:x} "
+            "slot6=0x{:x}/res0x{:x} slot7=0x{:x}/res0x{:x}",
+            n,
+            sn2_eye_name(view_id, state.last_viewport_bucket),
+            view_id,
+            ps_crc,
+            static_cast<unsigned>(state.last_rtv_count),
+            rtvs[0], sn2_rtv_resource_ptr(rtvs[0]),
+            rtvs[1], sn2_rtv_resource_ptr(rtvs[1]),
+            rtvs[2], sn2_rtv_resource_ptr(rtvs[2]),
+            rtvs[3], sn2_rtv_resource_ptr(rtvs[3]),
+            rtvs[4], sn2_rtv_resource_ptr(rtvs[4]),
+            rtvs[5], sn2_rtv_resource_ptr(rtvs[5]),
+            rtvs[6], sn2_rtv_resource_ptr(rtvs[6]),
+            rtvs[7], sn2_rtv_resource_ptr(rtvs[7]));
+    }
 
     // V2 schema (gated by UEVR_SN2_DRAWLOG_V2=1) — adds frame_idx,
     // desc_heap_revision, cmdlist_id, pass_tag, cb fingerprints, root_sig hash,
@@ -11730,9 +15324,327 @@ static void sn2_log_render_name_pso3069(
     }
 }
 
+static void sn2_log_zero_dispatch(
+    const CommandListCorrelationState& state,
+    uint32_t cs_crc,
+    UINT x,
+    UINT y,
+    UINT z,
+    const char* call_kind)
+{
+    if (!sn2_zero_dispatch_log_enabled()) {
+        return;
+    }
+
+    const bool is_zero = x == 0 || y == 0 || z == 0;
+    if (!is_zero && !sn2_zero_dispatch_log_include_nonzero()) {
+        return;
+    }
+
+    static std::atomic<uint64_t> s_rows{0};
+    const auto row = s_rows.fetch_add(1, std::memory_order_relaxed);
+    const int max_rows = sn2_zero_dispatch_log_max_rows();
+    if (max_rows <= 0 || row >= static_cast<uint64_t>(max_rows)) {
+        return;
+    }
+
+    const uintptr_t pso = reinterpret_cast<uintptr_t>(state.current_pso);
+    auto& registry = render::ShaderOverrideRegistry::get();
+    auto [ps_hash, vs_hash] = registry.snapshot_pso_hashes_for(pso);
+    const int viewport_view_id = cmdlist_view_id(state);
+    const auto binding_vote = sn2_infer_compute_view_from_bound_descriptors(state);
+    const int view_id = sn2_compute_effective_view_id(state, binding_vote);
+
+    const uint64_t root0 = state.last_compute_root_desc_tables[0];
+    const uint64_t root1 = state.last_compute_root_desc_tables[1];
+    const uint64_t root2 = state.last_compute_root_desc_tables[2];
+    const auto r0s0 = sn2_resolve_pso3069_slot(root0, 0);
+    const auto r0s1 = sn2_resolve_pso3069_slot(root0, 1);
+    const auto r1s0 = sn2_resolve_pso3069_slot(root1, 0);
+    const auto r2s0 = sn2_resolve_pso3069_slot(root2, 0);
+
+    SPDLOG_WARN(
+        "[SN2-ZeroDispatch] row={} zero={} kind={} frame={} eye={} view_id={} viewport_view={} binding_view={} bind_votes={}L/{}R bucket={} "
+        "pso={:p} cs_crc=0x{:08x} hash_hint={} vs_hash={} dims={}x{}x{} "
+        "root_sig=0x{:x} root0=0x{:x} root1=0x{:x} root2=0x{:x} "
+        "cbv0=0x{:x} cbv1=0x{:x} cbv2=0x{:x} cbv3=0x{:x} cbv4=0x{:x} "
+        "uav0=0x{:x} uav1=0x{:x} srv0=0x{:x} srv1=0x{:x} "
+        "r0s0=0x{:x}/0x{:016x} r0s0_view={} r0s0_kind={} "
+        "r0s1=0x{:x}/0x{:016x} r0s1_view={} r0s1_kind={} "
+        "r1s0=0x{:x}/0x{:016x} r1s0_view={} r1s0_kind={} "
+        "r2s0=0x{:x}/0x{:016x} r2s0_view={} r2s0_kind={}",
+        row + 1,
+        is_zero ? 1 : 0,
+        call_kind != nullptr ? call_kind : "Dispatch",
+        sn2_draw_log_v2::current_frame(),
+        sn2_eye_name(view_id, state.last_viewport_bucket),
+        view_id,
+        viewport_view_id,
+        binding_vote.inferred_view_id,
+        binding_vote.left_votes,
+        binding_vote.right_votes,
+        static_cast<int>(state.last_viewport_bucket),
+        state.current_pso,
+        cs_crc,
+        ps_hash.empty() ? "(none)" : ps_hash,
+        vs_hash.empty() ? "(none)" : vs_hash,
+        x, y, z,
+        state.last_compute_root_signature,
+        root0,
+        root1,
+        root2,
+        state.last_compute_root_cbv[0],
+        state.last_compute_root_cbv[1],
+        state.last_compute_root_cbv[2],
+        state.last_compute_root_cbv[3],
+        state.last_compute_root_cbv[4],
+        state.last_compute_root_uav[0],
+        state.last_compute_root_uav[1],
+        state.last_compute_root_srv[0],
+        state.last_compute_root_srv[1],
+        reinterpret_cast<uintptr_t>(r0s0.resource), r0s0.desc_hash, r0s0.tracked_view_id, r0s0.kind,
+        reinterpret_cast<uintptr_t>(r0s1.resource), r0s1.desc_hash, r0s1.tracked_view_id, r0s1.kind,
+        reinterpret_cast<uintptr_t>(r1s0.resource), r1s0.desc_hash, r1s0.tracked_view_id, r1s0.kind,
+        reinterpret_cast<uintptr_t>(r2s0.resource), r2s0.desc_hash, r2s0.tracked_view_id, r2s0.kind);
+}
+
+static bool sn2_repair_direct_zero_dispatch(
+    const CommandListCorrelationState& state,
+    uint32_t cs_crc,
+    UINT& x,
+    UINT& y,
+    UINT& z)
+{
+    if (!sn2_direct_dispatch_mirror_enabled() || cs_crc == 0 || state.current_pso == nullptr) {
+        return false;
+    }
+
+    struct CachedDims {
+        UINT x = 0;
+        UINT y = 0;
+        UINT z = 0;
+        uint64_t frame = 0;
+        uintptr_t pso = 0;
+        uintptr_t root_signature = 0;
+    };
+
+    static std::mutex s_mutex;
+    static std::unordered_map<uint32_t, CachedDims> s_last_nonzero_by_cs;
+    static std::atomic<uint64_t> s_log_rows{0};
+
+    const bool is_zero = x == 0 || y == 0 || z == 0;
+    const int viewport_view_id = cmdlist_view_id(state);
+    const auto binding_vote = sn2_infer_compute_view_from_bound_descriptors(state);
+    const int view_id = sn2_compute_effective_view_id(state, binding_vote);
+    const auto frame = sn2_draw_log_v2::current_frame();
+    const uintptr_t pso = reinterpret_cast<uintptr_t>(state.current_pso);
+
+    if (!is_zero) {
+        // Treat non-right or unknown-eye nonzero dispatches as the producer side.
+        // This intentionally persists across frames so a right-eye-first command
+        // order can still borrow the previous frame's dimensions.
+        if (view_id != 1) {
+            std::scoped_lock _{s_mutex};
+            s_last_nonzero_by_cs[cs_crc] = CachedDims{
+                x,
+                y,
+                z,
+                frame,
+                pso,
+                state.last_compute_root_signature
+            };
+        }
+        return false;
+    }
+
+    const auto& crc_allowlist = sn2_direct_dispatch_mirror_crc_allowlist();
+    const bool unknown_repair_allowed =
+        view_id == -1 &&
+        sn2_direct_dispatch_mirror_repair_unknown_enabled() &&
+        !crc_allowlist.empty() &&
+        crc_allowlist.count(cs_crc) != 0;
+
+    if (view_id != 1 && !unknown_repair_allowed) {
+        return false;
+    }
+
+    CachedDims cached{};
+    {
+        std::scoped_lock _{s_mutex};
+        const auto it = s_last_nonzero_by_cs.find(cs_crc);
+        if (it == s_last_nonzero_by_cs.end()) {
+            return false;
+        }
+        cached = it->second;
+    }
+
+    if (cached.x == 0 || cached.y == 0 || cached.z == 0) {
+        return false;
+    }
+
+    const UINT old_x = x;
+    const UINT old_y = y;
+    const UINT old_z = z;
+    x = cached.x;
+    y = cached.y;
+    z = cached.z;
+
+    const auto row = s_log_rows.fetch_add(1, std::memory_order_relaxed);
+    const int max_rows = sn2_direct_dispatch_mirror_max_rows();
+    if (max_rows > 0 && row < static_cast<uint64_t>(max_rows)) {
+        SPDLOG_WARN(
+            "[SN2-DirectDispatchMirror] row={} frame={} eye={} view_id={} viewport_view={} binding_view={} bind_votes={}L/{}R bucket={} "
+            "cs_crc=0x{:08x} pso={:p} cached_pso=0x{:x} root_sig=0x{:x} cached_root_sig=0x{:x} "
+            "dims={}x{}x{} -> {}x{}x{} cached_frame={} unknown_repair={}",
+            row + 1,
+            frame,
+            sn2_eye_name(view_id, state.last_viewport_bucket),
+            view_id,
+            viewport_view_id,
+            binding_vote.inferred_view_id,
+            binding_vote.left_votes,
+            binding_vote.right_votes,
+            static_cast<int>(state.last_viewport_bucket),
+            cs_crc,
+            state.current_pso,
+            cached.pso,
+            state.last_compute_root_signature,
+            cached.root_signature,
+            old_x, old_y, old_z,
+            x, y, z,
+            cached.frame,
+            unknown_repair_allowed ? 1 : 0);
+    }
+
+    return true;
+}
+
+static void sn2_log_water_candidate_draw(
+    const CommandListCorrelationState& state,
+    const char* draw_kind,
+    UINT a,
+    UINT b,
+    UINT c,
+    INT d,
+    UINT e)
+{
+    if (!sn2_water_candidate_log_enabled() || state.current_pso == nullptr || !state.has_viewport) {
+        return;
+    }
+
+    const uint64_t water_ctx = g_subnautica2_water_context_id.load(std::memory_order_relaxed);
+    if (water_ctx == 0) {
+        return;
+    }
+
+    const auto bucket = state.last_viewport_bucket;
+    if (bucket != StereoTraceBucket::Left &&
+        bucket != StereoTraceBucket::Right &&
+        bucket != StereoTraceBucket::Full &&
+        bucket != StereoTraceBucket::Multi) {
+        return;
+    }
+
+    if (state.last_graphics_root_desc_table0 == 0 && state.last_graphics_root_desc_tables[2] == 0) {
+        return;
+    }
+
+    static std::atomic<uint64_t> s_rows{0};
+    const auto row = s_rows.fetch_add(1, std::memory_order_relaxed);
+    const int max_rows = sn2_water_candidate_log_max_rows();
+    if (max_rows <= 0 || row >= static_cast<uint64_t>(max_rows)) {
+        return;
+    }
+
+    const uintptr_t pso = reinterpret_cast<uintptr_t>(state.current_pso);
+    auto& registry = render::ShaderOverrideRegistry::get();
+    const uint32_t ps_crc = registry.d3d12_pso_pixel_crc32(pso);
+    const uint32_t gs_crc = registry.d3d12_pso_geometry_crc32(pso);
+    auto [ps_hash, vs_hash] = registry.snapshot_pso_hashes_for(pso);
+    const int view_id = cmdlist_view_id(state);
+
+    const auto r0s0 = sn2_resolve_pso3069_slot(state.last_graphics_root_desc_table0, 0);
+    const auto r0s1 = sn2_resolve_pso3069_slot(state.last_graphics_root_desc_table0, 1);
+    const auto r0s2 = sn2_resolve_pso3069_slot(state.last_graphics_root_desc_table0, 2);
+    const auto r0s3 = sn2_resolve_pso3069_slot(state.last_graphics_root_desc_table0, 3);
+    const auto r0s5 = sn2_resolve_pso3069_slot(state.last_graphics_root_desc_table0, 5);
+    const auto r0s8 = sn2_resolve_pso3069_slot(state.last_graphics_root_desc_table0, 8);
+    const auto r0s9 = sn2_resolve_pso3069_slot(state.last_graphics_root_desc_table0, 9);
+    const auto r2s0 = sn2_resolve_pso3069_slot(state.last_graphics_root_desc_tables[2], 0);
+    const auto r2s1 = sn2_resolve_pso3069_slot(state.last_graphics_root_desc_tables[2], 1);
+    const auto r2s2 = sn2_resolve_pso3069_slot(state.last_graphics_root_desc_tables[2], 2);
+    const auto& rtvs = state.last_rtv_handles;
+
+    SPDLOG_WARN(
+        "[SN2-WaterCandidate] row={} water_ctx={} water_views=0x{:x} water_color=0x{:x} water_depth=0x{:x} "
+        "kind={} eye={} view_id={} bucket={} pso={:p} ps_crc=0x{:08x} gs_crc=0x{:08x} "
+        "ps_hash={} vs_hash={} root_sig=0x{:x} vp=({:.1f},{:.1f},{:.1f},{:.1f}) "
+        "rtv0=0x{:x} root0=0x{:x} root1=0x{:x} root2=0x{:x} root3=0x{:x} "
+        "mrt_count={} mrt0=0x{:x}/res0x{:x} mrt1=0x{:x}/res0x{:x} "
+        "mrt2=0x{:x}/res0x{:x} mrt3=0x{:x}/res0x{:x} "
+        "mrt4=0x{:x}/res0x{:x} mrt5=0x{:x}/res0x{:x} "
+        "mrt6=0x{:x}/res0x{:x} mrt7=0x{:x}/res0x{:x} "
+        "cbv4=0x{:x} cbv5=0x{:x} cbv6=0x{:x} cbv7=0x{:x} cbv8=0x{:x} "
+        "r0s0=0x{:x}/0x{:016x} r0s1=0x{:x}/0x{:016x} r0s2=0x{:x}/0x{:016x} r0s3=0x{:x}/0x{:016x} "
+        "r0s5=0x{:x}/0x{:016x} r0s8=0x{:x}/0x{:016x} r0s9=0x{:x}/0x{:016x} "
+        "r2s0=0x{:x}/0x{:016x} r2s1=0x{:x}/0x{:016x} r2s2=0x{:x}/0x{:016x} "
+        "args=({}, {}, {}, {}, {})",
+        row + 1,
+        water_ctx,
+        g_subnautica2_water_context_views.load(std::memory_order_relaxed),
+        g_subnautica2_water_context_color.load(std::memory_order_relaxed),
+        g_subnautica2_water_context_depth.load(std::memory_order_relaxed),
+        draw_kind,
+        sn2_eye_name(view_id, bucket),
+        view_id,
+        static_cast<int>(bucket),
+        state.current_pso,
+        ps_crc,
+        gs_crc,
+        ps_hash.empty() ? "(none)" : ps_hash,
+        vs_hash.empty() ? "(none)" : vs_hash,
+        state.last_graphics_root_signature,
+        state.viewport_top_left_x,
+        state.viewport_top_left_y,
+        state.viewport_width,
+        state.viewport_height,
+        state.last_rtv0_handle,
+        state.last_graphics_root_desc_table0,
+        state.last_graphics_root_desc_tables[1],
+        state.last_graphics_root_desc_tables[2],
+        state.last_graphics_root_desc_tables[3],
+        static_cast<unsigned>(state.last_rtv_count),
+        rtvs[0], sn2_rtv_resource_ptr(rtvs[0]),
+        rtvs[1], sn2_rtv_resource_ptr(rtvs[1]),
+        rtvs[2], sn2_rtv_resource_ptr(rtvs[2]),
+        rtvs[3], sn2_rtv_resource_ptr(rtvs[3]),
+        rtvs[4], sn2_rtv_resource_ptr(rtvs[4]),
+        rtvs[5], sn2_rtv_resource_ptr(rtvs[5]),
+        rtvs[6], sn2_rtv_resource_ptr(rtvs[6]),
+        rtvs[7], sn2_rtv_resource_ptr(rtvs[7]),
+        state.last_graphics_root_cbv[4],
+        state.last_graphics_root_cbv[5],
+        state.last_graphics_root_cbv[6],
+        state.last_graphics_root_cbv[7],
+        state.last_graphics_root_cbv[8],
+        reinterpret_cast<uintptr_t>(r0s0.resource), r0s0.desc_hash,
+        reinterpret_cast<uintptr_t>(r0s1.resource), r0s1.desc_hash,
+        reinterpret_cast<uintptr_t>(r0s2.resource), r0s2.desc_hash,
+        reinterpret_cast<uintptr_t>(r0s3.resource), r0s3.desc_hash,
+        reinterpret_cast<uintptr_t>(r0s5.resource), r0s5.desc_hash,
+        reinterpret_cast<uintptr_t>(r0s8.resource), r0s8.desc_hash,
+        reinterpret_cast<uintptr_t>(r0s9.resource), r0s9.desc_hash,
+        reinterpret_cast<uintptr_t>(r2s0.resource), r2s0.desc_hash,
+        reinterpret_cast<uintptr_t>(r2s1.resource), r2s1.desc_hash,
+        reinterpret_cast<uintptr_t>(r2s2.resource), r2s2.desc_hash,
+        a, b, c, d, e);
+}
+
 static void sn2_log_water_chain_draw(
     ID3D12GraphicsCommandList* command_list,
     const CommandListCorrelationState& state,
+    const Sn2CopyRectScratchScope* water_chain_scope,
+    const Sn2Pso3069CbvScope* water_chain_cbv_scope,
     const char* draw_kind,
     UINT a,
     UINT b,
@@ -11810,11 +15722,40 @@ static void sn2_log_water_chain_draw(
 
     const int view_id = cmdlist_view_id(state);
     const uint64_t root0 = sn2_graphics_root_table_gpu(state, 0);
+    const uint64_t root2 = sn2_graphics_root_table_gpu(state, 2);
+    const uint64_t root3 = sn2_graphics_root_table_gpu(state, 3);
+    const bool scratch_active = water_chain_scope != nullptr && water_chain_scope->active;
+    const bool cbv_active = water_chain_cbv_scope != nullptr && water_chain_cbv_scope->active;
+    const auto active_root_table = [&](UINT root) -> uint64_t {
+        if (scratch_active &&
+            root < water_chain_scope->active_graphics_tables.size() &&
+            water_chain_scope->active_graphics_tables[root] != 0) {
+            return water_chain_scope->active_graphics_tables[root];
+        }
+        return sn2_graphics_root_table_gpu(state, root);
+    };
+    const auto active_cbv = [&](UINT root) -> uint64_t {
+        if (cbv_active &&
+            root < water_chain_cbv_scope->restore_root.size() &&
+            water_chain_cbv_scope->restore_root[root] &&
+            water_chain_cbv_scope->active_cbvs[root] != 0) {
+            return water_chain_cbv_scope->active_cbvs[root];
+        }
+        return root < state.last_graphics_root_cbv.size() ? state.last_graphics_root_cbv[root] : 0;
+    };
+    const uint64_t active_root0 = active_root_table(0);
+    const uint64_t active_root2 = active_root_table(2);
+    const uint64_t active_root3 = active_root_table(3);
 
     SPDLOG_WARN(
-        "[SN2-WaterChain] seq={} name={} kind={} eye={} view_id={} ps_crc=0x{:08x} pso={:p} "
+        "[SN2-WaterChain] seq={} water_ctx={} water_views=0x{:x} water_color=0x{:x} water_depth=0x{:x} "
+        "name={} kind={} eye={} view_id={} ps_crc=0x{:08x} pso={:p} "
         "root_sig=0x{:x} vp=({:.1f},{:.1f},{:.1f},{:.1f}) rtv0=0x{:x} root0=0x{:x} args=({}, {}, {}, {}, {})",
         n,
+        g_subnautica2_water_context_id.load(std::memory_order_relaxed),
+        g_subnautica2_water_context_views.load(std::memory_order_relaxed),
+        g_subnautica2_water_context_color.load(std::memory_order_relaxed),
+        g_subnautica2_water_context_depth.load(std::memory_order_relaxed),
         name,
         draw_kind,
         sn2_eye_name(view_id, state.last_viewport_bucket),
@@ -11830,14 +15771,99 @@ static void sn2_log_water_chain_draw(
         root0,
         a, b, c, d, e);
 
+    if (scratch_active || cbv_active) {
+        SPDLOG_WARN(
+            "[SN2-WaterChainPost] seq={} name={} eye={} view_id={} ps_crc=0x{:08x} "
+            "scratch_active={} cbv_active={} root0_pre=0x{:x} root0_draw=0x{:x} "
+            "root2_pre=0x{:x} root2_draw=0x{:x} root3_pre=0x{:x} root3_draw=0x{:x}",
+            n,
+            name,
+            sn2_eye_name(view_id, state.last_viewport_bucket),
+            view_id,
+            ps_crc,
+            scratch_active ? 1 : 0,
+            cbv_active ? 1 : 0,
+            root0,
+            active_root0,
+            root2,
+            active_root2,
+            root3,
+            active_root3);
+    }
+
+    // V2 schema for the complete water chain, not just pso3069. This gives the
+    // capture sync tool one common row format for basepass + the overlay passes
+    // that can carry the missing teal water layer.
+    {
+        const auto* dict = sn2_draw_log_v2::lookup_pso(ps_crc);
+        const UINT cb_base = sn2_water_chain_pixel_cbv_root_base(ps_crc);
+        sn2_draw_log_v2::DrawLogV2Args v2{};
+        v2.seq = n;
+        v2.view_idx = view_id;
+        v2.eye_name = sn2_eye_name(view_id, state.last_viewport_bucket);
+        v2.cmdlist_id = reinterpret_cast<uintptr_t>(command_list);
+        v2.ps_crc = ps_crc;
+        v2.pso_dxil_hash = dict ? dict->dxil_hash : nullptr;
+        v2.pso_entry_function = dict ? dict->entry_function : nullptr;
+        v2.root_sig_gpu_va = state.last_graphics_root_signature;
+        v2.rtv0_handle = state.last_rtv0_handle;
+        v2.vp_x = state.viewport_top_left_x;
+        v2.vp_y = state.viewport_top_left_y;
+        v2.vp_w = state.viewport_width;
+        v2.vp_h = state.viewport_height;
+        v2.viewport_bucket = static_cast<int>(state.last_viewport_bucket);
+        v2.cb_root4_gpu = active_cbv(cb_base + 0);
+        v2.cb_root5_gpu = active_cbv(cb_base + 1);
+        v2.cb_root6_gpu = active_cbv(cb_base + 2);
+        v2.cb_root7_gpu = active_cbv(cb_base + 3);
+        sn2_draw_log_v2::emit(v2);
+
+        sn2_overlay_ui::DrawRow row{};
+        row.seq = n;
+        row.frame_idx = sn2_draw_log_v2::current_frame();
+        row.view_idx = view_id;
+        row.eye_name = sn2_eye_name(view_id, state.last_viewport_bucket);
+        row.ps_crc = ps_crc;
+        row.entry_function = dict ? dict->entry_function : nullptr;
+        row.pass_tag = sn2_draw_log_v2::pass_tag_from_ps_crc(ps_crc);
+        row.cb0_fp = sn2_draw_log_v2::cb_fingerprint(active_cbv(cb_base + 0));
+        row.cmdlist_id = reinterpret_cast<uintptr_t>(command_list);
+        row.override_fired = scratch_active || cbv_active;
+        sn2_overlay_ui::record_draw(row);
+    }
+
+    if (cbv_active) {
+        const UINT cb_base = sn2_water_chain_pixel_cbv_root_base(ps_crc);
+        for (UINT i = 0; i < 4; ++i) {
+            const UINT root = cb_base + i;
+            if (root >= water_chain_cbv_scope->restore_root.size() ||
+                !water_chain_cbv_scope->restore_root[root]) {
+                continue;
+            }
+            SPDLOG_WARN(
+                "[SN2-WaterChainCBVPost] seq={} name={} eye={} view_id={} ps_crc=0x{:08x} "
+                "root={} pre=0x{:x} draw=0x{:x} restore=0x{:x}",
+                n,
+                name,
+                sn2_eye_name(view_id, state.last_viewport_bucket),
+                view_id,
+                ps_crc,
+                root,
+                root < state.last_graphics_root_cbv.size() ? state.last_graphics_root_cbv[root] : 0,
+                water_chain_cbv_scope->active_cbvs[root],
+                water_chain_cbv_scope->restore_cbvs[root]);
+        }
+    }
+
     if (!sn2_water_chain_slot_log_enabled()) {
         return;
     }
 
     for (size_t i = 0; i < count; ++i) {
         const auto info = sn2_resolve_pso3069_slot(root0, slots[i]);
+        const char* semantic = sn2_water_chain_semantic_slot_name(ps_crc, 0, slots[i]);
         SPDLOG_WARN(
-            "[SN2-WaterChainSlot] seq={} name={} eye={} view_id={} ps_crc=0x{:08x} root=0 bind={} slot={} "
+            "[SN2-WaterChainSlot] seq={} name={} eye={} view_id={} ps_crc=0x{:08x} root=0 bind={} slot={} semantic={} "
             "gpu=0x{:x} cpu=0x{:x} known={} kind={} res={:p} fmt={} dim={} size={}x{}x{} view={} desc_hash=0x{:016x} gen={} root_table=0x{:x}",
             n,
             name,
@@ -11846,6 +15872,7 @@ static void sn2_log_water_chain_draw(
             ps_crc,
             binds[i],
             slots[i],
+            semantic,
             info.gpu_handle,
             static_cast<uint64_t>(info.cpu_handle),
             info.known_descriptor ? 1 : 0,
@@ -11860,6 +15887,35 @@ static void sn2_log_water_chain_draw(
             info.desc_hash,
             info.descriptor_generation,
             root0);
+
+        if (scratch_active) {
+            const auto post_info = sn2_resolve_pso3069_slot(active_root0, slots[i]);
+            SPDLOG_WARN(
+                "[SN2-WaterChainSlotPost] seq={} name={} eye={} view_id={} ps_crc=0x{:08x} root=0 bind={} slot={} semantic={} "
+                "gpu=0x{:x} cpu=0x{:x} known={} kind={} res={:p} fmt={} dim={} size={}x{}x{} view={} desc_hash=0x{:016x} gen={} root_table=0x{:x}",
+                n,
+                name,
+                sn2_eye_name(view_id, state.last_viewport_bucket),
+                view_id,
+                ps_crc,
+                binds[i],
+                slots[i],
+                semantic,
+                post_info.gpu_handle,
+                static_cast<uint64_t>(post_info.cpu_handle),
+                post_info.known_descriptor ? 1 : 0,
+                post_info.kind,
+                static_cast<void*>(post_info.resource),
+                static_cast<int>(post_info.format),
+                static_cast<int>(post_info.dimension),
+                post_info.width,
+                post_info.height,
+                post_info.depth_or_array,
+                post_info.tracked_view_id,
+                post_info.desc_hash,
+                post_info.descriptor_generation,
+                active_root0);
+        }
     }
 }
 
@@ -12486,6 +16542,20 @@ void WINAPI D3D12Hook::set_graphics_root_descriptor_table(
     // -1=unknown — viewport not set yet on this cmdlist).
     const auto state = read_cmdlist_state(command_list);
     const int view_id = cmdlist_view_id(state);
+
+    // 2026-05-22: Binding ledger record. Captures which descriptor table is
+    // bound at which root param per PSO per eye. Used to determine what
+    // right-eye basepass actually reads.
+    if (sn2_resource_binding_ledger::env_enabled() && state.current_pso != nullptr) {
+        const uint32_t ps_crc_ledger = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(
+            reinterpret_cast<uintptr_t>(state.current_pso));
+        sn2_resource_binding_ledger::record_root_table(
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            ps_crc_ledger,
+            view_id,
+            root_parameter_index,
+            static_cast<uint64_t>(base_descriptor.ptr));
+    }
 
     // 2026-05-20 SN2 CopyRectPS probe. The confirmed visible bad-region shader
     // is UE's ScreenPass CopyRectPS (PS CRC E85849AA): t0/s0 -> SV_Target.
@@ -13365,17 +17435,21 @@ void WINAPI D3D12Hook::set_descriptor_heaps(
                     tls_bindless_heap.gpu_base = heap->GetGPUDescriptorHandleForHeapStart().ptr;
                     tls_bindless_heap.stride   = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
                     tls_bindless_heap.num_descriptors = desc.NumDescriptors;
+                    // 2026-05-22: Register globally so other command lists /
+                    // tables in different heaps remain resolvable.
+                    bindless_heap_registry().note(tls_bindless_heap);
 
                     static std::atomic<uint64_t> n{0};
                     const auto idx = n.fetch_add(1, std::memory_order_relaxed);
                     if (idx < 8) {
                         SPDLOG_WARN(
-                            "[D3D12-BindlessHeap] tid={} heap={:p} cpu_base=0x{:x} gpu_base=0x{:x} stride={} num_desc={}",
+                            "[D3D12-BindlessHeap] tid={} heap={:p} cpu_base=0x{:x} gpu_base=0x{:x} stride={} num_desc={} registry_total={}",
                             (uint32_t)GetCurrentThreadId(), (void*)heap,
                             (uint64_t)tls_bindless_heap.cpu_base,
                             (uint64_t)tls_bindless_heap.gpu_base,
                             tls_bindless_heap.stride,
-                            desc.NumDescriptors);
+                            desc.NumDescriptors,
+                            bindless_heap_registry().count());
                     }
                 } else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
                     tls_sampler_heap.heap = heap;
@@ -13714,6 +17788,27 @@ void WINAPI D3D12Hook::set_compute_root_constant_buffer_view(
         cbv_hash != 0 ? 256 : 0,
         cbv_hash);
 
+    // 2026-05-22: Binding analyzer (compute path).
+    if (sn2_binding_analyzer::env_enabled() && command_list != nullptr &&
+        state.current_pso != nullptr) {
+        const int view_id_ba_c = cmdlist_view_id(state);
+        const uint32_t cs_crc_ba = render::ShaderOverrideRegistry::get().d3d12_pso_compute_crc32(
+            reinterpret_cast<uintptr_t>(state.current_pso));
+        sn2_binding_analyzer::record_root_cbv(
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            0,  // ps_crc N/A
+            cs_crc_ba,
+            view_id_ba_c,
+            root_parameter_index,
+            effective_gpu_va,
+            'C');
+        // 2026-05-22: CB content dumper (compute).
+        if (sn2_cb_dumper::env_enabled()) {
+            sn2_cb_dumper::record_cbv_bind(
+                cs_crc_ba, view_id_ba_c, root_parameter_index, effective_gpu_va, 'C');
+        }
+    }
+
     if (original != nullptr) {
         original(command_list, root_parameter_index, effective_gpu_va);
     }
@@ -13847,6 +17942,59 @@ void WINAPI D3D12Hook::set_graphics_root_constant_buffer_view(
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_graphics_root_constant_buffer_view)*>() : nullptr;
 
+    // 2026-05-22: Binding ledger record CBV bindings.
+    if (sn2_resource_binding_ledger::env_enabled() && command_list != nullptr) {
+        const auto state_ledger = read_cmdlist_state(command_list);
+        if (state_ledger.current_pso != nullptr) {
+            const int view_id_ledger = cmdlist_view_id(state_ledger);
+            const uint32_t ps_crc_ledger = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(
+                reinterpret_cast<uintptr_t>(state_ledger.current_pso));
+            sn2_resource_binding_ledger::record_root_cbv(
+                reinterpret_cast<uintptr_t>(state_ledger.current_pso),
+                ps_crc_ledger,
+                view_id_ledger,
+                root_parameter_index,
+                static_cast<uint64_t>(gpu_va));
+        }
+    }
+
+    // 2026-05-22: Binding analyzer + CB dumper + right-CB synthesizer.
+    // These three observe per-PSO per-eye CBV bindings. Each independently
+    // env-gated; pre-compute state once if ANY of them is enabled.
+    const bool any_observer_on =
+        (sn2_binding_analyzer::env_enabled() ||
+         sn2_cb_dumper::env_enabled() ||
+         sn2_right_cb_synth::env_enabled());
+    if (any_observer_on && command_list != nullptr) {
+        const auto state_ba = read_cmdlist_state(command_list);
+        if (state_ba.current_pso != nullptr) {
+            const int view_id_ba = cmdlist_view_id(state_ba);
+            const uint32_t ps_crc_ba = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(
+                reinterpret_cast<uintptr_t>(state_ba.current_pso));
+            if (sn2_binding_analyzer::env_enabled()) {
+                sn2_binding_analyzer::record_root_cbv(
+                    reinterpret_cast<uintptr_t>(state_ba.current_pso),
+                    ps_crc_ba, 0, view_id_ba,
+                    root_parameter_index, gpu_va, 'G');
+            }
+            if (sn2_cb_dumper::env_enabled()) {
+                sn2_cb_dumper::record_cbv_bind(
+                    ps_crc_ba, view_id_ba, root_parameter_index, gpu_va, 'G');
+            }
+            if (sn2_right_cb_synth::env_enabled()) {
+                if (!sn2_right_cb_synth::initialized()) {
+                    if (auto* d3d12_hook = g_d3d12_hook) {
+                        if (auto* device = d3d12_hook->get_device()) {
+                            sn2_right_cb_synth::init(device);
+                        }
+                    }
+                }
+                sn2_right_cb_synth::update_donor(
+                    ps_crc_ba, view_id_ba, root_parameter_index, gpu_va);
+            }
+        }
+    }
+
     // 2026-05-20 SN2 CopyRectPS probe. ScreenPassVS uses root CBV slot 2 for
     // DrawRectangleParameters. If the right-eye copy's UV/output rect is bad,
     // borrowing the previous left-eye CBV for the same CopyRectPS PSO should
@@ -13955,6 +18103,152 @@ void WINAPI D3D12Hook::set_graphics_root_constant_buffer_view(
                             if (rc < 32 || (rc % 200) == 0) {
                                 SPDLOG_WARN("[SN2-SKYATMOS-CB-REDIRECT] right rp={} va 0x{:x} -> 0x{:x} (left snap) pso_crc=0x{:08x} (rc={})",
                                     root_parameter_index, before, lva, crc_sa, rc + 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2026-05-22 SN2 SingleLayerWater / UWEWater basepass cb1 redirect.
+    //
+    // Per upstream-divergence analysis (E:\Github\UEVRJ\SN2_UPSTREAM_DIVERGENCE_REPORT.md):
+    // the 276-byte cb1 at PIXEL root param 5 carries per-eye-divergent "is
+    // underwater" classification:
+    //   offset 120 (f@120):  LEFT=-1552.6 (15m underwater)  RIGHT=0.0  (surface)
+    //   offset 124 (f@124):  LEFT=1.0 (underwater bool)     RIGHT=0.0
+    //   offset 196 (f@196):  LEFT=+0.9947                   RIGHT=-0.0190
+    //   offset 220 (f@220):  LEFT=3024.65                   RIGHT=0.0
+    // RIGHT eye therefore renders "above water" while LEFT renders "underwater".
+    //
+    // Fix: at right-eye draw of UWEWater basepass / SLW PS, substitute LEFT's
+    // most-recent cb1 GPU_VA. Rest of cb1 contents (matrices, light params)
+    // are identical per eye anyway per the report.
+    //
+    // Gated by UEVR_SN2_SLW_CB_REDIRECT=1.
+    if (command_list != nullptr && root_parameter_index < 16) {
+        static const bool slw_cb_redirect = []() {
+            const char* env = std::getenv("UEVR_SN2_SLW_CB_REDIRECT");
+            return env != nullptr && env[0] != '\0' && env[0] != '0';
+        }();
+        static const std::array<bool, 16> slw_cb_redirect_roots = []() {
+            std::array<bool, 16> roots{};
+            const char* env = std::getenv("UEVR_SN2_SLW_CB_REDIRECT_ROOTS");
+            if (env == nullptr || env[0] == '\0') {
+                // Default per report: root param 5 (PIXEL CBV) carries cb1.
+                roots[5] = true;
+                return roots;
+            }
+            const char* p = env;
+            while (*p != '\0') {
+                while (*p == ' ' || *p == '\t' || *p == ',' || *p == ';' || *p == '|') ++p;
+                if (*p < '0' || *p > '9') { if (*p != '\0') ++p; continue; }
+                unsigned value = 0;
+                while (*p >= '0' && *p <= '9') { value = value * 10u + (*p - '0'); ++p; }
+                if (value < roots.size()) roots[value] = true;
+            }
+            return roots;
+        }();
+        if (slw_cb_redirect && slw_cb_redirect_roots[root_parameter_index]) {
+            const auto state_slw = read_cmdlist_state(command_list);
+            void* pso = state_slw.current_pso;
+            if (pso != nullptr) {
+                const uint32_t crc_slw = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(pso));
+                // UWEWater BasePass + 2 MainPS variants + 3 SLW variants per report
+                const bool is_slw_or_basepass =
+                    crc_slw == 0x166DBA88u ||  // pso3069 / UWEWater BasePass
+                    crc_slw == 0x8733F2E0u ||  // MainPS variant 1
+                    crc_slw == 0xFEDC00F9u ||  // MainPS variant 2
+                    crc_slw == 0xb9be2499u ||  // SLW PS variant 1
+                    crc_slw == 0x32040a0du ||  // SLW PS variant 2
+                    crc_slw == 0xde7c3822u;    // SLW PS variant 3
+                // UEVR_SN2_SLW_CB_REDIRECT_ANY_PSO=1: bypass PS-CRC filter,
+                // redirect cb at the listed root parameter for ALL PSOs on
+                // right-eye. Diagnostic for finding which PSO actually drives
+                // the visible above-water/underwater divergence.
+                static const bool any_pso = []() {
+                    const char* env = std::getenv("UEVR_SN2_SLW_CB_REDIRECT_ANY_PSO");
+                    return env != nullptr && env[0] != '\0' && env[0] != '0';
+                }();
+                if (is_slw_or_basepass || any_pso) {
+                    // 2026-05-22 PATCH MODE (UEVR_SN2_SLW_CB_PATCH=1):
+                    // Instead of swapping GPU_VA to LEFT's CBV (which corrupts
+                    // LWC tile data at +872/+876 → geometry distortion), write
+                    // ONLY the bUnderwater flag (uint32) at offset +880 in place.
+                    //
+                    // Per-eye RIGHT CBV's bytes are persistent-mapped via
+                    // sn2_upload_buf_map::gpu_va_to_cpu — modify the byte
+                    // directly. GPU reads the modified value on execute.
+                    static const bool patch_mode = []() {
+                        const char* env = std::getenv("UEVR_SN2_SLW_CB_PATCH");
+                        return env != nullptr && env[0] != '\0' && env[0] != '0';
+                    }();
+                    static const uint32_t patch_offset = []() {
+                        const char* env = std::getenv("UEVR_SN2_SLW_CB_PATCH_OFFSET");
+                        return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 0)) : 880u;
+                    }();
+                    static const uint32_t patch_value = []() {
+                        const char* env = std::getenv("UEVR_SN2_SLW_CB_PATCH_VALUE");
+                        return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 0)) : 1u;
+                    }();
+
+                    const int view_slw = cmdlist_view_id(state_slw);
+                    if (patch_mode && view_slw == 1 && gpu_va != 0) {
+                        // Patch +880 to force bUnderwater=1 on right eye.
+                        uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(
+                            static_cast<uint64_t>(gpu_va), patch_offset + 4);
+                        static std::atomic<uint64_t> patch_hits{0};
+                        static std::atomic<uint64_t> patch_misses{0};
+                        if (cpu != nullptr) {
+                            uint32_t* target = reinterpret_cast<uint32_t*>(cpu + patch_offset);
+                            const uint32_t prev = *target;
+                            *target = patch_value;
+                            const auto h = patch_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if (h <= 32 || (h % 600) == 0) {
+                                SPDLOG_WARN("[SN2-SLW-CB-PATCH] right rp={} va=0x{:x} off=+{} {}->{} pso_crc=0x{:08x} hits={}",
+                                    root_parameter_index, (uint64_t)gpu_va,
+                                    patch_offset, prev, patch_value, crc_slw, h);
+                            }
+                        } else {
+                            const auto m = patch_misses.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if (m <= 16 || (m % 600) == 0) {
+                                SPDLOG_INFO("[SN2-SLW-CB-PATCH-MISS] right rp={} va=0x{:x} pso_crc=0x{:08x} misses={}",
+                                    root_parameter_index, (uint64_t)gpu_va, crc_slw, m);
+                            }
+                        }
+                    }
+
+                    // Legacy GPU_VA swap mode — disabled by default in favor of patch mode.
+                    static const bool swap_mode = []() {
+                        const char* env = std::getenv("UEVR_SN2_SLW_CB_SWAP");
+                        return env != nullptr && env[0] != '\0' && env[0] != '0';
+                    }();
+                    if (swap_mode) {
+                        static std::mutex g_slw_snap_mu;
+                        static std::unordered_map<uint64_t, uint64_t> g_left_slw_cb_va_by_key;
+                        static std::atomic<uint64_t> g_slw_redirect_count{0};
+                        const uint64_t key =
+                            (static_cast<uint64_t>(crc_slw) << 4) |
+                            static_cast<uint64_t>(root_parameter_index & 0xF);
+                        if (view_slw == 0 && gpu_va != 0) {
+                            std::scoped_lock _{g_slw_snap_mu};
+                            g_left_slw_cb_va_by_key[key] = static_cast<uint64_t>(gpu_va);
+                        } else if (view_slw == 1) {
+                            uint64_t lva = 0;
+                            {
+                                std::scoped_lock _{g_slw_snap_mu};
+                                auto it = g_left_slw_cb_va_by_key.find(key);
+                                if (it != g_left_slw_cb_va_by_key.end()) lva = it->second;
+                            }
+                            if (lva != 0 && lva != static_cast<uint64_t>(gpu_va)) {
+                                const uint64_t before = static_cast<uint64_t>(gpu_va);
+                                gpu_va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(lva);
+                                const auto rc = g_slw_redirect_count.fetch_add(1, std::memory_order_relaxed);
+                                if (rc < 32 || (rc % 200) == 0) {
+                                    SPDLOG_WARN("[SN2-SLW-CB-REDIRECT] right rp={} va 0x{:x} -> 0x{:x} (left snap) pso_crc=0x{:08x} (rc={})",
+                                        root_parameter_index, before, lva, crc_slw, rc + 1);
+                                }
                             }
                         }
                     }

@@ -366,6 +366,13 @@ public:
         ID3D12RootSignature* root_signature
     );
 
+    // Lockless-friendly accessors used by Sn2RootSigDumpHook to export a
+    // per-PSO root-signature JSON for the dup-config loader. Both maps are
+    // populated unconditionally (do not gate on is_enabled()), so callers
+    // get the full set even when global diagnostics is off.
+    std::vector<RootSignatureInfo> snapshot_root_signatures() const;
+    std::vector<std::pair<uintptr_t, uintptr_t>> snapshot_pso_root_signature_pairs() const;
+
     void record_descriptor_heaps_set(
         std::string_view source,
         uint32_t count,

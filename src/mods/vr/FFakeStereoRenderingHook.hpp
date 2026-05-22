@@ -617,6 +617,8 @@ private:
     static bool subnautica2_render_fog_wrapper_hook(void* scene_renderer, FRDGBuilder* graph_builder, void* scene_textures, void* scene_color_or_data, bool should_render_volumetric);
     static bool subnautica2_render_fog_pass_hook(void* scene_renderer, FRDGBuilder* graph_builder, void* scene_textures, void* scene_color_or_data, bool should_render_volumetric);
     static void subnautica2_render_underwater_fog_hook(void* scene_renderer, FRDGBuilder* graph_builder, void* scene_without_water_textures, void* scene_textures);
+    static void subnautica2_underwater_fog_guard_proceed_midhook(safetyhook::Context& ctx);
+    static void subnautica2_underwater_fog_build_block_midhook(safetyhook::Context& ctx);
     static void subnautica2_setup_volumetric_fog_ub_hook(void* view_info, void* view_uniform_shader_parameters);
     static void subnautica2_lightscat_store_midhook(safetyhook::Context& ctx);
     static void subnautica2_volfog_param_trace_FCFD20(safetyhook::Context& ctx);
@@ -723,6 +725,8 @@ private:
     safetyhook::InlineHook m_subnautica2_render_fog_wrapper_hook{};
     safetyhook::InlineHook m_subnautica2_render_fog_pass_hook{};
     safetyhook::InlineHook m_subnautica2_render_underwater_fog_hook{};
+    safetyhook::MidHook m_subnautica2_underwater_fog_guard_proceed_midhook{};
+    safetyhook::MidHook m_subnautica2_underwater_fog_build_block_midhook{};
     safetyhook::InlineHook m_subnautica2_setup_volumetric_fog_ub_hook{};
     safetyhook::MidHook m_subnautica2_lightscat_store_midhook{};
     safetyhook::MidHook m_subnautica2_volfog_param_trace_FCFD20{};

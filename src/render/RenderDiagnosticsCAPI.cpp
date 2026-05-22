@@ -2090,23 +2090,36 @@ extern "C" UEVR_RENDER_CAPI UevrRenderDocBootstrapResult uevr_renderdoc_bootstra
         }
     }
 
-    // Check if already loaded (most common case — launched via
-    // `renderdoccmd capture --opt-hook-children` so DLL is in the process
-    // before UEVR ever ran).
+    // Check if already loaded — the ONLY safe case. The user launched via
+    // `renderdoccmd capture --opt-hook-children` so renderdoc.dll is in
+    // the process before UEVR ever ran (and before D3D12CreateDevice).
+    //
+    // We deliberately do NOT LoadLibrary renderdoc.dll ourselves: late-
+    // loading RenderDoc after UEVR's D3D12Hook is installed (or after
+    // D3D12CreateDevice has run) breaks UEVR's hook scanner and crashes
+    // the game. Opt-in via UEVR_LOAD_RENDERDOC_DLL=1 if you really know
+    // what you're doing (analysis-API queries only — no live capture).
     HMODULE mod = GetModuleHandleA("renderdoc.dll");
     if (mod != nullptr) {
         r.was_preloaded = true;
         spdlog::info("[RenderDoc] preloaded by launcher: 0x{:x}",
                      reinterpret_cast<uintptr_t>(mod));
     } else {
-        // Try LoadLibrary as a fallback. This works for analysis-API queries
-        // (status / num_captures / launch UI) but capture itself will likely
-        // fail because D3D12 was created before our hooks could install.
-        // Search PATH first, then standard install locations.
+        wchar_t buf[8]{};
+        const bool opt_in_load = GetEnvironmentVariableW(L"UEVR_LOAD_RENDERDOC_DLL", buf,
+                                                          (DWORD)std::size(buf)) > 0 && buf[0] == L'1';
+        if (!opt_in_load) {
+            // Default: do nothing. UEVR's D3D12Hook needs to be the only
+            // DXGI wrapper at the bottom of the chain.
+            return r;
+        }
+        // Opt-in: try LoadLibrary as a fallback. Works for analysis-API
+        // queries (status / num_captures / launch UI) but capture itself
+        // will likely fail because D3D12 was created before our hooks
+        // could install — AND it may break UEVR's own D3D12Hook.
         const wchar_t* search_paths[] = {
             L"renderdoc.dll",
             L"C:\\Program Files\\RenderDoc\\renderdoc.dll",
-            // Our fork's dev build path:
             L"E:\\Github\\renderdoc\\x64\\Development\\renderdoc.dll",
             L"E:\\Github\\renderdoc\\x64\\Release\\renderdoc.dll",
             nullptr,
@@ -2114,19 +2127,14 @@ extern "C" UEVR_RENDER_CAPI UevrRenderDocBootstrapResult uevr_renderdoc_bootstra
         for (auto* p = search_paths; *p != nullptr; ++p) {
             mod = LoadLibraryW(*p);
             if (mod != nullptr) {
-                spdlog::warn("[RenderDoc] late-loaded from {} — capture safety: DEGRADED "
-                             "(D3D12 device was already created before our hooks could install). "
-                             "Status/UI queries still work. For full capture, relaunch via "
-                             "`renderdoccmd capture --opt-hook-children`.",
-                             std::string{reinterpret_cast<const char*>(*p),
-                                          wcslen(*p)});
+                spdlog::warn("[RenderDoc] OPT-IN late-load from {} — "
+                             "UEVR D3D12Hook may now fail. Use only for analysis queries.",
+                             std::string{reinterpret_cast<const char*>(*p), wcslen(*p)});
                 break;
             }
         }
         if (mod == nullptr) {
-            spdlog::info("[RenderDoc] not loaded — capture/diagnostics unavailable. "
-                         "To enable: launch via `renderdoccmd capture --opt-hook-children` "
-                         "or install RenderDoc to C:\\Program Files\\RenderDoc\\");
+            spdlog::info("[RenderDoc] UEVR_LOAD_RENDERDOC_DLL=1 set but no renderdoc.dll found");
             return r;
         }
     }

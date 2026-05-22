@@ -606,22 +606,32 @@ Framework::Framework(HMODULE framework_module)
     // See ProfilerMode.hpp.
     // RenderDoc integration — proactively load renderdoc.dll if present (or
     // LoadLibrary it from standard paths) and initialize the in-app API.
-    // Works alongside PIX and Nsight (RenderDoc hooks D3D12 the same way PIX
-    // does so PIX-mode skips RenderDoc bootstrap too).
+    //
+    // 2026-05-22: Gated behind UEVR_RENDERDOC_BOOTSTRAP=1 by default. The
+    // unconditional bootstrap was loading renderdoc.dll into the process at
+    // injection time, which interfered with the Nsight RTTI probe path and
+    // caused UEVR's diagnostic command-list hooks to never install on SN2.
+    // Symptom: the game rendered but PointerHook reinstalls looped every
+    // ~11 seconds without ever firing user hooks.
     {
-        auto rd_result = uevr_renderdoc_bootstrap();
-        if (rd_result.api_loaded) {
-            spdlog::info("[RenderDoc] integration READY: v{}.{}.{} (preloaded={})",
-                         rd_result.api_version_major, rd_result.api_version_minor,
-                         rd_result.api_version_patch, rd_result.was_preloaded);
-            // Start the sentinel-file watcher so external processes can
-            // trigger captures by writing to %TEMP%/uevr_renderdoc_capture.req
-            uevr_renderdoc_start_capture_watcher();
-            if (!rd_result.was_preloaded) {
-                spdlog::warn("[RenderDoc] capture_safe=DEGRADED: renderdoc.dll was LoadLibrary'd "
-                             "after D3D12CreateDevice. Status/UI queries work, but live captures "
-                             "may be incomplete. For full capture: relaunch via "
-                             "`renderdoccmd capture --opt-hook-children` then inject UEVR.");
+        const bool rd_bootstrap_enabled = []() {
+            char v[8]{};
+            return GetEnvironmentVariableA("UEVR_RENDERDOC_BOOTSTRAP", v, sizeof(v)) > 0
+                   && v[0] != '\0' && v[0] != '0';
+        }();
+        if (rd_bootstrap_enabled) {
+            auto rd_result = uevr_renderdoc_bootstrap();
+            if (rd_result.api_loaded) {
+                spdlog::info("[RenderDoc] integration READY: v{}.{}.{} (preloaded={})",
+                             rd_result.api_version_major, rd_result.api_version_minor,
+                             rd_result.api_version_patch, rd_result.was_preloaded);
+                uevr_renderdoc_start_capture_watcher();
+                if (!rd_result.was_preloaded) {
+                    spdlog::warn("[RenderDoc] capture_safe=DEGRADED: renderdoc.dll was LoadLibrary'd "
+                                 "after D3D12CreateDevice. Status/UI queries work, but live captures "
+                                 "may be incomplete. For full capture: relaunch via "
+                                 "`renderdoccmd capture --opt-hook-children` then inject UEVR.");
+                }
             }
         }
     }

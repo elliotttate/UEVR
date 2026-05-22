@@ -968,6 +968,28 @@ void D3D12Diagnostics::register_pipeline_root_signature(
         reinterpret_cast<uintptr_t>(root_signature);
 }
 
+std::vector<D3D12Diagnostics::RootSignatureInfo>
+D3D12Diagnostics::snapshot_root_signatures() const {
+    std::scoped_lock _{m_mutex};
+    std::vector<RootSignatureInfo> out{};
+    out.reserve(m_root_signatures.size());
+    for (const auto& kv : m_root_signatures) {
+        out.push_back(kv.second);
+    }
+    return out;
+}
+
+std::vector<std::pair<uintptr_t, uintptr_t>>
+D3D12Diagnostics::snapshot_pso_root_signature_pairs() const {
+    std::scoped_lock _{m_mutex};
+    std::vector<std::pair<uintptr_t, uintptr_t>> out{};
+    out.reserve(m_pso_root_signatures.size());
+    for (const auto& [pso, rs] : m_pso_root_signatures) {
+        out.emplace_back(pso, rs);
+    }
+    return out;
+}
+
 void D3D12Diagnostics::record_descriptor_heaps_set(
     std::string_view source,
     uint32_t count,

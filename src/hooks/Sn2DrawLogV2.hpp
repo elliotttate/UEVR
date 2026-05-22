@@ -58,7 +58,10 @@ inline const char* pass_tag_from_ps_crc(uint32_t ps_crc) {
         case 0x166DBA88u: return "basepass.uwewater";
         case 0x18B0D90Au: return "basepass.variant2";
         case 0x6E79C7F3u: return "sky.raymarch";
-        case 0x8733F2E0u: return "post.candidate";
+        case 0x8733F2E0u: return "water.overlay.a";
+        case 0xFEDC00F9u: return "water.overlay.b";
+        case 0x8568E000u: return "water.overlay.c";
+        case 0x4A4EB78Cu: return "water.overlay.d";
         case 0xE85849AAu: return "post.copyrect";
         default:          return "unknown";
     }
@@ -337,6 +340,10 @@ inline const PsoDictEntry* lookup_pso(uint32_t ps_crc) {
         { 0x166DBA88u, "e739f41c284b20e07a28dc30e34a47ea", "MainPS" },                   // pso3069
         { 0x18B0D90Au, "18b0d90a86d86dd8647c9eab739075a5", "MainPS" },                   // pso3113
         { 0x6E79C7F3u, "6e79c7f3b5776b62b67cd355cdd36f6d", "RenderSkyAtmosphereRayMarchingPS" }, // pso2993
+        { 0x8733F2E0u, "f13c974ac8d1e059", "MainPS" },                                   // Water.PostBasePass.VolumeOverlayA
+        { 0xFEDC00F9u, "94033f1086558a15", "MainPS" },                                   // Water.PostBasePass.VolumeOverlayB
+        { 0x8568E000u, "c8b83644302c711b", "MainPS" },                                   // Water.PostBasePass.VolumeOverlayC
+        { 0x4A4EB78Cu, "1dc19af5e56f965b", "MainPS" },                                   // Water.PostBasePass.VolumeOverlayD
     };
     for (const auto& e : k_table) {
         if (e.ps_crc == ps_crc) return &e;

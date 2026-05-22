@@ -278,6 +278,7 @@ protected:
     std::vector<std::unique_ptr<PointerHook>> m_create_pipeline_library_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_pipeline_state_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_root_signature_hooks{};
+    std::vector<std::unique_ptr<PointerHook>> m_create_descriptor_heap_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_constant_buffer_view_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_render_target_view_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_create_depth_stencil_view_hooks{};
@@ -296,6 +297,7 @@ protected:
     std::unordered_map<uintptr_t, PointerHook*> m_create_pipeline_library_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_pipeline_state_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_root_signature_hook_lookup{};
+    std::unordered_map<uintptr_t, PointerHook*> m_create_descriptor_heap_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_constant_buffer_view_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_render_target_view_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_depth_stencil_view_hook_lookup{};
@@ -335,6 +337,7 @@ protected:
     static HRESULT WINAPI pipeline_library_load_graphics_pipeline(ID3D12PipelineLibrary* library, LPCWSTR name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** pipeline_state);
     static HRESULT WINAPI pipeline_library_load_compute_pipeline(ID3D12PipelineLibrary* library, LPCWSTR name, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** pipeline_state);
     static HRESULT WINAPI create_root_signature(ID3D12Device* device, UINT node_mask, const void* blob, SIZE_T blob_length_in_bytes, REFIID riid, void** root_signature);
+    static HRESULT WINAPI create_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** heap);
     static void WINAPI create_constant_buffer_view(ID3D12Device* device, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
     static void WINAPI create_render_target_view(ID3D12Device* device, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
     static void WINAPI create_shader_resource_view(ID3D12Device* device, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
@@ -392,6 +395,7 @@ protected:
     PointerHook* find_create_pipeline_state_hook(void* slot) const;
     PointerHook* find_pipeline_library_hook(void* slot) const;
     PointerHook* find_create_root_signature_hook(void* slot) const;
+    PointerHook* find_create_descriptor_heap_hook(void* slot) const;
     PointerHook* find_create_constant_buffer_view_hook(void* slot) const;
     PointerHook* find_create_render_target_view_hook(void* slot) const;
     PointerHook* find_create_depth_stencil_view_hook(void* slot) const;

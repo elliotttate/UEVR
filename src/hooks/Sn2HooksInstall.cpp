@@ -28,6 +28,7 @@
 
 #include "Sn2RDGPassHook.hpp"
 #include "Sn2MaterialNameHook.hpp"
+#include "Sn2VsmUbClampPatch.hpp"
 
 static bool sn2_is_executable_process_range(uintptr_t address, size_t size) {
     if (address == 0 || size == 0 || address + size < address) {
@@ -224,6 +225,113 @@ static bool install_material_name_hook() {
 }
 
 // ============================================================================
+// Sn2VsmUbClampPatch: 3-byte binary patch on FVirtualShadowMapArray::GetUniformBuffer
+// ============================================================================
+//
+// Replaces the per-view-index clamp (cmovl eax, edx) with (xor eax, eax; nop)
+// so the function always returns CachedUniformBuffers[0]. See the header for
+// the rationale and patch coordinates.
+
+static uint8_t g_vsm_ub_clamp_saved_bytes[3]{};
+static bool g_vsm_ub_clamp_applied = false;
+static uintptr_t g_vsm_ub_clamp_target = 0;
+
+static bool install_vsm_ub_clamp_patch() {
+    if (!sn2_vsm_ub_clamp_patch::env_enabled()) {
+        SPDLOG_INFO("[SN2-VsmUbClamp] disabled (UEVR_SN2_VSM_UB_CLAMP_PATCH not set)");
+        return false;
+    }
+
+    const auto exe_base = reinterpret_cast<uintptr_t>(utility::get_executable());
+    if (exe_base == 0) {
+        SPDLOG_WARN("[SN2-VsmUbClamp] could not resolve executable base");
+        return false;
+    }
+
+    const auto fn_target = exe_base + sn2_vsm_ub_clamp_patch::SUBNAUTICA2_GETUNIFORMBUFFER_RVA;
+    const auto patch_target = exe_base + sn2_vsm_ub_clamp_patch::SUBNAUTICA2_GETUNIFORMBUFFER_CMOVL_RVA;
+
+    if (!sn2_is_executable_process_range(fn_target, sizeof(sn2_vsm_ub_clamp_patch::k_expected_function_prologue))) {
+        SPDLOG_WARN("[SN2-VsmUbClamp] function address 0x{:x} not executable; skipping", fn_target);
+        return false;
+    }
+
+    if (std::memcmp(reinterpret_cast<void*>(fn_target),
+                    sn2_vsm_ub_clamp_patch::k_expected_function_prologue,
+                    sizeof(sn2_vsm_ub_clamp_patch::k_expected_function_prologue)) != 0) {
+        SPDLOG_WARN("[SN2-VsmUbClamp] function prologue mismatch at 0x{:x}; binary likely changed, skipping", fn_target);
+        return false;
+    }
+
+    if (std::memcmp(reinterpret_cast<void*>(patch_target),
+                    sn2_vsm_ub_clamp_patch::k_original_bytes,
+                    sizeof(sn2_vsm_ub_clamp_patch::k_original_bytes)) != 0) {
+        SPDLOG_WARN("[SN2-VsmUbClamp] patch site bytes mismatch at 0x{:x}; binary likely changed, skipping", patch_target);
+        return false;
+    }
+
+    std::memcpy(g_vsm_ub_clamp_saved_bytes,
+                reinterpret_cast<const void*>(patch_target),
+                sizeof(g_vsm_ub_clamp_saved_bytes));
+
+    DWORD old_protect = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(patch_target),
+                        sizeof(sn2_vsm_ub_clamp_patch::k_patched_bytes),
+                        PAGE_EXECUTE_READWRITE,
+                        &old_protect)) {
+        SPDLOG_WARN("[SN2-VsmUbClamp] VirtualProtect RWX failed at 0x{:x}", patch_target);
+        return false;
+    }
+
+    std::memcpy(reinterpret_cast<void*>(patch_target),
+                sn2_vsm_ub_clamp_patch::k_patched_bytes,
+                sizeof(sn2_vsm_ub_clamp_patch::k_patched_bytes));
+
+    DWORD ignored = 0;
+    VirtualProtect(reinterpret_cast<void*>(patch_target),
+                   sizeof(sn2_vsm_ub_clamp_patch::k_patched_bytes),
+                   old_protect,
+                   &ignored);
+    FlushInstructionCache(GetCurrentProcess(),
+                          reinterpret_cast<void*>(patch_target),
+                          sizeof(sn2_vsm_ub_clamp_patch::k_patched_bytes));
+
+    g_vsm_ub_clamp_applied = true;
+    g_vsm_ub_clamp_target = patch_target;
+    SPDLOG_WARN(
+        "[SN2-VsmUbClamp] applied 3-byte patch at 0x{:x} (RVA 0x{:x}); GetUniformBuffer now always returns CachedUniformBuffers[0]",
+        patch_target,
+        sn2_vsm_ub_clamp_patch::SUBNAUTICA2_GETUNIFORMBUFFER_CMOVL_RVA);
+    return true;
+}
+
+static void revert_vsm_ub_clamp_patch() {
+    if (!g_vsm_ub_clamp_applied || g_vsm_ub_clamp_target == 0) return;
+
+    DWORD old_protect = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(g_vsm_ub_clamp_target),
+                        sizeof(g_vsm_ub_clamp_saved_bytes),
+                        PAGE_EXECUTE_READWRITE,
+                        &old_protect)) {
+        SPDLOG_WARN("[SN2-VsmUbClamp] revert VirtualProtect failed at 0x{:x}", g_vsm_ub_clamp_target);
+        return;
+    }
+    std::memcpy(reinterpret_cast<void*>(g_vsm_ub_clamp_target),
+                g_vsm_ub_clamp_saved_bytes,
+                sizeof(g_vsm_ub_clamp_saved_bytes));
+    DWORD ignored = 0;
+    VirtualProtect(reinterpret_cast<void*>(g_vsm_ub_clamp_target),
+                   sizeof(g_vsm_ub_clamp_saved_bytes),
+                   old_protect,
+                   &ignored);
+    FlushInstructionCache(GetCurrentProcess(),
+                          reinterpret_cast<void*>(g_vsm_ub_clamp_target),
+                          sizeof(g_vsm_ub_clamp_saved_bytes));
+    g_vsm_ub_clamp_applied = false;
+    SPDLOG_INFO("[SN2-VsmUbClamp] reverted patch at 0x{:x}", g_vsm_ub_clamp_target);
+}
+
+// ============================================================================
 // Public entry point: call once during UEVR startup, after the executable's
 // renderer modules are loaded (i.e. after D3D12CreateDevice).
 // ============================================================================
@@ -233,6 +341,11 @@ void install_all() {
     if (!s_installed.compare_exchange_strong(expected, true)) return;
     install_rdg_pass_hook();
     install_material_name_hook();
+    install_vsm_ub_clamp_patch();
+}
+
+void revert_all() {
+    revert_vsm_ub_clamp_patch();
 }
 
 } // namespace sn2_hooks_install
@@ -240,4 +353,8 @@ void install_all() {
 // Public C linkage for ease of calling from the main UEVR init path.
 extern "C" void uevr_sn2_install_render_hooks() {
     sn2_hooks_install::install_all();
+}
+
+extern "C" void uevr_sn2_revert_render_hooks() {
+    sn2_hooks_install::revert_all();
 }
