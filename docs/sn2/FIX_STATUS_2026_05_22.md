@@ -87,6 +87,34 @@ eye gets corrupted. This is the heap-aliasing issue. Approaches:
    index from CB, write to mirror slice if right eye). Bigger work
    but architecturally cleaner — no RTV swap, no aliasing risk.
 
+## Stable launcher
+
+`E:\Github\Subnautica 2\moddingkit\runs\launch_stable.ps1` — the
+minimum-sufficient stable config. Use this as the canonical baseline
+for next-session work.
+
+## Why we can't go further this session
+
+The fix-the-fix loop hit an architectural wall. With FixRules now
+correctly consulted (bug fixed in `ba9279f`), VoxelizePS gets the
+`synth_right_cb` dup. The dup writes to a mirror resource. But:
+
+1. **Mirror is created via CreateCommittedResource** in
+   Sn2UweFogMirrorHook — should be own heap, not aliased
+2. **OMSetRenderTargets correctly binds mirror RTVs** before dup
+3. **OMSetRenderTargets restores original RTVs** after dup
+4. **LEFT eye still gets corrupted visually** when synth dup fires
+
+Possible causes (unverified):
+- D3D12 placed-resource virtual address aliasing — the mirror's GPU
+  VA might overlap with the original's via the underlying VA range
+- Driver-level resource aliasing for similar-shape committed resources
+- A timing/ordering issue where the dup draw completes BEFORE LEFT
+  draw's writes settle (unlikely — DX12 is in-order on a single CL)
+
+Verifying requires Nsight GPU memory inspection or DXIL-level shader
+patch (paths 1-3 in section above).
+
 ## Tooling we shipped this session
 
 All committed to UEVR + pushed:

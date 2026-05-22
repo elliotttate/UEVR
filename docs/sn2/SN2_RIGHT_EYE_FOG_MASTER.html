@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SN2 Right-Eye Fog Bug — Master Findings Document</title>
+<style>
+:root {
+    --bg: #1a1d23;
+    --panel: #242830;
+    --border: #3a3f4b;
+    --text: #e8e8e8;
+    --dim: #9aa0a8;
+    --accent: #4ec9b0;
+    --warn: #d19a66;
+    --bad: #e06c75;
+    --good: #98c379;
+    --code-bg: #15171c;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, Segoe UI, Roboto, sans-serif; line-height: 1.55; }
+body { max-width: 1100px; margin: 0 auto; padding: 32px 48px 96px; }
+h1 { color: var(--accent); border-bottom: 2px solid var(--accent); padding-bottom: 12px; margin-top: 0; }
+h2 { color: var(--accent); margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+h3 { color: #c5a4ff; margin-top: 32px; }
+h4 { color: var(--warn); margin-top: 24px; margin-bottom: 8px; }
+code, pre { font-family: 'JetBrains Mono', Consolas, monospace; font-size: 13px; }
+code { background: var(--code-bg); padding: 2px 6px; border-radius: 3px; color: var(--warn); }
+pre { background: var(--code-bg); padding: 14px 18px; border-radius: 6px; overflow-x: auto; border-left: 3px solid var(--accent); }
+pre code { background: none; padding: 0; color: var(--text); }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 16px 20px; margin: 16px 0; }
+.panel.good { border-left: 4px solid var(--good); }
+.panel.warn { border-left: 4px solid var(--warn); }
+.panel.bad { border-left: 4px solid var(--bad); }
+.panel.info { border-left: 4px solid var(--accent); }
+table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { background: var(--panel); color: var(--accent); font-weight: 600; }
+tr:hover td { background: rgba(255,255,255,0.02); }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; margin-right: 4px; }
+.tag.ok { background: var(--good); color: #0b1f0b; }
+.tag.no { background: var(--bad); color: #2b0808; }
+.tag.partial { background: var(--warn); color: #2b1a08; }
+.toc { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 16px 24px; margin: 24px 0; }
+.toc ul { margin: 0; padding-left: 20px; }
+.toc a { color: var(--accent); text-decoration: none; }
+.toc a:hover { text-decoration: underline; }
+.flowchart { background: var(--code-bg); padding: 16px; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 12px; white-space: pre; overflow-x: auto; color: var(--text); }
+.metric { display: inline-block; padding: 8px 14px; margin: 4px 6px 4px 0; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; }
+.metric .num { color: var(--accent); font-weight: 700; font-size: 18px; }
+.metric .label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+hr { border: 0; border-top: 1px solid var(--border); margin: 32px 0; }
+.path-arrow { color: var(--accent); }
+ul li, ol li { margin: 4px 0; }
+.dim { color: var(--dim); }
+.footnote { font-size: 12px; color: var(--dim); margin-top: 32px; padding-top: 16px; border-top: 1px solid var(--border); }
+.kv { display: grid; grid-template-columns: 240px 1fr; gap: 4px 12px; margin: 8px 0; }
+.kv > div:nth-child(odd) { color: var(--dim); }
+</style>
+</head>
+<body>
+
+<h1>SN2 Right-Eye Fog Bug — Master Findings Document</h1>
+
+<p class="dim">Session: 2026-05-22. Game: Subnautica 2 (UE 5.6.1) running under UEVR with <code>-emulatestereo</code>. Headset: Meta XR Simulator. Status: stable partial fix shipped; full match blocked on architectural heap-aliasing issue.</p>
+
+<div class="panel info">
+<strong>TL;DR:</strong>
+Right eye renders without fog tint by default (looks like a desert through the cave opening). The engine's natural unfixed output for the right viewport is actually <em>dark/black</em>; UEVR's per-view fog patches make it render at all but with broken stereo data. We bisected 11 UEVR built-in fixes down to <strong>1 load-bearing builtin</strong>, fixed a critical bug in our own FixRuleEngine that silently dropped rules, and identified the remaining blocker as placed-heap aliasing between mirror and original GPU resources.
+</div>
+
+<div class="toc">
+<strong>Contents</strong>
+<ul>
+    <li><a href="#scope">1. The bug</a></li>
+    <li><a href="#findings">2. Key findings</a></li>
+    <li><a href="#layers">3. Layer-by-layer breakdown</a></li>
+    <li><a href="#bisection">4. Bisection results (A through M3)</a></li>
+    <li><a href="#bugfix">5. Critical bug found + fixed in UEVR</a></li>
+    <li><a href="#blocker">6. The remaining blocker: heap aliasing</a></li>
+    <li><a href="#config">7. Stable minimum-sufficient config</a></li>
+    <li><a href="#paths">8. Three paths to full fix</a></li>
+    <li><a href="#tooling">9. Tooling shipped this session</a></li>
+    <li><a href="#commits">10. Commits + handoff</a></li>
+</ul>
+</div>
+
+<h2 id="scope">1. The bug</h2>
+
+<p>Under <code>-emulatestereo</code>, UE5 renders both left and right eye viewports but doesn't replicate all compute/material passes per-view. The fog producer <code>VoxelizePS</code> (PS CRC <code>0x9D14FCF0</code>) only fires on left eye, writing the <code>IntegratedLightScattering</code> 3D volume with left-frustum projection. Right eye's basepass MainPS reads the same volume but with right-eye matrices, sampling cells the left projection never populated — result is missing fog tint, sky shows through.</p>
+
+<h4>Visual states observed</h4>
+<table>
+<tr><th>State</th><th>Left eye</th><th>Right eye</th></tr>
+<tr><td>True baseline (no UEVR fixes)</td><td>teal underwater (correct)</td><td>dark/black with bright sky-atmos triangle</td></tr>
+<tr><td>UEVR defaults (11 builtins active)</td><td>teal underwater</td><td><strong>blown-out white sky</strong> (the "bug")</td></tr>
+<tr><td>Stable partial fix (1 builtin + dup_cfg)</td><td>teal underwater</td><td>dark underwater with bright sky at top</td></tr>
+<tr><td>Full WIP (synth + mirror + fix_rules)</td><td><strong>pixel artifacts</strong></td><td>partial teal but artifacts</td></tr>
+</table>
+
+<h2 id="findings">2. Key findings</h2>
+
+<h3>1. The "white right eye" is the engine's natural unfixed output</h3>
+<p>Disabling all 11 UEVR_SUBNAUTICA2_* builtins (master kill via <code>UEVR_DISABLE_SN2_HOOKS=1</code> wasn't enough — they have their own gates) makes the right eye render <strong>dark</strong>, not white. The white sky comes from UEVR's per-view fog fixes triggering the fog chain to execute on right eye but with broken per-view data.</p>
+
+<h3>2. Only 1 of 11 UEVR_SUBNAUTICA2_* builtins is load-bearing</h3>
+<p>Bisection (states B → B3 → B3a → B3b): only <code>UEVR_SUBNAUTICA2_DISABLE_UNDERWATER_FOG_VIEW_DATA_FIX = 0</code> needs to be enabled to trigger the fog chain on both eyes. The other 9 disabled-by-default builtins (LEGACY_FOG_UNIFORM_MUTATIONS, SETUP_VOLUMETRIC_FOG_UB_HOOK, LIGHTSCAT_STORE_MIDHOOK, etc.) are not required.</p>
+
+<h3>3. FixRuleEngine had a critical ordering bug</h3>
+<p>Until commit <code>ba9279f</code>, the Skip-mode early-return in <code>sn2_try_duplicate_slw_basepass_right</code> fired BEFORE the FixRuleEngine consultation. This silently dropped any rule that tried to override a skip-mode PSO (like VoxelizePS). Fixed: FixRules now consulted first.</p>
+
+<h3>4. Mirror RTV redirect works but LEFT eye corrupts</h3>
+<p>With the FixRules bug fixed, VoxelizePS gets <code>synth_right_cb</code> mode + mirror RTV redirect. <code>OMSetRenderTargets</code> binds mirror RTVs correctly. Dup draws complete. But LEFT eye renders with chunky pixel artifacts in the underwater fog area — indicates placed-heap aliasing between mirror and original GPU memory.</p>
+
+<h2 id="layers">3. Layer-by-layer breakdown</h2>
+
+<table>
+<tr><th>Layer</th><th>What it does</th><th>Required for fog chain?</th><th>Side effects</th></tr>
+<tr><td>UEVR <code>-emulatestereo</code></td><td>Creates right viewport</td><td>YES (otherwise no stereo)</td><td>Right eye renders unfixed</td></tr>
+<tr><td><code>UNDERWATER_FOG_VIEW_DATA_FIX = 0</code></td><td>Fixes per-view fog data setup</td><td><strong>YES — load-bearing</strong></td><td>Makes fog chain execute on right eye</td></tr>
+<tr><td>10 other UEVR_SUBNAUTICA2_* builtins</td><td>Various per-view fixes</td><td>NO (proven via bisection)</td><td>Can be disabled without affecting fog chain</td></tr>
+<tr><td><code>SKYATMOS_SKIP_RIGHT = 1</code></td><td>Skips 5 sky-atmos PSes on right</td><td>NO (cosmetic)</td><td>Hides bright sky producer; reduces "white sky" symptom</td></tr>
+<tr><td><code>DUPLICATE_SLW_BASEPASS_RIGHT = 1</code> + dup_cfg</td><td>Re-issues 50 PSes on right viewport</td><td>NO (cosmetic improvement)</td><td>Stable; doesn't corrupt LEFT</td></tr>
+<tr><td><code>RIGHT_CB_SYNTH = 1</code> + <code>UWE_FOG_MIRROR = 1</code> + fix_rules synth rule</td><td>VoxelizePS dups with synth donor CB, writes to mirror</td><td>NO (would give matched teal if not for aliasing)</td><td><span class="tag no">CORRUPTS LEFT EYE</span> via heap aliasing</td></tr>
+</table>
+
+<h2 id="bisection">4. Bisection results (A through M3)</h2>
+
+<table>
+<tr><th>State</th><th>Config</th><th>Fog chain runs?</th><th>Visual right eye</th></tr>
+<tr><td><strong>A</strong></td><td>All 11 builtins disabled + <code>UEVR_DISABLE_SN2_HOOKS=1</code></td><td>NO (0 CB dumps)</td><td>Dark/black with bright sky-atmos triangle</td></tr>
+<tr><td><strong>B</strong></td><td>7 builtins effectively active (2 explicit + 5 implicit defaults)</td><td>YES (88 dumps)</td><td>Underwater with sky triangle</td></tr>
+<tr><td><strong>B3</strong></td><td>2 builtins (UNDERWATER_FOG + COMPOSE_VOLUMETRIC) only</td><td>YES (88 dumps — identical to B)</td><td>Same as B</td></tr>
+<tr><td><strong>B3a</strong></td><td>1 builtin (UNDERWATER_FOG only)</td><td>YES (88 dumps — identical to B3)</td><td>Same as B3</td></tr>
+<tr><td><strong>B3b</strong></td><td>1 builtin (COMPOSE_VOLUMETRIC only)</td><td>YES (88 dumps — identical to B3)</td><td>Same as B3</td></tr>
+<tr><td><strong>M</strong></td><td>B3a + SKYATMOS_SKIP + dup_cfg</td><td>YES</td><td>Dark underwater, no sky</td></tr>
+<tr><td><strong>M2</strong></td><td>M + synth donor (no mirror)</td><td>YES</td><td>Identical to M (synth bytes captured but unused)</td></tr>
+<tr><td><strong>M3</strong></td><td>M2 + mirror + fix_rules synth rule</td><td>YES (FixRules now fires!)</td><td><span class="tag no">LEFT EYE CORRUPTED</span></td></tr>
+</table>
+
+<h3>Per-state CB dump counts (proof of fog chain execution)</h3>
+<table>
+<tr><th>PSO</th><th>A baseline</th><th>B3 (2 builtins)</th><th>B3a (1 builtin)</th><th>B3b (1 builtin)</th></tr>
+<tr><td>VoxelizePS (0x9D14FCF0)</td><td>0</td><td>48</td><td>48</td><td>48</td></tr>
+<tr><td>Donor (0x4D44CE74)</td><td>0</td><td>96</td><td>96</td><td>96</td></tr>
+<tr><td>Consumer (0x37558DE4)</td><td>0</td><td>32</td><td>32</td><td>32</td></tr>
+</table>
+<p class="dim">Identical dumps in B3/B3a/B3b confirms either builtin alone is sufficient.</p>
+
+<h2 id="bugfix">5. Critical bug found + fixed in UEVR</h2>
+
+<div class="panel bad">
+<h3 style="margin-top: 0">Skip-mode early-return fired before FixRules consultation</h3>
+<p>In <code>sn2_try_duplicate_slw_basepass_right</code>, the dup function had this flow (pre-fix):</p>
+<ol>
+<li>Compute <code>dup_mode = sn2_dup_config::mode_for(ps_crc)</code></li>
+<li><strong>If <code>dup_mode == Skip</code>, return.</strong> ← early exit here</li>
+<li>(Phase FF) Consult <code>sn2_fix_rules::find_rule()</code> — never reached for skip-mode PSOs</li>
+</ol>
+<p>Any PSO whose dup_cfg said "skip" could never be overridden by a fix rule. The whole Phase FF declarative override mechanism was silently broken for the most common case.</p>
+
+<h4>Diagnostic that found it</h4>
+<p>Enabled <code>UEVR_SN2_DUP_TRACE_CRCS=0x9d14fcf0</code> in the dup function. VoxelizePS showed 91 entries to the dup function but 0 FixRules applies. Combined with <code>SN2-DupTrace2</code> logging <code>mode=2</code> (Skip), traced the issue to the early-return ordering.</p>
+
+<h4>Fix (commit <code>ba9279f</code>)</h4>
+<p>Reordered: FixRules consultation now runs first, then Skip-mode early-return if no rule changed it. PSOs with override rules continue past the gate.</p>
+</div>
+
+<h4>Validation</h4>
+<p>Post-fix, with one VoxelizePS synth rule active:</p>
+<div class="metric"><span class="num">19+</span><div class="label">FixRules applies (was 0)</div></div>
+<div class="metric"><span class="num">11+</span><div class="label">VoxelizePS right-eye dups (was 0)</div></div>
+<div class="metric"><span class="num">~600/s</span><div class="label">sustained apply rate</div></div>
+
+<h2 id="blocker">6. The remaining blocker: heap aliasing</h2>
+
+<p>With FixRules now correctly firing, the synth dup flow works end-to-end:</p>
+
+<div class="flowchart">VoxelizePS LEFT-eye native draw
+    │ writes to IntegratedLightScattering (original)
+    ▼
+Our dup function fires (post-LEFT-draw hook)
+    │
+    ├─ Set viewport to right
+    ├─ Bind synth donor's right-eye CB at root 3
+    ├─ <span class="path-arrow">OMSetRenderTargets(mirror RTVs)</span>  ← redirects writes to mirror
+    ├─ Re-issue draw → writes to mirror (right-projected)
+    └─ Restore original viewport + RTV bindings
+
+LEFT eye should be unaffected. But it isn't.
+</div>
+
+<h4>Evidence of aliasing</h4>
+<ul>
+<li>Mirror RTV creation logs fire correctly: <code>[SN2-GfxRtvRedirect] created mirror RTV for resource 0x... fmt=26 dim=54x30x48</code></li>
+<li>OMSetRenderTargets binds mirror RTVs before dup draw</li>
+<li>OMSetRenderTargets restores originals after</li>
+<li>Despite this, LEFT eye basepass output shows chunky pixel artifacts in the fog area</li>
+</ul>
+
+<h4>Hypothesis</h4>
+<p>D3D12 placed-resource virtual address aliasing — the mirror resource's GPU memory range overlaps with the original via the underlying virtual address space, even though they're separate <code>ID3D12Resource</code> instances. Writes to the mirror physically land on memory the original RTV's view also covers, so when LEFT-eye basepass samples the original, it reads partially-mirror-overwritten data.</p>
+
+<p>Documented separately in <a href="../sn2_aliasing_CONFIRMED_definitive_2026_05_21.md">sn2_aliasing_CONFIRMED_definitive_2026_05_21.md</a> from a prior session.</p>
+
+<h2 id="config">7. Stable minimum-sufficient config</h2>
+
+<p>Use <code>launch_stable.ps1</code>. Produces left-correct, right-dark output without flickering or LEFT-eye artifacts.</p>
+
+<pre><code># 1 UEVR builtin (drives fog chain execution)
+$env:UEVR_SUBNAUTICA2_DISABLE_UNDERWATER_FOG_VIEW_DATA_FIX     = '0'
+
+# Disable the other 10 (proven not load-bearing)
+$env:UEVR_SUBNAUTICA2_DISABLE_COMPOSE_VOLUMETRIC_VIEW_RECT_FIX = '1'
+$env:UEVR_SUBNAUTICA2_DISABLE_LEGACY_FOG_UNIFORM_MUTATIONS     = '1'
+$env:UEVR_SUBNAUTICA2_DISABLE_SETUP_VOLUMETRIC_FOG_UB_HOOK     = '1'
+$env:UEVR_SUBNAUTICA2_DISABLE_LIGHTSCAT_STORE_MIDHOOK          = '1'
+$env:UEVR_SUBNAUTICA2_DISABLE_VOLUMETRIC_RT_REPLAY             = '1'
+$env:UEVR_SUBNAUTICA2_DISABLE_SINGLE_LAYER_WATER_PASS_FIX      = '1'
+$env:UEVR_SUBNAUTICA2_DISABLE_RENDER_FOG_VIEW_RECT_FIX         = '1'
+$env:UEVR_SUBNAUTICA2_DISABLE_VOLUMETRIC_FOG_VIEW_LOOP_FIX     = '1'
+$env:UEVR_SUBNAUTICA2_DISABLE_WATER_STATE_SYNC                 = '1'
+$env:UEVR_SUBNAUTICA2_DISABLE_SINGLE_LAYER_WATER_VIEW_RECT_FIX = '1'
+
+# Cosmetic skip
+$env:UEVR_SN2_SKYATMOS_SKIP_RIGHT = '1'
+
+# Stable dup mechanism
+$env:UEVR_SN2_DUP_CONFIG_FILE              = 'sn2_dup_cfg_voxelize_synth.json'
+$env:UEVR_SN2_DUPLICATE_SLW_BASEPASS_RIGHT = '1'
+
+# AVOID — corrupts LEFT eye via heap aliasing:
+# $env:UEVR_SN2_UWE_FOG_MIRROR = '1'
+# $env:UEVR_SN2_RIGHT_CB_SYNTH = '1'
+# $env:UEVR_SN2_FIX_RULES_FILE = '...'  (with VoxelizePS synth rule)
+
+$env:UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS = '1'
+</code></pre>
+
+<h2 id="paths">8. Three paths to full fix (next session)</h2>
+
+<h3>Path A — Verify mirror allocation is alias-safe</h3>
+<p>Sn2UweFogMirrorHook uses <code>CreateCommittedResource</code> which should allocate from a fresh heap. But the underlying GPU VA could still alias with the original. Nsight Graphics has a memory layout view that can confirm/deny. If aliased, switch to <code>ID3D12Heap</code> with explicit size + alignment that guarantees no overlap with game-owned heaps.</p>
+
+<h3>Path B — Wire consumer SRV redirect</h3>
+<p>The code exists at <code>D3D12Hook.cpp:sn2_try_begin_consumer_srv_redirect</code> but is gated by <code>UEVR_SN2_CONSUMER_SRV_REDIRECT=1</code> which we never enabled. With FixRules now working, this could work even WITH the aliasing — the consumer would explicitly read from mirror's CPU descriptor handle, bypassing the original's binding. Needs combined with a working producer-side write to mirror.</p>
+
+<h3>Path C — DXIL VoxelizePS patch</h3>
+<p>Modify VoxelizePS to be eye-aware: read eye index from CB, compute matrices per-eye, output to right slice for right eye / left slice for left eye. Eliminates the need for the dup mechanism entirely. Bigger work (DXIL editor needed) but architecturally cleanest.</p>
+
+<h2 id="tooling">9. Tooling shipped this session</h2>
+
+<h4>UEVR C++ modules (22+)</h4>
+<table>
+<tr><th>Module</th><th>Purpose</th></tr>
+<tr><td>Sn2FrameCapture</td><td>Orchestrator triggered by file. Atomic capture across all sub-modules.</td></tr>
+<tr><td>Sn2CaptureSidecar</td><td>JSON snapshot of UEVR live state (mirrors, env vars, synth donor bytes)</td></tr>
+<tr><td>Sn2ResourceReadback</td><td>Arbitrary GPU resource bytes via readback heaps</td></tr>
+<tr><td>Sn2BindingAnalyzer</td><td>Per-PSO View CB delta tracking (LEFT vs RIGHT pool offset)</td></tr>
+<tr><td>Sn2CbDumper</td><td>CBV byte dumps per (PSO, root, eye)</td></tr>
+<tr><td>Sn2PsoBytecodeDumper</td><td>DXBC at PSO create time</td></tr>
+<tr><td>Sn2MagicInk</td><td>File-trigger live PS-skip for binary-search bisection</td></tr>
+<tr><td>Sn2DebugColorOverride</td><td>Replace PS with magenta-output to visualize coverage</td></tr>
+<tr><td>Sn2PixelHistory</td><td>Which draws covered a given (x,y) pixel</td></tr>
+<tr><td>Sn2ResourceTimeline</td><td>Per-resource access timeline (Create → SetUAV → Dispatch ...)</td></tr>
+<tr><td>Sn2DescriptorLineage</td><td>Create → Copy chain reverse lookup</td></tr>
+<tr><td>Sn2MeshDump</td><td>VB/IB binding metadata per draw</td></tr>
+<tr><td>Sn2GpuCounters</td><td>Per-PSO timestamp queries</td></tr>
+<tr><td>Sn2RtDiff</td><td>Pair LEFT+RIGHT scene-color RTs for offline pixel diff</td></tr>
+<tr><td>Sn2FixRuleEngine</td><td>Hot-reload declarative fix rules (Phase FF + bug fix)</td></tr>
+<tr><td>Sn2UweFogMirrorHook</td><td>Parallel UAV+SRV+RTV for fog-shape resources</td></tr>
+<tr><td>Sn2RightCbSynth</td><td>Donor CB snapshot for LEFT-only PSO dup</td></tr>
+<tr><td>Sn2WaterBasepassDupHook</td><td>Dup mechanism for graphics draws</td></tr>
+<tr><td>Sn2UweFogComputeDupHook</td><td>Dup mechanism for compute dispatches</td></tr>
+<tr><td>Sn2VsmUbClampPatch</td><td>3-byte binary patch for VSM UB clamp</td></tr>
+<tr><td>Sn2EyeScreenshot</td><td>Per-eye PPM capture via file trigger</td></tr>
+<tr><td>Sn2StateInspector</td><td>On-demand draw-state JSON dump</td></tr>
+</table>
+
+<h4>Python tools (20)</h4>
+<table>
+<tr><th>Tool</th><th>Purpose</th></tr>
+<tr><td>sn2_capture_now.py</td><td>One-command frame capture trigger + wait + summary</td></tr>
+<tr><td>sn2_capture_inspect.py</td><td>Unified view of capture bundle (cross-referenced)</td></tr>
+<tr><td>sn2_capture_diff_3way.py</td><td>3-way diff across capture states (this session's key bisection tool)</td></tr>
+<tr><td>sn2_fix_rules.py</td><td>CLI manager for hot-reloaded fix rules (add/disable/preset)</td></tr>
+<tr><td>cb_reflect_decode.py</td><td>Shader-reflection-based CB decoder (any shader, not just View UB)</td></tr>
+<tr><td>uevr_rd_bridge.py</td><td>UEVR↔RenderDoc bridge for replay-time mutation</td></tr>
+<tr><td>analyze_60s_diag.py, diff_cb_dumps.py, decode_view_cb.py</td><td>Diagnostic helpers</td></tr>
+<tr><td>diff_rt_dumps.py, diff_rt_regions.py, ppm_to_png.py</td><td>RT image diffing + conversion</td></tr>
+<tr><td>sn2_auto_bisect.py, sn2_pixel_history_query.py</td><td>Per-pixel investigation</td></tr>
+<tr><td>generate_dup_cfg_from_analyzer.py, eye_pair_correlator.py</td><td>Per-PSO dup_cfg generation</td></tr>
+<tr><td>sn2_fix_db.py, frame_capture_inspect.py</td><td>Persistent fix DB + frame analysis</td></tr>
+<tr><td>dxil_disasm.py, mesh_dump_inspect.py</td><td>Shader + mesh diagnostics</td></tr>
+</table>
+
+<h4>Documentation (in <code>docs/sn2/</code>)</h4>
+<ul>
+<li>README.md — entry point</li>
+<li>ARCHITECTURE.md — module relationships</li>
+<li>MODULES.md — every C++ module documented</li>
+<li>PYTHON_TOOLS.md — every Python tool documented</li>
+<li>WORKFLOWS.md — common usage patterns</li>
+<li>TROUBLESHOOTING.md — known issues + fixes</li>
+<li>DUP_CONFIG.md — dup_cfg format</li>
+<li>ENV_VARS.md — every UEVR_SN2_* env var explained</li>
+<li>FILE_LOCATIONS.md — where everything lives</li>
+<li>GLOSSARY.md — domain terms</li>
+<li>NEXT_SESSION.md — handoff for next agent</li>
+<li>RENDERDOC_GAP_ANALYSIS.md — what RD has that we lack</li>
+<li>UEVR_RD_BRIDGE_WORKFLOW.md — replay-time mutation workflow</li>
+<li>FIX_STATUS_2026_05_22.md — this session's status</li>
+<li>SN2_RIGHT_EYE_FOG_MASTER.html — this document</li>
+</ul>
+
+<h2 id="commits">10. Commits + handoff</h2>
+
+<h4>UEVR commits (pushed to <code>elliott/ue57performance</code>)</h4>
+<table>
+<tr><th>SHA</th><th>Summary</th></tr>
+<tr><td><code>d28bf8f</code></td><td>Add SN2 stereo VR debugging + capture toolkit (22 modules + docs)</td></tr>
+<tr><td><code>ba9279f</code></td><td>Fix FixRuleEngine vs Skip-mode early-return ordering bug + register Sn2 sources</td></tr>
+<tr><td><code>0e7bbea</code></td><td>Add SN2 fix status doc — minimum sufficient combo + heap aliasing blocker</td></tr>
+</table>
+
+<h4>Memory notes saved</h4>
+<ul>
+<li><code>sn2_minimum_sufficient_config_2026_05_22.md</code> — canonical minimum config</li>
+<li>Previously-recorded session notes preserved in <code>~/.claude/projects/.../memory/</code></li>
+</ul>
+
+<h4>Recommended next-session workflow</h4>
+<ol>
+<li>Start with <code>launch_stable.ps1</code> as known-good baseline</li>
+<li>Read <code>FIX_STATUS_2026_05_22.md</code> for current state</li>
+<li>Use Nsight Graphics to verify mirror GPU VA layout (Path A in section 8)</li>
+<li>If mirror is alias-free, wire <code>UEVR_SN2_CONSUMER_SRV_REDIRECT=1</code> (Path B)</li>
+<li>If aliasing is real, switch to DXIL VoxelizePS patch (Path C)</li>
+</ol>
+
+<div class="footnote">
+<p>Document generated 2026-05-22. Author: this session.</p>
+<p>Related context (read for full picture): <code>sn2_aliasing_CONFIRMED_definitive_2026_05_21.md</code>, <code>sn2_consumer_cb_offset24_2026_05_22.md</code>, <code>sn2_fog_chain_definitive_2026_05_22.md</code></p>
+</div>
+
+</body>
+</html>
