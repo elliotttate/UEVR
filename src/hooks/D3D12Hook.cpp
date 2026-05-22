@@ -318,6 +318,97 @@ struct Sn2DebugColorScope {
 // referencing a mirrored fog volume, substitute the slot with the mirror's SRV
 // so the right eye reads its own (right-projected) fog data instead of the
 // LEFT-projected original volume.
+// 2026-05-22: Consumer CB swap. For the right-eye native draw of a configured
+// PS CRC (default 0x37558DE4), substitute its bound CBV at a configured root
+// with the LEFT-eye instance's CBV GPU_VA. The fog applier 0x37558DE4 fires
+// natively on both eyes; CB-diff diagnostic showed RIGHT's root 3 has 3 slots
+// (offset 768/784/800) ZEROED while LEFT has valid inverse-viewport scalars.
+// Swapping to LEFT's CBV restores those values to RIGHT's sampler arithmetic.
+//
+// Since left + right of the same frame both bind from the same upload ring
+// buffer, LEFT's GPU_VA points at LEFT's bytes for the duration of the frame
+// (the ring doesn't wrap mid-frame in practice). No bytes copy required.
+struct Sn2ConsumerCbSwapScope {
+    bool active = false;
+    ID3D12GraphicsCommandList* command_list = nullptr;
+    UINT root_param = UINT_MAX;
+    uint64_t restore_va = 0;
+
+    Sn2ConsumerCbSwapScope() = default;
+    Sn2ConsumerCbSwapScope(const Sn2ConsumerCbSwapScope&) = delete;
+    Sn2ConsumerCbSwapScope& operator=(const Sn2ConsumerCbSwapScope&) = delete;
+    ~Sn2ConsumerCbSwapScope() { restore(); }
+    void restore() {
+        if (!active) return;
+        if (command_list != nullptr && root_param != UINT_MAX && restore_va != 0) {
+            command_list->SetGraphicsRootConstantBufferView(
+                root_param, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(restore_va));
+        }
+        active = false;
+    }
+};
+
+// Captures last-seen LEFT-eye CBV GPU_VA at (PS CRC, root) and owns a small
+// UEVR-side upload buffer used to build a partially-patched CB (RIGHT bytes
+// with the 3 zeroed slots replaced by LEFT bytes). This preserves per-eye
+// view fields (offsets 16/272/528 — different but valid between L/R) while
+// fixing the missing inverse-viewport scalars (offsets 768/784/800).
+struct Sn2ConsumerLeftCbSnapshot {
+    std::mutex init_mu;
+    std::atomic<uint64_t> last_left_va{0};
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload_buf;
+    uint8_t* buf_cpu{nullptr};
+    D3D12_GPU_VIRTUAL_ADDRESS buf_gpu{0};
+    uint64_t buf_size{0};
+    bool initialized{false};
+
+    bool ensure(ID3D12Device* device, uint64_t size = 4096) {
+        if (initialized) return true;
+        std::scoped_lock _{init_mu};
+        if (initialized) return true;
+        if (device == nullptr) return false;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = size;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT hr = device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload_buf));
+        if (FAILED(hr) || upload_buf == nullptr) return false;
+        D3D12_RANGE no_read{0, 0};
+        void* mapped = nullptr;
+        hr = upload_buf->Map(0, &no_read, &mapped);
+        if (FAILED(hr) || mapped == nullptr) return false;
+        buf_cpu = static_cast<uint8_t*>(mapped);
+        std::memset(buf_cpu, 0, size);
+        buf_gpu = upload_buf->GetGPUVirtualAddress();
+        buf_size = size;
+        initialized = true;
+        SPDLOG_WARN("[SN2-ConsumerCbSwap] patch buffer ready cpu=0x{:x} gpu_va=0x{:x} size={}",
+            reinterpret_cast<uintptr_t>(buf_cpu), buf_gpu, size);
+        return true;
+    }
+};
+inline Sn2ConsumerLeftCbSnapshot& consumer_left_cb_snapshot() {
+    static Sn2ConsumerLeftCbSnapshot s;
+    return s;
+}
+
+// SEH-guarded memcpy for upload-buffer reads (game may unmap mid-frame).
+static bool sn2_consumer_safe_memcpy(void* dst, const void* src, size_t bytes) {
+    __try {
+        std::memcpy(dst, src, bytes);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 struct Sn2ConsumerSrvRedirectScope {
     bool active = false;
     ID3D12GraphicsCommandList* command_list = nullptr;
@@ -9441,6 +9532,172 @@ static bool sn2_consumer_srv_redirect_env_enabled() {
     return e;
 }
 
+// 2026-05-22: Consumer CB swap env helpers.
+static bool sn2_consumer_cb_swap_env_enabled() {
+    static const bool e = []() {
+        const char* v = std::getenv("UEVR_SN2_CONSUMER_CB_SWAP");
+        return v && v[0] && v[0] != '0';
+    }();
+    return e;
+}
+
+static uint32_t sn2_consumer_cb_swap_target_crc() {
+    static const uint32_t v = []() -> uint32_t {
+        const char* s = std::getenv("UEVR_SN2_CONSUMER_CB_SWAP_PS_CRC");
+        if (s == nullptr || s[0] == 0) return 0x37558DE4u;
+        return static_cast<uint32_t>(std::strtoul(s, nullptr, 0));
+    }();
+    return v != 0 ? v : 0x37558DE4u;
+}
+
+static uint32_t sn2_consumer_cb_swap_root() {
+    static const uint32_t v = []() -> uint32_t {
+        const char* s = std::getenv("UEVR_SN2_CONSUMER_CB_SWAP_ROOT");
+        if (s == nullptr || s[0] == 0) return 3;
+        return static_cast<uint32_t>(std::strtoul(s, nullptr, 0));
+    }();
+    return v;
+}
+
+// Called from the draw path on LEFT-eye matches. Captures the GPU_VA the game
+// just bound at root N for the target PSO so the next right-eye draw of the
+// same PSO can substitute it.
+static void sn2_consumer_cb_swap_note_left(uint64_t left_va) {
+    if (left_va == 0) return;
+    auto& s = consumer_left_cb_snapshot();
+    s.last_left_va.store(left_va, std::memory_order_release);
+}
+
+// Per-slot patch table. Two complementary modes:
+//   - LEFT_BASE (default): start with LEFT CB everywhere, overwrite the
+//     configured ranges with RIGHT bytes (preserves the per-eye stereo view
+//     fields at offsets 16/272/528 while keeping LEFT's fog scalars at 800).
+//   - RIGHT_BASE: start with RIGHT CB, overwrite the configured ranges with
+//     LEFT bytes (the earlier hypothesis — useful for diagnostic).
+// Toggle via UEVR_SN2_CONSUMER_CB_PATCH_MODE=left_base|right_base. Slot list
+// via UEVR_SN2_CONSUMER_CB_PATCH_SLOTS="off:len,off:len,...".
+struct PatchRange { uint32_t off; uint32_t len; };
+static const std::vector<PatchRange>& sn2_consumer_cb_patch_ranges() {
+    static const std::vector<PatchRange> v = []() {
+        std::vector<PatchRange> out;
+        const char* s = std::getenv("UEVR_SN2_CONSUMER_CB_PATCH_SLOTS");
+        if (s == nullptr || s[0] == 0) {
+            // Default depends on mode (see below).
+            const char* m = std::getenv("UEVR_SN2_CONSUMER_CB_PATCH_MODE");
+            const bool left_base = (m == nullptr) || (std::string(m) == "left_base") || (m[0] == 0);
+            if (left_base) {
+                // Base = LEFT, overwrite RIGHT into per-eye stereo slots.
+                out.push_back({16, 16});
+                out.push_back({272, 16});
+                out.push_back({528, 16});
+            } else {
+                // Base = RIGHT, overwrite LEFT into the zeroed fog scalars.
+                out.push_back({768, 16});
+                out.push_back({784, 16});
+                out.push_back({800, 16});
+            }
+            return out;
+        }
+        std::string str{s};
+        size_t pos = 0;
+        while (pos < str.size()) {
+            // Find ':' for "off:len" or accept "off" alone (default len=16).
+            size_t comma = str.find(',', pos);
+            if (comma == std::string::npos) comma = str.size();
+            std::string tok = str.substr(pos, comma - pos);
+            size_t colon = tok.find(':');
+            uint32_t off = 0, len = 16;
+            try {
+                off = static_cast<uint32_t>(std::stoul(colon == std::string::npos ? tok : tok.substr(0, colon), nullptr, 0));
+                if (colon != std::string::npos) {
+                    len = static_cast<uint32_t>(std::stoul(tok.substr(colon + 1), nullptr, 0));
+                }
+                out.push_back({off, len});
+            } catch (...) {}
+            pos = comma + 1;
+        }
+        return out;
+    }();
+    return v;
+}
+
+// Called from the draw path BEFORE original() runs on right-eye matches.
+// Builds a hybrid CB in our upload buffer (RIGHT bytes everywhere except the
+// configured offset ranges, which are patched from LEFT), then binds it.
+static bool sn2_try_begin_consumer_cb_swap(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2ConsumerCbSwapScope& scope)
+{
+    if (!sn2_consumer_cb_swap_env_enabled()) return false;
+    if (command_list == nullptr || state.current_pso == nullptr) return false;
+    if (state.last_viewport_bucket != StereoTraceBucket::Right) return false;
+
+    auto& reg = render::ShaderOverrideRegistry::get();
+    const uint32_t ps_crc = reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso));
+    if (ps_crc != sn2_consumer_cb_swap_target_crc()) return false;
+
+    const uint32_t root = sn2_consumer_cb_swap_root();
+    if (root >= state.last_graphics_root_cbv.size()) return false;
+    const uint64_t right_va = state.last_graphics_root_cbv[root];
+    if (right_va == 0) return false;
+
+    const uint64_t left_va = consumer_left_cb_snapshot().last_left_va.load(std::memory_order_acquire);
+    if (left_va == 0 || left_va == right_va) return false;
+
+    // Resolve CPU pointers for both VAs via the upload-buffer map.
+    constexpr uint64_t kCbSize = 4096;
+    uint8_t* right_cpu = sn2_upload_buf_map::gpu_va_to_cpu(
+        static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(right_va), kCbSize);
+    uint8_t* left_cpu = sn2_upload_buf_map::gpu_va_to_cpu(
+        static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(left_va), kCbSize);
+    if (right_cpu == nullptr || left_cpu == nullptr) {
+        static std::atomic<uint64_t> miss{0};
+        const auto n = miss.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 4 || (n % 600) == 0) {
+            SPDLOG_INFO("[SN2-ConsumerCbSwap] gpu_va_to_cpu miss right={:p} left={:p}",
+                (void*)right_cpu, (void*)left_cpu);
+        }
+        return false;
+    }
+
+    // Ensure our upload buffer is ready.
+    auto& snap = consumer_left_cb_snapshot();
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (!snap.ensure(dev, kCbSize)) return false;
+
+    // Determine base+override per mode.
+    const char* mode_s = std::getenv("UEVR_SN2_CONSUMER_CB_PATCH_MODE");
+    const bool left_base = (mode_s == nullptr || mode_s[0] == 0 ||
+                            std::string(mode_s) == "left_base");
+    const uint8_t* base_cpu = left_base ? left_cpu : right_cpu;
+    const uint8_t* override_cpu = left_base ? right_cpu : left_cpu;
+    if (!sn2_consumer_safe_memcpy(snap.buf_cpu, base_cpu, kCbSize)) return false;
+    const auto& ranges = sn2_consumer_cb_patch_ranges();
+    for (const auto& r : ranges) {
+        if (r.off + r.len > kCbSize) continue;
+        if (!sn2_consumer_safe_memcpy(snap.buf_cpu + r.off, override_cpu + r.off, r.len)) {
+            return false;
+        }
+    }
+
+    command_list->SetGraphicsRootConstantBufferView(
+        root, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(snap.buf_gpu));
+
+    scope.active = true;
+    scope.command_list = command_list;
+    scope.root_param = root;
+    scope.restore_va = right_va;
+
+    static std::atomic<uint64_t> seq{0};
+    const auto n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 16 || (n % 600) == 0) {
+        SPDLOG_WARN("[SN2-ConsumerCbSwap] #{} ps_crc=0x{:08x} root={} right_va=0x{:x} patched({} ranges) → hybrid_gpu=0x{:x}",
+            n, ps_crc, root, right_va, ranges.size(), snap.buf_gpu);
+    }
+    return true;
+}
+
 static bool sn2_try_begin_consumer_srv_redirect(
     ID3D12GraphicsCommandList* command_list,
     const CommandListCorrelationState& state,
@@ -9860,12 +10117,6 @@ static void sn2_try_duplicate_slw_basepass_right(
     if (!is_water_basepass && !is_any_mrt && !is_config_entry) {
         return;
     }
-    if (sn2_dup_config::mode_for(ps_crc) == sn2_dup_config::DupMode::Skip) {
-        return;
-    }
-    if (is_water_basepass && !is_any_mrt && !is_config_entry && state.last_rtv_count != 7) {
-        return;
-    }
 
     // Snapshot LEFT View CBVs at each configured root. Prefer the per-PSO
     // roots from the JSON config; otherwise fall back to the env/default
@@ -9875,7 +10126,8 @@ static void sn2_try_duplicate_slw_basepass_right(
     auto view_roots = sn2_dup_config::view_cb_roots_for(ps_crc);
     auto dup_mode = sn2_dup_config::mode_for(ps_crc);
 
-    // Phase FF: consult FixRuleEngine for declarative overrides (hot-reloaded).
+    // Phase FF (moved earlier 2026-05-22): consult FixRuleEngine BEFORE the
+    // Skip early-return so a rule can override a skip-mode PSO in dup_cfg.
     // A rule that matches (ps_crc, eye_bucket) overrides the static dup_cfg.
     // Dup function always targets right-eye redirects, so eye_bucket = 2 (Right).
     const int fix_rule_eye = static_cast<int>(StereoTraceBucket::Right);
@@ -9907,6 +10159,17 @@ static void sn2_try_duplicate_slw_basepass_right(
             }
         }
     }
+
+    // Post-FixRules Skip check — if no rule overrode dup_mode away from Skip,
+    // honor it. (The earlier Skip check was moved to here so FixRules can
+    // override skip-mode PSOs.)
+    if (dup_mode == sn2_dup_config::DupMode::Skip) {
+        return;
+    }
+    if (is_water_basepass && !is_any_mrt && !is_config_entry && state.last_rtv_count != 7) {
+        return;
+    }
+
     struct ViewRootSwap {
         UINT root_param;
         uint64_t left_va;
@@ -10659,6 +10922,24 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         // the original descriptor table after the draw.
         Sn2ConsumerSrvRedirectScope consumer_srv_scope{};
         sn2_try_begin_consumer_srv_redirect(command_list, s2, consumer_srv_scope);
+        // 2026-05-22: Consumer CB swap. Capture LEFT-eye CBV on left draws of
+        // the target PSO; on RIGHT-eye draws, swap that CBV in. Fixes the
+        // zeroed inverse-viewport-scalars in 0x37558DE4's RIGHT root-3 CB.
+        Sn2ConsumerCbSwapScope consumer_cb_scope{};
+        if (sn2_consumer_cb_swap_env_enabled() && s2.current_pso != nullptr) {
+            auto& reg_cb = render::ShaderOverrideRegistry::get();
+            const uint32_t pscrc_cb = reg_cb.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso));
+            if (pscrc_cb == sn2_consumer_cb_swap_target_crc()) {
+                if (s2.last_viewport_bucket == StereoTraceBucket::Left) {
+                    const uint32_t root = sn2_consumer_cb_swap_root();
+                    if (root < s2.last_graphics_root_cbv.size()) {
+                        sn2_consumer_cb_swap_note_left(s2.last_graphics_root_cbv[root]);
+                    }
+                } else if (s2.last_viewport_bucket == StereoTraceBucket::Right) {
+                    sn2_try_begin_consumer_cb_swap(command_list, s2, consumer_cb_scope);
+                }
+            }
+        }
         // 2026-05-22: Debug color override (magenta PS swap) for visualizing
         // exactly where a given PS CRC renders pixels. Enabled when
         // UEVR_SN2_DEBUG_COLOR_OVERRIDE_FILE points at a file listing PS CRCs.
@@ -10687,6 +10968,7 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         sn2_note_draw_output_for_copyrect_fix(s2);
         sn2_note_copyrect_post_draw_output(command_list, s2);
         debug_color_scope.restore();
+        consumer_cb_scope.restore();
         consumer_srv_scope.restore();
         copyrect_scope.restore();
         copyrect_cbv_scope.restore();
