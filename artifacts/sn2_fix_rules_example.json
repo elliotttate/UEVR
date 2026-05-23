@@ -1,0 +1,31 @@
+{
+  "_comment": "Example FixRuleEngine config — hot-reloaded by UEVR. Edit + save → ~1s later rules apply. Equivalent fixes were previously C++ + rebuild + game restart.",
+  "rules": [
+    {
+      "_comment": "VoxelizePS — write right-projected fog via donor-snapshot CB",
+      "when": {
+        "ps_crc": "0x9d14fcf0",
+        "eye": "right"
+      },
+      "then": {
+        "swap_cb": [
+          { "root": 3, "to": "synth(donor=0x4d44ce74)" }
+        ],
+        "redirect_rtv": "mirror",
+        "no_viewport_shift": true
+      }
+    },
+    {
+      "_comment": "Donor PSO — view_cb_only with delta=-10240 (validated safe)",
+      "when": {
+        "ps_crc": "0x4d44ce74",
+        "eye": "right"
+      },
+      "then": {
+        "swap_cb": [
+          { "root": 3, "to": "delta=-10240" }
+        ]
+      }
+    }
+  ]
+}

@@ -206,6 +206,19 @@ std::optional<render::ShaderOverrideRegistry::Stage> parse_stage(std::string_vie
     return std::nullopt;
 }
 
+std::string hunter_stage_to_string(render::ShaderOverrideRegistry::HunterStage stage) {
+    switch (stage) {
+    case render::ShaderOverrideRegistry::HunterStage::Pixel:
+        return "pixel";
+    case render::ShaderOverrideRegistry::HunterStage::Vertex:
+        return "vertex";
+    case render::ShaderOverrideRegistry::HunterStage::Compute:
+        return "compute";
+    default:
+        return "unknown";
+    }
+}
+
 std::optional<render::ShaderCompilerBackend> parse_compiler(std::string_view value) {
     if (_stricmp(value.data(), "auto") == 0) {
         return render::ShaderCompilerBackend::Auto;
@@ -4589,12 +4602,13 @@ void ShaderOverrideRegistry::hunter_record_bind_locked(const D3D12GraphicsPsoRec
         spdlog::info("[ShaderHunter] frame window expired ({} frames). Collection paused; {} hashes captured.",
             m_hunter_frame_window, m_hunter_collected.size());
     }
+    const bool collection_paused = m_hunter_window_stopped || window_expired;
 
     auto it = m_hunter_collected.find(hunted_hash);
     if (it == m_hunter_collected.end()) {
         // After the frame window expires, keep live/hit data fresh for captured
         // hashes, but do not let new hashes shift the list being hunted.
-        if (window_expired) {
+        if (collection_paused) {
             return;
         }
 
@@ -4622,7 +4636,7 @@ void ShaderOverrideRegistry::hunter_record_bind_locked(const D3D12GraphicsPsoRec
     // companion PS hash and PSO bytecode size for context in the UI.
     if (!compute_only && !record.vertex_hash.empty()) {
         auto vs_it = m_hunter_collected_vs.find(record.vertex_hash);
-        if (vs_it == m_hunter_collected_vs.end() && !window_expired) {
+        if (vs_it == m_hunter_collected_vs.end() && !collection_paused) {
             auto [inserted, _] = m_hunter_collected_vs.emplace(record.vertex_hash, HunterCollectedEntry{});
             vs_it = inserted;
             vs_it->second.first_seen_frame = m_frame;
@@ -4632,6 +4646,7 @@ void ShaderOverrideRegistry::hunter_record_bind_locked(const D3D12GraphicsPsoRec
         }
         if (vs_it != m_hunter_collected_vs.end()) {
             vs_it->second.vs_hash = record.pixel_hash; // companion PS hash for context
+            vs_it->second.crc32 = record.vertex_crc32;
             vs_it->second.ps_size = record.owned_stream.vertex_shader.size();
             if (vs_it->second.ps_size == 0 && record.owned_desc.vertex_shader.size() > 0) {
                 vs_it->second.ps_size = record.owned_desc.vertex_shader.size();
@@ -4646,7 +4661,7 @@ void ShaderOverrideRegistry::hunter_record_bind_locked(const D3D12GraphicsPsoRec
     // mirror it into a CS-only map so the UI can iterate just compute shaders.
     if (compute_only) {
         auto cs_it = m_hunter_collected_cs.find(record.compute_hash);
-        if (cs_it == m_hunter_collected_cs.end() && !window_expired) {
+        if (cs_it == m_hunter_collected_cs.end() && !collection_paused) {
             auto [inserted, _] = m_hunter_collected_cs.emplace(record.compute_hash, HunterCollectedEntry{});
             cs_it = inserted;
             cs_it->second.first_seen_frame = m_frame;
@@ -4659,6 +4674,95 @@ void ShaderOverrideRegistry::hunter_record_bind_locked(const D3D12GraphicsPsoRec
             cs_it->second.ps_size = record.owned_stream.compute_shader.size();
             cs_it->second.last_seen_frame = m_frame;
             cs_it->second.hits += 1;
+        }
+    }
+}
+
+void ShaderOverrideRegistry::hunter_record_draw_event(uintptr_t pso_pointer, int eye_bucket, bool compute, bool indexed) {
+    if (!m_hunter_active.load(std::memory_order_relaxed)) return;
+    if (pso_pointer == 0) return;
+    if (eye_bucket < 0 || eye_bucket > 4) eye_bucket = 0;
+
+    std::scoped_lock _{m_mutex};
+    const auto rec_it = m_d3d12_graphics_pso_records.find(pso_pointer);
+    if (rec_it == m_d3d12_graphics_pso_records.end()) return;
+
+    const auto& record = rec_it->second;
+    const bool compute_only = compute || (record.pixel_hash.empty() && !record.compute_hash.empty());
+    const std::string& hunted_hash = compute_only ? record.compute_hash : record.pixel_hash;
+    if (hunted_hash.empty()) return;
+
+    // Keep the original bind-based list populated for compatibility when a
+    // draw reaches us before the SetPipelineState collection path did.
+    const bool needs_primary_entry = m_hunter_collected.find(hunted_hash) == m_hunter_collected.end();
+    const bool needs_vs_entry = !compute_only && !record.vertex_hash.empty() &&
+        m_hunter_collected_vs.find(record.vertex_hash) == m_hunter_collected_vs.end();
+    const bool needs_cs_entry = compute_only && !record.compute_hash.empty() &&
+        m_hunter_collected_cs.find(record.compute_hash) == m_hunter_collected_cs.end();
+    if (needs_primary_entry || needs_vs_entry || needs_cs_entry) {
+        hunter_record_bind_locked(record);
+    }
+
+    auto update_common = [&](HunterCollectedEntry& e, HunterStage stage, const std::string& companion_hash) {
+        e.stage = stage;
+        e.last_draw_frame = m_frame;
+        e.last_seen_frame = m_frame;
+        e.last_pso = pso_pointer;
+        e.eye_hits[static_cast<size_t>(eye_bucket)] += 1;
+        if (compute_only) {
+            e.dispatch_hits += 1;
+        } else {
+            e.draw_hits += 1;
+            if (indexed) {
+                e.indexed_draw_hits += 1;
+            }
+        }
+
+        if (!companion_hash.empty()) {
+            e.vs_hash = companion_hash;
+        }
+
+        const auto bind_context = D3D12Diagnostics::get().current_bind_context();
+        if (bind_context.has_value()) {
+            const auto render_target_name = join_target_names(bind_context->render_targets);
+            const auto render_target_key = join_target_keys(bind_context->render_targets);
+            const auto depth_target_name = bind_context->depth_target.has_value()
+                ? bind_context->depth_target->name
+                : std::string{};
+            const auto depth_target_key = bind_context->depth_target.has_value()
+                ? format_pointer_to_hex(bind_context->depth_target->handle)
+                : std::string{};
+            if (!render_target_name.empty()) {
+                e.last_render_targets = render_target_name;
+                e.last_render_target_key = render_target_key;
+            }
+            if (!depth_target_name.empty() || !depth_target_key.empty()) {
+                e.last_depth_target = depth_target_name.empty() ? depth_target_key : depth_target_name;
+                e.last_depth_target_key = depth_target_key;
+            }
+        }
+    };
+
+    auto it = m_hunter_collected.find(hunted_hash);
+    if (it != m_hunter_collected.end()) {
+        it->second.crc32 = compute_only ? record.compute_crc32 : record.pixel_crc32;
+        update_common(it->second, compute_only ? HunterStage::Compute : HunterStage::Pixel,
+            compute_only ? std::string{"CS"} : (!record.vertex_hash.empty() ? record.vertex_hash : record.mesh_hash));
+    }
+
+    if (!compute_only && !record.vertex_hash.empty()) {
+        auto vs_it = m_hunter_collected_vs.find(record.vertex_hash);
+        if (vs_it != m_hunter_collected_vs.end()) {
+            vs_it->second.crc32 = record.vertex_crc32;
+            update_common(vs_it->second, HunterStage::Vertex, record.pixel_hash);
+        }
+    }
+
+    if (compute_only && !record.compute_hash.empty()) {
+        auto cs_it = m_hunter_collected_cs.find(record.compute_hash);
+        if (cs_it != m_hunter_collected_cs.end()) {
+            cs_it->second.crc32 = record.compute_crc32;
+            update_common(cs_it->second, HunterStage::Compute, std::string{"CS"});
         }
     }
 }
@@ -4711,18 +4815,69 @@ bool ShaderOverrideRegistry::hunter_record_is_safe_suppression_candidate_locked(
 }
 
 bool ShaderOverrideRegistry::hunter_entry_is_scene_candidate_locked(const HunterCollectedEntry& entry) const {
-    return !entry.vs_hash.empty() && entry.ps_size >= HUNTER_MIN_SCENE_PS_SIZE;
+    const bool has_actual_work = (entry.draw_hits + entry.dispatch_hits) > 0;
+    if (!has_actual_work) {
+        return false;
+    }
+
+    if (entry.stage == HunterStage::Vertex) {
+        return !entry.vs_hash.empty();
+    }
+
+    if (entry.ps_size < HUNTER_MIN_SCENE_PS_SIZE) {
+        return false;
+    }
+
+    if (entry.stage == HunterStage::Compute) {
+        return true;
+    }
+
+    return !entry.vs_hash.empty();
 }
 
 void ShaderOverrideRegistry::hunter_rebuild_active_locked() {
-    if (m_hunter_order.empty()) {
+    auto clear_active = [&]() {
+        const std::string old_hash = m_hunter_active_hash;
         m_hunter_active_hash.clear();
         m_hunter_active_index = -1;
+        if (!old_hash.empty()) {
+            for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+                if (rec.pixel_hash == old_hash || rec.compute_hash == old_hash) {
+                    rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+                }
+            }
+        }
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    };
+
+    if (m_hunter_order.empty()) {
+        clear_active();
         return;
     }
     if (m_hunter_active_index < 0) m_hunter_active_index = 0;
     if (m_hunter_active_index >= static_cast<int>(m_hunter_order.size())) {
         m_hunter_active_index = static_cast<int>(m_hunter_order.size()) - 1;
+    }
+    auto is_pixel_index = [&](int idx) {
+        if (idx < 0 || idx >= static_cast<int>(m_hunter_order.size())) {
+            return false;
+        }
+        const auto it = m_hunter_collected.find(m_hunter_order[static_cast<size_t>(idx)]);
+        return it != m_hunter_collected.end() && it->second.stage != HunterStage::Compute;
+    };
+    if (!is_pixel_index(m_hunter_active_index)) {
+        m_hunter_active_index = -1;
+        for (int i = 0; i < static_cast<int>(m_hunter_order.size()); ++i) {
+            if (is_pixel_index(i)) {
+                m_hunter_active_index = i;
+                break;
+            }
+        }
+        if (m_hunter_active_index < 0) {
+            clear_active();
+            return;
+        }
     }
     const std::string new_hash = m_hunter_order[static_cast<size_t>(m_hunter_active_index)];
     const std::string old_hash = m_hunter_active_hash;
@@ -4733,8 +4888,47 @@ void ShaderOverrideRegistry::hunter_rebuild_active_locked() {
     // Avoids bumping the global revision counter which would re-evaluate
     // every tracked PSO and trigger driver pressure / GPU TDR.
     for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
-        if (rec.pixel_hash == old_hash || rec.pixel_hash == new_hash ||
-            rec.compute_hash == old_hash || rec.compute_hash == new_hash) {
+        if ((!old_hash.empty() && (rec.pixel_hash == old_hash || rec.compute_hash == old_hash)) ||
+                (!new_hash.empty() && (rec.pixel_hash == new_hash || rec.compute_hash == new_hash))) {
+            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+        }
+    }
+    {
+        std::scoped_lock skip_lock{m_hunter_skip_mutex};
+        m_hunter_skip_by_cmdlist.clear();
+    }
+}
+
+void ShaderOverrideRegistry::hunter_rebuild_stage_active_locked(HunterStage stage) {
+    if (stage == HunterStage::Pixel) {
+        hunter_rebuild_active_locked();
+        return;
+    }
+
+    auto& order = (stage == HunterStage::Vertex) ? m_hunter_order_vs : m_hunter_order_cs;
+    auto& idx = (stage == HunterStage::Vertex) ? m_hunter_active_index_vs : m_hunter_active_index_cs;
+    auto& hash = (stage == HunterStage::Vertex) ? m_hunter_active_hash_vs : m_hunter_active_hash_cs;
+    const std::string old_hash = hash;
+
+    if (order.empty()) {
+        idx = -1;
+        hash.clear();
+    } else {
+        if (idx < 0) idx = 0;
+        if (idx >= static_cast<int>(order.size())) {
+            idx = static_cast<int>(order.size()) - 1;
+        }
+        hash = order[static_cast<size_t>(idx)];
+    }
+
+    const std::string new_hash = hash;
+    if (old_hash == new_hash) {
+        return;
+    }
+
+    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
+        const auto& h = (stage == HunterStage::Vertex) ? rec.vertex_hash : rec.compute_hash;
+        if ((!old_hash.empty() && h == old_hash) || (!new_hash.empty() && h == new_hash)) {
             rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
         }
     }
@@ -4748,9 +4942,17 @@ void ShaderOverrideRegistry::hunter_start() {
     std::scoped_lock _{m_mutex};
     m_hunter_active = true;
     m_hunter_collected.clear();
+    m_hunter_collected_vs.clear();
+    m_hunter_collected_cs.clear();
     m_hunter_order.clear();
+    m_hunter_order_vs.clear();
+    m_hunter_order_cs.clear();
     m_hunter_active_index = -1;
     m_hunter_active_hash.clear();
+    m_hunter_active_index_vs = -1;
+    m_hunter_active_hash_vs.clear();
+    m_hunter_active_index_cs = -1;
+    m_hunter_active_hash_cs.clear();
     m_hunter_window_start_frame = m_frame;
     m_hunter_window_stopped = false;
     {
@@ -4822,7 +5024,10 @@ void ShaderOverrideRegistry::hunter_set_recent_frame_age(int frames) {
 
 void ShaderOverrideRegistry::hunter_step(int delta) {
     std::scoped_lock _{m_mutex};
-    if (m_hunter_order.empty()) return;
+    if (m_hunter_order.empty()) {
+        hunter_rebuild_active_locked();
+        return;
+    }
 
     std::vector<int> scene_live_candidates{};
     std::vector<int> live_candidates{};
@@ -4838,6 +5043,9 @@ void ShaderOverrideRegistry::hunter_step(int delta) {
         if (it == m_hunter_collected.end()) {
             continue;
         }
+        if (it->second.stage == HunterStage::Compute) {
+            continue;
+        }
 
         all_candidates.push_back(i);
         const bool scene_candidate = hunter_entry_is_scene_candidate_locked(it->second);
@@ -4845,10 +5053,14 @@ void ShaderOverrideRegistry::hunter_step(int delta) {
             scene_candidates.push_back(i);
         }
 
-        const auto age = m_frame >= it->second.last_seen_frame
-            ? (m_frame - it->second.last_seen_frame)
+        const uint64_t activity_frame = it->second.last_draw_frame != 0
+            ? it->second.last_draw_frame
+            : it->second.last_seen_frame;
+        const auto age = m_frame >= activity_frame
+            ? (m_frame - activity_frame)
             : 0;
-        if (age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
+        if ((it->second.draw_hits + it->second.dispatch_hits) > 0 &&
+                age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
             live_candidates.push_back(i);
             if (scene_candidate) {
                 scene_live_candidates.push_back(i);
@@ -4878,7 +5090,10 @@ void ShaderOverrideRegistry::hunter_step(int delta) {
     }
 
     const int n = static_cast<int>(candidates->size());
-    if (n == 0) return;
+    if (n == 0) {
+        hunter_rebuild_active_locked();
+        return;
+    }
     int next_pos = current_pos + delta;
     if (current_pos < 0) {
         next_pos = delta < 0 ? (n - 1) : 0;
@@ -4894,11 +5109,30 @@ void ShaderOverrideRegistry::hunter_step(int delta) {
 
 void ShaderOverrideRegistry::hunter_set_index(int index) {
     std::scoped_lock _{m_mutex};
-    if (m_hunter_order.empty()) return;
-    const int n = static_cast<int>(m_hunter_order.size());
+    if (m_hunter_order.empty()) {
+        hunter_rebuild_active_locked();
+        return;
+    }
+
+    std::vector<int> pixel_indices{};
+    pixel_indices.reserve(m_hunter_order.size());
+    for (int i = 0; i < static_cast<int>(m_hunter_order.size()); ++i) {
+        const auto it = m_hunter_collected.find(m_hunter_order[static_cast<size_t>(i)]);
+        if (it == m_hunter_collected.end() || it->second.stage == HunterStage::Compute) {
+            continue;
+        }
+        pixel_indices.push_back(i);
+    }
+    if (pixel_indices.empty()) {
+        m_hunter_active_index = -1;
+        hunter_rebuild_active_locked();
+        return;
+    }
+
+    const int n = static_cast<int>(pixel_indices.size());
     if (index < 0) index = 0;
     if (index >= n) index = n - 1;
-    m_hunter_active_index = index;
+    m_hunter_active_index = pixel_indices[static_cast<size_t>(index)];
     hunter_rebuild_active_locked();
 }
 
@@ -4911,29 +5145,81 @@ void ShaderOverrideRegistry::hunter_step(HunterStage stage, int delta) {
     if (stage == HunterStage::Pixel) { hunter_step(delta); return; }
     std::scoped_lock _{m_mutex};
     auto& order = (stage == HunterStage::Vertex) ? m_hunter_order_vs : m_hunter_order_cs;
+    auto& collected = (stage == HunterStage::Vertex) ? m_hunter_collected_vs : m_hunter_collected_cs;
     auto& idx = (stage == HunterStage::Vertex) ? m_hunter_active_index_vs : m_hunter_active_index_cs;
     auto& hash = (stage == HunterStage::Vertex) ? m_hunter_active_hash_vs : m_hunter_active_hash_cs;
-    if (order.empty()) return;
-    const int n = static_cast<int>(order.size());
-    int next = idx + delta;
-    if (idx < 0) next = (delta < 0) ? (n - 1) : 0;
-    while (next < 0) next += n;
-    next = next % n;
-    const std::string old_hash = hash;
-    idx = next;
-    hash = order[static_cast<size_t>(idx)];
-    // Invalidate any records whose corresponding stage hash matches old or new
-    // so SetPipelineState re-evaluates suppression for them.
-    for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
-        const auto& h = (stage == HunterStage::Vertex) ? rec.vertex_hash : rec.compute_hash;
-        if (h == old_hash || h == hash) {
-            rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
+    if (order.empty()) {
+        hunter_rebuild_stage_active_locked(stage);
+        return;
+    }
+
+    std::vector<int> scene_live_candidates{};
+    std::vector<int> live_candidates{};
+    std::vector<int> scene_candidates{};
+    std::vector<int> all_candidates{};
+    scene_live_candidates.reserve(order.size());
+    live_candidates.reserve(order.size());
+    scene_candidates.reserve(order.size());
+    all_candidates.reserve(order.size());
+
+    for (int i = 0; i < static_cast<int>(order.size()); ++i) {
+        const auto it = collected.find(order[static_cast<size_t>(i)]);
+        if (it == collected.end()) {
+            continue;
+        }
+
+        all_candidates.push_back(i);
+        const bool scene_candidate = hunter_entry_is_scene_candidate_locked(it->second);
+        if (scene_candidate) {
+            scene_candidates.push_back(i);
+        }
+
+        const uint64_t activity_frame = it->second.last_draw_frame != 0
+            ? it->second.last_draw_frame
+            : it->second.last_seen_frame;
+        const auto age = m_frame >= activity_frame
+            ? (m_frame - activity_frame)
+            : 0;
+        if ((it->second.draw_hits + it->second.dispatch_hits) > 0 &&
+                age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
+            live_candidates.push_back(i);
+            if (scene_candidate) {
+                scene_live_candidates.push_back(i);
+            }
         }
     }
-    {
-        std::scoped_lock skip_lock{m_hunter_skip_mutex};
-        m_hunter_skip_by_cmdlist.clear();
+
+    const auto* candidates = &scene_live_candidates;
+    if (candidates->empty() && !scene_candidates.empty()) {
+        candidates = &scene_candidates;
     }
+    if (candidates->empty() && !live_candidates.empty()) {
+        candidates = &live_candidates;
+    }
+    if (candidates->empty()) {
+        candidates = &all_candidates;
+    }
+
+    const int n = static_cast<int>(candidates->size());
+    if (n == 0) {
+        hunter_rebuild_stage_active_locked(stage);
+        return;
+    }
+
+    int current_pos = -1;
+    for (int i = 0; i < n; ++i) {
+        if ((*candidates)[static_cast<size_t>(i)] == idx) {
+            current_pos = i;
+            break;
+        }
+    }
+
+    int next = current_pos + delta;
+    if (current_pos < 0) next = (delta < 0) ? (n - 1) : 0;
+    while (next < 0) next += n;
+    next = next % n;
+    idx = (*candidates)[static_cast<size_t>(next)];
+    hunter_rebuild_stage_active_locked(stage);
     spdlog::info("[ShaderHunter] hunting stage={} idx={} hash={} (total={})",
         static_cast<int>(stage), idx, hash, n);
 }
@@ -4943,17 +5229,15 @@ void ShaderOverrideRegistry::hunter_set_index(HunterStage stage, int index) {
     std::scoped_lock _{m_mutex};
     auto& order = (stage == HunterStage::Vertex) ? m_hunter_order_vs : m_hunter_order_cs;
     auto& idx = (stage == HunterStage::Vertex) ? m_hunter_active_index_vs : m_hunter_active_index_cs;
-    auto& hash = (stage == HunterStage::Vertex) ? m_hunter_active_hash_vs : m_hunter_active_hash_cs;
-    if (order.empty()) return;
+    if (order.empty()) {
+        hunter_rebuild_stage_active_locked(stage);
+        return;
+    }
     const int n = static_cast<int>(order.size());
     if (index < 0) index = 0;
     if (index >= n) index = n - 1;
     idx = index;
-    hash = order[static_cast<size_t>(idx)];
-    {
-        std::scoped_lock skip_lock{m_hunter_skip_mutex};
-        m_hunter_skip_by_cmdlist.clear();
-    }
+    hunter_rebuild_stage_active_locked(stage);
 }
 
 void ShaderOverrideRegistry::hunter_toggle_mark_active(HunterStage stage) {
@@ -5005,12 +5289,24 @@ void ShaderOverrideRegistry::hunter_toggle_mark_active() {
 }
 
 void ShaderOverrideRegistry::hunter_toggle_mark_hash(std::string_view hash) {
+    hunter_toggle_mark_hash(HunterStage::Pixel, hash);
+}
+
+void ShaderOverrideRegistry::hunter_toggle_mark_hash(HunterStage stage, std::string_view hash) {
     std::scoped_lock _{m_mutex};
     std::string h{hash};
-    if (m_hunter_marked.count(h) > 0) m_hunter_marked.erase(h);
-    else m_hunter_marked.insert(h);
+    if (h.empty()) return;
+    auto& marked = stage == HunterStage::Vertex
+        ? m_hunter_marked_vs
+        : (stage == HunterStage::Compute ? m_hunter_marked_cs : m_hunter_marked);
+    if (marked.count(h) > 0) marked.erase(h);
+    else marked.insert(h);
     for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
-        if (rec.pixel_hash == h || rec.compute_hash == h) {
+        const bool touched =
+            (stage == HunterStage::Pixel && (rec.pixel_hash == h || rec.compute_hash == h)) ||
+            (stage == HunterStage::Vertex && rec.vertex_hash == h) ||
+            (stage == HunterStage::Compute && rec.compute_hash == h);
+        if (touched) {
             rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
         }
     }
@@ -5309,7 +5605,9 @@ void ShaderOverrideRegistry::hunter_set_cycle_highlight_mode(bool v) {
     const auto h_vs = m_hunter_active_hash_vs;
     const auto h_cs = m_hunter_active_hash_cs;
     for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
-        if (rec.pixel_hash == h_ps || rec.vertex_hash == h_vs || rec.compute_hash == h_cs) {
+        if ((!h_ps.empty() && rec.pixel_hash == h_ps) ||
+                (!h_vs.empty() && rec.vertex_hash == h_vs) ||
+                (!h_cs.empty() && rec.compute_hash == h_cs)) {
             rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
         }
     }
@@ -5323,90 +5621,165 @@ void ShaderOverrideRegistry::hunter_set_cycle_highlight_mode(bool v) {
 
 size_t ShaderOverrideRegistry::hunter_trim_collected(bool scene_only, bool live_only) {
     std::scoped_lock _{m_mutex};
-    const size_t before = m_hunter_order.size();
-    std::vector<std::string> new_order{};
-    new_order.reserve(before);
-    for (const auto& hash : m_hunter_order) {
-        auto it = m_hunter_collected.find(hash);
-        if (it == m_hunter_collected.end()) continue;
-        const auto& info = it->second;
+    const size_t before = m_hunter_order.size() + m_hunter_order_vs.size() + m_hunter_order_cs.size();
+
+    auto should_keep = [&](const HunterCollectedEntry& info) {
         if (live_only) {
-            const auto age = m_frame >= info.last_seen_frame
-                ? (m_frame - info.last_seen_frame) : 0;
+            const uint64_t activity_frame = info.last_draw_frame != 0
+                ? info.last_draw_frame
+                : info.last_seen_frame;
+            const auto age = m_frame >= activity_frame
+                ? (m_frame - activity_frame) : 0;
             if (age > static_cast<uint64_t>(m_hunter_recent_frame_age)) {
-                m_hunter_collected.erase(it);
-                continue;
+                return false;
             }
         }
         if (scene_only && !hunter_entry_is_scene_candidate_locked(info)) {
-            m_hunter_collected.erase(it);
-            continue;
+            return false;
         }
-        new_order.push_back(hash);
-    }
-    m_hunter_order = std::move(new_order);
+        return true;
+    };
+
+    auto trim_stage = [&](std::vector<std::string>& order, auto& collected, bool skip_compute) {
+        std::vector<std::string> new_order{};
+        new_order.reserve(order.size());
+        for (const auto& hash : order) {
+            auto it = collected.find(hash);
+            if (it == collected.end()) continue;
+            if (skip_compute && it->second.stage == HunterStage::Compute) {
+                collected.erase(it);
+                continue;
+            }
+            if (!should_keep(it->second)) {
+                collected.erase(it);
+                continue;
+            }
+            new_order.push_back(hash);
+        }
+        order = std::move(new_order);
+        return order.size();
+    };
+
+    const size_t kept_main = trim_stage(m_hunter_order, m_hunter_collected, true);
+    const size_t kept_vs = trim_stage(m_hunter_order_vs, m_hunter_collected_vs, false);
+    const size_t kept_cs = trim_stage(m_hunter_order_cs, m_hunter_collected_cs, false);
     // Snap active idx back into range.
     if (m_hunter_active_index >= static_cast<int>(m_hunter_order.size())) {
         m_hunter_active_index = static_cast<int>(m_hunter_order.size()) - 1;
     }
     if (m_hunter_active_index < 0 && !m_hunter_order.empty()) m_hunter_active_index = 0;
-    if (!m_hunter_order.empty()) {
-        m_hunter_active_hash = m_hunter_order[static_cast<size_t>(m_hunter_active_index)];
-    } else {
-        m_hunter_active_hash.clear();
-        m_hunter_active_index = -1;
-    }
+    hunter_rebuild_active_locked();
+    hunter_rebuild_stage_active_locked(HunterStage::Vertex);
+    hunter_rebuild_stage_active_locked(HunterStage::Compute);
     // Also auto-pause collection so the trimmed list stays stable.
     m_hunter_window_stopped = true;
-    const size_t after = m_hunter_order.size();
-    spdlog::info("[ShaderHunter] trim_collected: {} -> {} (scene_only={} live_only={})",
-        before, after, scene_only ? 1 : 0, live_only ? 1 : 0);
+    const size_t after = kept_main + kept_vs + kept_cs;
+    spdlog::info("[ShaderHunter] trim_collected: {} -> {} (main={} vs={} cs={} scene_only={} live_only={})",
+        before, after, kept_main, kept_vs, kept_cs, scene_only ? 1 : 0, live_only ? 1 : 0);
     return after;
 }
 
 size_t ShaderOverrideRegistry::hunter_trim_to_top_hits(size_t keep_count) {
     std::scoped_lock _{m_mutex};
     if (keep_count == 0) return 0;
-    const size_t before = m_hunter_order.size();
-    if (before <= keep_count) return before;
-    std::vector<std::pair<uint64_t, std::string>> by_hits{};
+    const size_t before = m_hunter_order.size() + m_hunter_order_vs.size() + m_hunter_order_cs.size();
+
+    struct TopHitCandidate {
+        uint64_t hits{};
+        HunterStage stage{HunterStage::Pixel};
+        std::string hash{};
+    };
+    std::vector<TopHitCandidate> by_hits{};
     by_hits.reserve(before);
-    for (const auto& hash : m_hunter_order) {
-        auto it = m_hunter_collected.find(hash);
-        if (it == m_hunter_collected.end()) continue;
-        by_hits.emplace_back(it->second.hits, hash);
-    }
+    bool has_actual_hits = false;
+
+    auto scan_actual = [&](const std::vector<std::string>& order, const auto& collected, bool skip_compute) {
+        for (const auto& hash : order) {
+            const auto it = collected.find(hash);
+            if (it == collected.end()) continue;
+            if (skip_compute && it->second.stage == HunterStage::Compute) continue;
+            if ((it->second.draw_hits + it->second.dispatch_hits) > 0) {
+                has_actual_hits = true;
+                return;
+            }
+        }
+    };
+    scan_actual(m_hunter_order, m_hunter_collected, true);
+    if (!has_actual_hits) scan_actual(m_hunter_order_vs, m_hunter_collected_vs, false);
+    if (!has_actual_hits) scan_actual(m_hunter_order_cs, m_hunter_collected_cs, false);
+
+    auto collect_candidates = [&](const std::vector<std::string>& order, const auto& collected, HunterStage stage, bool skip_compute) {
+        for (const auto& hash : order) {
+            const auto it = collected.find(hash);
+            if (it == collected.end()) continue;
+            if (skip_compute && it->second.stage == HunterStage::Compute) continue;
+            const uint64_t actual_hits = it->second.draw_hits + it->second.dispatch_hits;
+            if (has_actual_hits && actual_hits == 0) {
+                continue;
+            }
+            by_hits.push_back(TopHitCandidate{
+                has_actual_hits ? actual_hits : it->second.hits,
+                stage,
+                hash});
+        }
+    };
+    collect_candidates(m_hunter_order, m_hunter_collected, HunterStage::Pixel, true);
+    collect_candidates(m_hunter_order_vs, m_hunter_collected_vs, HunterStage::Vertex, false);
+    collect_candidates(m_hunter_order_cs, m_hunter_collected_cs, HunterStage::Compute, false);
+
     std::sort(by_hits.begin(), by_hits.end(),
-        [](const auto& a, const auto& b) { return a.first > b.first; });
-    std::unordered_set<std::string> keep_set{};
-    keep_set.reserve(keep_count);
+        [](const auto& a, const auto& b) { return a.hits > b.hits; });
+    std::unordered_set<std::string> keep_pixel{};
+    std::unordered_set<std::string> keep_vertex{};
+    std::unordered_set<std::string> keep_compute{};
+    keep_pixel.reserve(keep_count);
+    keep_vertex.reserve(keep_count);
+    keep_compute.reserve(keep_count);
     for (size_t i = 0; i < keep_count && i < by_hits.size(); ++i) {
-        keep_set.insert(by_hits[i].second);
+        if (by_hits[i].stage == HunterStage::Vertex) {
+            keep_vertex.insert(by_hits[i].hash);
+        } else if (by_hits[i].stage == HunterStage::Compute) {
+            keep_compute.insert(by_hits[i].hash);
+        } else {
+            keep_pixel.insert(by_hits[i].hash);
+        }
     }
-    std::vector<std::string> new_order{};
-    new_order.reserve(keep_count);
-    for (const auto& hash : m_hunter_order) {
-        if (keep_set.count(hash) > 0) new_order.push_back(hash);
-    }
-    // Erase dropped entries from m_hunter_collected.
-    for (auto it = m_hunter_collected.begin(); it != m_hunter_collected.end(); ) {
-        if (keep_set.count(it->first) == 0) it = m_hunter_collected.erase(it);
-        else ++it;
-    }
-    m_hunter_order = std::move(new_order);
+
+    auto trim_to_keep = [](std::vector<std::string>& order, auto& collected, const std::unordered_set<std::string>& keep, bool skip_compute) {
+        std::vector<std::string> new_order{};
+        new_order.reserve(keep.size());
+        for (const auto& hash : order) {
+            auto it = collected.find(hash);
+            if (it == collected.end()) continue;
+            if (skip_compute && it->second.stage == HunterStage::Compute) {
+                collected.erase(it);
+                continue;
+            }
+            if (keep.count(hash) > 0) {
+                new_order.push_back(hash);
+            } else {
+                collected.erase(it);
+            }
+        }
+        order = std::move(new_order);
+        return order.size();
+    };
+    const size_t kept_main = trim_to_keep(m_hunter_order, m_hunter_collected, keep_pixel, true);
+    const size_t kept_vs = trim_to_keep(m_hunter_order_vs, m_hunter_collected_vs, keep_vertex, false);
+    const size_t kept_cs = trim_to_keep(m_hunter_order_cs, m_hunter_collected_cs, keep_compute, false);
+
     if (m_hunter_active_index >= static_cast<int>(m_hunter_order.size())) {
         m_hunter_active_index = static_cast<int>(m_hunter_order.size()) - 1;
     }
     if (m_hunter_active_index < 0 && !m_hunter_order.empty()) m_hunter_active_index = 0;
-    if (!m_hunter_order.empty()) {
-        m_hunter_active_hash = m_hunter_order[static_cast<size_t>(m_hunter_active_index)];
-    } else {
-        m_hunter_active_hash.clear();
-        m_hunter_active_index = -1;
-    }
+    hunter_rebuild_active_locked();
+    hunter_rebuild_stage_active_locked(HunterStage::Vertex);
+    hunter_rebuild_stage_active_locked(HunterStage::Compute);
     m_hunter_window_stopped = true;
-    spdlog::info("[ShaderHunter] trim_to_top_hits: {} -> {}", before, m_hunter_order.size());
-    return m_hunter_order.size();
+    const size_t after = kept_main + kept_vs + kept_cs;
+    spdlog::info("[ShaderHunter] trim_to_top_hits: {} -> {} (main={} vs={} cs={})",
+        before, after, kept_main, kept_vs, kept_cs);
+    return after;
 }
 
 void ShaderOverrideRegistry::hunter_clear_all_marks() {
@@ -5495,7 +5868,10 @@ void ShaderOverrideRegistry::hunter_set_hide_marked(bool v) {
     m_hunter_hide_marked.store(v, std::memory_order_relaxed);
     // Invalidate all marked-hash records so they pick up new hide state.
     for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
-        if (m_hunter_marked.count(rec.pixel_hash) > 0 || m_hunter_marked.count(rec.compute_hash) > 0) {
+        if (m_hunter_marked.count(rec.pixel_hash) > 0 ||
+                m_hunter_marked.count(rec.compute_hash) > 0 ||
+                m_hunter_marked_vs.count(rec.vertex_hash) > 0 ||
+                m_hunter_marked_cs.count(rec.compute_hash) > 0) {
             rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
         }
     }
@@ -5509,8 +5885,12 @@ void ShaderOverrideRegistry::hunter_set_suppression_enabled(bool v) {
     std::scoped_lock _{m_mutex};
     m_hunter_suppression_enabled.store(v, std::memory_order_relaxed);
     const auto active_hash = m_hunter_active_hash;
+    const auto active_hash_vs = m_hunter_active_hash_vs;
+    const auto active_hash_cs = m_hunter_active_hash_cs;
     for (auto& [ptr, rec] : m_d3d12_graphics_pso_records) {
-        if (!active_hash.empty() && (rec.pixel_hash == active_hash || rec.compute_hash == active_hash)) {
+        if ((!active_hash.empty() && (rec.pixel_hash == active_hash || rec.compute_hash == active_hash)) ||
+                (!active_hash_vs.empty() && rec.vertex_hash == active_hash_vs) ||
+                (!active_hash_cs.empty() && rec.compute_hash == active_hash_cs)) {
             rec.applied_override_revision = (std::numeric_limits<uint64_t>::max)();
         }
     }
@@ -5527,16 +5907,16 @@ ShaderOverrideRegistry::HunterStateView ShaderOverrideRegistry::hunter_state() c
     v.active = m_hunter_active.load(std::memory_order_relaxed);
     v.hide_marked = m_hunter_hide_marked.load(std::memory_order_relaxed);
     v.suppression_enabled = m_hunter_suppression_enabled.load(std::memory_order_relaxed);
-    v.active_index = m_hunter_active_index;
+    v.active_index = -1;
     v.active_hash = m_hunter_active_hash;
     // Mirror per-stage state into the per-stage arrays in the view.
-    v.active_index_per_stage[0] = m_hunter_active_index;
+    v.active_index_per_stage[0] = -1;
     v.active_hash_per_stage[0] = m_hunter_active_hash;
     v.active_index_per_stage[1] = m_hunter_active_index_vs;
     v.active_hash_per_stage[1] = m_hunter_active_hash_vs;
     v.active_index_per_stage[2] = m_hunter_active_index_cs;
     v.active_hash_per_stage[2] = m_hunter_active_hash_cs;
-    v.collected_count_per_stage[0] = m_hunter_order.size();
+    v.collected_count_per_stage[0] = 0;
     v.collected_count_per_stage[1] = m_hunter_order_vs.size();
     v.collected_count_per_stage[2] = m_hunter_order_cs.size();
     v.marked_count_per_stage[0] = m_hunter_marked.size();
@@ -5550,7 +5930,7 @@ ShaderOverrideRegistry::HunterStateView ShaderOverrideRegistry::hunter_state() c
     v.active_is_marked_per_stage[2] = !m_hunter_active_hash_cs.empty() &&
         m_hunter_marked_cs.count(m_hunter_active_hash_cs) > 0;
     v.collected_count = m_hunter_order.size();
-    v.marked_count = m_hunter_marked.size();
+    v.marked_count = m_hunter_marked.size() + m_hunter_marked_vs.size() + m_hunter_marked_cs.size();
     v.frame_window = m_hunter_frame_window;
     v.recent_frame_age = m_hunter_recent_frame_age;
     v.min_scene_ps_size = HUNTER_MIN_SCENE_PS_SIZE;
@@ -5567,6 +5947,15 @@ ShaderOverrideRegistry::HunterStateView ShaderOverrideRegistry::hunter_state() c
     v.collected_crc32s.reserve(v.collected_count);
     v.collected_sizes.reserve(v.collected_count);
     v.collected_hits.reserve(v.collected_count);
+    v.collected_draw_hits.reserve(v.collected_count);
+    v.collected_dispatch_hits.reserve(v.collected_count);
+    v.collected_eye_left_hits.reserve(v.collected_count);
+    v.collected_eye_right_hits.reserve(v.collected_count);
+    v.collected_eye_full_hits.reserve(v.collected_count);
+    v.collected_eye_other_hits.reserve(v.collected_count);
+    v.collected_draw_age_frames.reserve(v.collected_count);
+    v.collected_last_render_targets.reserve(v.collected_count);
+    v.collected_last_depth_target.reserve(v.collected_count);
     v.collected_age_frames.reserve(v.collected_count);
     v.collected_marked.reserve(v.collected_count);
     for (const auto& hash : m_hunter_order) {
@@ -5576,27 +5965,46 @@ ShaderOverrideRegistry::HunterStateView ShaderOverrideRegistry::hunter_state() c
         }
 
         const auto& info = it->second;
+        if (info.stage == HunterStage::Compute) {
+            continue;
+        }
+        const uint64_t activity_frame = info.last_draw_frame != 0 ? info.last_draw_frame : info.last_seen_frame;
         const auto age = m_frame >= info.last_seen_frame ? (m_frame - info.last_seen_frame) : 0;
-        if (age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
+        const auto draw_age = activity_frame != 0 && m_frame >= activity_frame ? (m_frame - activity_frame) : 0;
+        if ((info.draw_hits + info.dispatch_hits) > 0 &&
+                draw_age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
             ++v.live_count;
             if (hunter_entry_is_scene_candidate_locked(info)) {
                 ++v.scene_live_count;
             }
         }
 
+        const int pixel_view_index = static_cast<int>(v.collected_count_per_stage[0]);
         v.collected_hashes.push_back(hash);
+        ++v.collected_count_per_stage[0];
         v.collected_vs_hashes.push_back(info.vs_hash);
         v.collected_crc32s.push_back(info.crc32);
         v.collected_sizes.push_back(info.ps_size);
         v.collected_hits.push_back(info.hits);
+        v.collected_draw_hits.push_back(info.draw_hits + info.dispatch_hits);
+        v.collected_dispatch_hits.push_back(info.dispatch_hits);
+        v.collected_eye_left_hits.push_back(info.eye_hits[1]);
+        v.collected_eye_right_hits.push_back(info.eye_hits[2]);
+        v.collected_eye_full_hits.push_back(info.eye_hits[3]);
+        v.collected_eye_other_hits.push_back(info.eye_hits[0] + info.eye_hits[4]);
+        v.collected_draw_age_frames.push_back(draw_age);
+        v.collected_last_render_targets.push_back(info.last_render_targets);
+        v.collected_last_depth_target.push_back(info.last_depth_target);
         v.collected_age_frames.push_back(age);
         v.collected_marked.push_back(m_hunter_marked.count(hash) > 0);
         v.collected_stages.push_back(HunterStage::Pixel);
         if (hash == m_hunter_active_hash) {
+            v.active_index = pixel_view_index;
+            v.active_index_per_stage[0] = pixel_view_index;
             v.active_crc32 = info.crc32;
-            v.active_age_frames = age;
+            v.active_age_frames = draw_age;
             v.active_crc32_per_stage[0] = info.crc32;
-            v.active_age_frames_per_stage[0] = age;
+            v.active_age_frames_per_stage[0] = draw_age;
         }
     }
     v.live_count_per_stage[0] = v.live_count;
@@ -5605,21 +6013,37 @@ ShaderOverrideRegistry::HunterStateView ShaderOverrideRegistry::hunter_state() c
         const auto it = m_hunter_collected_vs.find(vs_hash);
         if (it == m_hunter_collected_vs.end()) continue;
         const auto& info = it->second;
+        const uint64_t activity_frame = info.last_draw_frame != 0 ? info.last_draw_frame : info.last_seen_frame;
         const auto age = m_frame >= info.last_seen_frame ? (m_frame - info.last_seen_frame) : 0;
-        if (age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
+        const auto draw_age = activity_frame != 0 && m_frame >= activity_frame ? (m_frame - activity_frame) : 0;
+        if ((info.draw_hits + info.dispatch_hits) > 0 &&
+                draw_age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
+            ++v.live_count;
             ++v.live_count_per_stage[1];
+            if (hunter_entry_is_scene_candidate_locked(info)) {
+                ++v.scene_live_count;
+            }
         }
         v.collected_hashes.push_back(vs_hash);
         v.collected_vs_hashes.push_back(info.vs_hash);  // companion PS for context
         v.collected_crc32s.push_back(info.crc32);
         v.collected_sizes.push_back(info.ps_size);
         v.collected_hits.push_back(info.hits);
+        v.collected_draw_hits.push_back(info.draw_hits + info.dispatch_hits);
+        v.collected_dispatch_hits.push_back(info.dispatch_hits);
+        v.collected_eye_left_hits.push_back(info.eye_hits[1]);
+        v.collected_eye_right_hits.push_back(info.eye_hits[2]);
+        v.collected_eye_full_hits.push_back(info.eye_hits[3]);
+        v.collected_eye_other_hits.push_back(info.eye_hits[0] + info.eye_hits[4]);
+        v.collected_draw_age_frames.push_back(draw_age);
+        v.collected_last_render_targets.push_back(info.last_render_targets);
+        v.collected_last_depth_target.push_back(info.last_depth_target);
         v.collected_age_frames.push_back(age);
         v.collected_marked.push_back(m_hunter_marked_vs.count(vs_hash) > 0);
         v.collected_stages.push_back(HunterStage::Vertex);
         if (vs_hash == m_hunter_active_hash_vs) {
             v.active_crc32_per_stage[1] = info.crc32;
-            v.active_age_frames_per_stage[1] = age;
+            v.active_age_frames_per_stage[1] = draw_age;
         }
     }
     // === CS-stage loop ===
@@ -5627,21 +6051,37 @@ ShaderOverrideRegistry::HunterStateView ShaderOverrideRegistry::hunter_state() c
         const auto it = m_hunter_collected_cs.find(cs_hash);
         if (it == m_hunter_collected_cs.end()) continue;
         const auto& info = it->second;
+        const uint64_t activity_frame = info.last_draw_frame != 0 ? info.last_draw_frame : info.last_seen_frame;
         const auto age = m_frame >= info.last_seen_frame ? (m_frame - info.last_seen_frame) : 0;
-        if (age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
+        const auto draw_age = activity_frame != 0 && m_frame >= activity_frame ? (m_frame - activity_frame) : 0;
+        if ((info.draw_hits + info.dispatch_hits) > 0 &&
+                draw_age <= static_cast<uint64_t>(m_hunter_recent_frame_age)) {
+            ++v.live_count;
             ++v.live_count_per_stage[2];
+            if (hunter_entry_is_scene_candidate_locked(info)) {
+                ++v.scene_live_count;
+            }
         }
         v.collected_hashes.push_back(cs_hash);
         v.collected_vs_hashes.push_back("");
         v.collected_crc32s.push_back(info.crc32);
         v.collected_sizes.push_back(info.ps_size);
         v.collected_hits.push_back(info.hits);
+        v.collected_draw_hits.push_back(info.draw_hits + info.dispatch_hits);
+        v.collected_dispatch_hits.push_back(info.dispatch_hits);
+        v.collected_eye_left_hits.push_back(info.eye_hits[1]);
+        v.collected_eye_right_hits.push_back(info.eye_hits[2]);
+        v.collected_eye_full_hits.push_back(info.eye_hits[3]);
+        v.collected_eye_other_hits.push_back(info.eye_hits[0] + info.eye_hits[4]);
+        v.collected_draw_age_frames.push_back(draw_age);
+        v.collected_last_render_targets.push_back(info.last_render_targets);
+        v.collected_last_depth_target.push_back(info.last_depth_target);
         v.collected_age_frames.push_back(age);
         v.collected_marked.push_back(m_hunter_marked_cs.count(cs_hash) > 0);
         v.collected_stages.push_back(HunterStage::Compute);
         if (cs_hash == m_hunter_active_hash_cs) {
             v.active_crc32_per_stage[2] = info.crc32;
-            v.active_age_frames_per_stage[2] = age;
+            v.active_age_frames_per_stage[2] = draw_age;
         }
     }
     v.collected_count = v.collected_hashes.size();
@@ -5731,6 +6171,13 @@ void ShaderOverrideRegistry::hunter_record_set_pipeline_state_with_eye(void* com
     if (is_graphics) {
         state.graphics = skip;
     }
+}
+
+uint32_t ShaderOverrideRegistry::d3d12_pso_vertex_crc32(uintptr_t pso_pointer) const {
+    std::scoped_lock _{m_mutex};
+    auto it = m_d3d12_graphics_pso_records.find(pso_pointer);
+    if (it == m_d3d12_graphics_pso_records.end()) return 0;
+    return it->second.vertex_crc32;
 }
 
 uint32_t ShaderOverrideRegistry::d3d12_pso_pixel_crc32(uintptr_t pso_pointer) const {
@@ -5945,6 +6392,157 @@ bool ShaderOverrideRegistry::hunter_capture_active_as_override_stub(
 
     push_event("Captured disabled override stub for " + stage_name + " hash " + hash);
     request_reload();
+    return true;
+}
+
+bool ShaderOverrideRegistry::hunter_export_scene_list_json(std::filesystem::path& out_path, std::string& error_out) const {
+    std::scoped_lock _{m_mutex};
+    namespace fs = std::filesystem;
+
+    std::vector<json> rows{};
+    rows.reserve(m_hunter_collected.size() + m_hunter_collected_vs.size() + m_hunter_collected_cs.size());
+
+    auto add_row = [&](HunterStage stage, const std::string& hash, const HunterCollectedEntry& info, bool marked) {
+        const uint64_t actual_hits = info.draw_hits + info.dispatch_hits;
+        if (actual_hits == 0) {
+            return;
+        }
+
+        const uint64_t activity_frame = info.last_draw_frame != 0 ? info.last_draw_frame : info.last_seen_frame;
+        const uint64_t draw_age = activity_frame != 0 && m_frame >= activity_frame ? (m_frame - activity_frame) : 0;
+        const bool scene_candidate = hunter_entry_is_scene_candidate_locked(info);
+        const char* companion_stage =
+            stage == HunterStage::Pixel ? "vertex_or_mesh" :
+            stage == HunterStage::Vertex ? "pixel" :
+            "compute";
+
+        json row{};
+        row["stage"] = hunter_stage_to_string(stage);
+        row["hash"] = hash;
+        row["crc32"] = info.crc32;
+        row["companion_stage"] = companion_stage;
+        row["companion_hash"] = info.vs_hash;
+        row["bytecode_size"] = info.ps_size;
+        row["bind_hits"] = info.hits;
+        row["actual_hits"] = actual_hits;
+        row["draw_hits"] = info.draw_hits;
+        row["indexed_draw_hits"] = info.indexed_draw_hits;
+        row["dispatch_hits"] = info.dispatch_hits;
+        row["eye_hits"] = {
+            {"unknown", info.eye_hits[0]},
+            {"left", info.eye_hits[1]},
+            {"right", info.eye_hits[2]},
+            {"full", info.eye_hits[3]},
+            {"multi", info.eye_hits[4]},
+        };
+        row["first_seen_frame"] = info.first_seen_frame;
+        row["last_bind_frame"] = info.last_seen_frame;
+        row["last_draw_frame"] = info.last_draw_frame;
+        row["draw_age_frames"] = draw_age;
+        row["last_pso"] = info.last_pso != 0 ? format_pointer_to_hex(info.last_pso) : std::string{};
+        row["last_render_targets"] = info.last_render_targets;
+        row["last_render_target_key"] = info.last_render_target_key;
+        row["last_depth_target"] = info.last_depth_target;
+        row["last_depth_target_key"] = info.last_depth_target_key;
+        row["scene_candidate"] = scene_candidate;
+        row["marked"] = marked;
+        rows.push_back(std::move(row));
+    };
+
+    std::unordered_set<std::string> emitted{};
+    emitted.reserve(rows.capacity());
+    auto add_unique = [&](HunterStage stage, const std::string& hash, const HunterCollectedEntry& info, bool marked) {
+        std::string key = hunter_stage_to_string(stage);
+        key.push_back(':');
+        key += hash;
+        if (!emitted.insert(key).second) {
+            return;
+        }
+        add_row(stage, hash, info, marked);
+    };
+
+    for (const auto& hash : m_hunter_order) {
+        const auto it = m_hunter_collected.find(hash);
+        if (it == m_hunter_collected.end()) {
+            continue;
+        }
+
+        const HunterStage stage = it->second.stage == HunterStage::Compute
+            ? HunterStage::Compute
+            : HunterStage::Pixel;
+        const bool marked = stage == HunterStage::Compute
+            ? m_hunter_marked_cs.count(hash) > 0
+            : m_hunter_marked.count(hash) > 0;
+        add_unique(stage, hash, it->second, marked);
+    }
+
+    for (const auto& hash : m_hunter_order_vs) {
+        const auto it = m_hunter_collected_vs.find(hash);
+        if (it == m_hunter_collected_vs.end()) {
+            continue;
+        }
+        add_unique(HunterStage::Vertex, hash, it->second, m_hunter_marked_vs.count(hash) > 0);
+    }
+
+    for (const auto& hash : m_hunter_order_cs) {
+        const auto it = m_hunter_collected_cs.find(hash);
+        if (it == m_hunter_collected_cs.end()) {
+            continue;
+        }
+        add_unique(HunterStage::Compute, hash, it->second, m_hunter_marked_cs.count(hash) > 0);
+    }
+
+    std::sort(rows.begin(), rows.end(), [](const json& a, const json& b) {
+        const uint64_t a_hits = a.value("actual_hits", uint64_t{0});
+        const uint64_t b_hits = b.value("actual_hits", uint64_t{0});
+        if (a_hits != b_hits) {
+            return a_hits > b_hits;
+        }
+        const uint64_t a_age = a.value("draw_age_frames", uint64_t{0});
+        const uint64_t b_age = b.value("draw_age_frames", uint64_t{0});
+        if (a_age != b_age) {
+            return a_age < b_age;
+        }
+        return a.value("hash", std::string{}) < b.value("hash", std::string{});
+    });
+
+    json doc{};
+    doc["generated_by"] = "UEVR Shader Hunter";
+    doc["frame"] = m_frame;
+    doc["active"] = m_hunter_active.load(std::memory_order_relaxed);
+    doc["recent_frame_age"] = m_hunter_recent_frame_age;
+    doc["frame_window"] = m_hunter_frame_window;
+    doc["window_stopped"] = m_hunter_window_stopped;
+    doc["min_scene_bytecode_size"] = HUNTER_MIN_SCENE_PS_SIZE;
+    doc["entry_count"] = rows.size();
+    doc["entries"] = json::array();
+    for (auto& row : rows) {
+        doc["entries"].push_back(std::move(row));
+    }
+
+    const fs::path export_dir = Framework::get_persistent_dir("shader_hunter");
+    std::error_code ec{};
+    fs::create_directories(export_dir, ec);
+    if (ec) {
+        error_out = "Failed to create shader_hunter export dir: " + ec.message();
+        return false;
+    }
+
+    out_path = export_dir / ("scene_shaders_frame_" + std::to_string(m_frame) + ".json");
+    std::ofstream out{out_path, std::ios::binary | std::ios::trunc};
+    if (!out) {
+        error_out = "Failed to open scene shader export for writing: " + out_path.string();
+        return false;
+    }
+
+    out << doc.dump(2) << "\n";
+    if (!out) {
+        error_out = "Failed while writing scene shader export: " + out_path.string();
+        return false;
+    }
+
+    spdlog::info("[ShaderHunter] exported {} scene shader entries to {}", doc["entry_count"].get<size_t>(), out_path.string());
+    error_out.clear();
     return true;
 }
 

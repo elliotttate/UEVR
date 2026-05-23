@@ -100,7 +100,7 @@ void update_donor(uint32_t crc, int eye, uint32_t root, D3D12_GPU_VIRTUAL_ADDRES
     if (!env_enabled()) return;
     if (crc != donor_crc()) return;
     if (root != donor_root()) return;
-    if (eye != 1) return;  // only snapshot RIGHT-eye bindings
+    if (eye != 2) return;  // only snapshot RIGHT-eye bindings (canonical StereoTraceBucket::Right)
     if (gpu_va == 0) return;
     auto& s = state();
     if (!s.initialized) return;

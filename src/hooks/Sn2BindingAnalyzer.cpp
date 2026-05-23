@@ -17,6 +17,8 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "render/StereoEye.hpp"
+
 namespace sn2_upload_buf_map {
 bool resolve_va(D3D12_GPU_VIRTUAL_ADDRESS gpu_va,
                 ID3D12Resource*& out_resource, uint64_t& out_offset);
@@ -103,7 +105,8 @@ void write_json_locked() {
     if (!env_enabled()) return;
     auto& s = state();
     nlohmann::json doc;
-    doc["schema"] = "uevr.sn2.binding_analyzer.v1";
+    doc["schema"] = "uevr.sn2.binding_analyzer.v2";
+    doc["eye_bucket_convention"] = "StereoTraceBucket: unknown=0 left=1 right=2 full=3 multi=4";
     doc["frame_count"] = s.frame_count.load(std::memory_order_relaxed);
     doc["samples_total"] = s.samples_total.load(std::memory_order_relaxed);
     doc["samples_unresolved"] = s.samples_unresolved.load(std::memory_order_relaxed);
@@ -177,10 +180,11 @@ void record_root_cbv(uintptr_t pso,
         a.representative_resource = parent;
     }
 
-    if (eye_bucket == 0) {
+    const int canonical_eye = render::canonicalize_stereo_eye_bucket(eye_bucket, -1);
+    if (canonical_eye == static_cast<int>(render::StereoTraceBucket::Left)) {
         a.samples_l++;
         if (ok) push_unique(a.left_offsets, offset);
-    } else if (eye_bucket == 1) {
+    } else if (canonical_eye == static_cast<int>(render::StereoTraceBucket::Right)) {
         a.samples_r++;
         if (ok) push_unique(a.right_offsets, offset);
     } else {

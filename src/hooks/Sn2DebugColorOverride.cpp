@@ -11,6 +11,7 @@
 #include "Sn2DebugColorOverride.hpp"
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -19,7 +20,11 @@
 
 #include <Windows.h>
 #include <d3dcompiler.h>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+
+#include "render/StereoEye.hpp"
+#include "render/StereoForensics.hpp"
 
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -59,10 +64,41 @@ std::unordered_set<uint32_t> parse_crc_csv(const std::string& s) {
     return out;
 }
 
+bool env_truthy(const char* name) {
+    const auto v = env_str(name);
+    return !v.empty() && v != "0" && v != "false" && v != "FALSE";
+}
+
+uint32_t parse_crc_json(const nlohmann::json& value) {
+    if (value.is_number_unsigned()) {
+        return static_cast<uint32_t>(value.get<uint64_t>());
+    }
+    if (value.is_string()) {
+        const auto s = value.get<std::string>();
+        char* tail = nullptr;
+        const auto v = std::strtoul(s.c_str(), &tail, 0);
+        return tail != s.c_str() ? static_cast<uint32_t>(v) : 0u;
+    }
+    return 0u;
+}
+
+int parse_eye_json(const nlohmann::json& value) {
+    if (value.is_number_integer()) {
+        return render::canonicalize_stereo_eye_bucket(value.get<int>(), render::kStereoEyeAny);
+    }
+    if (!value.is_string()) {
+        return render::kStereoEyeAny;
+    }
+    return render::parse_stereo_eye_bucket(value.get<std::string>(), render::kStereoEyeAny);
+}
+
 struct Storage {
     std::mutex mu;
     std::unordered_set<uint32_t> live_set;
+    std::unordered_map<uint32_t, int> forensics_color_eye_by_crc;
+    std::unordered_map<uint32_t, std::vector<std::pair<int, std::string>>> forensics_color_rules_by_crc;
     int64_t last_mtime = 0;
+    int64_t forensics_last_mtime = 0;
     std::atomic<uint64_t> poll_counter{0};
 
     // Per-original-PSO cache: PSO* → cloned replacement PSO
@@ -89,10 +125,30 @@ struct Storage {
 
 Storage& storage() { static Storage s; return s; }
 
+// 6-MRT replacement that outputs teal to SV_Target0..4 and SV_Target6.
+// Matches the SLW basepass MainPS (0xDE7C3822) output signature so D3D12
+// pipeline validation accepts the substituted PSO. RGB tuned for the
+// right-eye underwater fix: pushes the right eye towards left-eye teal.
 constexpr const char* kMagentaHlsl = R"HLSL(
 struct PSIn { float4 pos : SV_Position; };
-float4 main(PSIn i) : SV_Target0 {
-    return float4(1.0, 0.0, 1.0, 1.0);
+struct PSOut {
+    float4 t0 : SV_Target0;
+    float4 t1 : SV_Target1;
+    float4 t2 : SV_Target2;
+    float4 t3 : SV_Target3;
+    float4 t4 : SV_Target4;
+    float4 t6 : SV_Target6;
+};
+PSOut main(PSIn i) {
+    PSOut o;
+    float4 teal = float4(0.05, 0.35, 0.45, 1.0);
+    o.t0 = teal;
+    o.t1 = teal;
+    o.t2 = teal;
+    o.t3 = teal;
+    o.t4 = teal;
+    o.t6 = teal;
+    return o;
 }
 )HLSL";
 
@@ -118,7 +174,13 @@ bool compile_magenta_ps() {
 
 bool env_enabled() {
     static const bool e = []() {
-        return !env_str("UEVR_SN2_DEBUG_COLOR_OVERRIDE_FILE").empty();
+        const bool x = !env_str("UEVR_SN2_DEBUG_COLOR_OVERRIDE_FILE").empty() ||
+            (env_truthy("UEVR_STEREO_EXPERIMENTS") && !env_str("UEVR_STEREO_EXPERIMENTS_FILE").empty());
+        SPDLOG_WARN("[SN2-DebugColor] env_enabled first-eval: {} file='{}' eye='{}'",
+                    x ? "true" : "false",
+                    env_str("UEVR_SN2_DEBUG_COLOR_OVERRIDE_FILE"),
+                    env_str("UEVR_SN2_DEBUG_COLOR_OVERRIDE_EYE"));
+        return x;
     }();
     return e;
 }
@@ -136,6 +198,60 @@ int target_eye_bucket() {
         return -1;
     }();
     return v;
+}
+
+void refresh_forensics_color_rules() {
+    if (!env_truthy("UEVR_STEREO_EXPERIMENTS")) return;
+    const auto path = env_str("UEVR_STEREO_EXPERIMENTS_FILE");
+    if (path.empty()) return;
+
+    auto& s = storage();
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad)) {
+        return;
+    }
+    const int64_t mtime = (static_cast<int64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32)
+                          | fad.ftLastWriteTime.dwLowDateTime;
+    if (mtime == s.forensics_last_mtime) {
+        return;
+    }
+
+    try {
+        std::ifstream f(path);
+        if (!f.good()) return;
+        const auto doc = nlohmann::json::parse(f);
+        const auto& arr = doc.contains("rules")
+            ? doc.at("rules")
+            : (doc.contains("experiments") ? doc.at("experiments") : doc);
+        if (!arr.is_array()) return;
+
+        std::unordered_map<uint32_t, int> parsed;
+        std::unordered_map<uint32_t, std::vector<std::pair<int, std::string>>> parsed_rules;
+        for (const auto& item : arr) {
+            if (!item.value("enabled", true)) continue;
+            const auto match = item.value("match", nlohmann::json::object());
+            const auto action = item.value("action", nlohmann::json{});
+            std::string action_type;
+            if (action.is_string()) {
+                action_type = action.get<std::string>();
+            } else if (action.is_object()) {
+                action_type = action.value("type", std::string{});
+            }
+            if (action_type != "color_override") continue;
+            const auto ps_crc = parse_crc_json(match.value("ps_crc", item.value("ps_crc", nlohmann::json{})));
+            if (ps_crc == 0) continue;
+            const int eye = parse_eye_json(match.value("eye", item.value("eye", nlohmann::json{"both"})));
+            parsed[ps_crc] = eye;
+            parsed_rules[ps_crc].push_back({eye, item.value("name", std::string{"color_override_" + std::to_string(ps_crc)})});
+        }
+
+        std::scoped_lock _{s.mu};
+        s.forensics_color_eye_by_crc = std::move(parsed);
+        s.forensics_color_rules_by_crc = std::move(parsed_rules);
+        s.forensics_last_mtime = mtime;
+    } catch (const std::exception& e) {
+        SPDLOG_WARN("[SN2-DebugColor] failed to parse Stereo Forensics color rules: {}", e.what());
+    }
 }
 
 std::unordered_set<uint32_t> override_crcs() {
@@ -159,18 +275,61 @@ std::unordered_set<uint32_t> override_crcs() {
                 }
             }
         }
+        refresh_forensics_color_rules();
     }
     std::scoped_lock _{s.mu};
-    return s.live_set;
+    auto out = s.live_set;
+    for (const auto& [crc, _eye] : s.forensics_color_eye_by_crc) {
+        out.insert(crc);
+    }
+    return out;
 }
 
 bool should_override(uint32_t ps_crc, int eye_bucket) {
     if (!env_enabled()) return false;
-    const auto set = override_crcs();
-    if (set.find(ps_crc) == set.end()) return false;
-    const int t = target_eye_bucket();
-    if (t == -1) return true;
-    return eye_bucket == t;
+    (void)override_crcs();
+    auto& s = storage();
+    std::scoped_lock _{s.mu};
+    if (s.live_set.find(ps_crc) != s.live_set.end()) {
+        const int t = target_eye_bucket();
+        return t == -1 || eye_bucket == t;
+    }
+    const auto it = s.forensics_color_eye_by_crc.find(ps_crc);
+    if (it == s.forensics_color_eye_by_crc.end()) {
+        return false;
+    }
+    return it->second == -1 || it->second == eye_bucket;
+}
+
+void note_override_applied(uint32_t ps_crc, int eye_bucket, const char* kind) {
+    if (!env_enabled() || ps_crc == 0) {
+        return;
+    }
+    (void)override_crcs();
+
+    std::vector<std::string> names;
+    {
+        auto& s = storage();
+        std::scoped_lock _{s.mu};
+        const auto it = s.forensics_color_rules_by_crc.find(ps_crc);
+        if (it != s.forensics_color_rules_by_crc.end()) {
+            for (const auto& [eye, name] : it->second) {
+                if (eye == render::kStereoEyeAny || eye == eye_bucket) {
+                    names.push_back(name);
+                }
+            }
+        }
+    }
+    for (const auto& name : names) {
+        render::StereoForensics::get().record_experiment_observation(
+            name,
+            "color_override",
+            "applied",
+            kind != nullptr ? kind : "draw_indexed",
+            ps_crc,
+            0,
+            eye_bucket);
+    }
 }
 
 void note_create_graphics_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,

@@ -1,0 +1,14 @@
+{
+  "schema": "uevr.sn2.dup_config.v1",
+  "description": "A/B: dup DE7C3822 right viewport with right View CB (root 4 delta=-10240) but FORCE LEFT root 5 (delta=0 means use the captured LEFT VA unchanged). Tests if root5 content gates fog.",
+  "default_view_cb_delta": 0,
+  "default_view_cb_roots": [],
+  "entries": {
+    "0xde7c3822": {
+      "mode": "viewport_shift",
+      "view_cb_roots": [4],
+      "view_cb_delta": -10240,
+      "note": "Standard: right viewport + right View CB. Use this to compare against cb5/cb7 variants."
+    }
+  }
+}

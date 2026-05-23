@@ -59,7 +59,13 @@ bool is_loaded();
 
 // Called from Present hook every frame. Checks for trigger file existence.
 // If present, calls api->TriggerCapture() and (optionally) emits sidecar.
-void on_present(uint64_t frame_count);
+//
+// d3d12_queue: the ID3D12CommandQueue* used by the present chain. RD's
+//   in-app API for D3D12 expects the queue as its "device pointer".
+// hwnd:        the window the swap chain targets.
+// Either may be null — wildcard capture fallback still attempts but is
+// less reliable.
+void on_present(uint64_t frame_count, void* d3d12_queue = nullptr, void* hwnd = nullptr);
 
 // Programmatic trigger (no file). Call when you want to capture from C++.
 void request_capture_next_frame();

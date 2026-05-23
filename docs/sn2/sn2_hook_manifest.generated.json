@@ -1,0 +1,567 @@
+{
+  "generated_at_utc": "2026-05-23T14:51:42+00:00",
+  "inputs": {
+    "exe": "E:\\Github\\Subnautica 2\\Subnautica2\\Binaries\\Win64\\Subnautica2-Win64-Shipping.exe",
+    "symbols": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\binfold_scratch\\symbols.json",
+    "decomp_root": "E:\\Github\\Subnautica 2\\moddingkit\\runs",
+    "image_base": "0x140000000"
+  },
+  "candidate_totals": {
+    "binfold_symbols": 18,
+    "selected_functions": 13,
+    "decompile_asm": 104
+  },
+  "stereo_forensics_runtime_actions": {
+    "executable_actions": [
+      "skip",
+      "skip_draw",
+      "skip_dispatch",
+      "color_override",
+      "swap_cbv_left_to_right",
+      "swap_descriptor_from_left",
+      "force_srv_array_slice"
+    ],
+    "mutation_actions": [
+      "swap_cbv_left_to_right",
+      "swap_descriptor_from_left",
+      "force_srv_array_slice"
+    ],
+    "probe_actions": [
+      "color_override"
+    ],
+    "unsupported_actions": [
+      "duplicate_left_work_into_right_bucket",
+      "replace_shader_from_left_permutation",
+      "replace_ps_bytecode",
+      "patch_cb_bytes"
+    ],
+    "source": "E:\\Github\\UEVRJ\\src\\render\\StereoForensics.cpp",
+    "source_status": "parsed"
+  },
+  "targets": [
+    {
+      "key": "scene_renderer_render",
+      "needles": [
+        "FSceneRenderer::Render("
+      ],
+      "raw_needles": [
+        "?Render@FSceneRenderer@@"
+      ],
+      "candidate_counts": {},
+      "entries": []
+    },
+    {
+      "key": "setup_fog_uniform_parameters",
+      "needles": [
+        "SetupFogUniformParameters"
+      ],
+      "raw_needles": [
+        "?SetupFogUniformParameters@@"
+      ],
+      "candidate_counts": {
+        "decompile_asm": 13,
+        "selected_functions": 3
+      },
+      "entries": [
+        {
+          "key": "setup_fog_uniform_parameters",
+          "source": "decompile_asm",
+          "name": "SetupFogUniformParameters(FRDGBuilder &,FViewInfo const &,FFogUniformParameters &,bool)",
+          "raw_name": "?SetupFogUniformParameters@@YAXAEAVFRDGBuilder@@AEBVFViewInfo@@AEAVFFogUniformParameters@@_N@Z",
+          "ea": "0x1426FD010",
+          "rva": "0x26FD010",
+          "match_kind": "strict",
+          "ref_rva": "0x24df2a0",
+          "hash": "9acd88f5d2a669f68ec80664bc08f525124a1b9c1f940b317de1bd0dd2ca708f",
+          "prologue_pattern": "48 89 5C 24 18 48 89 7C 24 20 41 56 48 83 EC 50 48 8B 42 08 4C 8B F1 0F",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\fog_decompile_20260514\\linear_fog\\00000001426FD010_SetupFogUniformParameters_FRDGBuilder___FViewInfo_const___FFogUniformParameters___bool.linear.asm.txt",
+          "note": "asm function header"
+        },
+        {
+          "key": "setup_fog_uniform_parameters",
+          "source": "selected_functions",
+          "name": "SetupFogUniformParameters(FRDGBuilder &,FViewInfo const &,FFogUniformParameters &,bool)",
+          "raw_name": "?SetupFogUniformParameters@@YAXAEAVFRDGBuilder@@AEBVFViewInfo@@AEAVFFogUniformParameters@@_N@Z",
+          "ea": "0x1426FD010",
+          "rva": "0x26FD010",
+          "prologue_pattern": "48 89 5C 24 18 48 89 7C 24 20 41 56 48 83 EC 50 48 8B 42 08 4C 8B F1 0F",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\fog_decompile_20260514\\rebuilt\\00000001426FD010_SetupFogUniformParameters_FRDGBuilder___FViewInfo_const___FFogUniformParameters___bool.asm.txt",
+          "decompile_c": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\fog_decompile_20260514\\rebuilt\\00000001426FD010_SetupFogUniformParameters_FRDGBuilder___FViewInfo_const___FFogUniformParameters___bool.c",
+          "note": "from E:\\Github\\Subnautica 2\\moddingkit\\runs\\fog_decompile_20260514\\rebuilt\\selected_functions.json"
+        }
+      ]
+    },
+    {
+      "key": "basepass_mesh_processor_ctor",
+      "needles": [
+        "FBasePassMeshProcessor::FBasePassMeshProcessor"
+      ],
+      "raw_needles": [
+        "??0FBasePassMeshProcessor@@"
+      ],
+      "candidate_counts": {
+        "decompile_asm": 6,
+        "selected_functions": 2
+      },
+      "entries": [
+        {
+          "key": "basepass_mesh_processor_ctor",
+          "source": "decompile_asm",
+          "name": "FBasePassMeshProcessor::FBasePassMeshProcessor(EMeshPass::Type,FScene const *,ERHIFeatureLevel::Type,FSceneView const *,FMeshPassProcessorRenderState const &,FMeshPassDrawListContext *,FBasePassMeshProcessor::EFlags,ETranslucencyPass::Type)",
+          "ea": "0x14263A3A0",
+          "rva": "0x263A3A0",
+          "prologue_pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\basepass_ctor_callers_decomp_20260515_124700\\0000000142D129B0_sub_142D129B0.asm.txt",
+          "note": "call target reference"
+        },
+        {
+          "key": "basepass_mesh_processor_ctor",
+          "source": "selected_functions",
+          "name": "FBasePassMeshProcessor::FBasePassMeshProcessor(EMeshPass::Type,FScene const *,ERHIFeatureLevel::Type,FSceneView const *,FMeshPassProcessorRenderState const &,FMeshPassDrawListContext *,FBasePassMeshProcessor::EFlags,ETranslucencyPass::Type)",
+          "raw_name": "??0FBasePassMeshProcessor@@QEAA@W4Type@EMeshPass@@PEBVFScene@@W41ERHIFeatureLevel@@PEBVFSceneView@@AEBUFMeshPassProcessorRenderState@@PEAVFMeshPassDrawListContext@@W4EFlags@0@W41ETranslucencyPass@@@Z",
+          "ea": "0x14263A3A0",
+          "rva": "0x263A3A0",
+          "prologue_pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\basepass_mp_ctor_decomp_20260515_124400\\000000014263A3A0_FBasePassMeshProcessor__FBasePassMeshProcessor_EMeshPass__Type_FScene_const___ERHIFeatureLevel__.asm.txt",
+          "decompile_c": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\basepass_mp_ctor_decomp_20260515_124400\\000000014263A3A0_FBasePassMeshProcessor__FBasePassMeshProcessor_EMeshPass__Type_FScene_const___ERHIFeatureLevel__.c",
+          "note": "from E:\\Github\\Subnautica 2\\moddingkit\\runs\\basepass_mp_ctor_decomp_20260515_124400\\selected_functions.json"
+        }
+      ]
+    },
+    {
+      "key": "basepass_add_mesh_batch",
+      "needles": [
+        "FBasePassMeshProcessor::AddMeshBatch"
+      ],
+      "raw_needles": [
+        "?AddMeshBatch@FBasePassMeshProcessor@@"
+      ],
+      "candidate_counts": {
+        "binfold_symbols": 1,
+        "decompile_asm": 4
+      },
+      "entries": [
+        {
+          "key": "basepass_add_mesh_batch",
+          "source": "binfold_symbols",
+          "name": "?AddMeshBatch@FBasePassMeshProcessor@@UEAAXAEIBUFMeshBatch@@_KPEIBVFPrimitiveSceneProxy@@H@Z",
+          "ea": "0x142644A70",
+          "rva": "0x2644A70",
+          "matched_constraints": 6,
+          "total_constraints": 9,
+          "prologue_pattern": "48 89 6C 24 20 56 41 54 41 57 48 83 EC 40 F6 82 C8 00 00 00 08 4D 8B F9"
+        },
+        {
+          "key": "basepass_add_mesh_batch",
+          "source": "decompile_asm",
+          "name": "FBasePassMeshProcessor::AddMeshBatch(FMeshBatch const restrict &,unsigned __int64,FPrimitiveSceneProxy const restrict *,int)",
+          "ea": "0x142644A70",
+          "rva": "0x2644A70",
+          "prologue_pattern": "48 89 6C 24 20 56 41 54 41 57 48 83 EC 40 F6 82 C8 00 00 00 08 4D 8B F9",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\basepass_ctor_callers_decomp_20260515_124700\\0000000142D129B0_sub_142D129B0.asm.txt",
+          "note": "call target reference"
+        }
+      ]
+    },
+    {
+      "key": "basepass_try_add_mesh_batch",
+      "needles": [
+        "FBasePassMeshProcessor::TryAddMeshBatch"
+      ],
+      "raw_needles": [
+        "?TryAddMeshBatch@FBasePassMeshProcessor@@"
+      ],
+      "candidate_counts": {
+        "decompile_asm": 2
+      },
+      "entries": [
+        {
+          "key": "basepass_try_add_mesh_batch",
+          "source": "decompile_asm",
+          "name": "?TryAddMeshBatch@FBasePassMeshProcessor@@AEAA_NAEIBUFMeshBatch@@_KPEIBVFPrimitiveSceneProxy@@HAEBVFMaterialRenderProxy@@AEBVFMaterial@@@Z",
+          "raw_name": "?TryAddMeshBatch@FBasePassMeshProcessor@@AEAA_NAEIBUFMeshBatch@@_KPEIBVFPrimitiveSceneProxy@@HAEBVFMaterialRenderProxy@@AEBVFMaterial@@@Z",
+          "ea": "0x142687030",
+          "rva": "0x2687030",
+          "match_kind": "loose",
+          "ref_rva": "0x2468e60",
+          "hash": "cfd5b5fa6c81165cb376c1ff9ce25cdd7bdec9209fe95f38595ffa090d2e7a78",
+          "prologue_pattern": "40 55 53 56 57 41 56 41 57 48 8D AC 24 48 FF FF FF 48 81 EC B8 01 00 00",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\tryadd_decomp_20260515_121907\\0000000142687030_TryAddMeshBatch.asm.txt",
+          "decompile_c": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\tryadd_decomp_20260515_121907\\0000000142687030_TryAddMeshBatch.c",
+          "note": "asm function header"
+        }
+      ]
+    },
+    {
+      "key": "basepass_process_uniform_lightmap_policy",
+      "needles": [
+        "FBasePassMeshProcessor::Process<FUniformLightMapPolicy>"
+      ],
+      "raw_needles": [
+        "??$Process@VFUniformLightMapPolicy@@@FBasePassMeshProcessor@@"
+      ],
+      "candidate_counts": {
+        "decompile_asm": 3,
+        "selected_functions": 2
+      },
+      "entries": [
+        {
+          "key": "basepass_process_uniform_lightmap_policy",
+          "source": "decompile_asm",
+          "name": "FBasePassMeshProcessor::Process<FUniformLightMapPolicy>(FMeshBatch const restrict &,unsigned __int64,int,FPrimitiveSceneProxy const restrict *,FMaterialRenderProxy const restrict &,FMaterial const restrict &,bool,bool,FMaterialShadingModelField,FUniformLightMapPolicy const restrict &,FLightCacheInterface const * const restrict &,ERasterizerFillMode,ERasterizerCullMode)",
+          "raw_name": "??$Process@VFUniformLightMapPolicy@@@FBasePassMeshProcessor@@AEAA_NAEIBUFMeshBatch@@_KHPEIBVFPrimitiveSceneProxy@@AEIBVFMaterialRenderProxy@@AEIBVFMaterial@@_N5UFMaterialShadingModelField@@AEIBVFUniformLightMapPolicy@@AEIBQEBVFLightCacheInterface@@W4ERasterizerFillMode@@W4ERasterizerCullMode@@@Z",
+          "ea": "0x142635460",
+          "rva": "0x2635460",
+          "prologue_pattern": "44 89 4C 24 20 4C 89 44 24 18 48 89 54 24 10 55 53 56 57 41 54 41 55 41",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\basepass_perm_decomp_20260515_105907\\0000000142635460_FBasePassMeshProcessor__Process_FUniformLightMapPolicy__FMeshBatch_const_restrict___unsigned___i.asm.txt",
+          "decompile_c": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\basepass_perm_decomp_20260515_105907\\0000000142635460_FBasePassMeshProcessor__Process_FUniformLightMapPolicy__FMeshBatch_const_restrict___unsigned___i.c",
+          "note": "asm function header"
+        },
+        {
+          "key": "basepass_process_uniform_lightmap_policy",
+          "source": "selected_functions",
+          "name": "FBasePassMeshProcessor::Process<FUniformLightMapPolicy>(FMeshBatch const restrict &,unsigned __int64,int,FPrimitiveSceneProxy const restrict *,FMaterialRenderProxy const restrict &,FMaterial const restrict &,bool,bool,FMaterialShadingModelField,FUniformLightMapPolicy const restrict &,FLightCacheInterface const * const restrict &,ERasterizerFillMode,ERasterizerCullMode)",
+          "raw_name": "??$Process@VFUniformLightMapPolicy@@@FBasePassMeshProcessor@@AEAA_NAEIBUFMeshBatch@@_KHPEIBVFPrimitiveSceneProxy@@AEIBVFMaterialRenderProxy@@AEIBVFMaterial@@_N5UFMaterialShadingModelField@@AEIBVFUniformLightMapPolicy@@AEIBQEBVFLightCacheInterface@@W4ERasterizerFillMode@@W4ERasterizerCullMode@@@Z",
+          "ea": "0x142635460",
+          "rva": "0x2635460",
+          "prologue_pattern": "44 89 4C 24 20 4C 89 44 24 18 48 89 54 24 10 55 53 56 57 41 54 41 55 41",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\basepass_perm_decomp_20260515_105907\\0000000142635460_FBasePassMeshProcessor__Process_FUniformLightMapPolicy__FMeshBatch_const_restrict___unsigned___i.asm.txt",
+          "decompile_c": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\basepass_perm_decomp_20260515_105907\\0000000142635460_FBasePassMeshProcessor__Process_FUniformLightMapPolicy__FMeshBatch_const_restrict___unsigned___i.c",
+          "note": "from E:\\Github\\Subnautica 2\\moddingkit\\runs\\basepass_perm_decomp_20260515_105907\\selected_functions.json"
+        }
+      ]
+    },
+    {
+      "key": "render_single_layer_water",
+      "needles": [
+        "FDeferredShadingSceneRenderer::RenderSingleLayerWater("
+      ],
+      "raw_needles": [
+        "?RenderSingleLayerWater@FDeferredShadingSceneRenderer@@"
+      ],
+      "candidate_counts": {
+        "binfold_symbols": 1,
+        "decompile_asm": 6,
+        "selected_functions": 1
+      },
+      "entries": [
+        {
+          "key": "render_single_layer_water",
+          "source": "binfold_symbols",
+          "name": "?RenderSingleLayerWater@FDeferredShadingSceneRenderer@@QEAAXAEAVFRDGBuilder@@V?$TArrayView@VFViewInfo@@H@@AEBUFSceneTextures@@PEBUFSingleLayerWaterPrePassResult@@_NAEAUFSceneWithoutWaterTextures@@AEAUFLumenSceneFrameTemporaries@@4@Z",
+          "ea": "0x142EC70C0",
+          "rva": "0x2EC70C0",
+          "matched_constraints": 10,
+          "total_constraints": 27,
+          "prologue_pattern": "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 98 FD FF FF 48 81 EC"
+        },
+        {
+          "key": "render_single_layer_water",
+          "source": "decompile_asm",
+          "name": "FDeferredShadingSceneRenderer::RenderSingleLayerWater(FRDGBuilder &,TArrayView<FViewInfo,int>,FSceneTextures const &,FSingleLayerWaterPrePassResult const *,bool,FSceneWithoutWaterTextures &,FLumenSceneFrameTemporaries &,bool)",
+          "raw_name": "?RenderSingleLayerWater@FDeferredShadingSceneRenderer@@QEAAXAEAVFRDGBuilder@@V?$TArrayView@VFViewInfo@@H@@AEBUFSceneTextures@@PEBUFSingleLayerWaterPrePassResult@@_NAEAUFSceneWithoutWaterTextures@@AEAUFLumenSceneFrameTemporaries@@4@Z",
+          "ea": "0x142EC70C0",
+          "rva": "0x2EC70C0",
+          "match_kind": "strict",
+          "ref_rva": "0x2c392c0",
+          "hash": "284e935c749470220960a9a2bfe5c6deb966685732bba04c5c5740de8cde65d9",
+          "prologue_pattern": "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 98 FD FF FF 48 81 EC",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\linear_water_nowait\\0000000142EC70C0_FDeferredShadingSceneRenderer__RenderSingleLayerWater_FRDGBuilder___TArrayView_FViewInfo_int__FS.linear.asm.txt",
+          "note": "asm function header"
+        },
+        {
+          "key": "render_single_layer_water",
+          "source": "selected_functions",
+          "name": "FDeferredShadingSceneRenderer::RenderSingleLayerWater(FRDGBuilder &,TArrayView<FViewInfo,int>,FSceneTextures const &,FSingleLayerWaterPrePassResult const *,bool,FSceneWithoutWaterTextures &,FLumenSceneFrameTemporaries &,bool)",
+          "raw_name": "?RenderSingleLayerWater@FDeferredShadingSceneRenderer@@QEAAXAEAVFRDGBuilder@@V?$TArrayView@VFViewInfo@@H@@AEBUFSceneTextures@@PEBUFSingleLayerWaterPrePassResult@@_NAEAUFSceneWithoutWaterTextures@@AEAUFLumenSceneFrameTemporaries@@4@Z",
+          "ea": "0x142EC70C0",
+          "rva": "0x2EC70C0",
+          "prologue_pattern": "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 98 FD FF FF 48 81 EC",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\selected_water_nowait\\0000000142EC70C0_FDeferredShadingSceneRenderer__RenderSingleLayerWater_FRDGBuilder___TArrayView_FViewInfo_int__FS.asm.txt",
+          "decompile_c": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\selected_water_nowait\\0000000142EC70C0_FDeferredShadingSceneRenderer__RenderSingleLayerWater_FRDGBuilder___TArrayView_FViewInfo_int__FS.c",
+          "note": "from E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\selected_water_nowait\\selected_functions.json"
+        }
+      ]
+    },
+    {
+      "key": "render_single_layer_water_inner",
+      "needles": [
+        "FDeferredShadingSceneRenderer::RenderSingleLayerWaterInner"
+      ],
+      "raw_needles": [
+        "?RenderSingleLayerWaterInner@FDeferredShadingSceneRenderer@@"
+      ],
+      "candidate_counts": {
+        "decompile_asm": 4,
+        "selected_functions": 1
+      },
+      "entries": [
+        {
+          "key": "render_single_layer_water_inner",
+          "source": "decompile_asm",
+          "name": "FDeferredShadingSceneRenderer::RenderSingleLayerWaterInner(FRDGBuilder &,TArrayView<FViewInfo,int>,FSceneTextures const &,FSceneWithoutWaterTextures const &,FSingleLayerWaterPrePassResult const *)",
+          "raw_name": "?RenderSingleLayerWaterInner@FDeferredShadingSceneRenderer@@QEAAXAEAVFRDGBuilder@@V?$TArrayView@VFViewInfo@@H@@AEBUFSceneTextures@@AEBUFSceneWithoutWaterTextures@@PEBUFSingleLayerWaterPrePassResult@@@Z",
+          "ea": "0x142EC8C40",
+          "rva": "0x2EC8C40",
+          "match_kind": "strict",
+          "ref_rva": "0x2c3ae40",
+          "hash": "6a91a662e66b97e737ea88dbd7e9dbb5518f91aa3dc330b23ef46525cc173250",
+          "prologue_pattern": "4C 8B DC 55 41 57 49 8D AB D8 FC FF FF 48 81 EC 18 04 00 00 48 8B 05 E5",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\linear_water_nowait\\0000000142EC8C40_FDeferredShadingSceneRenderer__RenderSingleLayerWaterInner_FRDGBuilder___TArrayView_FViewInfo_in.linear.asm.txt",
+          "note": "asm function header"
+        },
+        {
+          "key": "render_single_layer_water_inner",
+          "source": "selected_functions",
+          "name": "FDeferredShadingSceneRenderer::RenderSingleLayerWaterInner(FRDGBuilder &,TArrayView<FViewInfo,int>,FSceneTextures const &,FSceneWithoutWaterTextures const &,FSingleLayerWaterPrePassResult const *)",
+          "raw_name": "?RenderSingleLayerWaterInner@FDeferredShadingSceneRenderer@@QEAAXAEAVFRDGBuilder@@V?$TArrayView@VFViewInfo@@H@@AEBUFSceneTextures@@AEBUFSceneWithoutWaterTextures@@PEBUFSingleLayerWaterPrePassResult@@@Z",
+          "ea": "0x142EC8C40",
+          "rva": "0x2EC8C40",
+          "prologue_pattern": "4C 8B DC 55 41 57 49 8D AB D8 FC FF FF 48 81 EC 18 04 00 00 48 8B 05 E5",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\selected_water_nowait\\0000000142EC8C40_FDeferredShadingSceneRenderer__RenderSingleLayerWaterInner_FRDGBuilder___TArrayView_FViewInfo_in.asm.txt",
+          "decompile_c": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\selected_water_nowait\\0000000142EC8C40_FDeferredShadingSceneRenderer__RenderSingleLayerWaterInner_FRDGBuilder___TArrayView_FViewInfo_in.c",
+          "note": "from E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\selected_water_nowait\\selected_functions.json"
+        }
+      ]
+    },
+    {
+      "key": "render_single_layer_water_depth_prepass",
+      "needles": [
+        "FDeferredShadingSceneRenderer::RenderSingleLayerWaterDepthPrepass"
+      ],
+      "raw_needles": [
+        "?RenderSingleLayerWaterDepthPrepass@FDeferredShadingSceneRenderer@@"
+      ],
+      "candidate_counts": {
+        "decompile_asm": 9,
+        "selected_functions": 1
+      },
+      "entries": [
+        {
+          "key": "render_single_layer_water_depth_prepass",
+          "source": "decompile_asm",
+          "name": "FDeferredShadingSceneRenderer::RenderSingleLayerWaterDepthPrepass(FRDGBuilder &,TArrayView<FViewInfo,int>,FSceneTextures const &,ESingleLayerWaterPrepassLocation,TArrayView<Nanite::FRasterResults const,int>)",
+          "raw_name": "?RenderSingleLayerWaterDepthPrepass@FDeferredShadingSceneRenderer@@QEAAPEAUFSingleLayerWaterPrePassResult@@AEAVFRDGBuilder@@V?$TArrayView@VFViewInfo@@H@@AEBUFSceneTextures@@W4ESingleLayerWaterPrepassLocation@@V?$TArrayView@$$CBUFRasterResults@Nanite@@H@@@Z",
+          "ea": "0x142EC75C0",
+          "rva": "0x2EC75C0",
+          "match_kind": "strict",
+          "ref_rva": "0x2c397c0",
+          "hash": "9b35d510c0ed51af0589ee5f77ebde8596d7b8043446cb5d329cf3076b116ef7",
+          "prologue_pattern": "40 55 53 56 57 41 54 41 55 41 56 48 8D AC 24 00 FE FF FF 48 81 EC 00 03",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\linear_water_nowait\\0000000142EC75C0_FDeferredShadingSceneRenderer__RenderSingleLayerWaterDepthPrepass_FRDGBuilder___TArrayView_FView.linear.asm.txt",
+          "note": "asm function header"
+        },
+        {
+          "key": "render_single_layer_water_depth_prepass",
+          "source": "selected_functions",
+          "name": "FDeferredShadingSceneRenderer::RenderSingleLayerWaterDepthPrepass(FRDGBuilder &,TArrayView<FViewInfo,int>,FSceneTextures const &,ESingleLayerWaterPrepassLocation,TArrayView<Nanite::FRasterResults const,int>)",
+          "raw_name": "?RenderSingleLayerWaterDepthPrepass@FDeferredShadingSceneRenderer@@QEAAPEAUFSingleLayerWaterPrePassResult@@AEAVFRDGBuilder@@V?$TArrayView@VFViewInfo@@H@@AEBUFSceneTextures@@W4ESingleLayerWaterPrepassLocation@@V?$TArrayView@$$CBUFRasterResults@Nanite@@H@@@Z",
+          "ea": "0x142EC75C0",
+          "rva": "0x2EC75C0",
+          "prologue_pattern": "40 55 53 56 57 41 54 41 55 41 56 48 8D AC 24 00 FE FF FF 48 81 EC 00 03",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\selected_water_nowait\\0000000142EC75C0_FDeferredShadingSceneRenderer__RenderSingleLayerWaterDepthPrepass_FRDGBuilder___TArrayView_FView.asm.txt",
+          "decompile_c": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\selected_water_nowait\\0000000142EC75C0_FDeferredShadingSceneRenderer__RenderSingleLayerWaterDepthPrepass_FRDGBuilder___TArrayView_FView.c",
+          "note": "from E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\selected_water_nowait\\selected_functions.json"
+        }
+      ]
+    },
+    {
+      "key": "render_underwater_fog",
+      "needles": [
+        "RenderUnderWaterFog",
+        "RenderUnderwaterFog"
+      ],
+      "raw_needles": [
+        "?RenderUnderWaterFog",
+        "?RenderUnderwaterFog"
+      ],
+      "candidate_counts": {
+        "decompile_asm": 9,
+        "selected_functions": 3
+      },
+      "entries": [
+        {
+          "key": "render_underwater_fog",
+          "source": "decompile_asm",
+          "name": "FDeferredShadingSceneRenderer::RenderUnderWaterFog(FRDGBuilder &,FSceneWithoutWaterTextures const &,TRDGUniformBuffer<FSceneTextureUniformParameters> *)",
+          "raw_name": "?RenderUnderWaterFog@FDeferredShadingSceneRenderer@@AEAAXAEAVFRDGBuilder@@AEBUFSceneWithoutWaterTextures@@PEAV?$TRDGUniformBuffer@VFSceneTextureUniformParameters@@@@@Z",
+          "ea": "0x1426F9B40",
+          "rva": "0x26F9B40",
+          "match_kind": "loose",
+          "ref_rva": "0x24dbc80",
+          "hash": "e71dbc2832261c7f1df4f044a13484ce7584916d4a7352eceb6278b203f8ea62",
+          "prologue_pattern": "4C 89 4C 24 20 4C 89 44 24 18 48 89 54 24 10 55 41 54 41 55 41 57 48 8D",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\water_decompile_20260514\\linear_water_nowait\\00000001426F9B40_FDeferredShadingSceneRenderer__RenderUnderWaterFog_FRDGBuilder___FSceneWithoutWaterTextures_cons.linear.asm.txt",
+          "note": "asm function header"
+        },
+        {
+          "key": "render_underwater_fog",
+          "source": "selected_functions",
+          "name": "FDeferredShadingSceneRenderer::RenderUnderWaterFog(FRDGBuilder &,FSceneWithoutWaterTextures const &,TRDGUniformBuffer<FSceneTextureUniformParameters> *)",
+          "raw_name": "?RenderUnderWaterFog@FDeferredShadingSceneRenderer@@AEAAXAEAVFRDGBuilder@@AEBUFSceneWithoutWaterTextures@@PEAV?$TRDGUniformBuffer@VFSceneTextureUniformParameters@@@@@Z",
+          "ea": "0x1426F9B40",
+          "rva": "0x26F9B40",
+          "prologue_pattern": "4C 89 4C 24 20 4C 89 44 24 18 48 89 54 24 10 55 41 54 41 55 41 57 48 8D",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\render_fog_decomp_20260515_115913\\00000001426F9B40_FDeferredShadingSceneRenderer__RenderUnderWaterFog_FRDGBuilder___FSceneWithoutWaterTextures_cons.asm.txt",
+          "decompile_c": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\render_fog_decomp_20260515_115913\\00000001426F9B40_FDeferredShadingSceneRenderer__RenderUnderWaterFog_FRDGBuilder___FSceneWithoutWaterTextures_cons.c",
+          "note": "from E:\\Github\\Subnautica 2\\moddingkit\\runs\\render_fog_decomp_20260515_115913\\selected_functions.json"
+        }
+      ]
+    },
+    {
+      "key": "scene_renderer_compute_volumetric_fog",
+      "needles": [
+        "FSceneRenderer::ComputeVolumetricFog"
+      ],
+      "raw_needles": [
+        "?ComputeVolumetricFog@FSceneRenderer@@"
+      ],
+      "candidate_counts": {
+        "binfold_symbols": 6
+      },
+      "entries": [
+        {
+          "key": "scene_renderer_compute_volumetric_fog",
+          "source": "binfold_symbols",
+          "name": "`FSceneRenderer::ComputeVolumetricFog'::`66'::<lambda_2>::operator()",
+          "ea": "0x142FBB770",
+          "rva": "0x2FBB770",
+          "matched_constraints": 11,
+          "total_constraints": 15,
+          "prologue_pattern": "48 89 5C 24 18 48 89 6C 24 20 56 57 41 54 41 56 41 57 48 83 EC 40 8B 41"
+        }
+      ]
+    },
+    {
+      "key": "rdg_create_texture",
+      "needles": [
+        "FRDGBuilder::CreateTexture"
+      ],
+      "raw_needles": [
+        "?CreateTexture@FRDGBuilder@@"
+      ],
+      "candidate_counts": {
+        "binfold_symbols": 1,
+        "decompile_asm": 18
+      },
+      "entries": [
+        {
+          "key": "rdg_create_texture",
+          "source": "binfold_symbols",
+          "name": "?CreateTexture@FRDGBuilder@@QEAAPEAVFRDGTexture@@AEBUFRDGTextureDesc@@PEB_WW4ERDGTextureFlags@@@Z",
+          "ea": "0x14264E5E0",
+          "rva": "0x264E5E0",
+          "matched_constraints": 132,
+          "total_constraints": 884,
+          "prologue_pattern": "48 89 5C 24 10 55 56 57 48 83 EC 60 48 8B 05 4D 94 53 0A 48 33 C4 48 89"
+        },
+        {
+          "key": "rdg_create_texture",
+          "source": "decompile_asm",
+          "name": "FRDGBuilder::CreateTexture(FRDGTextureDesc const &,wchar_t const *,ERDGTextureFlags)",
+          "ea": "0x14264E5E0",
+          "rva": "0x264E5E0",
+          "prologue_pattern": "48 89 5C 24 10 55 56 57 48 83 EC 60 48 8B 05 4D 94 53 0A 48 33 C4 48 89",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\fog_render_callers_rebuilt_20260515_0408\\00000001426BBC40_sub_1426BBC40.asm.txt",
+          "note": "call target reference"
+        }
+      ]
+    },
+    {
+      "key": "rdg_create_uav",
+      "needles": [
+        "FRDGBuilder::CreateUAV"
+      ],
+      "raw_needles": [
+        "?CreateUAV@FRDGBuilder@@"
+      ],
+      "candidate_counts": {
+        "binfold_symbols": 1,
+        "decompile_asm": 10
+      },
+      "entries": [
+        {
+          "key": "rdg_create_uav",
+          "source": "binfold_symbols",
+          "name": "?CreateUAV@FRDGBuilder@@QEAAPEAVFRDGTextureUAV@@AEBVFRDGTextureUAVDesc@@W4ERDGUnorderedAccessViewFlags@@@Z",
+          "ea": "0x14264F6B0",
+          "rva": "0x264F6B0",
+          "matched_constraints": 158,
+          "total_constraints": 981,
+          "prologue_pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 20"
+        },
+        {
+          "key": "rdg_create_uav",
+          "source": "decompile_asm",
+          "name": "FRDGBuilder::CreateUAV(FRDGTextureUAVDesc const &,ERDGUnorderedAccessViewFlags)",
+          "ea": "0x14264F6B0",
+          "rva": "0x264F6B0",
+          "prologue_pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 20",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\per_view_fog_decomp_20260515_120134\\0000000142F57D50_sub_142F57D50.asm.txt",
+          "note": "call target reference"
+        }
+      ]
+    },
+    {
+      "key": "rdg_setup_parameter_pass",
+      "needles": [
+        "FRDGBuilder::SetupParameterPass",
+        "FRDGBuilder::SetupPassInternals",
+        "FRDGBuilder::SetupPassResources"
+      ],
+      "raw_needles": [
+        "?SetupParameterPass@FRDGBuilder@@",
+        "?SetupPassInternals@FRDGBuilder@@",
+        "?SetupPassResources@FRDGBuilder@@"
+      ],
+      "candidate_counts": {
+        "binfold_symbols": 8,
+        "decompile_asm": 20
+      },
+      "entries": [
+        {
+          "key": "rdg_setup_parameter_pass",
+          "source": "binfold_symbols",
+          "name": "?SetupParameterPass@FRDGBuilder@@AEAAPEAVFRDGPass@@PEAV2@@Z",
+          "ea": "0x1432A2C20",
+          "rva": "0x32A2C20",
+          "matched_constraints": 183,
+          "total_constraints": 1336,
+          "prologue_pattern": "40 56 57 48 83 EC 68 48 8B FA 48 8B F1 E8 4E 06 00 00 80 BE 28 05 00 00"
+        },
+        {
+          "key": "rdg_setup_parameter_pass",
+          "source": "decompile_asm",
+          "name": "FRDGBuilder::SetupParameterPass(FRDGPass *)",
+          "ea": "0x1432A2C20",
+          "rva": "0x32A2C20",
+          "prologue_pattern": "40 56 57 48 83 EC 68 48 8B FA 48 8B F1 E8 4E 06 00 00 80 BE 28 05 00 00",
+          "decompile_asm": "E:\\Github\\Subnautica 2\\moddingkit\\runs\\basepass_perm_decomp_20260515_105907\\0000000142666FB0_FDeferredShadingSceneRenderer__RenderBasePass_FDeferredShadingSceneRenderer___FRDGBuilder___TArr.asm.txt",
+          "note": "call target reference"
+        }
+      ]
+    },
+    {
+      "key": "create_opaque_basepass_uniform_buffer",
+      "needles": [
+        "CreateOpaqueBasePassUniformBuffer"
+      ],
+      "raw_needles": [
+        "?CreateOpaqueBasePassUniformBuffer@@"
+      ],
+      "candidate_counts": {},
+      "entries": []
+    },
+    {
+      "key": "setup_shared_basepass_parameters",
+      "needles": [
+        "SetupSharedBasePassParameters"
+      ],
+      "raw_needles": [
+        "?SetupSharedBasePassParameters@@"
+      ],
+      "candidate_counts": {},
+      "entries": []
+    }
+  ]
+}

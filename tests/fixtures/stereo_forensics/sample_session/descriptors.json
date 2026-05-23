@@ -1,0 +1,40 @@
+{
+  "descriptors": [
+    {
+      "id": 1,
+      "cpu": 8192,
+      "cpu_hex": "0x2000",
+      "kind": "SRV",
+      "resource": 4096,
+      "resource_hex": "0x1000",
+      "resource_id": 1,
+      "resource_desc_key": "3:512x512x8:24:1:0",
+      "format": 28,
+      "view_dimension": 4,
+      "most_detailed_mip": 0,
+      "mip_levels": 1,
+      "first_array_slice": 0,
+      "array_size": 1,
+      "plane_slice": 0,
+      "view_key": "0x1000|SRV|fmt:28|dim:4|mip:0+1|slice:0+1|plane:0|w:0+0|elem:0+0|cb:0x0+0"
+    },
+    {
+      "id": 2,
+      "cpu": 8208,
+      "cpu_hex": "0x2010",
+      "kind": "SRV",
+      "resource": 4096,
+      "resource_hex": "0x1000",
+      "resource_id": 1,
+      "resource_desc_key": "3:512x512x8:24:1:0",
+      "format": 28,
+      "view_dimension": 4,
+      "most_detailed_mip": 0,
+      "mip_levels": 1,
+      "first_array_slice": 1,
+      "array_size": 1,
+      "plane_slice": 0,
+      "view_key": "0x1000|SRV|fmt:28|dim:4|mip:0+1|slice:1+1|plane:0|w:0+0|elem:0+0|cb:0x0+0"
+    }
+  ]
+}

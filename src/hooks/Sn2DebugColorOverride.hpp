@@ -50,6 +50,10 @@ std::unordered_set<uint32_t> override_crcs();
 // True if (ps_crc, eye) is configured for override.
 bool should_override(uint32_t ps_crc, int eye_bucket);
 
+// Records a Stereo Forensics confirmation for matching color_override rules.
+// Called only after a replacement PSO was successfully rebound for the draw.
+void note_override_applied(uint32_t ps_crc, int eye_bucket, const char* kind);
+
 // Called at CreateGraphicsPipelineState — caches the original desc for later
 // cloning when override is requested. Lightweight (just stores by PSO ptr).
 void note_create_graphics_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,

@@ -38,6 +38,7 @@
 #include "render/FrameResourceInspector.hpp"
 #include "render/RenderAnalysisExport.hpp"
 #include "render/ShaderOverrideRegistry.hpp"
+#include "render/StereoForensics.hpp"
 
 using json = nlohmann::json;
 template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
@@ -573,6 +574,7 @@ json root_signature_to_json(const render::D3D12Diagnostics::RootSignatureInfo& r
         {"first_seen_frame", r.first_seen_frame},
         {"last_seen_frame", r.last_seen_frame},
         {"blob_size", r.blob_size},
+        {"blob_hash", format_pointer(r.blob_hash)},
         {"version", r.version},
         {"flags", r.flags},
         {"static_sampler_count", r.static_sampler_count},
@@ -1591,6 +1593,25 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_export_bundle(
         return publish(std::move(out));
     } catch (const std::exception& e) {
         return publish(json{{"ok", false}, {"error", e.what()}});
+    }
+}
+
+extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_stereo_forensics_json() {
+    try {
+        auto& forensics = render::StereoForensics::get();
+        const auto dir = forensics.session_dir();
+        return publish(json{
+            {"enabled", forensics.is_enabled()},
+            {"experiments_enabled", forensics.experiments_enabled()},
+            {"session_dir", dir.string()},
+            {"manifest", dir.empty() ? std::string{} : (dir / "manifest.json").string()},
+            {"events_jsonl", dir.empty() ? std::string{} : (dir / "events.jsonl").string()},
+            {"eye_diff", dir.empty() ? std::string{} : (dir / "eye_diff.json").string()},
+            {"lineage", dir.empty() ? std::string{} : (dir / "lineage.json").string()},
+            {"experiments", dir.empty() ? std::string{} : (dir / "experiments.json").string()}
+        });
+    } catch (const std::exception& e) {
+        return publish(json{{"enabled", false}, {"error", e.what()}});
     }
 }
 

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -15,6 +16,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <wrl/client.h>
 #include <utility/Thread.hpp>
@@ -25,6 +27,8 @@
 #include "Framework.hpp"
 #include "render/D3D12Diagnostics.hpp"
 #include "render/ShaderOverrideRegistry.hpp"
+#include "render/StereoEye.hpp"
+#include "render/StereoForensics.hpp"
 
 #include "D3D12Hook.hpp"
 #include "Sn2DrawLogV2.hpp"
@@ -39,10 +43,13 @@
 #include "Sn2RtDiff.hpp"
 #include "Sn2EyeScreenshot.hpp"
 #include "Sn2FrameCapture.hpp"
+#include "Sn2RdCapture.hpp"
+#include "Sn2HeapDxbcScanner.hpp"
 #include "Sn2ResourceReadback.hpp"
 #include "Sn2FixRuleEngine.hpp"
 #include "Sn2UweFogComputeDupHook.hpp"
 #include "Sn2UweFogMirrorHook.hpp"
+#include "Sn2EyePairingHook.hpp"
 #include "Sn2DebugColorOverride.hpp"
 #include "Sn2WaterBasepassDupHook.hpp"
 #include "Sn2RootSigDumpHook.hpp"
@@ -79,6 +86,8 @@ static inline bool is_readable_process_range_d3d12(uintptr_t address, size_t siz
 }
 
 namespace {
+using render::StereoTraceBucket;
+
 constexpr size_t CREATE_GRAPHICS_PIPELINE_STATE_VTABLE_INDEX = 10;
 constexpr size_t CREATE_COMPUTE_PIPELINE_STATE_VTABLE_INDEX = 11;
 constexpr size_t CREATE_COMMAND_LIST_VTABLE_INDEX = 12;
@@ -139,14 +148,6 @@ constexpr size_t PIPELINE_LIBRARY_STORE_PIPELINE_VTABLE_INDEX = 8;
 constexpr size_t PIPELINE_LIBRARY_LOAD_GRAPHICS_PIPELINE_VTABLE_INDEX = 9;
 constexpr size_t PIPELINE_LIBRARY_LOAD_COMPUTE_PIPELINE_VTABLE_INDEX = 10;
 
-enum class StereoTraceBucket : uint8_t {
-    Unknown,
-    Left,
-    Right,
-    Full,
-    Multi
-};
-
 struct StereoTraceCounters {
     std::atomic<uint64_t> viewport_unknown{};
     std::atomic<uint64_t> viewport_left{};
@@ -177,6 +178,7 @@ thread_local StereoTraceBucket g_current_stereo_trace_bucket = StereoTraceBucket
 // External-consumer toggle so the FFI (uevr_render_diag_set_stereo_trace_enabled)
 // can enable the trace for *any* game, not just Subnautica2.
 std::atomic<bool> g_stereo_trace_ffi_enabled{false};
+std::atomic<uint64_t> g_sn2_d3d12_present_frame_index{0};
 
 // 2026-05-16 SN2 fog descriptor-swap correlation state.
 // 2026-05-17 REWRITE: was thread_local, but UE5's parallel rendering means
@@ -427,6 +429,50 @@ struct Sn2ConsumerSrvRedirectScope {
             command_list->SetGraphicsRootDescriptorTable(root_param, h);
         }
         active = false;
+    }
+};
+
+// 2026-05-22: Multi-slot per-eye SRV pairing redirect (Sn2EyePairing). Restores
+// up to 8 root descriptor tables that we swapped to scratch ranges. See
+// Sn2EyePairingHook.hpp for the architecture.
+struct Sn2EyePairingRedirectScope {
+    bool active = false;
+    ID3D12GraphicsCommandList* command_list = nullptr;
+    ID3D12DescriptorHeap* restore_cbv_srv_uav_heap = nullptr;
+    ID3D12DescriptorHeap* restore_sampler_heap = nullptr;
+    bool restore_heaps = false;
+    struct Entry { UINT root_param; uint64_t restore_table_gpu; };
+    std::array<Entry, 64> entries{};
+    size_t entry_count = 0;
+
+    Sn2EyePairingRedirectScope() = default;
+    Sn2EyePairingRedirectScope(const Sn2EyePairingRedirectScope&) = delete;
+    Sn2EyePairingRedirectScope& operator=(const Sn2EyePairingRedirectScope&) = delete;
+    ~Sn2EyePairingRedirectScope() { restore(); }
+
+    void restore() {
+        if (!active) return;
+        if (command_list != nullptr) {
+            if (restore_heaps && restore_cbv_srv_uav_heap != nullptr) {
+                ID3D12DescriptorHeap* heaps[2]{restore_cbv_srv_uav_heap, restore_sampler_heap};
+                const UINT heap_count = restore_sampler_heap != nullptr ? 2u : 1u;
+                command_list->SetDescriptorHeaps(heap_count, heaps);
+            }
+
+            ++g_sn2_descriptor_table_rebind_depth;
+            for (size_t i = 0; i < entry_count; ++i) {
+                const auto& e = entries[i];
+                if (e.restore_table_gpu == 0) continue;
+                D3D12_GPU_DESCRIPTOR_HANDLE h{e.restore_table_gpu};
+                command_list->SetGraphicsRootDescriptorTable(e.root_param, h);
+            }
+            --g_sn2_descriptor_table_rebind_depth;
+        }
+        active = false;
+        entry_count = 0;
+        restore_cbv_srv_uav_heap = nullptr;
+        restore_sampler_heap = nullptr;
+        restore_heaps = false;
     }
 };
 
@@ -1526,6 +1572,10 @@ namespace sn2_descriptor_registry {
     void record_uav(ID3D12Resource* resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE cpu);
     ID3D12Resource* lookup_resource_by_cpu_ptr(SIZE_T cpu_ptr);
     ID3D12Resource* lookup_resource_by_cpu_ptr_or_hash(SIZE_T cpu_ptr);
+    bool lookup_srv_by_cpu_ptr_or_hash(SIZE_T cpu_ptr,
+                                       ID3D12Resource*& out_resource,
+                                       D3D12_SHADER_RESOURCE_VIEW_DESC& out_desc,
+                                       bool& out_has_desc);
     size_t registry_size();
     size_t count_entries_in_range(SIZE_T cpu_base, SIZE_T size_bytes);
     void sample_cpu_ptrs(SIZE_T* out, size_t max_n, size_t& out_count);
@@ -3651,6 +3701,7 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
 
     d3d12->m_inside_present = true;
     d3d12->m_swap_chain = swap_chain;
+    g_sn2_d3d12_present_frame_index.fetch_add(1, std::memory_order_relaxed);
 
     swap_chain->GetDevice(IID_PPV_ARGS(&d3d12->m_device));
 
@@ -3660,7 +3711,7 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
         // creation time. The Map vtable hook installs lazily via fog_path_a path,
         // but by then the engine's cbuffer pool is already created — this catches
         // future creations.
-        if (sn2_upload_buffer_tracking_enabled()) {
+        if (sn2_upload_buffer_tracking_enabled() || render::StereoForensics::get().is_enabled()) {
             sn2_upload_buf_map::install_device_hook(d3d12->m_device);
         }
 
@@ -3669,6 +3720,22 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
             d3d12->m_command_queue = *(ID3D12CommandQueue**)(real_swapchain + d3d12->m_command_queue_offset);
         } else {
             d3d12->m_command_queue = *(ID3D12CommandQueue**)((uintptr_t)swap_chain + d3d12->m_command_queue_offset);
+        }
+
+        auto& stereo_forensics = render::StereoForensics::get();
+        if (stereo_forensics.is_enabled()) {
+            render::D3D12Diagnostics::get().set_enabled(true);
+            stereo_forensics.begin_frame(
+                d3d12->m_device,
+                swap_chain,
+                d3d12->m_command_queue,
+                d3d12->m_render_width,
+                d3d12->m_render_height,
+                d3d12->m_display_width,
+                d3d12->m_display_height,
+                d3d12->m_using_proton_swapchain,
+                d3d12->m_using_frame_generation_swapchain
+            );
         }
 
         render::D3D12Diagnostics::get().begin_frame(
@@ -3915,6 +3982,38 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, UINT sync_interva
     }
     sn2_resource_readback::on_present();
     sn2_fix_rules::refresh_rules();
+    // 2026-05-22: Sn2RdCapture — in-process RenderDoc capture trigger.
+    // Loads renderdoc.dll on first call (lazy init), then polls trigger file
+    // each present. Touch UEVR_SN2_RD_CAPTURE_TRIGGER_FILE to capture one
+    // frame. See feedback_rd_capture_inprocess_only memory for rationale.
+    // Pass queue + HWND so SetActiveWindow can latch the API pair.
+    if (sn2_rd_capture::env_enabled()) {
+        static std::atomic<bool> rd_init_attempted{false};
+        if (!rd_init_attempted.exchange(true, std::memory_order_acq_rel)) {
+            sn2_rd_capture::init();
+        }
+        void* rd_queue = (g_d3d12_hook != nullptr) ? (void*)g_d3d12_hook->get_command_queue() : nullptr;
+        void* rd_hwnd = nullptr;
+        if (swap_chain != nullptr) {
+            DXGI_SWAP_CHAIN_DESC sc_desc{};
+            if (SUCCEEDED(swap_chain->GetDesc(&sc_desc))) {
+                rd_hwnd = (void*)sc_desc.OutputWindow;
+            }
+        }
+        static std::atomic<uint64_t> rd_frame{0};
+        sn2_rd_capture::on_present(rd_frame.fetch_add(1, std::memory_order_relaxed), rd_queue, rd_hwnd);
+    }
+    // 2026-05-22: Sn2HeapDxbcScanner — mid-run DXBC bytecode dumper. Scans
+    // the process heap for "DXBC" magic, dumps matching shader containers.
+    // Trigger via touching UEVR_SN2_HEAP_SCAN_TRIGGER_FILE. Works on
+    // pre-injection PSOs because UE5 keeps the bytecode bytes alive in heap.
+    if (sn2_heap_dxbc_scanner::env_enabled()) {
+        static std::atomic<uint64_t> hs_frame{0};
+        sn2_heap_dxbc_scanner::on_present(hs_frame.fetch_add(1, std::memory_order_relaxed));
+    }
+    if (sn2_eye_pairing::env_enabled()) {
+        sn2_eye_pairing::on_present();
+    }
     return D3D12Hook::present_internal(swap_chain, sync_interval, flags, nullptr, false);
 }
 
@@ -3936,6 +4035,38 @@ HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain3* swap_chain, UINT sync_interv
     }
     sn2_resource_readback::on_present();
     sn2_fix_rules::refresh_rules();
+    // 2026-05-22: Sn2RdCapture — in-process RenderDoc capture trigger.
+    // Loads renderdoc.dll on first call (lazy init), then polls trigger file
+    // each present. Touch UEVR_SN2_RD_CAPTURE_TRIGGER_FILE to capture one
+    // frame. See feedback_rd_capture_inprocess_only memory for rationale.
+    // Pass queue + HWND so SetActiveWindow can latch the API pair.
+    if (sn2_rd_capture::env_enabled()) {
+        static std::atomic<bool> rd_init_attempted{false};
+        if (!rd_init_attempted.exchange(true, std::memory_order_acq_rel)) {
+            sn2_rd_capture::init();
+        }
+        void* rd_queue = (g_d3d12_hook != nullptr) ? (void*)g_d3d12_hook->get_command_queue() : nullptr;
+        void* rd_hwnd = nullptr;
+        if (swap_chain != nullptr) {
+            DXGI_SWAP_CHAIN_DESC sc_desc{};
+            if (SUCCEEDED(swap_chain->GetDesc(&sc_desc))) {
+                rd_hwnd = (void*)sc_desc.OutputWindow;
+            }
+        }
+        static std::atomic<uint64_t> rd_frame{0};
+        sn2_rd_capture::on_present(rd_frame.fetch_add(1, std::memory_order_relaxed), rd_queue, rd_hwnd);
+    }
+    // 2026-05-22: Sn2HeapDxbcScanner — mid-run DXBC bytecode dumper. Scans
+    // the process heap for "DXBC" magic, dumps matching shader containers.
+    // Trigger via touching UEVR_SN2_HEAP_SCAN_TRIGGER_FILE. Works on
+    // pre-injection PSOs because UE5 keeps the bytecode bytes alive in heap.
+    if (sn2_heap_dxbc_scanner::env_enabled()) {
+        static std::atomic<uint64_t> hs_frame{0};
+        sn2_heap_dxbc_scanner::on_present(hs_frame.fetch_add(1, std::memory_order_relaxed));
+    }
+    if (sn2_eye_pairing::env_enabled()) {
+        sn2_eye_pairing::on_present();
+    }
     return D3D12Hook::present_internal(swap_chain, sync_interval, flags, params, true);
 }
 
@@ -4688,6 +4819,174 @@ HRESULT WINAPI D3D12Hook::create_pipeline_state(
         }
     }
 
+    // 2026-05-23: Build a graphics PSO desc equivalent from the stream so
+    // Sn2DebugColorOverride can clone the PSO with a substituted PS bytecode.
+    // UE5.6 uses the stream API exclusively, so without this wiring the cache
+    // is empty and PSO substitution can't fire.
+    if (is_subnautica2_process() && pso != nullptr && desc != nullptr &&
+        desc->pPipelineStateSubobjectStream != nullptr && desc->SizeInBytes > 0 &&
+        sn2_debug_color::env_enabled()) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC gdesc{};
+        const auto* base = static_cast<const uint8_t*>(desc->pPipelineStateSubobjectStream);
+        size_t pos = 0;
+        while (pos + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= desc->SizeInBytes) {
+            const auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*>(base + pos);
+            pos += sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE);
+            const size_t align = alignof(void*);
+            pos = (pos + align - 1) & ~(align - 1);
+            size_t value_size = 0;
+            switch (type) {
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
+                    value_size = sizeof(ID3D12RootSignature*);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.pRootSignature = *reinterpret_cast<ID3D12RootSignature* const*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+                    value_size = sizeof(D3D12_SHADER_BYTECODE);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.VS = *reinterpret_cast<const D3D12_SHADER_BYTECODE*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+                    value_size = sizeof(D3D12_SHADER_BYTECODE);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.PS = *reinterpret_cast<const D3D12_SHADER_BYTECODE*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+                    value_size = sizeof(D3D12_SHADER_BYTECODE);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.DS = *reinterpret_cast<const D3D12_SHADER_BYTECODE*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+                    value_size = sizeof(D3D12_SHADER_BYTECODE);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.HS = *reinterpret_cast<const D3D12_SHADER_BYTECODE*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+                    value_size = sizeof(D3D12_SHADER_BYTECODE);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.GS = *reinterpret_cast<const D3D12_SHADER_BYTECODE*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+                    value_size = sizeof(D3D12_SHADER_BYTECODE);
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT:
+                    value_size = sizeof(D3D12_STREAM_OUTPUT_DESC);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.StreamOutput = *reinterpret_cast<const D3D12_STREAM_OUTPUT_DESC*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND:
+                    value_size = sizeof(D3D12_BLEND_DESC);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.BlendState = *reinterpret_cast<const D3D12_BLEND_DESC*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK:
+                    value_size = sizeof(UINT);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.SampleMask = *reinterpret_cast<const UINT*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER:
+                    value_size = sizeof(D3D12_RASTERIZER_DESC);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.RasterizerState = *reinterpret_cast<const D3D12_RASTERIZER_DESC*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL:
+                    value_size = sizeof(D3D12_DEPTH_STENCIL_DESC);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.DepthStencilState = *reinterpret_cast<const D3D12_DEPTH_STENCIL_DESC*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT:
+                    value_size = sizeof(D3D12_INPUT_LAYOUT_DESC);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.InputLayout = *reinterpret_cast<const D3D12_INPUT_LAYOUT_DESC*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE:
+                    value_size = sizeof(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.IBStripCutValue = *reinterpret_cast<const D3D12_INDEX_BUFFER_STRIP_CUT_VALUE*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY:
+                    value_size = sizeof(D3D12_PRIMITIVE_TOPOLOGY_TYPE);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.PrimitiveTopologyType = *reinterpret_cast<const D3D12_PRIMITIVE_TOPOLOGY_TYPE*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: {
+                    value_size = sizeof(D3D12_RT_FORMAT_ARRAY);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        const auto& rta = *reinterpret_cast<const D3D12_RT_FORMAT_ARRAY*>(base + pos);
+                        gdesc.NumRenderTargets = rta.NumRenderTargets;
+                        for (UINT i = 0; i < rta.NumRenderTargets && i < 8; ++i) {
+                            gdesc.RTVFormats[i] = rta.RTFormats[i];
+                        }
+                    }
+                } break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT:
+                    value_size = sizeof(DXGI_FORMAT);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.DSVFormat = *reinterpret_cast<const DXGI_FORMAT*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC:
+                    value_size = sizeof(DXGI_SAMPLE_DESC);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.SampleDesc = *reinterpret_cast<const DXGI_SAMPLE_DESC*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK:
+                    value_size = sizeof(UINT);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.NodeMask = *reinterpret_cast<const UINT*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+                    value_size = sizeof(D3D12_CACHED_PIPELINE_STATE);
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS:
+                    value_size = sizeof(D3D12_PIPELINE_STATE_FLAGS);
+                    if (pos + value_size <= desc->SizeInBytes) {
+                        gdesc.Flags = *reinterpret_cast<const D3D12_PIPELINE_STATE_FLAGS*>(base + pos);
+                    }
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1:
+                    value_size = sizeof(D3D12_DEPTH_STENCIL_DESC1);
+                    break;
+                case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
+                    value_size = sizeof(D3D12_VIEW_INSTANCING_DESC);
+                    break;
+                default: value_size = 0; break;
+            }
+            if (value_size == 0 || pos + value_size > desc->SizeInBytes) break;
+            pos += value_size;
+            pos = (pos + align - 1) & ~(align - 1);
+        }
+        // Only register if PS bytecode is present (substitution is PS-only).
+        if (gdesc.PS.pShaderBytecode != nullptr && gdesc.PS.BytecodeLength > 0) {
+            sn2_debug_color::note_create_graphics_pso(&gdesc, pso);
+            static std::atomic<uint64_t> note_count{0};
+            const auto n = note_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 4 || (n % 200) == 0) {
+                SPDLOG_WARN("[SN2-DebugColor-StreamNote] #{} pso=0x{:x} ps_bytes={}",
+                            n, reinterpret_cast<uintptr_t>(pso),
+                            static_cast<unsigned>(gdesc.PS.BytecodeLength));
+            }
+        }
+    }
+
     // 2026-05-17 night: SkyAtmosFix PSO fingerprint — also scan stream variant.
     // SN2 uses D3D12_PIPELINE_STATE_STREAM_DESC. Parse the stream to extract
     // PS bytecode, then memmem-scan for entry name "RenderSkyAtmosphereRayMarchingPS".
@@ -4811,6 +5110,10 @@ void WINAPI D3D12Hook::create_constant_buffer_view(
         original(device, desc, descriptor);
     }
 
+    render::StereoForensics::get().record_cbv_descriptor(
+        "D3D12Hook::CreateConstantBufferView",
+        desc,
+        descriptor);
     sn2_descriptor_registry::record_cbv(desc, descriptor);
 }
 
@@ -4831,6 +5134,11 @@ void WINAPI D3D12Hook::create_render_target_view(
     }
 
     render::D3D12Diagnostics::get().register_rtv_descriptor("D3D12Hook::CreateRenderTargetView", resource, descriptor);
+    render::StereoForensics::get().record_rtv_descriptor(
+        "D3D12Hook::CreateRenderTargetView",
+        resource,
+        desc,
+        descriptor);
     sn2_rt_snapshot::record_rtv(static_cast<uint64_t>(descriptor.ptr), resource);
 }
 
@@ -5732,6 +6040,21 @@ namespace sn2_upload_buf_map {
 
         HRESULT hr = original(self, heap_props, heap_flags, desc, initial_state, clear, riid, ppv);
         if (SUCCEEDED(hr) && ppv && *ppv && heap_props != nullptr && desc != nullptr) {
+            render::StereoForensics::get().record_resource_created(
+                "D3D12Hook::CreateCommittedResource",
+                reinterpret_cast<ID3D12Resource*>(*ppv),
+                desc,
+                heap_props,
+                heap_flags,
+                initial_state);
+
+            // 2026-05-22: Sn2EyePairing twin-detector (committed path).
+            // Wired BEFORE other conditional blocks so it fires regardless
+            // of UweFogMirror / other env gates.
+            if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                !sn2_uwe_fog_mirror::in_mirror_create()) {
+                sn2_eye_pairing::record_creation(reinterpret_cast<ID3D12Resource*>(*ppv));
+            }
             // Only UPLOAD heap buffers (where cb0 lives)
             if (heap_props->Type == D3D12_HEAP_TYPE_UPLOAD &&
                 desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
@@ -5853,6 +6176,14 @@ namespace sn2_upload_buf_map {
 
         HRESULT hr = original(self, heap, heap_offset, desc, initial_state, clear, riid, ppv);
         if (SUCCEEDED(hr) && ppv && *ppv && heap != nullptr && desc != nullptr) {
+            render::StereoForensics::get().record_placed_resource_created(
+                "D3D12Hook::CreatePlacedResource",
+                reinterpret_cast<ID3D12Resource*>(*ppv),
+                heap,
+                heap_offset,
+                desc,
+                initial_state);
+
             const auto heap_desc = heap->GetDesc();
             if (heap_desc.Properties.Type == D3D12_HEAP_TYPE_UPLOAD &&
                 desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
@@ -5880,6 +6211,16 @@ namespace sn2_upload_buf_map {
                 }
             }
 
+            // 2026-05-22: Sn2EyePairing twin-detector (placed path). Same
+            // mechanism as the committed path: pair adjacent same-desc
+            // textures created within a single Present frame as L→R twins.
+            if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                !sn2_uwe_fog_mirror::in_mirror_create()) {
+                sn2_eye_pairing::record_placed_creation(
+                    reinterpret_cast<ID3D12Resource*>(*ppv),
+                    heap,
+                    heap_offset);
+            }
             // === UWE Fog mirror allocation (P1+P2) — placed-resource path ===
             // UE5 commonly uses CreatePlacedResource for transient pool textures
             // (fog volumes, render targets). Same detection logic as committed.
@@ -7064,6 +7405,9 @@ namespace sn2_descriptor_registry {
             sn2_fog_compute_diag_enabled() ||
             sn2_fog_srv_redirect_mode() != 0 ||
             sn2_tail_srv_repair_mode() != 0 ||
+            // Sn2EyePairing needs CPU descriptor -> resource resolution even
+            // when none of the older diagnostics are active.
+            sn2_eye_pairing::env_enabled() ||
             // UWE fog mirror P3 needs the cpu-handle → resource lookup.
             env_flag_enabled_a("UEVR_SN2_UWE_FOG_MIRROR");
     }
@@ -7099,6 +7443,43 @@ namespace sn2_descriptor_registry {
         const auto it = g_by_descriptor_hash.find(hash);
         if (it == g_by_descriptor_hash.end()) return nullptr;
         return it->second.resource;
+    }
+
+    bool lookup_entry_by_cpu_ptr_or_hash(SIZE_T cpu_ptr, Entry& out) {
+        if (cpu_ptr == 0) return false;
+        {
+            std::scoped_lock _{g_mutex};
+            const auto it = g_by_cpu.find(cpu_ptr);
+            if (it != g_by_cpu.end()) {
+                out = it->second;
+                return true;
+            }
+        }
+        const uint64_t hash = descriptor_memory_hash(D3D12_CPU_DESCRIPTOR_HANDLE{cpu_ptr});
+        if (hash == 0) return false;
+        std::scoped_lock _{g_mutex};
+        const auto it = g_by_descriptor_hash.find(hash);
+        if (it == g_by_descriptor_hash.end()) return false;
+        out = it->second;
+        return true;
+    }
+
+    bool lookup_srv_by_cpu_ptr_or_hash(SIZE_T cpu_ptr,
+                                       ID3D12Resource*& out_resource,
+                                       D3D12_SHADER_RESOURCE_VIEW_DESC& out_desc,
+                                       bool& out_has_desc) {
+        out_resource = nullptr;
+        out_desc = {};
+        out_has_desc = false;
+        Entry e{};
+        if (!lookup_entry_by_cpu_ptr_or_hash(cpu_ptr, e)) return false;
+        if (e.kind != Kind::SRV || e.resource == nullptr) return false;
+        out_resource = e.resource;
+        if (e.has_srv_desc) {
+            out_desc = e.srv_desc;
+            out_has_desc = true;
+        }
+        return true;
     }
 
     size_t registry_size() {
@@ -7181,6 +7562,57 @@ namespace sn2_descriptor_registry {
         publish(e);
     }
 
+    bool build_default_srv_desc(ID3D12Resource* resource, D3D12_SHADER_RESOURCE_VIEW_DESC& out) {
+        if (resource == nullptr) return false;
+        const auto rdesc = resource->GetDesc();
+        if (rdesc.Format == DXGI_FORMAT_UNKNOWN && rdesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            return false;
+        }
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = rdesc.Format;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+        switch (rdesc.Dimension) {
+        case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
+            if (rdesc.DepthOrArraySize > 1) {
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+                sv.Texture1DArray.MipLevels = rdesc.MipLevels;
+                sv.Texture1DArray.ArraySize = rdesc.DepthOrArraySize;
+            } else {
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+                sv.Texture1D.MipLevels = rdesc.MipLevels;
+            }
+            break;
+        case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
+            if (rdesc.SampleDesc.Count > 1) {
+                if (rdesc.DepthOrArraySize > 1) {
+                    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                    sv.Texture2DMSArray.ArraySize = rdesc.DepthOrArraySize;
+                } else {
+                    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                }
+            } else if (rdesc.DepthOrArraySize > 1) {
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                sv.Texture2DArray.MipLevels = rdesc.MipLevels;
+                sv.Texture2DArray.ArraySize = rdesc.DepthOrArraySize;
+            } else {
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                sv.Texture2D.MipLevels = rdesc.MipLevels;
+            }
+            break;
+        case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
+            sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            sv.Texture3D.MipLevels = rdesc.MipLevels;
+            break;
+        default:
+            return false;
+        }
+
+        out = sv;
+        return true;
+    }
+
     void record_srv(ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE cpu) {
         if (!enabled() || resource == nullptr || cpu.ptr == 0) return;
         Entry e{};
@@ -7192,6 +7624,8 @@ namespace sn2_descriptor_registry {
         if (desc != nullptr) {
             e.srv_desc = *desc;
             e.has_srv_desc = true;
+        } else {
+            e.has_srv_desc = build_default_srv_desc(resource, e.srv_desc);
         }
         publish(e);
     }
@@ -7473,6 +7907,11 @@ void WINAPI D3D12Hook::create_shader_resource_view(
     }
 
     render::D3D12Diagnostics::get().register_srv_descriptor("D3D12Hook::CreateShaderResourceView", resource, descriptor);
+    render::StereoForensics::get().record_srv_descriptor(
+        "D3D12Hook::CreateShaderResourceView",
+        resource,
+        desc,
+        descriptor);
     sn2_descriptor_registry::record_srv(resource, desc, descriptor);
 }
 
@@ -7529,6 +7968,11 @@ void WINAPI D3D12Hook::create_unordered_access_view(
     }
 
     render::D3D12Diagnostics::get().register_uav_descriptor("D3D12Hook::CreateUnorderedAccessView", resource, descriptor);
+    render::StereoForensics::get().record_uav_descriptor(
+        "D3D12Hook::CreateUnorderedAccessView",
+        resource,
+        desc,
+        descriptor);
     sn2_descriptor_registry::record_uav(resource, desc, descriptor);
 }
 
@@ -7592,6 +8036,10 @@ void WINAPI D3D12Hook::copy_descriptors_simple(
             D3D12_CPU_DESCRIPTOR_HANDLE dst{dst_start.ptr + (SIZE_T)i * stride};
             D3D12_CPU_DESCRIPTOR_HANDLE src{src_start.ptr + (SIZE_T)i * stride};
             render::D3D12Diagnostics::get().record_descriptor_copy(
+                "D3D12Hook::CopyDescriptorsSimple",
+                dst,
+                src);
+            render::StereoForensics::get().record_descriptor_copy(
                 "D3D12Hook::CopyDescriptorsSimple",
                 dst,
                 src);
@@ -7736,6 +8184,10 @@ void WINAPI D3D12Hook::copy_descriptors(
                 "D3D12Hook::CopyDescriptors",
                 dst,
                 src);
+            render::StereoForensics::get().record_descriptor_copy(
+                "D3D12Hook::CopyDescriptors",
+                dst,
+                src);
 
             ++dst_within;
             ++src_within;
@@ -7799,6 +8251,11 @@ void WINAPI D3D12Hook::create_depth_stencil_view(
     }
 
     render::D3D12Diagnostics::get().register_dsv_descriptor("D3D12Hook::CreateDepthStencilView", resource, descriptor);
+    render::StereoForensics::get().record_dsv_descriptor(
+        "D3D12Hook::CreateDepthStencilView",
+        resource,
+        desc,
+        descriptor);
 }
 
 namespace {
@@ -8141,6 +8598,14 @@ namespace bind_override_uploads {
     }
 } // namespace bind_override_uploads
 
+inline int cmdlist_eye_bucket(const CommandListCorrelationState& s) {
+    const int ue_bucket = sn2_eye_pairing::current_ue_view_bucket();
+    if (ue_bucket == 1 || ue_bucket == 2) {
+        return ue_bucket;
+    }
+    return render::canonicalize_stereo_eye_bucket(static_cast<int>(s.last_viewport_bucket));
+}
+
 namespace gpu_timestamp_timing {
     constexpr UINT QUERY_COUNT = 4096;
 
@@ -8290,7 +8755,7 @@ namespace gpu_timestamp_timing {
         token.valid = true;
         token.begin_index = begin_index;
         token.pso = reinterpret_cast<uintptr_t>(state.current_pso);
-        token.eye_bucket = static_cast<int32_t>(state.last_viewport_bucket);
+        token.eye_bucket = cmdlist_eye_bucket(state);
         token.kind = kind;
         return token;
     }
@@ -8340,12 +8805,24 @@ inline void record_root_bind_event(
     UINT value_count = 0,
     uint64_t value_hash = 0
 ) {
+    const int eye_bucket = cmdlist_eye_bucket(state);
     render::D3D12Diagnostics::get().record_root_bind(
         source,
         reinterpret_cast<uintptr_t>(cl),
         reinterpret_cast<uintptr_t>(state.current_pso),
-        static_cast<int32_t>(state.last_viewport_bucket),
+        eye_bucket,
         graphics ? "graphics" : "compute",
+        kind,
+        root_param,
+        value,
+        value_count,
+        value_hash);
+    render::StereoForensics::get().record_root_bind(
+        source,
+        reinterpret_cast<uintptr_t>(cl),
+        reinterpret_cast<uintptr_t>(state.current_pso),
+        eye_bucket,
+        graphics,
         kind,
         root_param,
         value,
@@ -8380,6 +8857,7 @@ inline void record_draw_event_from_state(
     const auto root_signature = compute_event
         ? state.last_compute_root_signature
         : state.last_graphics_root_signature;
+    const int eye_bucket = cmdlist_eye_bucket(state);
 
     render::D3D12Diagnostics::get().record_draw_event(
         source,
@@ -8387,7 +8865,7 @@ inline void record_draw_event_from_state(
         reinterpret_cast<uintptr_t>(cl),
         reinterpret_cast<uintptr_t>(state.current_pso),
         root_signature,
-        static_cast<int32_t>(state.last_viewport_bucket),
+        eye_bucket,
         executed,
         state.has_viewport,
         state.viewport_top_left_x,
@@ -8407,6 +8885,46 @@ inline void record_draw_event_from_state(
         arg3,
         arg4,
         static_cast<uintptr_t>(state.last_rtv0_handle),
+        state.last_graphics_root_desc_tables,
+        state.last_compute_root_desc_tables,
+        state.last_graphics_root_cbv,
+        state.last_compute_root_cbv,
+        state.last_graphics_root_srv,
+        state.last_compute_root_srv,
+        state.last_graphics_root_uav,
+        state.last_compute_root_uav,
+        state.last_graphics_root_cbv_hash,
+        state.last_compute_root_cbv_hash,
+        state.last_graphics_root_constants_hash,
+        state.last_compute_root_constants_hash,
+        state.last_graphics_root_desc_table_resource_hash,
+        state.last_compute_root_desc_table_resource_hash,
+        descriptor_reads);
+    render::StereoForensics::get().record_draw_or_dispatch(
+        source,
+        kind,
+        reinterpret_cast<uintptr_t>(cl),
+        reinterpret_cast<uintptr_t>(state.current_pso),
+        root_signature,
+        eye_bucket,
+        executed,
+        state.has_viewport,
+        state.viewport_top_left_x,
+        state.viewport_top_left_y,
+        state.viewport_width,
+        state.viewport_height,
+        state.viewport_count,
+        state.has_scissor,
+        state.scissor0.left,
+        state.scissor0.top,
+        state.scissor0.right,
+        state.scissor0.bottom,
+        state.scissor_count,
+        arg0,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
         state.last_graphics_root_desc_tables,
         state.last_compute_root_desc_tables,
         state.last_graphics_root_cbv,
@@ -8590,6 +9108,22 @@ struct BindlessHeapRegistry {
                 const uint64_t off = gpu_ptr - h.gpu_base;
                 out_cpu_ptr = h.cpu_base + static_cast<SIZE_T>(off);
                 out_stride = h.stride;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool resolve_state(uint64_t gpu_ptr, BindlessHeapState& out_state, SIZE_T& out_cpu_ptr) {
+        if (gpu_ptr == 0) return false;
+        std::scoped_lock _{mu};
+        for (const auto& h : heaps) {
+            if (h.gpu_base == 0 || h.stride == 0 || h.num_descriptors == 0) continue;
+            const uint64_t end = h.gpu_base + static_cast<uint64_t>(h.stride) * h.num_descriptors;
+            if (gpu_ptr >= h.gpu_base && gpu_ptr < end) {
+                const uint64_t off = gpu_ptr - h.gpu_base;
+                out_state = h;
+                out_cpu_ptr = h.cpu_base + static_cast<SIZE_T>(off);
                 return true;
             }
         }
@@ -9010,6 +9544,17 @@ HRESULT WINAPI D3D12Hook::create_descriptor_heap(
     }
 
     const HRESULT hr = original(device, desc, riid, heap);
+    if (SUCCEEDED(hr) && heap != nullptr && *heap != nullptr && desc != nullptr && device != nullptr) {
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_iface_forensics{};
+        auto* unknown = reinterpret_cast<IUnknown*>(*heap);
+        if (unknown != nullptr && SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&heap_iface_forensics)))) {
+            render::StereoForensics::get().record_descriptor_heap_created(
+                "D3D12Hook::CreateDescriptorHeap",
+                heap_iface_forensics.Get(),
+                desc,
+                device->GetDescriptorHandleIncrementSize(desc->Type));
+        }
+    }
     if (SUCCEEDED(hr) && heap != nullptr && *heap != nullptr && desc != nullptr &&
         desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
     {
@@ -9146,9 +9691,19 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
     }
 
     update_cmdlist_pso(command_list, pipeline_state);
+    const auto pso_state = read_cmdlist_state(command_list);
+    const auto eye_bucket = static_cast<int>(pso_state.last_viewport_bucket);
 
     auto& shader_registry = render::ShaderOverrideRegistry::get();
     if (!shader_registry.should_track_d3d12_pipelines()) {
+        render::StereoForensics::get().record_pso_bind(
+            "D3D12Hook::SetPipelineState",
+            reinterpret_cast<uintptr_t>(command_list),
+            reinterpret_cast<uintptr_t>(pipeline_state),
+            reinterpret_cast<uintptr_t>(pipeline_state),
+            pso_state.last_graphics_root_signature,
+            pso_state.last_compute_root_signature,
+            eye_bucket);
         original(command_list, pipeline_state);
         return;
     }
@@ -9184,11 +9739,14 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
     // Draw* hooks can early-return without forwarding when the hunter wants
     // this PS hash suppressed. Also pass the current eye bucket so per-eye
     // selective skip (skip_left_only / skip_right_only) can fire.
-    int eye_bucket = 0;
-    if (command_list != nullptr) {
-        const auto s = read_cmdlist_state(command_list);
-        eye_bucket = static_cast<int>(s.last_viewport_bucket);
-    }
+    render::StereoForensics::get().record_pso_bind(
+        "D3D12Hook::SetPipelineState",
+        reinterpret_cast<uintptr_t>(command_list),
+        reinterpret_cast<uintptr_t>(pipeline_state),
+        reinterpret_cast<uintptr_t>(bound_pipeline_state),
+        pso_state.last_graphics_root_signature,
+        pso_state.last_compute_root_signature,
+        eye_bucket);
     shader_registry.hunter_record_set_pipeline_state_with_eye(command_list, pipeline_state, eye_bucket);
     original(command_list, bound_pipeline_state);
     update_cmdlist_effective_pso(command_list, bound_pipeline_state);
@@ -9895,6 +10453,1069 @@ static bool sn2_try_begin_consumer_srv_redirect(
     return true;
 }
 
+// =============================================================================
+// 2026-05-22: Per-eye SRV pairing (Sn2EyePairing).
+//
+// observe_eye_pairing — walks the currently-bound descriptor tables for the
+// active PSO and records resource bindings per eye bucket. Run on EVERY draw
+// when enabled (rate-limited via internal mod). Lets us learn L↔R resource
+// pairs from PSOs that DO render to both eyes.
+//
+// try_begin_eye_pairing_redirect — at right-eye duplicate draws of target PS
+// CRC, walks the bound descriptor tables; for each slot whose resource has
+// a known right-eye counterpart in the pair map, allocates a scratch table
+// range, copies the original table over, overwrites swap-target slots with
+// the right resource's SRV, and rebinds the table.
+// =============================================================================
+
+static void sn2_observe_eye_pairing(const CommandListCorrelationState& state) {
+    if (!sn2_eye_pairing::env_enabled()) return;
+    if (state.current_pso == nullptr) return;
+    // Diagnostic counters: total observations seen by bucket. Helps confirm
+    // the hook is wired AND that we're actually seeing both eyes natively.
+    static std::atomic<uint64_t> total_draws{0};
+    static std::atomic<uint64_t> left_draws{0};
+    static std::atomic<uint64_t> right_draws{0};
+    static std::atomic<uint64_t> unknown_draws{0};
+    const auto t = total_draws.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Limit to LEFT and RIGHT viewport buckets.
+    int bucket = 0;
+    const int ue_bucket = sn2_eye_pairing::current_ue_view_bucket();
+    if (ue_bucket == 1 || ue_bucket == 2) {
+        bucket = ue_bucket;
+        if (bucket == 1) left_draws.fetch_add(1, std::memory_order_relaxed);
+        else right_draws.fetch_add(1, std::memory_order_relaxed);
+    } else if (state.last_viewport_bucket == StereoTraceBucket::Left) {
+        bucket = 1;
+        left_draws.fetch_add(1, std::memory_order_relaxed);
+    } else if (state.last_viewport_bucket == StereoTraceBucket::Right) {
+        bucket = 2;
+        right_draws.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        unknown_draws.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Periodic visibility log.
+    if ((t % 12000) == 1) {
+        SPDLOG_WARN("[SN2-EyePairing-Diag] draws total={} L={} R={} unknown={} ue_bucket={} pairs_learned={}",
+                    t,
+                    left_draws.load(),
+                    right_draws.load(),
+                    unknown_draws.load(),
+                    ue_bucket,
+                    sn2_eye_pairing::pair_count());
+    }
+    if (bucket == 0) return;
+    // Throttle observation to once every K draws to keep cost bounded
+    // (every draw walks up to 8 tables × 32 slots = 256 lookups).
+    static std::atomic<uint64_t> draw_counter{0};
+    const auto n = draw_counter.fetch_add(1, std::memory_order_relaxed);
+    constexpr uint64_t kThrottle = 4;
+    if ((n & (kThrottle - 1)) != 0) return;
+
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (dev == nullptr) return;
+    const auto pso = reinterpret_cast<uintptr_t>(state.current_pso);
+    const size_t num_tables = state.last_graphics_root_desc_tables.size();
+    constexpr UINT kMaxSlots = 32;
+    for (size_t ti = 0; ti < num_tables && ti < 8; ++ti) {
+        const uint64_t table_gpu = state.last_graphics_root_desc_tables[ti];
+        if (table_gpu == 0) continue;
+        SIZE_T cpu_base = 0;
+        UINT stride = 0;
+        if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride)) continue;
+        for (UINT slot = 0; slot < kMaxSlots; ++slot) {
+            const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * stride;
+            ID3D12Resource* srv_res = nullptr;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+            bool has_srv_desc = false;
+            const bool srv_hit = sn2_descriptor_registry::lookup_srv_by_cpu_ptr_or_hash(
+                slot_cpu, srv_res, srv_desc, has_srv_desc);
+            ID3D12Resource* res = srv_hit
+                ? srv_res
+                : sn2_descriptor_registry::lookup_resource_by_cpu_ptr_or_hash(slot_cpu);
+            if (res == nullptr) continue;
+            sn2_eye_pairing::record(bucket, pso, static_cast<uint32_t>(ti), slot, res, slot_cpu, dev);
+            if (srv_hit && has_srv_desc) {
+                sn2_eye_pairing::record_srv_descriptor(
+                    bucket, pso, static_cast<uint32_t>(ti), slot, srv_res, slot_cpu, srv_desc, dev);
+            }
+        }
+    }
+}
+
+static bool sn2_try_begin_eye_pairing_redirect(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2EyePairingRedirectScope& scope,
+    bool force_right_eye = false)
+{
+    if (!sn2_eye_pairing::env_enabled()) return false;
+    if (command_list == nullptr || state.current_pso == nullptr) return false;
+    if (!force_right_eye && state.last_viewport_bucket != StereoTraceBucket::Right) return false;
+    if (sn2_eye_pairing::pair_count() == 0) return false;
+
+    auto& reg = render::ShaderOverrideRegistry::get();
+    const uint32_t ps_crc = reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso));
+    if (!sn2_eye_pairing::is_target_ps_crc(ps_crc)) return false;
+
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (dev == nullptr || !sn2_eye_pairing::ensure_scratch_heap(dev)) return false;
+    ID3D12DescriptorHeap* scratch_heap = sn2_eye_pairing::scratch_descriptor_heap();
+    if (scratch_heap == nullptr) return false;
+
+    constexpr UINT kSearch = 256;  // UE local SRV tables are small, but leave room for bindless-style windows.
+    const size_t num_tables = state.last_graphics_root_desc_tables.size();
+    size_t total_swaps_this_draw = 0;
+
+    auto sampler_heap_contains = [](uint64_t gpu_ptr) {
+        if (gpu_ptr == 0 || tls_sampler_heap.gpu_base == 0 ||
+            tls_sampler_heap.stride == 0 || tls_sampler_heap.num_descriptors == 0) {
+            return false;
+        }
+        const uint64_t end =
+            tls_sampler_heap.gpu_base + static_cast<uint64_t>(tls_sampler_heap.stride) * tls_sampler_heap.num_descriptors;
+        return gpu_ptr >= tls_sampler_heap.gpu_base && gpu_ptr < end;
+    };
+
+    struct SwapSlot {
+        UINT slot{};
+        SIZE_T right_srv_cpu{};
+    };
+    struct TablePlan {
+        UINT root{};
+        uint64_t original_gpu{};
+        SIZE_T source_cpu{};
+        UINT stride{};
+        UINT copy_count{};
+        SIZE_T scratch_cpu{};
+        UINT64 scratch_gpu{};
+        std::array<SwapSlot, kSearch> swaps{};
+        UINT swap_count{};
+    };
+
+    std::array<TablePlan, 64> plans{};
+    UINT plan_count = 0;
+    BindlessHeapState source_heap{};
+    bool have_source_heap = false;
+
+    for (size_t ti = 0; ti < num_tables && plan_count < plans.size(); ++ti) {
+        const uint64_t table_gpu = state.last_graphics_root_desc_tables[ti];
+        if (table_gpu == 0) continue;
+
+        BindlessHeapState heap_state{};
+        SIZE_T cpu_base = 0;
+        if (!bindless_heap_registry().resolve_state(table_gpu, heap_state, cpu_base)) {
+            if (sampler_heap_contains(table_gpu)) {
+                continue;
+            }
+
+            static std::atomic<uint64_t> unresolved_table_logs{0};
+            const auto n = unresolved_table_logs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 8 || (n % 600) == 0) {
+                SPDLOG_WARN("[SN2-EyePairing] skip redirect: root={} table=0x{:x} is not in a registered CBV/SRV/UAV heap",
+                    ti, table_gpu);
+            }
+            return false;
+        }
+
+        if (!have_source_heap) {
+            source_heap = heap_state;
+            have_source_heap = true;
+        } else if (heap_state.heap != source_heap.heap) {
+            static std::atomic<uint64_t> mixed_heap_logs{0};
+            const auto n = mixed_heap_logs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 8 || (n % 600) == 0) {
+                SPDLOG_WARN("[SN2-EyePairing] skip redirect: root={} table heap {:p} differs from source heap {:p}",
+                    ti, static_cast<void*>(heap_state.heap), static_cast<void*>(source_heap.heap));
+            }
+            return false;
+        }
+
+        const uint64_t off = table_gpu - heap_state.gpu_base;
+        const uint64_t heap_bytes = static_cast<uint64_t>(heap_state.stride) * heap_state.num_descriptors;
+        const UINT remaining_desc = (off < heap_bytes && heap_state.stride != 0)
+            ? static_cast<UINT>((heap_bytes - off) / heap_state.stride)
+            : 0u;
+        const UINT copy_count = std::min(kSearch, remaining_desc);
+        if (copy_count == 0) continue;
+
+        // First pass: collect slots that need swap.
+        TablePlan plan{};
+        plan.root = static_cast<UINT>(ti);
+        plan.original_gpu = table_gpu;
+        plan.source_cpu = cpu_base;
+        plan.stride = heap_state.stride;
+        plan.copy_count = copy_count;
+        for (UINT slot = 0; slot < copy_count; ++slot) {
+            const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * heap_state.stride;
+            ID3D12Resource* srv_res = nullptr;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+            bool has_srv_desc = false;
+            const bool srv_hit = sn2_descriptor_registry::lookup_srv_by_cpu_ptr_or_hash(
+                slot_cpu, srv_res, srv_desc, has_srv_desc);
+            if (srv_hit && has_srv_desc) {
+                const SIZE_T right_srv = sn2_eye_pairing::ensure_right_srv_for_view(dev, srv_res, srv_desc);
+                if (right_srv != 0) {
+                    plan.swaps[plan.swap_count++] = {slot, right_srv};
+                    continue;
+                }
+            }
+
+            ID3D12Resource* left_res = srv_hit
+                ? srv_res
+                : sn2_descriptor_registry::lookup_resource_by_cpu_ptr_or_hash(slot_cpu);
+            if (left_res == nullptr) continue;
+            ID3D12Resource* right_res = sn2_eye_pairing::right_for(left_res);
+            if (right_res == nullptr) {
+                right_res = sn2_eye_pairing::right_for_desc_slot(left_res, static_cast<uint32_t>(ti), slot);
+            }
+            if (right_res == nullptr || right_res == left_res) continue;
+            const SIZE_T right_srv = sn2_eye_pairing::ensure_right_srv_cpu_handle(dev, right_res);
+            if (right_srv == 0) continue;
+            plan.swaps[plan.swap_count++] = {slot, right_srv};
+        }
+        total_swaps_this_draw += plan.swap_count;
+        plans[plan_count++] = plan;
+    }
+
+    if (total_swaps_this_draw == 0 || !have_source_heap || source_heap.heap == nullptr) return false;
+
+    UINT rebound_tables = 0;
+    for (UINT pi = 0; pi < plan_count; ++pi) {
+        TablePlan& plan = plans[pi];
+
+        UINT64 scratch_gpu = 0;
+        const SIZE_T scratch_cpu_base = sn2_eye_pairing::alloc_scratch(plan.copy_count, &scratch_gpu);
+        if (scratch_cpu_base == 0 || scratch_gpu == 0) continue;
+        plan.scratch_cpu = scratch_cpu_base;
+        plan.scratch_gpu = scratch_gpu;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE dst{scratch_cpu_base};
+        D3D12_CPU_DESCRIPTOR_HANDLE src{plan.source_cpu};
+        dev->CopyDescriptorsSimple(plan.copy_count, dst, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        for (UINT i = 0; i < plan.swap_count; ++i) {
+            D3D12_CPU_DESCRIPTOR_HANDLE patch{
+                scratch_cpu_base + static_cast<SIZE_T>(plan.swaps[i].slot) * plan.stride};
+            D3D12_CPU_DESCRIPTOR_HANDLE right_src{plan.swaps[i].right_srv_cpu};
+            dev->CopyDescriptorsSimple(1, patch, right_src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        ++rebound_tables;
+    }
+
+    if (rebound_tables == 0) return false;
+
+    ID3D12DescriptorHeap* restore_sampler_heap = tls_sampler_heap.heap;
+    ID3D12DescriptorHeap* heaps[2]{scratch_heap, restore_sampler_heap};
+    const UINT heap_count = restore_sampler_heap != nullptr ? 2u : 1u;
+    command_list->SetDescriptorHeaps(heap_count, heaps);
+
+    ++g_sn2_descriptor_table_rebind_depth;
+    for (UINT pi = 0; pi < plan_count && scope.entry_count < scope.entries.size(); ++pi) {
+        const TablePlan& plan = plans[pi];
+        if (plan.scratch_gpu == 0) continue;
+        D3D12_GPU_DESCRIPTOR_HANDLE h{plan.scratch_gpu};
+        command_list->SetGraphicsRootDescriptorTable(plan.root, h);
+        scope.entries[scope.entry_count++] = {plan.root, plan.original_gpu};
+    }
+    --g_sn2_descriptor_table_rebind_depth;
+
+    if (scope.entry_count == 0) return false;
+    scope.active = true;
+    scope.command_list = command_list;
+    scope.restore_heaps = true;
+    scope.restore_cbv_srv_uav_heap = source_heap.heap;
+    scope.restore_sampler_heap = restore_sampler_heap;
+
+    static std::atomic<uint64_t> redir{0};
+    const auto n = redir.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 16 || (n % 600) == 0) {
+        SPDLOG_WARN("[SN2-EyePairing] right-eye 0x{:08x} redirect#{} tables_rebound={} slot_swaps={} forced={} (pair_count={})",
+            ps_crc, n, rebound_tables, total_swaps_this_draw, force_right_eye ? 1 : 0, sn2_eye_pairing::pair_count());
+    }
+    return true;
+}
+
+// =============================================================================
+// Stereo Forensics generic mutation runner.
+//
+// This consumes the same v2 rule file as StereoForensics/Sn2DebugColorOverride
+// and applies the mutation-class actions that are safe to express as one-draw
+// state scopes:
+//
+// - swap_cbv_left_to_right: cache source-eye root CBV, bind it for target eye.
+// - swap_descriptor_from_left: cache source-eye descriptor, copy into a scratch
+//   table slot for target eye.
+// - force_srv_array_slice: clone the current SRV descriptor with a forced array
+//   slice into a scratch table slot for target eye.
+//
+// Generic duplicate-draw/dispatch remains intentionally unsupported here; that
+// needs a complete replay packet, not just a one-slot state mutation.
+// =============================================================================
+
+struct Sn2ForensicsMutationRule {
+    std::string name;
+    std::string action;
+    std::string kind;
+    uint32_t ps_crc = 0;
+    uint32_t cs_crc = 0;
+    int target_eye = 2;
+    int source_eye = 1;
+    UINT root = UINT_MAX;
+    UINT slot = UINT_MAX;
+    UINT array_slice = UINT_MAX;
+    bool enabled = true;
+};
+
+struct Sn2ForensicsMutationScope {
+    Sn2EyePairingRedirectScope descriptor_scope{};
+    Sn2Pso3069CbvScope cbv_scope{};
+
+    void restore() {
+        cbv_scope.restore();
+        descriptor_scope.restore();
+    }
+};
+
+namespace sn2_forensics_mutations {
+
+struct LeftDescriptorSnapshot {
+    SIZE_T cpu = 0;
+    uint64_t frame = 0;
+    uint64_t sequence = 0;
+};
+
+struct LeftCbvSnapshot {
+    uint64_t va = 0;
+    uint32_t bytes = 0;
+    uint64_t frame = 0;
+    uint64_t sequence = 0;
+};
+
+struct State {
+    std::mutex mu;
+    std::vector<Sn2ForensicsMutationRule> rules;
+    int64_t last_mtime = 0;
+    uint64_t poll_counter = 0;
+    std::unordered_map<std::string, LeftDescriptorSnapshot> left_descriptors;
+    std::unordered_map<std::string, LeftCbvSnapshot> left_cbvs;
+    uint64_t sequence = 0;
+
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> scratch_heap;
+    UINT scratch_stride = 0;
+    UINT scratch_capacity = 0;
+    UINT scratch_cursor = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE scratch_cpu_start{};
+    D3D12_GPU_DESCRIPTOR_HANDLE scratch_gpu_start{};
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> cbv_snapshot_upload;
+    uint8_t* cbv_snapshot_cpu = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS cbv_snapshot_gpu = 0;
+    uint64_t cbv_snapshot_capacity = 0;
+    uint64_t cbv_snapshot_cursor = 0;
+};
+
+State& state() {
+    static State s;
+    return s;
+}
+
+uint64_t current_frame() {
+    return g_sn2_d3d12_present_frame_index.load(std::memory_order_relaxed);
+}
+
+uint32_t cbv_snapshot_bytes() {
+    static const uint32_t bytes = []() {
+        const uint32_t raw = env_u32_a("UEVR_STEREO_MUTATION_CBV_SNAPSHOT_BYTES", 4096);
+        const uint32_t clamped = std::clamp<uint32_t>(raw == 0 ? 4096 : raw, 256, 65536);
+        return (clamped + 255u) & ~255u;
+    }();
+    return bytes;
+}
+
+bool safe_memcpy_seh_forensics(void* dst, const void* src, size_t bytes) {
+    __try {
+        std::memcpy(dst, src, bytes);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool ensure_scratch_heap(ID3D12Device* device) {
+    if (device == nullptr) {
+        return false;
+    }
+    auto& s = state();
+    std::scoped_lock _{s.mu};
+    if (s.scratch_heap != nullptr) {
+        return true;
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    desc.NumDescriptors = 32768;
+    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    const HRESULT hr = device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&s.scratch_heap));
+    if (FAILED(hr) || s.scratch_heap == nullptr) {
+        SPDLOG_WARN("[StereoForensics-Mutate] CreateDescriptorHeap failed hr=0x{:08x}", static_cast<uint32_t>(hr));
+        return false;
+    }
+    s.scratch_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    s.scratch_capacity = desc.NumDescriptors;
+    s.scratch_cursor = 0;
+    s.scratch_cpu_start = s.scratch_heap->GetCPUDescriptorHandleForHeapStart();
+    s.scratch_gpu_start = s.scratch_heap->GetGPUDescriptorHandleForHeapStart();
+    SPDLOG_WARN("[StereoForensics-Mutate] created private scratch descriptor heap count={} stride={}",
+        s.scratch_capacity, s.scratch_stride);
+    return s.scratch_stride != 0;
+}
+
+SIZE_T alloc_scratch(UINT count, UINT64* out_gpu) {
+    auto& s = state();
+    std::scoped_lock _{s.mu};
+    if (s.scratch_heap == nullptr || s.scratch_stride == 0 || s.scratch_capacity == 0 || count == 0 || count >= s.scratch_capacity) {
+        if (out_gpu != nullptr) *out_gpu = 0;
+        return 0;
+    }
+    if (s.scratch_cursor + count >= s.scratch_capacity) {
+        s.scratch_cursor = 0;
+    }
+    const UINT start = s.scratch_cursor;
+    s.scratch_cursor += count;
+    if (out_gpu != nullptr) {
+        *out_gpu = s.scratch_gpu_start.ptr + static_cast<UINT64>(start) * s.scratch_stride;
+    }
+    return s.scratch_cpu_start.ptr + static_cast<SIZE_T>(start) * s.scratch_stride;
+}
+
+ID3D12DescriptorHeap* scratch_descriptor_heap() {
+    auto& s = state();
+    std::scoped_lock _{s.mu};
+    return s.scratch_heap.Get();
+}
+
+bool ensure_cbv_snapshot_upload(ID3D12Device* device) {
+    if (device == nullptr) {
+        return false;
+    }
+    auto& s = state();
+    if (s.cbv_snapshot_upload != nullptr && s.cbv_snapshot_cpu != nullptr) {
+        return true;
+    }
+    const uint64_t capacity = std::max<uint64_t>(cbv_snapshot_bytes() * 1024ull, 4ull * 1024ull * 1024ull);
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = capacity;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const HRESULT hr = device->CreateCommittedResource(
+        &hp,
+        D3D12_HEAP_FLAG_NONE,
+        &rd,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&s.cbv_snapshot_upload));
+    if (FAILED(hr) || s.cbv_snapshot_upload == nullptr) {
+        SPDLOG_WARN("[StereoForensics-Mutate] CreateCommittedResource(CBV snapshot upload) failed hr=0x{:08x}", static_cast<uint32_t>(hr));
+        return false;
+    }
+    D3D12_RANGE no_read{0, 0};
+    void* mapped = nullptr;
+    if (FAILED(s.cbv_snapshot_upload->Map(0, &no_read, &mapped)) || mapped == nullptr) {
+        s.cbv_snapshot_upload.Reset();
+        SPDLOG_WARN("[StereoForensics-Mutate] Map(CBV snapshot upload) failed");
+        return false;
+    }
+    s.cbv_snapshot_cpu = static_cast<uint8_t*>(mapped);
+    s.cbv_snapshot_gpu = s.cbv_snapshot_upload->GetGPUVirtualAddress();
+    s.cbv_snapshot_capacity = capacity;
+    s.cbv_snapshot_cursor = 0;
+    SPDLOG_WARN("[StereoForensics-Mutate] created CBV snapshot upload bytes={} per_snapshot={}", capacity, cbv_snapshot_bytes());
+    return true;
+}
+
+uint64_t snapshot_cbv_to_upload(ID3D12Device* device, uint64_t source_va, uint32_t bytes, uint32_t* out_bytes) {
+    if (out_bytes != nullptr) {
+        *out_bytes = 0;
+    }
+    if (source_va == 0 || bytes == 0) {
+        return 0;
+    }
+    uint8_t* src = sn2_upload_buf_map::gpu_va_to_cpu(static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(source_va), bytes);
+    if (src == nullptr) {
+        return 0;
+    }
+    auto& s = state();
+    std::scoped_lock _{s.mu};
+    if (!ensure_cbv_snapshot_upload(device) || s.cbv_snapshot_capacity < bytes) {
+        return 0;
+    }
+    const uint64_t aligned_bytes = (static_cast<uint64_t>(bytes) + 255ull) & ~255ull;
+    if (s.cbv_snapshot_cursor + aligned_bytes >= s.cbv_snapshot_capacity) {
+        s.cbv_snapshot_cursor = 0;
+    }
+    const uint64_t offset = s.cbv_snapshot_cursor;
+    s.cbv_snapshot_cursor += aligned_bytes;
+    if (!safe_memcpy_seh_forensics(s.cbv_snapshot_cpu + offset, src, bytes)) {
+        return 0;
+    }
+    if (out_bytes != nullptr) {
+        *out_bytes = bytes;
+    }
+    return s.cbv_snapshot_gpu + offset;
+}
+
+std::string experiments_file_path() {
+    char value[4096]{};
+    const auto len = GetEnvironmentVariableA("UEVR_STEREO_EXPERIMENTS_FILE", value, static_cast<DWORD>(sizeof(value)));
+    if (len == 0 || len >= sizeof(value)) {
+        return {};
+    }
+    return std::string(value, value + len);
+}
+
+uint32_t parse_crc_json(const nlohmann::json& value) {
+    if (value.is_number_unsigned()) {
+        return static_cast<uint32_t>(value.get<uint64_t>());
+    }
+    if (value.is_number_integer()) {
+        return static_cast<uint32_t>(value.get<int64_t>());
+    }
+    if (value.is_string()) {
+        const auto s = value.get<std::string>();
+        char* end = nullptr;
+        const auto parsed = std::strtoul(s.c_str(), &end, 0);
+        return end != s.c_str() ? static_cast<uint32_t>(parsed) : 0u;
+    }
+    return 0;
+}
+
+int parse_eye_json(const nlohmann::json& value, int fallback) {
+    if (value.is_number_integer()) {
+        return render::canonicalize_stereo_eye_bucket(value.get<int>(), fallback);
+    }
+    if (!value.is_string()) {
+        return fallback;
+    }
+    return render::parse_stereo_eye_bucket(value.get<std::string>(), fallback);
+}
+
+UINT parse_u32_json(const nlohmann::json& value, UINT fallback = UINT_MAX) {
+    if (value.is_number_unsigned()) {
+        return static_cast<UINT>(value.get<uint64_t>());
+    }
+    if (value.is_number_integer()) {
+        return static_cast<UINT>(std::max<int64_t>(0, value.get<int64_t>()));
+    }
+    if (value.is_string()) {
+        const auto s = value.get<std::string>();
+        char* end = nullptr;
+        const auto parsed = std::strtoul(s.c_str(), &end, 0);
+        return end != s.c_str() ? static_cast<UINT>(parsed) : fallback;
+    }
+    return fallback;
+}
+
+std::string action_type_json(const nlohmann::json& item) {
+    const auto action = item.value("action", nlohmann::json{});
+    if (action.is_string()) {
+        return action.get<std::string>();
+    }
+    if (action.is_object()) {
+        return action.value("type", std::string{});
+    }
+    return {};
+}
+
+std::string canonical_action_type(std::string action) {
+    if (action == "force_srv_slice") return "force_srv_array_slice";
+    if (action == "swap_descriptor") return "swap_descriptor_from_left";
+    if (action == "swap_cbv") return "swap_cbv_left_to_right";
+    if (action == "duplicate_draw" || action == "duplicate_dispatch") return "duplicate_left_work_into_right_bucket";
+    return action;
+}
+
+void refresh_locked() {
+    if (!env_flag_enabled_a("UEVR_STEREO_EXPERIMENTS")) {
+        return;
+    }
+    auto& s = state();
+    ++s.poll_counter;
+    if (s.poll_counter % 30 != 1 && !s.rules.empty()) {
+        return;
+    }
+
+    const auto path = experiments_file_path();
+    if (path.empty()) {
+        return;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad)) {
+        return;
+    }
+    const int64_t mtime = (static_cast<int64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32)
+        | fad.ftLastWriteTime.dwLowDateTime;
+    if (mtime == s.last_mtime && !s.rules.empty()) {
+        return;
+    }
+
+    try {
+        std::ifstream file(path);
+        if (!file.good()) {
+            return;
+        }
+        const auto doc = nlohmann::json::parse(file);
+        const auto& arr = doc.contains("rules")
+            ? doc.at("rules")
+            : (doc.contains("experiments") ? doc.at("experiments") : doc);
+        if (!arr.is_array()) {
+            return;
+        }
+
+        std::vector<Sn2ForensicsMutationRule> loaded;
+        for (const auto& item : arr) {
+            if (!item.value("enabled", true)) {
+                continue;
+            }
+            const auto action = item.value("action", nlohmann::json{});
+            const auto match = item.value("match", nlohmann::json::object());
+            Sn2ForensicsMutationRule rule{};
+            rule.name = item.value("name", std::string{});
+            rule.action = canonical_action_type(action_type_json(item));
+            if (rule.action != "force_srv_array_slice" &&
+                rule.action != "swap_descriptor_from_left" &&
+                rule.action != "swap_cbv_left_to_right" &&
+                rule.action != "duplicate_left_work_into_right_bucket") {
+                continue;
+            }
+            rule.kind = match.value("kind", item.value("kind", std::string{}));
+            rule.ps_crc = parse_crc_json(match.value("ps_crc", item.value("ps_crc", nlohmann::json{})));
+            rule.cs_crc = parse_crc_json(match.value("cs_crc", item.value("cs_crc", nlohmann::json{})));
+            rule.target_eye = parse_eye_json(match.value("eye", item.value("eye", nlohmann::json{"right"})), 2);
+            if (action.is_object()) {
+                rule.target_eye = parse_eye_json(action.value("target_eye", nlohmann::json{}), rule.target_eye);
+                rule.source_eye = parse_eye_json(action.value("source_eye", nlohmann::json{"left"}), 1);
+                rule.root = parse_u32_json(action.value("root", item.value("root", nlohmann::json{})));
+                rule.slot = parse_u32_json(action.value("slot", item.value("slot", nlohmann::json{})));
+                rule.array_slice = parse_u32_json(action.value("array_slice", item.value("array_slice", nlohmann::json{})));
+            } else {
+                rule.root = parse_u32_json(item.value("root", nlohmann::json{}));
+                rule.slot = parse_u32_json(item.value("slot", nlohmann::json{}));
+                rule.array_slice = parse_u32_json(item.value("array_slice", nlohmann::json{}));
+            }
+            if (rule.name.empty()) {
+                rule.name = rule.action + "_" + std::to_string(loaded.size());
+            }
+            loaded.emplace_back(std::move(rule));
+        }
+
+        s.rules = std::move(loaded);
+        s.last_mtime = mtime;
+        SPDLOG_WARN("[StereoForensics-Mutate] loaded {} mutation rules from {}", s.rules.size(), path);
+    } catch (const std::exception& e) {
+        SPDLOG_WARN("[StereoForensics-Mutate] failed to parse {}: {}", path, e.what());
+    }
+}
+
+std::vector<Sn2ForensicsMutationRule> snapshot_rules() {
+    auto& s = state();
+    std::scoped_lock _{s.mu};
+    refresh_locked();
+    return s.rules;
+}
+
+bool kind_matches(const std::string& rule_kind, std::string_view actual_kind) {
+    if (rule_kind.empty() || rule_kind == "*" || rule_kind == "any") {
+        return true;
+    }
+    if (rule_kind == actual_kind) {
+        return true;
+    }
+    return rule_kind == "draw" && actual_kind.rfind("draw", 0) == 0;
+}
+
+bool shader_matches(const Sn2ForensicsMutationRule& rule, uint32_t ps_crc, uint32_t cs_crc) {
+    if (rule.ps_crc != 0 && rule.ps_crc != ps_crc) {
+        return false;
+    }
+    if (rule.cs_crc != 0 && rule.cs_crc != cs_crc) {
+        return false;
+    }
+    return rule.ps_crc != 0 || rule.cs_crc != 0;
+}
+
+bool eye_matches(int rule_eye, int eye_bucket) {
+    return rule_eye < 0 || rule_eye == eye_bucket;
+}
+
+void note_observation(
+    const Sn2ForensicsMutationRule& rule,
+    std::string_view outcome,
+    std::string_view draw_kind,
+    uint32_t ps_crc,
+    uint32_t cs_crc,
+    int eye_bucket)
+{
+    render::StereoForensics::get().record_experiment_observation(
+        rule.name,
+        rule.action,
+        outcome,
+        draw_kind,
+        ps_crc,
+        cs_crc,
+        eye_bucket);
+}
+
+std::string key_for(const Sn2ForensicsMutationRule& rule) {
+    return rule.name + "|" + rule.action + "|" + std::to_string(rule.ps_crc) + "|" +
+        std::to_string(rule.cs_crc) + "|" + std::to_string(rule.root) + "|" +
+        std::to_string(rule.slot);
+}
+
+bool patch_srv_slice_desc(D3D12_SHADER_RESOURCE_VIEW_DESC& desc, UINT array_slice) {
+    if (array_slice == UINT_MAX) {
+        return false;
+    }
+    switch (desc.ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+        desc.Texture1DArray.FirstArraySlice = array_slice;
+        return true;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+        desc.Texture2DArray.FirstArraySlice = array_slice;
+        return true;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+        desc.Texture2DMSArray.FirstArraySlice = array_slice;
+        return true;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+        desc.TextureCubeArray.First2DArrayFace = array_slice;
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace sn2_forensics_mutations
+
+static bool sn2_forensics_try_patch_descriptor_slot(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    const Sn2ForensicsMutationRule& rule,
+    Sn2EyePairingRedirectScope& scope,
+    SIZE_T source_descriptor_cpu,
+    const D3D12_SHADER_RESOURCE_VIEW_DESC* forced_srv_desc = nullptr,
+    ID3D12Resource* forced_srv_resource = nullptr)
+{
+    if (command_list == nullptr || rule.root == UINT_MAX || rule.slot == UINT_MAX) {
+        return false;
+    }
+    if (rule.root >= state.last_graphics_root_desc_tables.size()) {
+        return false;
+    }
+    const uint64_t table_gpu = state.last_graphics_root_desc_tables[rule.root];
+    if (table_gpu == 0) {
+        return false;
+    }
+
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (dev == nullptr || !sn2_forensics_mutations::ensure_scratch_heap(dev)) {
+        return false;
+    }
+    ID3D12DescriptorHeap* scratch_heap = sn2_forensics_mutations::scratch_descriptor_heap();
+    if (scratch_heap == nullptr) {
+        return false;
+    }
+
+    BindlessHeapState heap_state{};
+    SIZE_T cpu_base = 0;
+    if (!bindless_heap_registry().resolve_state(table_gpu, heap_state, cpu_base) ||
+        heap_state.heap == nullptr ||
+        heap_state.stride == 0 ||
+        heap_state.gpu_base == 0) {
+        return false;
+    }
+
+    const uint64_t off = table_gpu - heap_state.gpu_base;
+    const uint64_t heap_bytes = static_cast<uint64_t>(heap_state.stride) * heap_state.num_descriptors;
+    const UINT remaining_desc = (off < heap_bytes)
+        ? static_cast<UINT>((heap_bytes - off) / heap_state.stride)
+        : 0u;
+    if (remaining_desc == 0 || rule.slot >= remaining_desc) {
+        return false;
+    }
+
+    const UINT copy_count = std::min<UINT>(remaining_desc, std::max<UINT>(64, rule.slot + 1));
+    UINT64 scratch_gpu = 0;
+    const SIZE_T scratch_cpu = sn2_forensics_mutations::alloc_scratch(copy_count, &scratch_gpu);
+    if (scratch_cpu == 0 || scratch_gpu == 0) {
+        return false;
+    }
+
+    dev->CopyDescriptorsSimple(
+        copy_count,
+        D3D12_CPU_DESCRIPTOR_HANDLE{scratch_cpu},
+        D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base},
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE patch_cpu{
+        scratch_cpu + static_cast<SIZE_T>(rule.slot) * heap_state.stride};
+    if (forced_srv_desc != nullptr && forced_srv_resource != nullptr) {
+        dev->CreateShaderResourceView(forced_srv_resource, forced_srv_desc, patch_cpu);
+    } else if (source_descriptor_cpu != 0) {
+        dev->CopyDescriptorsSimple(
+            1,
+            patch_cpu,
+            D3D12_CPU_DESCRIPTOR_HANDLE{source_descriptor_cpu},
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    } else {
+        return false;
+    }
+
+    ID3D12DescriptorHeap* restore_sampler_heap = tls_sampler_heap.heap;
+    ID3D12DescriptorHeap* heaps[2]{scratch_heap, restore_sampler_heap};
+    command_list->SetDescriptorHeaps(restore_sampler_heap != nullptr ? 2u : 1u, heaps);
+
+    ++g_sn2_descriptor_table_rebind_depth;
+    command_list->SetGraphicsRootDescriptorTable(rule.root, D3D12_GPU_DESCRIPTOR_HANDLE{scratch_gpu});
+    --g_sn2_descriptor_table_rebind_depth;
+
+    scope.active = true;
+    scope.command_list = command_list;
+    scope.restore_heaps = true;
+    scope.restore_cbv_srv_uav_heap = heap_state.heap;
+    scope.restore_sampler_heap = restore_sampler_heap;
+    scope.entries[scope.entry_count++] = {rule.root, table_gpu};
+    return true;
+}
+
+static bool sn2_forensics_try_begin_mutations(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    std::string_view draw_kind,
+    uint32_t ps_crc,
+    uint32_t cs_crc,
+    int eye_bucket,
+    Sn2ForensicsMutationScope& scope)
+{
+    if (!env_flag_enabled_a("UEVR_STEREO_EXPERIMENTS") || command_list == nullptr || state.current_pso == nullptr) {
+        return false;
+    }
+    const auto rules = sn2_forensics_mutations::snapshot_rules();
+    if (rules.empty()) {
+        return false;
+    }
+
+    bool applied = false;
+    const uint64_t frame = sn2_forensics_mutations::current_frame();
+    ID3D12Device* device = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    auto& mut_state = sn2_forensics_mutations::state();
+    for (const auto& rule : rules) {
+        if (!sn2_forensics_mutations::kind_matches(rule.kind, draw_kind) ||
+            !sn2_forensics_mutations::shader_matches(rule, ps_crc, cs_crc)) {
+            continue;
+        }
+
+        const auto key = sn2_forensics_mutations::key_for(rule);
+        if ((rule.action == "swap_descriptor_from_left" || rule.action == "force_srv_array_slice") &&
+            rule.root != UINT_MAX &&
+            rule.slot != UINT_MAX &&
+            rule.root < state.last_graphics_root_desc_tables.size()) {
+            const uint64_t table_gpu = state.last_graphics_root_desc_tables[rule.root];
+            BindlessHeapState heap_state{};
+            SIZE_T cpu_base = 0;
+            if (table_gpu != 0 && bindless_heap_registry().resolve_state(table_gpu, heap_state, cpu_base) &&
+                heap_state.stride != 0) {
+                const uint64_t off = table_gpu - heap_state.gpu_base;
+                const uint64_t heap_bytes = static_cast<uint64_t>(heap_state.stride) * heap_state.num_descriptors;
+                const UINT remaining_desc = (off < heap_bytes)
+                    ? static_cast<UINT>((heap_bytes - off) / heap_state.stride)
+                    : 0u;
+                if (remaining_desc == 0 || rule.slot >= remaining_desc) {
+                    sn2_forensics_mutations::note_observation(rule, "descriptor_slot_out_of_range", draw_kind, ps_crc, cs_crc, eye_bucket);
+                    continue;
+                }
+                const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(rule.slot) * heap_state.stride;
+                if (rule.action == "swap_descriptor_from_left" &&
+                    sn2_forensics_mutations::eye_matches(rule.source_eye, eye_bucket)) {
+                    SIZE_T snapshot_cpu = 0;
+                    if (device != nullptr && sn2_forensics_mutations::ensure_scratch_heap(device)) {
+                        UINT64 ignored_gpu = 0;
+                        snapshot_cpu = sn2_forensics_mutations::alloc_scratch(1, &ignored_gpu);
+                    }
+                    if (snapshot_cpu == 0) {
+                        sn2_forensics_mutations::note_observation(rule, "source_snapshot_failed", draw_kind, ps_crc, cs_crc, eye_bucket);
+                        continue;
+                    }
+                    device->CopyDescriptorsSimple(
+                        1,
+                        D3D12_CPU_DESCRIPTOR_HANDLE{snapshot_cpu},
+                        D3D12_CPU_DESCRIPTOR_HANDLE{slot_cpu},
+                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    std::scoped_lock _{mut_state.mu};
+                    mut_state.left_descriptors[key] = {snapshot_cpu, frame, ++mut_state.sequence};
+                    sn2_forensics_mutations::note_observation(rule, "source_snapshot", draw_kind, ps_crc, cs_crc, eye_bucket);
+                    continue;
+                }
+            }
+        }
+
+        if (rule.action == "swap_cbv_left_to_right" &&
+            rule.root != UINT_MAX &&
+            rule.root < state.last_graphics_root_cbv.size() &&
+            sn2_forensics_mutations::eye_matches(rule.source_eye, eye_bucket)) {
+            const uint64_t left_va = state.last_graphics_root_cbv[rule.root];
+            if (left_va != 0) {
+                uint32_t copied_bytes = 0;
+                const uint64_t snapshot_va = sn2_forensics_mutations::snapshot_cbv_to_upload(
+                    device,
+                    left_va,
+                    sn2_forensics_mutations::cbv_snapshot_bytes(),
+                    &copied_bytes);
+                if (snapshot_va != 0) {
+                    std::scoped_lock _{mut_state.mu};
+                    mut_state.left_cbvs[key] = {snapshot_va, copied_bytes, frame, ++mut_state.sequence};
+                    sn2_forensics_mutations::note_observation(rule, "source_snapshot", draw_kind, ps_crc, cs_crc, eye_bucket);
+                } else {
+                    sn2_forensics_mutations::note_observation(rule, "source_snapshot_failed", draw_kind, ps_crc, cs_crc, eye_bucket);
+                }
+            }
+            continue;
+        }
+
+        if (!sn2_forensics_mutations::eye_matches(rule.target_eye, eye_bucket)) {
+            continue;
+        }
+
+        if (rule.action == "swap_cbv_left_to_right") {
+            if (rule.root == UINT_MAX || rule.root >= state.last_graphics_root_cbv.size()) {
+                continue;
+            }
+            uint64_t left_va = 0;
+            uint64_t source_frame = 0;
+            {
+                std::scoped_lock _{mut_state.mu};
+                const auto it = mut_state.left_cbvs.find(key);
+                if (it != mut_state.left_cbvs.end()) {
+                    left_va = it->second.va;
+                    source_frame = it->second.frame;
+                }
+            }
+            if (left_va != 0 && source_frame != frame) {
+                sn2_forensics_mutations::note_observation(rule, "stale_source", draw_kind, ps_crc, cs_crc, eye_bucket);
+                continue;
+            }
+            const uint64_t restore_va = state.last_graphics_root_cbv[rule.root];
+            if (left_va != 0 && restore_va != 0 && left_va != restore_va) {
+                scope.cbv_scope.active = true;
+                scope.cbv_scope.command_list = command_list;
+                scope.cbv_scope.restore_root[rule.root] = true;
+                scope.cbv_scope.restore_cbvs[rule.root] = restore_va;
+                scope.cbv_scope.active_cbvs[rule.root] = left_va;
+                command_list->SetGraphicsRootConstantBufferView(
+                    rule.root,
+                    static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(left_va));
+                applied = true;
+                sn2_forensics_mutations::note_observation(rule, "applied", draw_kind, ps_crc, cs_crc, eye_bucket);
+                static std::atomic<uint64_t> cbv_apply{0};
+                const auto n = cbv_apply.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 16 || (n % 600) == 0) {
+                    SPDLOG_WARN("[StereoForensics-Mutate] cbv_swap#{} rule={} root={} right=0x{:x} left=0x{:x}",
+                        n, rule.name, rule.root, restore_va, left_va);
+                }
+            } else {
+                sn2_forensics_mutations::note_observation(rule, left_va == 0 ? "missing_source" : "not_needed", draw_kind, ps_crc, cs_crc, eye_bucket);
+            }
+        } else if (rule.action == "swap_descriptor_from_left") {
+            SIZE_T left_cpu = 0;
+            uint64_t source_frame = 0;
+            {
+                std::scoped_lock _{mut_state.mu};
+                const auto it = mut_state.left_descriptors.find(key);
+                if (it != mut_state.left_descriptors.end()) {
+                    left_cpu = it->second.cpu;
+                    source_frame = it->second.frame;
+                }
+            }
+            if (left_cpu != 0 && source_frame != frame) {
+                sn2_forensics_mutations::note_observation(rule, "stale_source", draw_kind, ps_crc, cs_crc, eye_bucket);
+                continue;
+            }
+            if (left_cpu != 0 &&
+                scope.descriptor_scope.entry_count < scope.descriptor_scope.entries.size() &&
+                sn2_forensics_try_patch_descriptor_slot(command_list, state, rule, scope.descriptor_scope, left_cpu)) {
+                applied = true;
+                sn2_forensics_mutations::note_observation(rule, "applied", draw_kind, ps_crc, cs_crc, eye_bucket);
+                static std::atomic<uint64_t> desc_apply{0};
+                const auto n = desc_apply.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 16 || (n % 600) == 0) {
+                    SPDLOG_WARN("[StereoForensics-Mutate] descriptor_swap#{} rule={} root={} slot={} left_cpu=0x{:x}",
+                        n, rule.name, rule.root, rule.slot, static_cast<uintptr_t>(left_cpu));
+                }
+            } else {
+                sn2_forensics_mutations::note_observation(rule, left_cpu == 0 ? "missing_source" : "apply_failed", draw_kind, ps_crc, cs_crc, eye_bucket);
+            }
+        } else if (rule.action == "force_srv_array_slice") {
+            if (rule.root == UINT_MAX || rule.slot == UINT_MAX || rule.root >= state.last_graphics_root_desc_tables.size()) {
+                continue;
+            }
+            const uint64_t table_gpu = state.last_graphics_root_desc_tables[rule.root];
+            BindlessHeapState heap_state{};
+            SIZE_T cpu_base = 0;
+            if (table_gpu == 0 || !bindless_heap_registry().resolve_state(table_gpu, heap_state, cpu_base) || heap_state.stride == 0) {
+                continue;
+            }
+            const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(rule.slot) * heap_state.stride;
+            ID3D12Resource* srv_res = nullptr;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+            bool has_srv_desc = false;
+            if (!sn2_descriptor_registry::lookup_srv_by_cpu_ptr_or_hash(slot_cpu, srv_res, srv_desc, has_srv_desc) ||
+                srv_res == nullptr ||
+                !has_srv_desc) {
+                sn2_forensics_mutations::note_observation(rule, "descriptor_lookup_failed", draw_kind, ps_crc, cs_crc, eye_bucket);
+                continue;
+            }
+            D3D12_SHADER_RESOURCE_VIEW_DESC forced_desc = srv_desc;
+            if (!sn2_forensics_mutations::patch_srv_slice_desc(forced_desc, rule.array_slice)) {
+                sn2_forensics_mutations::note_observation(rule, "unsupported_view_dimension", draw_kind, ps_crc, cs_crc, eye_bucket);
+                continue;
+            }
+            if (scope.descriptor_scope.entry_count < scope.descriptor_scope.entries.size() &&
+                sn2_forensics_try_patch_descriptor_slot(
+                    command_list,
+                    state,
+                    rule,
+                    scope.descriptor_scope,
+                    0,
+                    &forced_desc,
+                    srv_res)) {
+                applied = true;
+                sn2_forensics_mutations::note_observation(rule, "applied", draw_kind, ps_crc, cs_crc, eye_bucket);
+                static std::atomic<uint64_t> slice_apply{0};
+                const auto n = slice_apply.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 16 || (n % 600) == 0) {
+                    SPDLOG_WARN("[StereoForensics-Mutate] force_slice#{} rule={} root={} slot={} slice={} res={:p}",
+                        n, rule.name, rule.root, rule.slot, rule.array_slice, static_cast<void*>(srv_res));
+                }
+            } else {
+                sn2_forensics_mutations::note_observation(rule, "apply_failed", draw_kind, ps_crc, cs_crc, eye_bucket);
+            }
+        } else if (rule.action == "duplicate_left_work_into_right_bucket") {
+            sn2_forensics_mutations::note_observation(rule, "unsupported_action", draw_kind, ps_crc, cs_crc, eye_bucket);
+            static std::atomic<uint64_t> duplicate_warn{0};
+            const auto n = duplicate_warn.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 4) {
+                SPDLOG_WARN("[StereoForensics-Mutate] rule={} requested generic duplicate work; live duplicate replay is not wired yet", rule.name);
+            }
+        }
+    }
+    return applied;
+}
+
 // Duplicate a LEFT-eye water-material basepass draw for the right eye.
 // Counterpart of sn2_try_duplicate_fog_voxelize_right (above) but for the
 // SLW basepass MRT slot 6 fill chain. See Sn2WaterBasepassDupHook.hpp for
@@ -10520,6 +12141,9 @@ static void sn2_try_duplicate_slw_basepass_right(
         }
     }
 
+    Sn2EyePairingRedirectScope eye_pairing_scope{};
+    sn2_try_begin_eye_pairing_redirect(command_list, state, eye_pairing_scope, true);
+
     // Re-issue the draw.
     original(
         command_list,
@@ -10528,6 +12152,35 @@ static void sn2_try_duplicate_slw_basepass_right(
         start_index_location,
         base_vertex_location,
         start_instance_location);
+
+    eye_pairing_scope.restore();
+
+    // 2026-05-23: Snapshot the basepass RT immediately after the dup draw
+    // completes, so we can examine what the dup actually wrote. Gated by
+    // UEVR_SN2_DUP_RT_SNAPSHOT=1, throttled to first N + every 600th.
+    {
+        static const bool snap_dup = []() {
+            char buf[8]{};
+            const auto n = GetEnvironmentVariableA("UEVR_SN2_DUP_RT_SNAPSHOT", buf, sizeof(buf));
+            return n != 0 && n < sizeof(buf) && buf[0] && buf[0] != '0';
+        }();
+        if (snap_dup && state.last_rtv_handles[0] != 0 && sn2_rt_snapshot::initialized()) {
+            ID3D12Resource* rt0_res = sn2_rt_snapshot::lookup_rtv(state.last_rtv_handles[0]);
+            if (rt0_res != nullptr) {
+                static std::atomic<uint64_t> snap_count{0};
+                const auto sn = snap_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (sn <= 8 || (sn % 600) == 0) {
+                    char tag[64];
+                    std::snprintf(tag, sizeof(tag), "DUP_BP_n%llu", (unsigned long long)sn);
+                    sn2_rt_snapshot::schedule_capture(
+                        command_list, rt0_res,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET, tag);
+                    SPDLOG_WARN("[SN2-DupRTSnap] #{} scheduled capture of dup-output RT0 res=0x{:x} tag={}",
+                                sn, reinterpret_cast<uintptr_t>(rt0_res), tag);
+                }
+            }
+        }
+    }
 
     // Restore RTV bindings.
     if (rtv_redirect_applied && orig_rtv_count > 0) {
@@ -10592,7 +12245,10 @@ void WINAPI D3D12Hook::draw_instanced(
     reg.hunter_inc_draw_hit();
     // Read per-CL state once for both eye-diff and per-eye-skip decisions.
     const auto s = (command_list != nullptr) ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
-    const int eye_bucket = static_cast<int>(s.last_viewport_bucket);
+    const int eye_bucket = cmdlist_eye_bucket(s);
+    if (s.current_pso != nullptr) {
+        reg.hunter_record_draw_event(reinterpret_cast<uintptr_t>(s.current_pso), eye_bucket, false, false);
+    }
     if (sn2_missing_pass_diff::env_enabled() && s.current_pso != nullptr) {
         const uint32_t ps_crc_for_diff = reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s.current_pso));
         sn2_missing_pass_diff::record(ps_crc_for_diff, eye_bucket, 'P');
@@ -10602,6 +12258,17 @@ void WINAPI D3D12Hook::draw_instanced(
     const bool per_eye_skip = s.current_pso != nullptr &&
         reg.hunter_should_skip_draw_per_eye(reinterpret_cast<uintptr_t>(s.current_pso), eye_bucket);
     const bool hunter_skip = reg.hunter_should_skip_graphics(command_list);
+    const uint32_t forensics_ps_crc = s.current_pso != nullptr
+        ? reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s.current_pso))
+        : 0;
+    const uint32_t forensics_cs_crc = s.current_pso != nullptr
+        ? reg.d3d12_pso_compute_crc32(reinterpret_cast<uintptr_t>(s.current_pso))
+        : 0;
+    const bool forensics_skip = render::StereoForensics::get().should_skip_event(
+        "draw",
+        forensics_ps_crc,
+        forensics_cs_crc,
+        eye_bucket);
     record_draw_event_from_state(
         "D3D12Hook::DrawInstanced",
         "draw",
@@ -10612,7 +12279,7 @@ void WINAPI D3D12Hook::draw_instanced(
         start_vertex_location,
         0,
         start_instance_location,
-        original != nullptr && !upstream_skip && !sky_skip && !per_eye_skip && !hunter_skip);
+        original != nullptr && !upstream_skip && !sky_skip && !per_eye_skip && !hunter_skip && !forensics_skip);
     // Eye-Diff record: per-PSO per-eye fingerprint of the current draw.
     if (reg.eyediff_enabled() && command_list != nullptr) {
         auto [ps_hash, vs_hash] = reg.snapshot_pso_hashes_for(reinterpret_cast<uintptr_t>(s.current_pso));
@@ -10660,6 +12327,10 @@ void WINAPI D3D12Hook::draw_instanced(
         return;
     }
     if (hunter_skip) {
+        reg.hunter_inc_draw_skipped();
+        return;
+    }
+    if (forensics_skip) {
         reg.hunter_inc_draw_skipped();
         return;
     }
@@ -10713,12 +12384,22 @@ void WINAPI D3D12Hook::draw_instanced(
         sn2_begin_copyrect_cbv_override(command_list, s, copyrect_cbv_scope);
         Sn2CopyRectScratchScope copyrect_scope{};
         sn2_begin_copyrect_scratch_table(command_list, s, copyrect_scope);
+        Sn2ForensicsMutationScope forensics_mutation_scope{};
+        sn2_forensics_try_begin_mutations(
+            command_list,
+            s,
+            "draw",
+            forensics_ps_crc,
+            forensics_cs_crc,
+            eye_bucket,
+            forensics_mutation_scope);
         const auto timing = gpu_timestamp_timing::begin(command_list, "draw", s);
         original(command_list, vertex_count_per_instance, instance_count, start_vertex_location, start_instance_location);
         gpu_timestamp_timing::end(command_list, timing);
         sn2_capture_water_chain_rtv_phase(command_list, s, water_rt_pair, "post");
         sn2_note_draw_output_for_copyrect_fix(s);
         sn2_note_copyrect_post_draw_output(command_list, s);
+        forensics_mutation_scope.restore();
         copyrect_scope.restore();
         copyrect_cbv_scope.restore();
         water_chain_viewcb_scope.restore();
@@ -10755,7 +12436,10 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
     auto& reg2 = render::ShaderOverrideRegistry::get();
     reg2.hunter_inc_draw_indexed_hit();
     const auto s2 = (command_list != nullptr) ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
-    const int eye_bucket2 = static_cast<int>(s2.last_viewport_bucket);
+    const int eye_bucket2 = cmdlist_eye_bucket(s2);
+    if (s2.current_pso != nullptr) {
+        reg2.hunter_record_draw_event(reinterpret_cast<uintptr_t>(s2.current_pso), eye_bucket2, false, true);
+    }
     if (sn2_missing_pass_diff::env_enabled() && s2.current_pso != nullptr) {
         const uint32_t ps_crc_for_diff = reg2.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso));
         sn2_missing_pass_diff::record(ps_crc_for_diff, eye_bucket2, 'P');
@@ -10765,6 +12449,17 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
     const bool per_eye_skip = s2.current_pso != nullptr &&
         reg2.hunter_should_skip_draw_per_eye(reinterpret_cast<uintptr_t>(s2.current_pso), eye_bucket2);
     const bool hunter_skip = reg2.hunter_should_skip_graphics(command_list);
+    const uint32_t forensics_ps_crc = s2.current_pso != nullptr
+        ? reg2.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso))
+        : 0;
+    const uint32_t forensics_cs_crc = s2.current_pso != nullptr
+        ? reg2.d3d12_pso_compute_crc32(reinterpret_cast<uintptr_t>(s2.current_pso))
+        : 0;
+    const bool forensics_skip = render::StereoForensics::get().should_skip_event(
+        "draw_indexed",
+        forensics_ps_crc,
+        forensics_cs_crc,
+        eye_bucket2);
     record_draw_event_from_state(
         "D3D12Hook::DrawIndexedInstanced",
         "draw_indexed",
@@ -10775,7 +12470,7 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         start_index_location,
         base_vertex_location,
         start_instance_location,
-        original != nullptr && !upstream_skip && !sky_skip && !per_eye_skip && !hunter_skip);
+        original != nullptr && !upstream_skip && !sky_skip && !per_eye_skip && !hunter_skip && !forensics_skip);
     if (reg2.eyediff_enabled() && command_list != nullptr) {
         auto [ps_hash, vs_hash] = reg2.snapshot_pso_hashes_for(reinterpret_cast<uintptr_t>(s2.current_pso));
         reg2.eyediff_record_draw(ps_hash, vs_hash, eye_bucket2, s2.last_rtv0_handle, s2.last_graphics_root_desc_table0);
@@ -10823,9 +12518,207 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         reg2.hunter_inc_draw_indexed_skipped();
         return;
     }
+    if (forensics_skip) {
+        reg2.hunter_inc_draw_indexed_skipped();
+        return;
+    }
     if (sn2_should_skip_water_chain_draw(s2, "DrawIndexedInstanced")) {
         reg2.hunter_inc_draw_indexed_skipped();
         return;
+    }
+
+    // 2026-05-23: Per-TAA(0x37558DE4)-draw deep dump.
+    // Logs each TAA draw's RT0 (output) and SRV bindings at root 0 slot 1
+    // (scene-color input per memory). Helps identify which RT the right-eye
+    // TAA reads — if it's not the 1180x616 basepass atlas, we know the
+    // disconnect.
+    {
+        static const bool taa_dump = []() {
+            char buf[8]{};
+            const auto n = GetEnvironmentVariableA("UEVR_SN2_TAA_DUMP", buf, sizeof(buf));
+            return n != 0 && n < sizeof(buf) && buf[0] && buf[0] != '0';
+        }();
+        if (taa_dump && s2.current_pso != nullptr) {
+            const uint32_t crc_t = reg2.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso));
+            if (crc_t == 0x37558DE4u) {
+                static std::atomic<uint64_t> taa_count{0};
+                const auto n = taa_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 32 || (n % 60) == 0) {
+                    const int bucket = static_cast<int>(s2.last_viewport_bucket);
+                    ID3D12Resource* rt0_res = s2.last_rtv_handles[0] != 0
+                        ? sn2_rt_snapshot::lookup_rtv(s2.last_rtv_handles[0]) : nullptr;
+                    unsigned rt0_w = 0, rt0_h = 0, rt0_fmt = 0;
+                    if (rt0_res != nullptr) {
+                        const auto rd = rt0_res->GetDesc();
+                        rt0_w = static_cast<unsigned>(rd.Width);
+                        rt0_h = rd.Height;
+                        rt0_fmt = static_cast<unsigned>(rd.Format);
+                    }
+                    // t1 (scene color input) — log root 0 slot 1 binding
+                    ID3D12Resource* t1_res = nullptr;
+                    unsigned t1_w = 0, t1_h = 0, t1_fmt = 0;
+                    const uint64_t table_gpu = s2.last_graphics_root_desc_tables[0];
+                    if (table_gpu != 0) {
+                        SIZE_T cpu_base = 0; UINT stride = 0;
+                        if (bindless_heap_registry().resolve(table_gpu, cpu_base, stride)) {
+                            const SIZE_T slot1_cpu = cpu_base + 1 * stride;
+                            t1_res = sn2_descriptor_registry::lookup_resource_by_cpu_ptr_or_hash(slot1_cpu);
+                            if (t1_res != nullptr) {
+                                const auto rd = t1_res->GetDesc();
+                                t1_w = static_cast<unsigned>(rd.Width);
+                                t1_h = rd.Height;
+                                t1_fmt = static_cast<unsigned>(rd.Format);
+                            }
+                        }
+                    }
+                    SPDLOG_WARN(
+                        "[SN2-TAADump] n={} eye={} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) "
+                        "scissor=({},{},{},{}) "
+                        "rt0=0x{:x}[{}x{} f{}] t1(scene)=0x{:x}[{}x{} f{}]",
+                        n, bucket == 1 ? "L" : (bucket == 2 ? "R" : "?"),
+                        s2.viewport0.TopLeftX, s2.viewport0.TopLeftY,
+                        s2.viewport0.Width, s2.viewport0.Height,
+                        s2.scissor0.left, s2.scissor0.top, s2.scissor0.right, s2.scissor0.bottom,
+                        reinterpret_cast<uintptr_t>(rt0_res), rt0_w, rt0_h, rt0_fmt,
+                        reinterpret_cast<uintptr_t>(t1_res), t1_w, t1_h, t1_fmt);
+                }
+            }
+        }
+    }
+
+    // 2026-05-23: Per-DE7C3822-draw deep dump. Gated by
+    // UEVR_SN2_DE7C3822_DUMP=1. Logs EVERY draw of DE7C3822 (not just first-
+    // sighting) with eye, RT0 resource pointer + dims, CBVs at root 4..7,
+    // and the t5 descriptor's bound resource. Throttled to log every Nth.
+    {
+        static const bool de7_dump = []() {
+            char buf[8]{};
+            const auto n = GetEnvironmentVariableA("UEVR_SN2_DE7C3822_DUMP", buf, sizeof(buf));
+            return n != 0 && n < sizeof(buf) && buf[0] && buf[0] != '0';
+        }();
+        if (de7_dump && s2.current_pso != nullptr) {
+            const uint32_t crc_d = reg2.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso));
+            if (crc_d == 0xDE7C3822u) {
+                static std::atomic<uint64_t> de7_log_count{0};
+                static std::atomic<uint64_t> de7_left{0};
+                static std::atomic<uint64_t> de7_right{0};
+                const int bucket = static_cast<int>(s2.last_viewport_bucket);
+                if (bucket == 1) de7_left.fetch_add(1, std::memory_order_relaxed);
+                else if (bucket == 2) de7_right.fetch_add(1, std::memory_order_relaxed);
+                const auto n = de7_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                // Log first 32, then every 60th
+                if (n <= 32 || (n % 60) == 0) {
+                    ID3D12Resource* rt0_res = s2.last_rtv_handles[0] != 0
+                        ? sn2_rt_snapshot::lookup_rtv(s2.last_rtv_handles[0]) : nullptr;
+                    unsigned rt0_w = 0, rt0_h = 0, rt0_d = 0, rt0_fmt = 0;
+                    if (rt0_res != nullptr) {
+                        const auto rd = rt0_res->GetDesc();
+                        rt0_w = static_cast<unsigned>(rd.Width);
+                        rt0_h = rd.Height;
+                        rt0_d = rd.DepthOrArraySize;
+                        rt0_fmt = static_cast<unsigned>(rd.Format);
+                    }
+                    // Look up t5 (root 0 slot 5) bound resource
+                    ID3D12Resource* t5_res = nullptr;
+                    unsigned t5_w = 0, t5_h = 0, t5_d = 0, t5_fmt = 0;
+                    {
+                        const uint64_t table_gpu = s2.last_graphics_root_desc_tables[0];
+                        if (table_gpu != 0) {
+                            SIZE_T cpu_base = 0; UINT stride = 0;
+                            if (bindless_heap_registry().resolve(table_gpu, cpu_base, stride)) {
+                                const SIZE_T slot5_cpu = cpu_base + 5 * stride;
+                                t5_res = sn2_descriptor_registry::lookup_resource_by_cpu_ptr_or_hash(slot5_cpu);
+                                if (t5_res != nullptr) {
+                                    const auto rd = t5_res->GetDesc();
+                                    t5_w = static_cast<unsigned>(rd.Width);
+                                    t5_h = rd.Height;
+                                    t5_d = rd.DepthOrArraySize;
+                                    t5_fmt = static_cast<unsigned>(rd.Format);
+                                }
+                            }
+                        }
+                    }
+                    SPDLOG_WARN(
+                        "[SN2-DE7Dump] n={} L={} R={} eye={} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) "
+                        "scissor=({},{},{},{}) "
+                        "rt0=0x{:x}[{}x{}x{} f{}] t5=0x{:x}[{}x{}x{} f{}] "
+                        "cb4=0x{:x} cb5=0x{:x} cb6=0x{:x} cb7=0x{:x}",
+                        n, de7_left.load(), de7_right.load(),
+                        bucket == 1 ? "L" : (bucket == 2 ? "R" : "?"),
+                        s2.viewport0.TopLeftX, s2.viewport0.TopLeftY,
+                        s2.viewport0.Width, s2.viewport0.Height,
+                        s2.scissor0.left, s2.scissor0.top, s2.scissor0.right, s2.scissor0.bottom,
+                        reinterpret_cast<uintptr_t>(rt0_res), rt0_w, rt0_h, rt0_d, rt0_fmt,
+                        reinterpret_cast<uintptr_t>(t5_res), t5_w, t5_h, t5_d, t5_fmt,
+                        s2.last_graphics_root_cbv[4],
+                        s2.last_graphics_root_cbv[5],
+                        s2.last_graphics_root_cbv[6],
+                        s2.last_graphics_root_cbv[7]);
+                }
+            }
+        }
+    }
+
+    // 2026-05-23: Universal per-eye PS CRC tracker. Gated by
+    // UEVR_SN2_DRAW_INSPECTOR=1. Logs first occurrence of each (eye, ps_crc)
+    // pair AND per-draw cb root bindings — separate from the dup-gated
+    // LeftOnlyProbe. Output goes to UEVR log as [SN2-DrawInspect].
+    {
+        static const bool inspect = []() {
+            char buf[8]{};
+            const auto n = GetEnvironmentVariableA("UEVR_SN2_DRAW_INSPECTOR", buf, sizeof(buf));
+            return n != 0 && n < sizeof(buf) && buf[0] && buf[0] != '0';
+        }();
+        if (inspect && s2.current_pso != nullptr) {
+            const uint32_t crc_d = reg2.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso));
+            const int bucket = static_cast<int>(s2.last_viewport_bucket);
+            if (crc_d != 0 && (bucket == 1 || bucket == 2)) {
+                static std::mutex inspect_mu;
+                static std::unordered_set<uint64_t> seen;  // hi=bucket, lo=crc
+                const uint64_t key = (static_cast<uint64_t>(bucket) << 32) | crc_d;
+                bool first = false;
+                {
+                    std::scoped_lock _{inspect_mu};
+                    first = seen.insert(key).second;
+                }
+                if (first) {
+                    // Also lookup RT resource dims/format to identify producers
+                    ID3D12Resource* rt0_res = s2.last_rtv_handles[0] != 0
+                        ? sn2_rt_snapshot::lookup_rtv(s2.last_rtv_handles[0])
+                        : nullptr;
+                    unsigned rt0_w = 0, rt0_h = 0, rt0_d = 0;
+                    unsigned rt0_fmt = 0, rt0_flags = 0;
+                    int rt0_dim_kind = 0;
+                    if (rt0_res != nullptr) {
+                        const auto desc = rt0_res->GetDesc();
+                        rt0_w = static_cast<unsigned>(desc.Width);
+                        rt0_h = desc.Height;
+                        rt0_d = desc.DepthOrArraySize;
+                        rt0_fmt = static_cast<unsigned>(desc.Format);
+                        rt0_flags = static_cast<unsigned>(desc.Flags);
+                        rt0_dim_kind = static_cast<int>(desc.Dimension);
+                    }
+                    SPDLOG_WARN(
+                        "[SN2-DrawInspect] FIRST eye={} ps_crc=0x{:08x} pso=0x{:x} "
+                        "rtv_count={} rtv0=0x{:x} rt0_res=0x{:x} rt0_dim={}x{}x{} "
+                        "rt0_fmt={} rt0_flags=0x{:x} rt0_kind={} "
+                        "cb0_root4=0x{:x} cb_root5=0x{:x} cb_root6=0x{:x} cb_root7=0x{:x} "
+                        "vp=({:.0f},{:.0f},{:.0f},{:.0f})",
+                        bucket == 1 ? "LEFT" : "RIGHT", crc_d,
+                        reinterpret_cast<uintptr_t>(s2.current_pso),
+                        static_cast<unsigned>(s2.last_rtv_count),
+                        s2.last_rtv_handles[0],
+                        reinterpret_cast<uintptr_t>(rt0_res),
+                        rt0_w, rt0_h, rt0_d, rt0_fmt, rt0_flags, rt0_dim_kind,
+                        s2.last_graphics_root_cbv[4],
+                        s2.last_graphics_root_cbv[5],
+                        s2.last_graphics_root_cbv[6],
+                        s2.last_graphics_root_cbv[7],
+                        s2.viewport0.TopLeftX, s2.viewport0.TopLeftY,
+                        s2.viewport0.Width, s2.viewport0.Height);
+                }
+            }
+        }
     }
 
     // 2026-05-22 Magic Ink: live skip for binary-search PSO identification.
@@ -10922,6 +12815,13 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         // the original descriptor table after the draw.
         Sn2ConsumerSrvRedirectScope consumer_srv_scope{};
         sn2_try_begin_consumer_srv_redirect(command_list, s2, consumer_srv_scope);
+        // 2026-05-22: per-eye SRV pairing observation + multi-slot redirect.
+        // Observation records LEFT/RIGHT resource bindings; redirect fires on
+        // right-eye DE7C3822 (or env-listed CRCs) and substitutes paired right
+        // resources into the bound descriptor tables via scratch copy.
+        sn2_observe_eye_pairing(s2);
+        Sn2EyePairingRedirectScope eye_pairing_scope{};
+        sn2_try_begin_eye_pairing_redirect(command_list, s2, eye_pairing_scope);
         // 2026-05-22: Consumer CB swap. Capture LEFT-eye CBV on left draws of
         // the target PSO; on RIGHT-eye draws, swap that CBV in. Fixes the
         // zeroed inverse-viewport-scalars in 0x37558DE4's RIGHT root-3 CB.
@@ -10940,6 +12840,15 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
                 }
             }
         }
+        Sn2ForensicsMutationScope forensics_mutation_scope{};
+        sn2_forensics_try_begin_mutations(
+            command_list,
+            s2,
+            "draw_indexed",
+            forensics_ps_crc,
+            forensics_cs_crc,
+            eye_bucket2,
+            forensics_mutation_scope);
         // 2026-05-22: Debug color override (magenta PS swap) for visualizing
         // exactly where a given PS CRC renders pixels. Enabled when
         // UEVR_SN2_DEBUG_COLOR_OVERRIDE_FILE points at a file listing PS CRCs.
@@ -10954,6 +12863,7 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
                         dev, current_pso_ps);
                     if (replacement != nullptr) {
                         command_list->SetPipelineState(replacement);
+                        sn2_debug_color::note_override_applied(pscrc_dc, eye_bucket2, "draw_indexed");
                         debug_color_scope.active = true;
                         debug_color_scope.command_list = command_list;
                         debug_color_scope.restore_pso = current_pso_ps;
@@ -10967,8 +12877,189 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         sn2_capture_water_chain_rtv_phase(command_list, s2, water_rt_pair, "post");
         sn2_note_draw_output_for_copyrect_fix(s2);
         sn2_note_copyrect_post_draw_output(command_list, s2);
+        // 2026-05-23: Right-eye SLW teal-clear / mirror hack. Disabled by
+        // default; produced visible artifacts (duplicate logo, dark sky)
+        // because basepass draws are interleaved per-eye and subsequent
+        // right-eye draws overwrite the cleared/mirrored region. Kept here
+        // gated by env so it can be re-enabled for experimentation while a
+        // proper diagnostic-driven fix is developed.
+        if (false && std::getenv("UEVR_SN2_RIGHT_TEAL_CLEAR") != nullptr) {
+            static const std::unordered_set<uint32_t> slw_crcs = {
+                0x0182D735u, 0x4528BE0Fu, 0xDE7C3822u, 0xF1D1132Cu};
+            const uint32_t cur_crc = s2.current_pso != nullptr
+                ? reg2.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso))
+                : 0u;
+            if (slw_crcs.count(cur_crc) != 0 &&
+                s2.last_viewport_bucket == StereoTraceBucket::Left &&
+                s2.last_rtv_count > 0) {
+                const auto getf = [](const char* name, float def) {
+                    char buf[32]{};
+                    const auto n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+                    if (n == 0 || n >= sizeof(buf)) return def;
+                    char* end = nullptr;
+                    const float v = std::strtof(buf, &end);
+                    return end != buf ? v : def;
+                };
+                const auto geti = [](const char* name, int def) {
+                    char buf[32]{};
+                    const auto n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+                    if (n == 0 || n >= sizeof(buf)) return def;
+                    char* end = nullptr;
+                    const int v = std::strtol(buf, &end, 0);
+                    return end != buf ? v : def;
+                };
+                const float teal[4] = {
+                    getf("UEVR_SN2_TEAL_R", 0.05f),
+                    getf("UEVR_SN2_TEAL_G", 0.35f),
+                    getf("UEVR_SN2_TEAL_B", 0.45f),
+                    1.0f
+                };
+                D3D12_RECT rect{
+                    geti("UEVR_SN2_TEAL_RECT_L", 640),
+                    geti("UEVR_SN2_TEAL_RECT_T", 0),
+                    geti("UEVR_SN2_TEAL_RECT_R", 1280),
+                    geti("UEVR_SN2_TEAL_RECT_B", 720)
+                };
+                // Clear only configured RTV slots (default: 0 — scene color).
+                // Set UEVR_SN2_TEAL_SLOTS=0,6 to clear multiple, "all" for all.
+                char slots_buf[64]{};
+                const auto slots_len = GetEnvironmentVariableA("UEVR_SN2_TEAL_SLOTS", slots_buf, sizeof(slots_buf));
+                std::vector<UINT> clear_slots;
+                if (slots_len == 0 || slots_len >= sizeof(slots_buf)) {
+                    clear_slots.push_back(0);
+                } else if (std::string{slots_buf} == "all") {
+                    for (UINT i = 0; i < s2.last_rtv_count && i < 8; ++i) clear_slots.push_back(i);
+                } else {
+                    std::string s{slots_buf, slots_len};
+                    size_t pos = 0;
+                    while (pos < s.size()) {
+                        while (pos < s.size() && (s[pos] == ',' || s[pos] == ' ')) ++pos;
+                        if (pos >= s.size()) break;
+                        size_t end = pos;
+                        while (end < s.size() && s[end] != ',' && s[end] != ' ') ++end;
+                        std::string tok = s.substr(pos, end - pos);
+                        pos = end;
+                        if (!tok.empty()) {
+                            char* tail = nullptr;
+                            const auto v = std::strtoul(tok.c_str(), &tail, 0);
+                            if (tail != tok.c_str()) clear_slots.push_back(static_cast<UINT>(v));
+                        }
+                    }
+                }
+                // Mode A (default): solid teal clear of right half.
+                // Mode B (UEVR_SN2_MIRROR_LEFT_TO_RIGHT_BP=1): copy LEFT half
+                //   of slot 0 RT to a per-resource staging buffer, then copy
+                //   to RIGHT half. Preserves LEFT-eye detail.
+                const bool mirror_mode = std::getenv("UEVR_SN2_MIRROR_LEFT_TO_RIGHT_BP") != nullptr;
+                if (mirror_mode && s2.last_rtv_handles[0] != 0) {
+                    ID3D12Resource* rt_res = sn2_rt_snapshot::lookup_rtv(s2.last_rtv_handles[0]);
+                    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+                    if (rt_res != nullptr && dev != nullptr) {
+                        const auto rdesc = rt_res->GetDesc();
+                        const UINT half_w = static_cast<UINT>(rdesc.Width) / 2;
+                        // Lazy-allocate persistent staging resource per RT format
+                        struct Staging {
+                            Microsoft::WRL::ComPtr<ID3D12Resource> res;
+                            DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+                            UINT w = 0, h = 0;
+                        };
+                        static std::mutex stage_mu;
+                        static Staging staging;
+                        bool ok = false;
+                        {
+                            std::scoped_lock _{stage_mu};
+                            if (staging.res == nullptr || staging.fmt != rdesc.Format ||
+                                staging.w != half_w || staging.h != rdesc.Height) {
+                                D3D12_HEAP_PROPERTIES hp{};
+                                hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                                D3D12_RESOURCE_DESC d = rdesc;
+                                d.Width = half_w;
+                                d.Flags = D3D12_RESOURCE_FLAG_NONE;
+                                HRESULT hr = dev->CreateCommittedResource(
+                                    &hp, D3D12_HEAP_FLAG_NONE, &d,
+                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                    IID_PPV_ARGS(&staging.res));
+                                if (SUCCEEDED(hr)) {
+                                    staging.fmt = rdesc.Format;
+                                    staging.w = half_w;
+                                    staging.h = static_cast<UINT>(rdesc.Height);
+                                    ok = true;
+                                }
+                            } else {
+                                ok = true;
+                            }
+                        }
+                        if (ok) {
+                            // Transition RT to COPY_SOURCE, staging to COPY_DEST
+                            D3D12_RESOURCE_BARRIER barriers[2]{};
+                            barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                            barriers[0].Transition.pResource = rt_res;
+                            barriers[0].Transition.Subresource = 0;
+                            barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                            barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                            command_list->ResourceBarrier(1, barriers);
+                            // Copy LEFT half of RT into staging
+                            D3D12_TEXTURE_COPY_LOCATION dst{};
+                            dst.pResource = staging.res.Get();
+                            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                            dst.SubresourceIndex = 0;
+                            D3D12_TEXTURE_COPY_LOCATION src{};
+                            src.pResource = rt_res;
+                            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                            src.SubresourceIndex = 0;
+                            D3D12_BOX src_box{0, 0, 0, half_w, static_cast<UINT>(rdesc.Height), 1};
+                            command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &src_box);
+                            // Transition RT to COPY_DEST, staging to COPY_SOURCE
+                            barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                            barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                            barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                            barriers[1].Transition.pResource = staging.res.Get();
+                            barriers[1].Transition.Subresource = 0;
+                            barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                            barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                            command_list->ResourceBarrier(2, barriers);
+                            // Copy staging into RIGHT half of RT
+                            dst.pResource = rt_res;
+                            src.pResource = staging.res.Get();
+                            D3D12_BOX stage_box{0, 0, 0, half_w, static_cast<UINT>(rdesc.Height), 1};
+                            command_list->CopyTextureRegion(&dst, half_w, 0, 0, &src, &stage_box);
+                            // Transition RT back to RENDER_TARGET, staging back to COPY_DEST
+                            barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                            barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                            barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                            barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                            command_list->ResourceBarrier(2, barriers);
+                            static std::atomic<uint64_t> mirror_count{0};
+                            const auto mn = mirror_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if (mn <= 8 || (mn % 600) == 0) {
+                                SPDLOG_WARN("[SN2-MirrorL2R] #{} ps_crc=0x{:08x} rt_w={} half_w={} fmt={}",
+                                            mn, cur_crc, static_cast<unsigned>(rdesc.Width), half_w,
+                                            static_cast<unsigned>(rdesc.Format));
+                            }
+                        }
+                    }
+                } else {
+                    for (UINT slot : clear_slots) {
+                        if (slot >= s2.last_rtv_count || s2.last_rtv_handles[slot] == 0) continue;
+                        D3D12_CPU_DESCRIPTOR_HANDLE rtv{
+                            static_cast<SIZE_T>(s2.last_rtv_handles[slot])};
+                        command_list->ClearRenderTargetView(rtv, teal, 1, &rect);
+                    }
+                }
+                static std::atomic<uint64_t> teal_clears{0};
+                const auto n = teal_clears.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 8 || (n % 600) == 0) {
+                    SPDLOG_WARN("[SN2-TealClear] #{} ps_crc=0x{:08x} rtv_count={} rect=({},{},{},{}) teal=({:.2f},{:.2f},{:.2f})",
+                                n, cur_crc, static_cast<unsigned>(s2.last_rtv_count),
+                                rect.left, rect.top, rect.right, rect.bottom,
+                                teal[0], teal[1], teal[2]);
+                }
+            }
+        }
         debug_color_scope.restore();
+        forensics_mutation_scope.restore();
         consumer_cb_scope.restore();
+        eye_pairing_scope.restore();
         consumer_srv_scope.restore();
         copyrect_scope.restore();
         copyrect_cbv_scope.restore();
@@ -10977,6 +13068,9 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         water_chain_scope.restore();
         pso3069_cbv_scope.restore();
         pso3069_fog_scope.restore();
+        // 2026-05-22: gate observations during synthetic right-eye dups
+        // so they don't pollute the L↔R pairing classification.
+        sn2_eye_pairing::enter_synthetic_draw();
         sn2_try_duplicate_fog_voxelize_right(
             command_list,
             s2,
@@ -10995,6 +13089,7 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
             start_index_location,
             base_vertex_location,
             start_instance_location);
+        sn2_eye_pairing::exit_synthetic_draw();
     }
 }
 
@@ -11021,6 +13116,13 @@ void WINAPI D3D12Hook::dispatch(
     // Per-eye selective skip for compute. eye_bucket from CL viewport state
     // (compute usually inherits the graphics-pass viewport set just before).
     const auto dispatch_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
+    if (dispatch_state.current_pso != nullptr) {
+        reg.hunter_record_draw_event(
+            reinterpret_cast<uintptr_t>(dispatch_state.current_pso),
+            static_cast<int>(dispatch_state.last_viewport_bucket),
+            true,
+            false);
+    }
     uint32_t current_cs_crc = 0;
     if (dispatch_state.current_pso != nullptr) {
         current_cs_crc = reg.d3d12_pso_compute_crc32(reinterpret_cast<uintptr_t>(dispatch_state.current_pso));
@@ -11031,6 +13133,72 @@ void WINAPI D3D12Hook::dispatch(
             static_cast<int>(dispatch_state.last_viewport_bucket),
             'C');
     }
+
+    // 2026-05-23: Per-(eye, cs_crc) FIRST-DISPATCH inspector — logs UAV
+    // bindings at compute root tables so we can identify which compute
+    // produces a target resource. Gated by UEVR_SN2_DISPATCH_INSPECTOR=1.
+    {
+        static const bool inspect = []() {
+            char buf[8]{};
+            const auto n = GetEnvironmentVariableA("UEVR_SN2_DISPATCH_INSPECTOR", buf, sizeof(buf));
+            return n != 0 && n < sizeof(buf) && buf[0] && buf[0] != '0';
+        }();
+        if (inspect && current_cs_crc != 0) {
+            const int bucket = static_cast<int>(dispatch_state.last_viewport_bucket);
+            if (bucket == 1 || bucket == 2) {
+                static std::mutex inspect_mu;
+                static std::unordered_set<uint64_t> seen;
+                const uint64_t key = (static_cast<uint64_t>(bucket) << 32) | current_cs_crc;
+                bool first = false;
+                {
+                    std::scoped_lock _{inspect_mu};
+                    first = seen.insert(key).second;
+                }
+                if (first) {
+                    // Walk compute root tables, log first 8 UAV slots' bound resources
+                    std::string uav_summary;
+                    for (size_t ti = 0; ti < dispatch_state.last_compute_root_desc_tables.size() && ti < 8; ++ti) {
+                        const uint64_t table_gpu = dispatch_state.last_compute_root_desc_tables[ti];
+                        if (table_gpu == 0) continue;
+                        SIZE_T cpu_base = 0;
+                        UINT stride = 0;
+                        if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride)) continue;
+                        // Sample first 16 descriptors at this root index
+                        for (UINT slot = 0; slot < 16; ++slot) {
+                            const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * stride;
+                            ID3D12Resource* res = sn2_descriptor_registry::lookup_resource_by_cpu_ptr_or_hash(slot_cpu);
+                            if (res != nullptr) {
+                                const auto rdesc = res->GetDesc();
+                                // Filter for 3D textures (the fog volume candidates)
+                                if (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                                    char tmp[128];
+                                    std::snprintf(tmp, sizeof(tmp), " r%zus%u=0x%llx[%ux%ux%u f%u]",
+                                        ti, slot,
+                                        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(res)),
+                                        static_cast<unsigned>(rdesc.Width),
+                                        rdesc.Height,
+                                        rdesc.DepthOrArraySize,
+                                        static_cast<unsigned>(rdesc.Format));
+                                    uav_summary += tmp;
+                                    if (uav_summary.size() > 800) break;
+                                }
+                            }
+                        }
+                        if (uav_summary.size() > 800) break;
+                    }
+                    SPDLOG_WARN(
+                        "[SN2-DispInspect] FIRST eye={} cs_crc=0x{:08x} pso=0x{:x} "
+                        "dim={}x{}x{} root_sig=0x{:x} UAVs:{}",
+                        bucket == 1 ? "LEFT" : "RIGHT", current_cs_crc,
+                        reinterpret_cast<uintptr_t>(dispatch_state.current_pso),
+                        thread_group_count_x, thread_group_count_y, thread_group_count_z,
+                        dispatch_state.last_compute_root_signature,
+                        uav_summary.empty() ? " (none)" : uav_summary.c_str());
+                }
+            }
+        }
+    }
+
     sn2_log_zero_dispatch(
         dispatch_state,
         current_cs_crc,
@@ -11070,6 +13238,11 @@ void WINAPI D3D12Hook::dispatch(
             reinterpret_cast<uintptr_t>(dispatch_state.current_pso),
             static_cast<int>(dispatch_state.last_viewport_bucket));
     const bool hunter_skip = reg.hunter_should_skip_compute(command_list);
+    const bool forensics_skip = render::StereoForensics::get().should_skip_event(
+        "dispatch",
+        0,
+        current_cs_crc,
+        static_cast<int>(dispatch_state.last_viewport_bucket));
     record_draw_event_from_state(
         "D3D12Hook::Dispatch",
         "dispatch",
@@ -11080,7 +13253,7 @@ void WINAPI D3D12Hook::dispatch(
         effective_thread_group_count_z,
         0,
         0,
-        original != nullptr && !upstream_skip && !per_eye_skip && !hunter_skip);
+        original != nullptr && !upstream_skip && !per_eye_skip && !hunter_skip && !forensics_skip);
     if (upstream_skip) {
         reg.hunter_inc_dispatch_skipped();
         return;
@@ -11090,6 +13263,10 @@ void WINAPI D3D12Hook::dispatch(
         return;
     }
     if (hunter_skip) {
+        reg.hunter_inc_dispatch_skipped();
+        return;
+    }
+    if (forensics_skip) {
         reg.hunter_inc_dispatch_skipped();
         return;
     }
@@ -11586,6 +13763,20 @@ void WINAPI D3D12Hook::copy_buffer_region(
         0,
         dst_offset,
         src_offset);
+    render::StereoForensics::get().record_resource_copy(
+        "D3D12Hook::CopyBufferRegion",
+        "copy_buffer",
+        reinterpret_cast<uintptr_t>(command_list),
+        reinterpret_cast<uintptr_t>(dst_buffer),
+        reinterpret_cast<uintptr_t>(src_buffer),
+        0,
+        0,
+        num_bytes,
+        0,
+        0,
+        0,
+        dst_offset,
+        src_offset);
 
     if (original != nullptr) {
         original(command_list, dst_buffer, dst_offset, src_buffer, src_offset, num_bytes);
@@ -11645,6 +13836,20 @@ void WINAPI D3D12Hook::copy_texture_region(
         width,
         height,
         depth);
+    render::StereoForensics::get().record_resource_copy(
+        "D3D12Hook::CopyTextureRegion",
+        "copy_texture",
+        reinterpret_cast<uintptr_t>(command_list),
+        reinterpret_cast<uintptr_t>(dst_resource),
+        reinterpret_cast<uintptr_t>(src_resource),
+        dst_subresource,
+        src_subresource,
+        0,
+        width,
+        height,
+        depth,
+        0,
+        0);
 
     if (original != nullptr) {
         original(command_list, dst, dst_x, dst_y, dst_z, src, src_box);
@@ -11683,6 +13888,20 @@ void WINAPI D3D12Hook::copy_resource(
         width,
         height,
         depth);
+    render::StereoForensics::get().record_resource_copy(
+        "D3D12Hook::CopyResource",
+        "copy_resource",
+        reinterpret_cast<uintptr_t>(command_list),
+        reinterpret_cast<uintptr_t>(dst_resource),
+        reinterpret_cast<uintptr_t>(src_resource),
+        0,
+        0,
+        0,
+        width,
+        height,
+        depth,
+        0,
+        0);
 
     if (original != nullptr) {
         original(command_list, dst_resource, src_resource);
@@ -11724,6 +13943,20 @@ void WINAPI D3D12Hook::resolve_subresource(
         width,
         height,
         depth);
+    render::StereoForensics::get().record_resource_copy(
+        "D3D12Hook::ResolveSubresource",
+        "resolve_subresource",
+        reinterpret_cast<uintptr_t>(command_list),
+        reinterpret_cast<uintptr_t>(dst_resource),
+        reinterpret_cast<uintptr_t>(src_resource),
+        dst_subresource,
+        src_subresource,
+        static_cast<uint64_t>(format),
+        width,
+        height,
+        depth,
+        0,
+        0);
 
     if (original != nullptr) {
         original(command_list, dst_resource, dst_subresource, src_resource, src_subresource, format);
@@ -11767,6 +14000,14 @@ void WINAPI D3D12Hook::execute_indirect(
 
     auto& reg = render::ShaderOverrideRegistry::get();
     reg.hunter_inc_execute_indirect_hit();
+    const auto hunter_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
+    if (hunter_state.current_pso != nullptr) {
+        reg.hunter_record_draw_event(
+            reinterpret_cast<uintptr_t>(hunter_state.current_pso),
+            static_cast<int>(hunter_state.last_viewport_bucket),
+            false,
+            false);
+    }
     if (reg.hunter_should_skip_graphics(command_list)) {
         reg.hunter_inc_execute_indirect_skipped();
         return;
@@ -11931,8 +14172,23 @@ void WINAPI D3D12Hook::dispatch_mesh(
     auto* base_command_list = reinterpret_cast<ID3D12GraphicsCommandList*>(command_list);
     reg.hunter_inc_dispatch_mesh_hit();
     const auto state = base_command_list != nullptr ? read_cmdlist_state(base_command_list) : g_cmdlist_state_empty;
+    if (state.current_pso != nullptr) {
+        reg.hunter_record_draw_event(
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            static_cast<int>(state.last_viewport_bucket),
+            false,
+            false);
+    }
     const bool upstream_skip = sn2_should_skip_upstream_perturbation(state, "dispatch_mesh");
     const bool hunter_skip = reg.hunter_should_skip_graphics(base_command_list);
+    const uint32_t forensics_ps_crc = state.current_pso != nullptr
+        ? reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso))
+        : 0;
+    const bool forensics_skip = render::StereoForensics::get().should_skip_event(
+        "dispatch_mesh",
+        forensics_ps_crc,
+        0,
+        static_cast<int>(state.last_viewport_bucket));
     record_draw_event_from_state(
         "D3D12Hook::DispatchMesh",
         "dispatch_mesh",
@@ -11943,12 +14199,16 @@ void WINAPI D3D12Hook::dispatch_mesh(
         thread_group_count_z,
         0,
         0,
-        original != nullptr && !upstream_skip && !hunter_skip);
+        original != nullptr && !upstream_skip && !hunter_skip && !forensics_skip);
     if (upstream_skip) {
         reg.hunter_inc_dispatch_mesh_skipped();
         return;
     }
     if (hunter_skip) {
+        reg.hunter_inc_dispatch_mesh_skipped();
+        return;
+    }
+    if (forensics_skip) {
         reg.hunter_inc_dispatch_mesh_skipped();
         return;
     }
@@ -12031,6 +14291,14 @@ void WINAPI D3D12Hook::om_set_render_targets(
         diagnostic_rtv_count,
         render_target_descriptors,
         depth_stencil_descriptor);
+    render::StereoForensics::get().record_render_targets_set(
+        "D3D12Hook::OMSetRenderTargets",
+        reinterpret_cast<uintptr_t>(command_list),
+        num_render_target_descriptors,
+        render_target_descriptors,
+        rts_single_handle_to_descriptor_range != FALSE,
+        rts_single_handle_to_descriptor_range != FALSE ? sn2_rtv_descriptor_stride(command_list) : 0,
+        depth_stencil_descriptor);
 
     // Eye-diff: capture RTV[0] handle so the draw-hook can fingerprint it.
     if (num_render_target_descriptors > 0 && render_target_descriptors != nullptr) {
@@ -12079,6 +14347,14 @@ void WINAPI D3D12Hook::clear_render_target_view(
         static_cast<int32_t>(state.last_viewport_bucket),
         render_target_view,
         "clear_rtv");
+    render::StereoForensics::get().record_rtv_clear(
+        "D3D12Hook::ClearRenderTargetView",
+        reinterpret_cast<uintptr_t>(command_list),
+        reinterpret_cast<uintptr_t>(state.current_pso),
+        static_cast<int32_t>(state.last_viewport_bucket),
+        render_target_view,
+        color_rgba,
+        num_rects);
 
     if (original != nullptr) {
         original(command_list, render_target_view, color_rgba, num_rects, rects);
@@ -12103,22 +14379,27 @@ void WINAPI D3D12Hook::resource_barrier(
         "D3D12Hook::ResourceBarrier",
         num_barriers,
         barriers);
+    render::StereoForensics::get().record_resource_barriers(
+        "D3D12Hook::ResourceBarrier",
+        reinterpret_cast<uintptr_t>(command_list),
+        num_barriers,
+        barriers);
 
-    // Aliasing-barrier publish tracker. The placed-heap aliasing bug is the
-    // root cause of SN2's right-eye fog: per-eye 3D fog volumes are written
-    // correctly but UE5 aliasing barriers publish them at SHARED uids so the
-    // last-eye-to-publish wins. We need to record which resource gets
-    // published per eye per frame so a downstream SRV redirect can use the
-    // eye-appropriate alias.
-    if (env_flag_enabled_a("UEVR_SN2_ALIASING_LOG") && barriers != nullptr && num_barriers > 0) {
+    // Aliasing-barrier publish tracker. UE5 RDG transient textures can be
+    // rebound through aliasing barriers on the same placed heap. Feed that
+    // per-eye signal into the pairer so stale cached twins are suppressed once
+    // a physical resource starts representing the opposite eye.
+    const bool sn2_eye_pairing_enabled = sn2_eye_pairing::env_enabled();
+    const bool sn2_alias_log_enabled = env_flag_enabled_a("UEVR_SN2_ALIASING_LOG");
+    if ((sn2_eye_pairing_enabled || sn2_alias_log_enabled) && barriers != nullptr && num_barriers > 0) {
         static std::atomic<uint64_t> alias_seq{0};
-        // Map view_id from command-list state.
         int view_id = -1;
+        int alias_bucket = sn2_eye_pairing::current_ue_view_bucket();
         if (command_list != nullptr) {
-            std::scoped_lock _{g_cmdlist_state_mutex};
-            const auto it = g_cmdlist_state_map.find(command_list);
-            if (it != g_cmdlist_state_map.end()) {
-                view_id = cmdlist_view_id(it->second);
+            const auto alias_state = read_cmdlist_state(command_list);
+            view_id = cmdlist_view_id(alias_state);
+            if (alias_bucket == 0 && (view_id == 0 || view_id == 1)) {
+                alias_bucket = view_id + 1;
             }
         }
         const auto log_max = []() {
@@ -12130,17 +14411,20 @@ void WINAPI D3D12Hook::resource_barrier(
         for (UINT i = 0; i < num_barriers; ++i) {
             const auto& b = barriers[i];
             if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_ALIASING) continue;
-            const auto n = alias_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (n > log_max && (n % 600) != 0) continue;
             ID3D12Resource* before = b.Aliasing.pResourceBefore;
             ID3D12Resource* after = b.Aliasing.pResourceAfter;
+            if (sn2_eye_pairing_enabled) {
+                sn2_eye_pairing::record_aliasing_barrier(alias_bucket, before, after);
+            }
+            const auto n = alias_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (!sn2_alias_log_enabled || (n > log_max && (n % 600) != 0)) continue;
             D3D12_RESOURCE_DESC before_desc{};
             D3D12_RESOURCE_DESC after_desc{};
             if (before != nullptr) before_desc = before->GetDesc();
             if (after != nullptr) after_desc = after->GetDesc();
             SPDLOG_WARN(
-                "[SN2-Aliasing] seq={} view_id={} before={:p} ({}x{}x{} fmt={} dim={}) after={:p} ({}x{}x{} fmt={} dim={})",
-                n, view_id,
+                "[SN2-Aliasing] seq={} view_id={} bucket={} before={:p} ({}x{}x{} fmt={} dim={}) after={:p} ({}x{}x{} fmt={} dim={})",
+                n, view_id, alias_bucket,
                 (void*)before,
                 before != nullptr ? static_cast<unsigned>(before_desc.Width) : 0u,
                 before != nullptr ? static_cast<unsigned>(before_desc.Height) : 0u,
@@ -16820,10 +19104,11 @@ void WINAPI D3D12Hook::set_graphics_root_descriptor_table(
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_graphics_root_descriptor_table)*>() : nullptr;
 
-    // Per-cmdlist viewport state. Used to derive view_id (0=left, 1=right,
-    // -1=unknown — viewport not set yet on this cmdlist).
+    // Per-cmdlist viewport state. view_id is UE-style (0=left, 1=right);
+    // eye_bucket is canonical StereoTraceBucket (1=left, 2=right).
     const auto state = read_cmdlist_state(command_list);
     const int view_id = cmdlist_view_id(state);
+    const int eye_bucket = cmdlist_eye_bucket(state);
 
     // 2026-05-22: Binding ledger record. Captures which descriptor table is
     // bound at which root param per PSO per eye. Used to determine what
@@ -16834,7 +19119,7 @@ void WINAPI D3D12Hook::set_graphics_root_descriptor_table(
         sn2_resource_binding_ledger::record_root_table(
             reinterpret_cast<uintptr_t>(state.current_pso),
             ps_crc_ledger,
-            view_id,
+            eye_bucket,
             root_parameter_index,
             static_cast<uint64_t>(base_descriptor.ptr));
     }
@@ -17752,6 +20037,11 @@ void WINAPI D3D12Hook::set_descriptor_heaps(
         "D3D12Hook::SetDescriptorHeaps",
         num_descriptor_heaps,
         descriptor_heaps);
+    render::StereoForensics::get().record_descriptor_heaps_set(
+        "D3D12Hook::SetDescriptorHeaps",
+        reinterpret_cast<uintptr_t>(command_list),
+        num_descriptor_heaps,
+        descriptor_heaps);
 }
 
 // 2026-05-17 SN2 FOG-FIX Task #45 — retroactive view tagging.
@@ -18073,21 +20363,21 @@ void WINAPI D3D12Hook::set_compute_root_constant_buffer_view(
     // 2026-05-22: Binding analyzer (compute path).
     if (sn2_binding_analyzer::env_enabled() && command_list != nullptr &&
         state.current_pso != nullptr) {
-        const int view_id_ba_c = cmdlist_view_id(state);
+        const int eye_bucket_ba_c = cmdlist_eye_bucket(state);
         const uint32_t cs_crc_ba = render::ShaderOverrideRegistry::get().d3d12_pso_compute_crc32(
             reinterpret_cast<uintptr_t>(state.current_pso));
         sn2_binding_analyzer::record_root_cbv(
             reinterpret_cast<uintptr_t>(state.current_pso),
             0,  // ps_crc N/A
             cs_crc_ba,
-            view_id_ba_c,
+            eye_bucket_ba_c,
             root_parameter_index,
             effective_gpu_va,
             'C');
         // 2026-05-22: CB content dumper (compute).
         if (sn2_cb_dumper::env_enabled()) {
             sn2_cb_dumper::record_cbv_bind(
-                cs_crc_ba, view_id_ba_c, root_parameter_index, effective_gpu_va, 'C');
+                cs_crc_ba, eye_bucket_ba_c, root_parameter_index, effective_gpu_va, 'C');
         }
     }
 
@@ -18228,13 +20518,13 @@ void WINAPI D3D12Hook::set_graphics_root_constant_buffer_view(
     if (sn2_resource_binding_ledger::env_enabled() && command_list != nullptr) {
         const auto state_ledger = read_cmdlist_state(command_list);
         if (state_ledger.current_pso != nullptr) {
-            const int view_id_ledger = cmdlist_view_id(state_ledger);
+            const int eye_bucket_ledger = cmdlist_eye_bucket(state_ledger);
             const uint32_t ps_crc_ledger = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(
                 reinterpret_cast<uintptr_t>(state_ledger.current_pso));
             sn2_resource_binding_ledger::record_root_cbv(
                 reinterpret_cast<uintptr_t>(state_ledger.current_pso),
                 ps_crc_ledger,
-                view_id_ledger,
+                eye_bucket_ledger,
                 root_parameter_index,
                 static_cast<uint64_t>(gpu_va));
         }
@@ -18250,18 +20540,18 @@ void WINAPI D3D12Hook::set_graphics_root_constant_buffer_view(
     if (any_observer_on && command_list != nullptr) {
         const auto state_ba = read_cmdlist_state(command_list);
         if (state_ba.current_pso != nullptr) {
-            const int view_id_ba = cmdlist_view_id(state_ba);
+            const int eye_bucket_ba = cmdlist_eye_bucket(state_ba);
             const uint32_t ps_crc_ba = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(
                 reinterpret_cast<uintptr_t>(state_ba.current_pso));
             if (sn2_binding_analyzer::env_enabled()) {
                 sn2_binding_analyzer::record_root_cbv(
                     reinterpret_cast<uintptr_t>(state_ba.current_pso),
-                    ps_crc_ba, 0, view_id_ba,
+                    ps_crc_ba, 0, eye_bucket_ba,
                     root_parameter_index, gpu_va, 'G');
             }
             if (sn2_cb_dumper::env_enabled()) {
                 sn2_cb_dumper::record_cbv_bind(
-                    ps_crc_ba, view_id_ba, root_parameter_index, gpu_va, 'G');
+                    ps_crc_ba, eye_bucket_ba, root_parameter_index, gpu_va, 'G');
             }
             if (sn2_right_cb_synth::env_enabled()) {
                 if (!sn2_right_cb_synth::initialized()) {
@@ -18272,7 +20562,7 @@ void WINAPI D3D12Hook::set_graphics_root_constant_buffer_view(
                     }
                 }
                 sn2_right_cb_synth::update_donor(
-                    ps_crc_ba, view_id_ba, root_parameter_index, gpu_va);
+                    ps_crc_ba, eye_bucket_ba, root_parameter_index, gpu_va);
             }
         }
     }

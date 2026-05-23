@@ -28,6 +28,8 @@
 #include <string>
 #include <unordered_set>
 
+#include "Sn2EyePairingHook.hpp"
+
 namespace sn2_magic_ink {
 
 inline bool env_enabled() {
@@ -140,6 +142,10 @@ inline int skip_eye_bucket() {
 // Returns true if this PS_CRC + eye combination should be skipped.
 inline bool should_skip(uint32_t ps_crc, int eye_bucket) {
     if (!env_enabled()) return false;
+    // Synthetic dup draws bypass magic-ink skip: lets the WaterBasepassDup
+    // re-issue LEFT-style draws on right viewport even when right-eye natural
+    // draws are being skipped.
+    if (sn2_eye_pairing::in_synthetic_draw()) return false;
     const auto set = skip_crcs();
     if (set.find(ps_crc) == set.end()) return false;
     const int target = skip_eye_bucket();

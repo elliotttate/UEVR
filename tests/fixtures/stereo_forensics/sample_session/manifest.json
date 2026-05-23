@@ -1,0 +1,12 @@
+{
+  "schema": "uevr.stereo_forensics.v1",
+  "session_dir": "tests/fixtures/stereo_forensics/sample_session",
+  "latest_frame": 1,
+  "latest_frame_event_count": 3,
+  "events_jsonl": "events.jsonl",
+  "resources": "resources.json",
+  "descriptors": "descriptors.json",
+  "lineage": "lineage.json",
+  "eye_diff": "eye_diff.json",
+  "experiments": "experiments.json"
+}

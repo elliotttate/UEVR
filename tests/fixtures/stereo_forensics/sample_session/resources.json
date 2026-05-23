@@ -1,0 +1,21 @@
+{
+  "resources": [
+    {
+      "id": 1,
+      "resource": 4096,
+      "resource_hex": "0x1000",
+      "desc_key": "3:512x512x8:24:1:0",
+      "alias_group": "",
+      "desc": {
+        "dimension_id": 3,
+        "dimension": "texture3d",
+        "width": 512,
+        "height": 512,
+        "depth_or_array_size": 8,
+        "format": 24,
+        "sample_count": 1,
+        "flags": 0
+      }
+    }
+  ]
+}

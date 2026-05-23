@@ -34,6 +34,15 @@ All tools live in `E:\Github\Subnautica 2\moddingkit\tools\`. They process outpu
 - `sn2_capture_inspect.py` — unified view of a capture bundle (cross-referenced)
 - `sn2_fix_rules.py` — CLI manager for hot-reloaded fix rules
 
+### Stereo Forensics
+- `E:\Github\UEVRJ\tools\stereo_forensics_query.py` — inspect `UEVR_STEREO_FORENSICS` session bundles by issue, event, shader, lineage slot, or alias group
+- `E:\Github\UEVRJ\tools\stereo_forensics_db.py` — persistent SQLite knowledge DB for captures, event pairs, lineage paths, resource lifetimes, suspects, findings, evidence, experiments, shader roles, and fix rules
+- `E:\Github\UEVRJ\tools\stereo_forensics_experiment.py` — emit v2 experiment rules and score left/right PPM ROI deltas
+- `E:\Github\UEVRJ\tools\stereo_forensics_run_experiments.py` — generate ranked probe/mutation rule candidates from DB suspects
+- `E:\Github\UEVRJ\tools\stereo_forensics_ab_loop.py` — run closed-loop baseline/trial screenshot experiments against hot-reloaded rule files
+- `E:\Github\UEVRJ\tools\stereo_forensics_compile_rule.py` — compile a captured event into a durable v2 rule skeleton
+- `E:\Github\UEVRJ\tools\stereo_forensics_shader_semantics.py` — build lightweight DXBC/DXIL semantic summaries and import shader roles into the DB
+
 ---
 
 ## analyze_60s_diag.py

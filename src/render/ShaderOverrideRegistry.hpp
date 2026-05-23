@@ -270,6 +270,15 @@ public:
         std::vector<uint32_t> collected_crc32s{};
         std::vector<size_t> collected_sizes{};
         std::vector<uint64_t> collected_hits{};
+        std::vector<uint64_t> collected_draw_hits{};
+        std::vector<uint64_t> collected_dispatch_hits{};
+        std::vector<uint64_t> collected_eye_left_hits{};
+        std::vector<uint64_t> collected_eye_right_hits{};
+        std::vector<uint64_t> collected_eye_full_hits{};
+        std::vector<uint64_t> collected_eye_other_hits{};
+        std::vector<uint64_t> collected_draw_age_frames{};
+        std::vector<std::string> collected_last_render_targets{};
+        std::vector<std::string> collected_last_depth_target{};
         std::vector<uint64_t> collected_age_frames{};
         std::vector<bool> collected_marked{};
         std::vector<HunterStage> collected_stages{};  // matches collected_hashes 1:1
@@ -293,6 +302,8 @@ public:
     void hunter_set_recent_frame_age(int frames);
     HunterStateView hunter_state() const;
     bool hunter_save_marked_as_manifests(std::string& error_out);
+    bool hunter_export_scene_list_json(std::filesystem::path& out_path, std::string& error_out) const;
+    void hunter_toggle_mark_hash(HunterStage stage, std::string_view hash);
     // Runtime suppression blocklist (additive on top of the env-var one).
     // Use when a hunting attempt crashes the game — flag the active hash via
     // the UI so it's permanently excluded from suppression for this session.
@@ -347,6 +358,7 @@ public:
     bool hunter_should_skip_draw_per_eye(uintptr_t pso_pointer, int eye_bucket) const;
     // Returns the PS CRC32 for the PSO at `pso_pointer`, or 0 if not tracked.
     // Used by the D3D12 cb0-swap hook to gate on specific shader fingerprints.
+    uint32_t d3d12_pso_vertex_crc32(uintptr_t pso_pointer) const;
     uint32_t d3d12_pso_pixel_crc32(uintptr_t pso_pointer) const;
     uint32_t d3d12_pso_geometry_crc32(uintptr_t pso_pointer) const;
     uint32_t d3d12_pso_compute_crc32(uintptr_t pso_pointer) const;
@@ -354,6 +366,7 @@ public:
     // Extended variant: caller passes the current eye bucket (0 Unknown, 1
     // Left, 2 Right, 3 Full, 4 Multi) so per-eye-selective skip can fire.
     void hunter_record_set_pipeline_state_with_eye(void* command_list, void* original_pso, int eye_bucket);
+    void hunter_record_draw_event(uintptr_t pso_pointer, int eye_bucket, bool compute, bool indexed);
     void hunter_clear_command_list(void* command_list);
     bool hunter_should_skip_graphics(void* command_list) const;
     bool hunter_should_skip_compute(void* command_list) const;
@@ -699,8 +712,18 @@ private:
         uint32_t crc32{};
         size_t ps_size{};
         uint64_t hits{};
+        uint64_t draw_hits{};
+        uint64_t indexed_draw_hits{};
+        uint64_t dispatch_hits{};
+        uint64_t eye_hits[5]{};
         uint64_t first_seen_frame{};
         uint64_t last_seen_frame{};
+        uint64_t last_draw_frame{};
+        uintptr_t last_pso{};
+        std::string last_render_targets{};
+        std::string last_render_target_key{};
+        std::string last_depth_target{};
+        std::string last_depth_target_key{};
         std::string vs_hash{};
         HunterStage stage{HunterStage::Pixel};
     };
@@ -819,5 +842,6 @@ private:
     bool hunter_record_is_safe_suppression_candidate_locked(const D3D12GraphicsPsoRecord& record) const;
     bool hunter_entry_is_scene_candidate_locked(const HunterCollectedEntry& entry) const;
     void hunter_rebuild_active_locked();
+    void hunter_rebuild_stage_active_locked(HunterStage stage);
 };
 } // namespace render

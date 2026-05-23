@@ -1,0 +1,14 @@
+{
+  "schema": "uevr.sn2.dup_config.v1",
+  "description": "Control test: dup DE7C3822 on right viewport with delta=0 (LEFT view CB unchanged). Tests whether dup writes are visible at all. If LEFT content appears at right viewport position, dup pipeline works. If nothing visible, dup writes get clipped/blocked.",
+  "default_view_cb_delta": 0,
+  "default_view_cb_roots": [],
+  "entries": {
+    "0xde7c3822": {
+      "mode": "viewport_shift",
+      "view_cb_roots": [4],
+      "view_cb_delta": 0,
+      "note": "Control: viewport shift + NO CB delta. If LEFT-style content appears at right viewport, dup pipeline visible. If nothing, dup writes are blocked."
+    }
+  }
+}

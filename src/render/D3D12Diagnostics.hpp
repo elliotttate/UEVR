@@ -75,6 +75,7 @@ public:
         uint64_t first_seen_frame{};
         uint64_t last_seen_frame{};
         uint32_t blob_size{};
+        uint64_t blob_hash{};
         std::string version{};
         std::string flags{};
         uint32_t static_sampler_count{};

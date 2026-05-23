@@ -195,11 +195,18 @@ inline nlohmann::json param_to_json(const render::D3D12Diagnostics::RootParamete
     return j;
 }
 
+inline std::string hex_ptr(uintptr_t p) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(p));
+    return std::string{buf};
+}
+
 inline nlohmann::json root_sig_to_json(const render::D3D12Diagnostics::RootSignatureInfo& rs) {
     auto params = nlohmann::json::array();
     for (const auto& p : rs.parameters) params.push_back(param_to_json(p));
     nlohmann::json j{
         {"blob_size", rs.blob_size},
+        {"blob_hash", hex_ptr(rs.blob_hash)},
         {"version", rs.version},
         {"flags", rs.flags},
         {"static_sampler_count", rs.static_sampler_count},
@@ -209,12 +216,6 @@ inline nlohmann::json root_sig_to_json(const render::D3D12Diagnostics::RootSigna
     };
     if (!rs.decode_error.empty()) j["decode_error"] = rs.decode_error;
     return j;
-}
-
-inline std::string hex_ptr(uintptr_t p) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(p));
-    return std::string{buf};
 }
 
 inline std::string hex_crc(uint32_t c) {

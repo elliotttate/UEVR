@@ -58,6 +58,10 @@ typedef int (*pRENDERDOC_IsTargetControlConnected)();
 typedef void (*pRENDERDOC_StartFrameCapture)(void* device, void* wndHandle);
 typedef uint32_t (*pRENDERDOC_EndFrameCapture)(void* device, void* wndHandle);
 
+// Late-injected RD needs SetActiveWindow(device, hwnd) before it can latch
+// the API pair. For D3D12 the "device" pointer is the COMMAND QUEUE.
+typedef void (*pRENDERDOC_SetActiveWindow)(void* device, void* hwnd);
+
 // Minimal API struct — same offsets as official renderdoc_app.h. Only fields
 // we use are non-null after RENDERDOC_GetAPI. Others are present so offset
 // matches RD's layout.
@@ -80,7 +84,7 @@ struct RENDERDOC_API_1_6_0 {
     pRENDERDOC_TriggerCapture TriggerCapture;
     pRENDERDOC_IsTargetControlConnected IsTargetControlConnected;
     void* LaunchReplayUI;
-    void* SetActiveWindow;
+    pRENDERDOC_SetActiveWindow SetActiveWindow;
     pRENDERDOC_StartFrameCapture StartFrameCapture;
     void* IsFrameCapturing;
     pRENDERDOC_EndFrameCapture EndFrameCapture;
@@ -109,6 +113,12 @@ struct State {
     HMODULE dll = nullptr;
     RENDERDOC_API_1_6_0* api = nullptr;
     std::atomic<bool> trigger_pending{false};
+    // Wildcard-capture state machine. Late-injected RD ignores TriggerCapture()
+    // because no window/device pair has been auto-selected. We instead call
+    // StartFrameCapture(NULL, NULL) on one Present and EndFrameCapture on the
+    // next — that wildcard-captures whichever active graphics API pair
+    // happens to be live.
+    std::atomic<bool> end_capture_pending{false};
     std::atomic<uint64_t> capture_count_{0};
     std::string last_path;
 };
@@ -242,7 +252,7 @@ void request_capture_next_frame() {
     s.trigger_pending.store(true, std::memory_order_release);
 }
 
-void on_present(uint64_t frame_count) {
+void on_present(uint64_t frame_count, void* d3d12_queue, void* hwnd) {
     if (!env_enabled()) return;
     auto& s = state();
     if (!s.loaded) {
@@ -251,6 +261,13 @@ void on_present(uint64_t frame_count) {
             init();
         }
         if (!s.loaded) return;
+    }
+
+    // Tell RD which (queue, window) pair is active. Required for late-injected
+    // sessions where RD didn't auto-detect the API pair at device-create time.
+    // Cheap to call every frame — RD only does work when the pair changes.
+    if (d3d12_queue != nullptr && hwnd != nullptr && s.api && s.api->SetActiveWindow) {
+        s.api->SetActiveWindow(d3d12_queue, hwnd);
     }
 
     // Poll trigger file every 30 frames (~0.5s @ 60fps).
@@ -263,12 +280,14 @@ void on_present(uint64_t frame_count) {
         }
     }
 
-    if (s.trigger_pending.exchange(false, std::memory_order_acq_rel)) {
-        SPDLOG_WARN("[SN2-RdCapture] firing TriggerCapture() at frame {}", frame_count);
-        if (s.api && s.api->TriggerCapture) {
-            s.api->TriggerCapture();
+    // Phase 2: if a wildcard EndFrameCapture is pending from a prior frame,
+    // close it now. This finalizes the .rdc that StartFrameCapture armed.
+    if (s.end_capture_pending.exchange(false, std::memory_order_acq_rel)) {
+        if (s.api && s.api->EndFrameCapture) {
+            const uint32_t end_ok = s.api->EndFrameCapture(nullptr, nullptr);
+            SPDLOG_WARN("[SN2-RdCapture] EndFrameCapture(NULL,NULL) -> {} at frame {}", end_ok, frame_count);
         }
-        // Optionally emit sidecar at same moment so UEVR↔RD bridge has both halves.
+        // Also fire sidecar / increment counter / record path.
         if (also_emit_sidecar() && sn2_capture_sidecar::env_enabled()) {
             const auto n = s.capture_count_.fetch_add(1, std::memory_order_relaxed) + 1;
             sn2_capture_sidecar::emit(n);
@@ -276,7 +295,6 @@ void on_present(uint64_t frame_count) {
         } else {
             s.capture_count_.fetch_add(1, std::memory_order_relaxed);
         }
-        // After RD writes the .rdc, find it for last_capture_file().
         if (s.api && s.api->GetNumCaptures && s.api->GetCapture) {
             const uint32_t num = s.api->GetNumCaptures();
             if (num > 0) {
@@ -290,6 +308,21 @@ void on_present(uint64_t frame_count) {
                 }
             }
         }
+    }
+
+    // Phase 1: if a new capture was triggered, arm wildcard StartFrameCapture
+    // (works for late-injected RD where TriggerCapture is a no-op). Also fire
+    // TriggerCapture as a belt-and-suspenders fallback for sessions where
+    // RD did latch a window/device pair.
+    if (s.trigger_pending.exchange(false, std::memory_order_acq_rel)) {
+        SPDLOG_WARN("[SN2-RdCapture] arming capture at frame {} (Start + Trigger)", frame_count);
+        if (s.api && s.api->StartFrameCapture) {
+            s.api->StartFrameCapture(nullptr, nullptr);
+        }
+        if (s.api && s.api->TriggerCapture) {
+            s.api->TriggerCapture();
+        }
+        s.end_capture_pending.store(true, std::memory_order_release);
     }
 }
 

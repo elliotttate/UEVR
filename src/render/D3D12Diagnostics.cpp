@@ -64,6 +64,21 @@ std::string format_pointer(uintptr_t pointer) {
     return ss.str();
 }
 
+uint64_t fnv1a64_bytes(const void* data, size_t size) {
+    constexpr uint64_t offset = 1469598103934665603ull;
+    constexpr uint64_t prime = 1099511628211ull;
+    if (data == nullptr || size == 0) {
+        return 0;
+    }
+    uint64_t hash = offset;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= prime;
+    }
+    return hash;
+}
+
 std::string descriptor_heap_type_to_string(D3D12_DESCRIPTOR_HEAP_TYPE type) {
     switch (type) {
     case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
@@ -458,6 +473,7 @@ void append_root_parameter(
 D3D12Diagnostics::RootSignatureInfo decode_root_signature_blob(const void* blob, size_t blob_size) {
     D3D12Diagnostics::RootSignatureInfo info{};
     info.blob_size = static_cast<uint32_t>(std::min<size_t>(blob_size, UINT32_MAX));
+    info.blob_hash = fnv1a64_bytes(blob, blob_size);
 
     if (blob == nullptr || blob_size == 0) {
         info.decode_error = "empty root signature blob";

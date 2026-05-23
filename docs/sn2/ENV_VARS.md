@@ -28,6 +28,19 @@ Every UEVR_SN2_* env var, what it does, where it's read.
 | `UEVR_SN2_STATE_INSPECTOR_EYE` | left/right/both | Eye filter |
 | `UEVR_SN2_STATE_INSPECTOR_MAX` | int | Max dumps per CRC (default 32) |
 
+## Stereo Forensics Layer
+
+| Env Var | Type | Purpose |
+|---|---|---|
+| `UEVR_STEREO_FORENSICS` | bool | Enable the unified D3D12 frame/event database |
+| `UEVR_STEREO_FORENSICS_DIR` | path | Output root for `session_*` bundles (default `C:\tmp\uevr_forensics`) |
+| `UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_FRAME` | int | Per-frame event cap before truncation (default 100000) |
+| `UEVR_STEREO_FORENSICS_MAX_DESCRIPTORS` | int | Descriptor side-table cap (default 262144) |
+| `UEVR_STEREO_FORENSICS_MAX_WRITER_HISTORY` | int | View/resource writer history cap for lineage DAG output (default 100000) |
+| `UEVR_STEREO_EXPERIMENTS` | bool | Enable live experiment rules inside Stereo Forensics |
+| `UEVR_STEREO_EXPERIMENTS_FILE` | path | JSON v2 rule file; runtime executes skip probes, color override probes, and supported mutation actions: CBV swap, descriptor swap, forced SRV array slice |
+| `UEVR_STEREO_FORENSICS_DB` | path | Default SQLite knowledge DB for Python tools (default `C:\tmp\uevr_forensics\forensics.db`) |
+
 ## Magic Ink (live PS skip)
 
 | Env Var | Type | Purpose |

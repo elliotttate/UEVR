@@ -1,0 +1,1134 @@
+{
+  "schema": "uevr.sn2.dup_config.v1",
+  "description": "FILTERED to only delta=-10240 entries (the canonical basepass View CB family). Other deltas (+1024, +768, +256, +512) had high false-positive rate causing crashes.",
+  "default_view_cb_delta": 0,
+  "default_view_cb_roots": [],
+  "entries": {
+    "0x0a23b83a": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x16357f54": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xace0b591": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x3961a957": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x042d6940": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xde1d412a": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xa1589c3c": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xeb08c9b2": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xd1d94ed1": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x6e901f3c": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x26aae534": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x67bad483": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x250b1d7f": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x9bb09cbb": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x45d31930": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1793,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x33ea5951": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x41a07801": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xbb7814b3": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x1ffc3f9b": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1793,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xe19ff864": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x7a2a3b13": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x3bd1e049": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x2a9fd3d4": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x554870a0": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xa56535c2": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xab0b55b7": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x8ac3b3b7": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xbae7f459": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xbd3584ee": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x1148c4ab": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x7175ac77": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x6d2e303f": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x7d0ccf01": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x139e4bd8": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x7f82a671": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x794cf7ae": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x1a15e3d7": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x9b9d2f83": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xdb43ff93": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x3c5b56d3": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xbe95fe40": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xe5726fbb": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x57588a21": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x05bf5ae8": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x9efeb42a": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x83538dd4": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        2
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1797,
+      "samples_r": 1793,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x441e7751": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x269dee48": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x441e735b": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x2b4cda82": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x4d44ce74": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x5e1e86ce": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xfd8019f5": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xa4c2c811": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x53035a07": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x5014f444": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xc8692132": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x5064efee": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x2a117e99": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x0445599c": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x8bb987fb": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x9c88cad4": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x3d96959e": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        5
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1766,
+      "samples_r": 1758,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x9dbe61f3": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xed1abbf0": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x84aa3136": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x90458caf": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xf7ddfe06": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 3595,
+      "samples_r": 3588,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x95f07340": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1798,
+      "samples_r": 1794,
+      "parent_resource": "0x1dd02c5efe0",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x477d34ed": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        10
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 3592,
+      "samples_r": 3584,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x7d884416": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xab62e317": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x3f060043": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x04a666a4": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x84cba615": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x61951bbb": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x20f60688": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x7bd06f6c": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xb3a3293d": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x4d774126": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x0e94ce1e": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x186a721d": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x9f70a1d3": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x98ae6c8e": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xa9d91ab1": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x06e8ae8c": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x4b2eab85": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x70102aca": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xbb0888f6": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x82185c86": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xbe75f0fa": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xfadc7927": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x5313d424": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x032e8e05": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x9d14fcf0": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x4179280a": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x54877e47": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x569c196a": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x10c6653f": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x07cb67f6": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x1d3ef687": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1779,
+      "samples_r": 1777,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xa2eb54ca": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xfe92ad3b": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x05601655": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x4a4eb78c": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        5
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 5555,
+      "samples_r": 5547,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x46d02f48": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xa8e93cef": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x6899e052": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1798,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xdb05d612": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x232eb390": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x0b0e2356": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        2
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xedb8d52d": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xf034e514": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x94039120": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        2
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1796,
+      "samples_r": 1794,
+      "parent_resource": "0x1dd02c5efe0",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x16f0b904": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1799,
+      "samples_r": 1795,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x89872979": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xb27fcc32": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1781,
+      "samples_r": 1777,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xb627b810": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x13b00f0c": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x8d06247f": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xcacaea96": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1996,
+      "samples_r": 1959,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x166dba88": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xaccfb7e0": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1797,
+      "samples_r": 1795,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x03f0d897": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        2
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x6e2bd227": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x4765b3a5": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x173d1142": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xb2b9812c": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xd666c465": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1691,
+      "samples_r": 1690,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x693fa482": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1990,
+      "samples_r": 1998,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xa2689d66": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x7231ac5d": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xf5e59782": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x9a0afe3d": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x394c788a": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xc5839aa6": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xbc31274d": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x744af667": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x37558de4": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        2
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x80776e21": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xfd0327d5": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x8733f2e0": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        5
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xed0745ae": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        1
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x4c7d0fb9": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x9151ce71": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x76c6719b": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        5
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1802,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x44496993": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xf922f28b": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        5
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1795,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xef3d9d61": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x10ff3b45": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xa0552c06": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x20488e6d": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x0e239542": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x9711ada9": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x695c5e53": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x59a1efd9": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x9d2b400a": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x1f6ec0bd": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x7f88f0c5": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        5
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xc24ba8c0": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x0f0ea4b5": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x32bca50a": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x30c7aaae": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x12d9875a": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x6fdef36f": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xd3ab43c5": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xedcd87dc": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x259beb60": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x009f8918": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x1e6d9efe": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x3cfd24f5": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xc80000f8": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x4e5b7e7d": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x4ad65dee": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x4528be0f": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x41f9154d": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0xdde44bfc": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x6aaee08e": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x96a4b92b": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xe2b8ded4": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x42e2dc12": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        4
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1802,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x5adcf589": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [
+        3
+      ],
+      "view_cb_delta": -10240,
+      "samples_l": 1800,
+      "samples_r": 1796,
+      "parent_resource": "0x1d811ee2e50",
+      "note": "auto-generated from binding analyzer; pool-agnostic delta"
+    },
+    "0x9a8a0b9c": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x4d478396": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x1f958d46": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x36a17277": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xb3a5de6f": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x37514a7b": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xfb5179d0": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xb8ec49af": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x194c423a": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xfc91443a": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0x57847ec7": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    },
+    "0xbf10d575": {
+      "mode": "skip",
+      "note": "LEFT-only PSO; engine never bound a right-eye CBV. Cannot dup safely without synthesized right View CB. Skipped to avoid crash."
+    }
+  }
+}

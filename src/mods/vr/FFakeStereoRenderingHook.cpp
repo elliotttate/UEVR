@@ -59,6 +59,7 @@
 #include "mods/UObjectHook.hpp"
 #include "mods/GameSpecific.hpp"
 #include "hooks/D3D12Hook.hpp"  // for sn2_fog_srv_map::lookup_by_gpu_va
+#include "hooks/Sn2EyePairingHook.hpp"
 
 #include <bdshemu.h>
 #include <bddisasm.h>
@@ -6193,6 +6194,29 @@ void FFakeStereoRenderingHook::subnautica2_setup_fog_uniform_params_hook(
     constexpr size_t FOG_PAIRED_OFFSET = 0x130;
     constexpr size_t FOG_APPLY_OFFSET  = 0x90;
 
+    uint32_t stereo_pass = 0xFFFFFFFF;
+    if (view_info != nullptr &&
+        is_readable_process_range((uintptr_t)view_info + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET, sizeof(uint32_t)))
+    {
+        stereo_pass = *(uint32_t*)((uintptr_t)view_info + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+    }
+    bool eye_pairing_scope_active = false;
+    if (stereo_pass == (uint32_t)EStereoscopicPass::eSSP_PRIMARY ||
+        stereo_pass == (uint32_t)EStereoscopicPass::eSSP_SECONDARY)
+    {
+        sn2_eye_pairing::enter_ue_view_scope(
+            stereo_pass == (uint32_t)EStereoscopicPass::eSSP_PRIMARY ? 1 : 2,
+            0,
+            reinterpret_cast<uintptr_t>(view_info),
+            "SetupFogUniformParams");
+        eye_pairing_scope_active = true;
+    }
+    utility::ScopeGuard eye_pairing_scope_guard{[&]() {
+        if (eye_pairing_scope_active) {
+            sn2_eye_pairing::exit_ue_view_scope();
+        }
+    }};
+
     // Pre-call diagnostic + fix: if this view's +0x2658 is null but a sibling
     // view (view-stride away) has a valid value, copy it in BEFORE the function
     // reads.
@@ -7617,6 +7641,27 @@ void __cdecl FFakeStereoRenderingHook::subnautica2_slw_per_view_hook(
         }
     }
 
+    int eye_pairing_bucket = 0;
+    if (stereo_pass == (uint32_t)EStereoscopicPass::eSSP_PRIMARY) {
+        eye_pairing_bucket = 1;
+    } else if (stereo_pass == (uint32_t)EStereoscopicPass::eSSP_SECONDARY) {
+        eye_pairing_bucket = 2;
+    }
+    bool eye_pairing_scope_active = false;
+    if (eye_pairing_bucket != 0) {
+        sn2_eye_pairing::enter_ue_view_scope(
+            eye_pairing_bucket,
+            reinterpret_cast<uintptr_t>(scene_renderer),
+            reinterpret_cast<uintptr_t>(view_info),
+            "SLWPerView");
+        eye_pairing_scope_active = true;
+    }
+    utility::ScopeGuard eye_pairing_scope_guard{[&]() {
+        if (eye_pairing_scope_active) {
+            sn2_eye_pairing::exit_ue_view_scope();
+        }
+    }};
+
     static std::atomic<uint64_t> call_count{0};
     const auto cn = call_count.fetch_add(1, std::memory_order_relaxed);
 
@@ -8069,6 +8114,21 @@ void __cdecl FFakeStereoRenderingHook::subnautica2_volumetric_fog_per_view_hook(
         if (pass == EStereoscopicPass::eSSP_PRIMARY) view_id = 0;
         else if (pass == EStereoscopicPass::eSSP_SECONDARY) view_id = 1;
     }
+
+    bool eye_pairing_scope_active = false;
+    if (view_id == 0 || view_id == 1) {
+        sn2_eye_pairing::enter_ue_view_scope(
+            view_id == 0 ? 1 : 2,
+            reinterpret_cast<uintptr_t>(arg1),
+            reinterpret_cast<uintptr_t>(view_info),
+            "VolumetricFogPerView");
+        eye_pairing_scope_active = true;
+    }
+    utility::ScopeGuard eye_pairing_scope_guard{[&]() {
+        if (eye_pairing_scope_active) {
+            sn2_eye_pairing::exit_ue_view_scope();
+        }
+    }};
 
     // Set the atomic view tag globally. We do NOT restore it: UE5's RDG
     // recording happens on the calling (render) thread, but actual D3D12
@@ -9464,6 +9524,27 @@ __int64 FFakeStereoRenderingHook::subnautica2_basepass_mp_ctor_hook(
     if (hook == nullptr || !hook->m_subnautica2_basepass_mp_ctor_hook) {
         return 0;
     }
+
+    uint32_t eye_pairing_stereo_pass = 0xFFFFFFFF;
+    if (a5 != 0 && !IsBadReadPtr((void*)(a5 + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET), sizeof(uint32_t))) {
+        eye_pairing_stereo_pass = *(uint32_t*)(a5 + SUBNAUTICA2_SCENEVIEW_STEREO_PASS_OFFSET);
+    }
+    bool eye_pairing_scope_active = false;
+    if (eye_pairing_stereo_pass == (uint32_t)EStereoscopicPass::eSSP_PRIMARY ||
+        eye_pairing_stereo_pass == (uint32_t)EStereoscopicPass::eSSP_SECONDARY)
+    {
+        sn2_eye_pairing::enter_ue_view_scope(
+            eye_pairing_stereo_pass == (uint32_t)EStereoscopicPass::eSSP_PRIMARY ? 1 : 2,
+            0,
+            static_cast<uintptr_t>(a5),
+            "BasePassMPCtor");
+        eye_pairing_scope_active = true;
+    }
+    utility::ScopeGuard eye_pairing_scope_guard{[&]() {
+        if (eye_pairing_scope_active) {
+            sn2_eye_pairing::exit_ue_view_scope();
+        }
+    }};
 
     // Call the original ctor first; it sets up *(_DWORD*)(a1+140) = the
     // per-view cull threshold based on View+0x24CC (only if View+0x11D9 != 0

@@ -16,6 +16,9 @@ A comprehensive set of UEVR modules and analysis tools built to diagnose and fix
 | [ENV_VARS.md](ENV_VARS.md) | Every UEVR_SN2_* env var with description |
 | [GLOSSARY.md](GLOSSARY.md) | Domain terms used throughout the codebase |
 | [NEXT_SESSION.md](NEXT_SESSION.md) | Concrete plan to finish the right-eye fog fix |
+| [STEREO_FORENSICS_STATUS_2026_05_23.md](STEREO_FORENSICS_STATUS_2026_05_23.md) | Status of the unified Stereo Forensics Layer and remaining 1-8 roadmap |
+| [STEREO_FORENSICS_DB_WORKFLOW.md](STEREO_FORENSICS_DB_WORKFLOW.md) | Required durable knowledge DB workflow for captures, findings, evidence, and fix rules |
+| [STEREO_FORENSICS_FINDINGS.md](STEREO_FORENSICS_FINDINGS.md) | Generated findings report from the Stereo Forensics DB |
 | [RENDERDOC_GAP_ANALYSIS.md](RENDERDOC_GAP_ANALYSIS.md) | What RD fork has that UEVR lacks + integration strategy |
 | [UEVR_RD_BRIDGE_WORKFLOW.md](UEVR_RD_BRIDGE_WORKFLOW.md) | End-to-end workflow: sidecar emit + qrenderdoc replay-time overrides |
 

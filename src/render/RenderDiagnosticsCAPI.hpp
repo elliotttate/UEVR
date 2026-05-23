@@ -85,6 +85,10 @@ UEVR_RENDER_CAPI const char* uevr_render_diag_export_bundle(
     const char* profile_name,
     const char* backend);
 
+// Stereo Forensics status and latest bundle paths. Returns
+// {enabled, experiments_enabled, session_dir, manifest, eye_diff, lineage}.
+UEVR_RENDER_CAPI const char* uevr_render_diag_stereo_forensics_json();
+
 // ── Stereo / one-eye-bug diagnostics ─────────────────────────────────
 
 // Walks the resource list + PSO aggregates and surfaces per-eye stats with

@@ -10,6 +10,7 @@
 #include <spdlog/spdlog.h>
 
 #include "Framework.hpp"
+#include "render/StereoForensics.hpp"
 
 using json = nlohmann::json;
 
@@ -305,6 +306,7 @@ RenderAnalysisExportResult RenderAnalysisExport::export_bundle(const RenderAnaly
         const auto shader_pairs_json_path = result.bundle_dir / "shader_pairs.json";
         const auto pso_profiler_json_path = result.bundle_dir / "pso_profiler.json";
         const auto overrides_json_path = result.bundle_dir / "overrides.json";
+        const auto stereo_forensics_json_path = result.bundle_dir / "stereo_forensics.json";
         const auto resources_csv_path = result.bundle_dir / "resources.csv";
         const auto shader_pairs_csv_path = result.bundle_dir / "shader_pairs.csv";
         const auto pso_profiler_csv_path = result.bundle_dir / "pso_profiler.csv";
@@ -386,6 +388,21 @@ RenderAnalysisExportResult RenderAnalysisExport::export_bundle(const RenderAnaly
             overrides_json.push_back(to_json(entry));
         }
         write_json_file(overrides_json_path, overrides_json);
+
+        {
+            auto& forensics = render::StereoForensics::get();
+            const auto dir = forensics.session_dir();
+            write_json_file(stereo_forensics_json_path, json{
+                {"enabled", forensics.is_enabled()},
+                {"experiments_enabled", forensics.experiments_enabled()},
+                {"session_dir", dir.string()},
+                {"manifest", dir.empty() ? std::string{} : (dir / "manifest.json").string()},
+                {"events_jsonl", dir.empty() ? std::string{} : (dir / "events.jsonl").string()},
+                {"eye_diff", dir.empty() ? std::string{} : (dir / "eye_diff.json").string()},
+                {"lineage", dir.empty() ? std::string{} : (dir / "lineage.json").string()},
+                {"experiments", dir.empty() ? std::string{} : (dir / "experiments.json").string()}
+            });
+        }
 
         {
             std::ofstream csv{resources_csv_path, std::ios::binary | std::ios::trunc};
@@ -476,6 +493,7 @@ RenderAnalysisExportResult RenderAnalysisExport::export_bundle(const RenderAnaly
                 "shader_pairs.json",
                 "pso_profiler.json",
                 "overrides.json",
+                "stereo_forensics.json",
                 "resources.csv",
                 "shader_pairs.csv",
                 "pso_profiler.csv"
@@ -490,6 +508,7 @@ RenderAnalysisExportResult RenderAnalysisExport::export_bundle(const RenderAnaly
             shader_pairs_json_path,
             pso_profiler_json_path,
             overrides_json_path,
+            stereo_forensics_json_path,
             resources_csv_path,
             shader_pairs_csv_path,
             pso_profiler_csv_path

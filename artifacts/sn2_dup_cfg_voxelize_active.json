@@ -1,0 +1,14 @@
+{
+  "schema": "uevr.sn2.dup_config.v1",
+  "description": "2026-05-23: voxelize 0x9D14FCF0 dup'd in view_cb_only mode — keep viewport (so pixels land in the 3D RT) but swap to synth right View CB so right-projection data overwrites left in the shared fog volume.",
+  "default_view_cb_delta": 0,
+  "default_view_cb_roots": [],
+  "entries": {
+    "0x9d14fcf0": {
+      "mode": "view_cb_only",
+      "view_cb_roots": [3],
+      "view_cb_delta": -10240,
+      "note": "VoxelizePS — fog volume producer. view_cb_only keeps same viewport so writes hit the small 3D RT correctly. delta=-10240 swaps to right-eye View CB (standard SN2 stride)."
+    }
+  }
+}

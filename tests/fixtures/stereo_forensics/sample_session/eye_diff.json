@@ -1,0 +1,28 @@
+{
+  "frame": 1,
+  "work_event_groups": 1,
+  "paired_groups": [
+    {
+      "key": "draw|45056|1920x1080|3:1:0|2:1920x1080x2:28:1:0",
+      "left_event": 2,
+      "right_event": 3,
+      "pair_score": 85,
+      "pair_confidence": 0.85,
+      "pair_reason": ["kind", "root_signature", "viewport", "args", "rtv_desc", "ps_crc"]
+    }
+  ],
+  "strict_mismatched_groups": [],
+  "issues": [
+    {
+      "severity": "info",
+      "kind": "same_resource_different_slice",
+      "left_event": 2,
+      "right_event": 3,
+      "root": 4,
+      "slot": 5,
+      "resource": "0x1000",
+      "left_first_array_slice": 0,
+      "right_first_array_slice": 1
+    }
+  ]
+}

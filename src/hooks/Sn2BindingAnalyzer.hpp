@@ -99,7 +99,7 @@ struct CbvSample {
     uint32_t ps_crc{};
     uint32_t cs_crc{};
     uint32_t root_param{};
-    int eye_bucket{-1};       // 0=left, 1=right, -1=unknown
+    int eye_bucket{-1};       // Canonical StereoTraceBucket: 1=left, 2=right, -1/0=unknown
     void* parent_resource{};  // ID3D12Resource* of the parent upload buffer
     uint64_t byte_offset{};   // offset within the parent
     uint64_t gpu_va{};        // raw VA for reference
