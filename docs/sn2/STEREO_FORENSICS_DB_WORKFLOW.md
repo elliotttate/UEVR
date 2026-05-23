@@ -10,6 +10,40 @@ not be the only place a finding exists.
 set UEVR_STEREO_FORENSICS_DB=C:\tmp\uevr_forensics\forensics.db
 ```
 
+Recommended live-capture env:
+
+```bat
+set UEVR_STEREO_FORENSICS=1
+set UEVR_STEREO_FORENSICS_DIR=C:\tmp\uevr_forensics
+set UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS=1
+```
+
+The command-list hook env is now auto-forced by `UEVR_STEREO_FORENSICS=1`, but
+setting it explicitly keeps launch logs unambiguous. If `events.jsonl` contains
+only bind/create/frame/lifetime events and `eye_diff.json` reports
+`work_event_groups: 0`, the capture is bind-only and cannot produce a real
+left/right diff.
+
+Default capture limiters are intentionally conservative for live games:
+`UEVR_STEREO_FORENSICS_FRAME_STRIDE=30`,
+`UEVR_STEREO_FORENSICS_MAX_CAPTURED_FRAMES=16`,
+`UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_FRAME=5000`,
+`UEVR_STEREO_FORENSICS_MAX_TOTAL_EVENTS=80000`, and
+`UEVR_STEREO_FORENSICS_MAX_TOTAL_BYTES=134217728`. Raise these only for a
+specific capture.
+
+To capture the active scene instead of startup/menu frames, re-arm a fresh burst
+while the game is already in the target state:
+
+```bat
+echo arm > C:\tmp\uevr_forensics_arm.txt
+```
+
+The runtime consumes the sentinel, resets the captured-frame burst counter, and
+starts the next eligible captured frame immediately. Skipped and stopped frames
+also skip expensive descriptor-read/draw-detail collection unless
+`UEVR_STEREO_FORENSICS_KEEP_HOOK_DETAIL_ON_SKIPPED_FRAMES=1` is set.
+
 All commands also accept:
 
 ```bat
@@ -77,9 +111,10 @@ python E:\Github\UEVRJ\tools\stereo_forensics_run_experiments.py generate ^
 ```
 
 Use `--mode mutations` to emit heavier candidate actions. Runtime currently
-executes descriptor swap, CBV swap, and forced SRV array-slice rules. Candidate
-actions that are not executable yet are converted to color probes by default so
-they cannot be ranked as false non-causal failures. Use
+executes descriptor swap, CBV swap, forced SRV array-slice, and
+`neutralize_texture` null-SRV rules. Candidate actions that are not executable
+yet are converted to color probes by default so they cannot be ranked as false
+non-causal failures. Use
 `--include-unsupported` only when you explicitly want skeleton rules.
 
 Run the closed-loop baseline/trial scorer:
@@ -111,6 +146,26 @@ scores same-eye baseline-vs-trial deltas, and records apply observations.
 side-by-side backbuffer coordinates into the per-eye screenshot space. Scores
 are marked untrusted unless the runtime reports a hit/apply confirmation for the
 rule; mutation actions specifically require an `applied` observation.
+
+For in-engine C-API ROI summaries instead of PPM pixel loops, use a manual
+eye-local sample ROI:
+
+```bat
+python E:\Github\UEVRJ\tools\stereo_forensics_ab_loop.py run ^
+  --candidate-rules C:\tmp\uevr_forensics\experiments\candidate_rules.json ^
+  --rules-file C:\tmp\uevr_forensics\experiments\live_rules.json ^
+  --runtime-experiments-json C:\tmp\uevr_forensics\session_latest\experiments.json ^
+  --out-dir C:\tmp\uevr_forensics\ab_loop_samples ^
+  --score-mode sample-json ^
+  --sample-roi 200,120,360,240 ^
+  --baseline-mode per-rule ^
+  --db C:\tmp\uevr_forensics\forensics.db ^
+  --game SN2
+```
+
+This writes `left_sample.json` and `right_sample.json` sidecars through the SN2
+eye screenshot trigger and scores baseline-vs-trial deltas from those runtime
+samples.
 
 Add a finding:
 
@@ -174,6 +229,10 @@ python E:\Github\UEVRJ\tools\stereo_forensics_compile_rule.py compile ... --db C
 python E:\Github\UEVRJ\tools\stereo_forensics_shader_semantics.py analyze-dir E:\captures\shaders --db C:\tmp\uevr_forensics\forensics.db
 ```
 
+Use `--dxil-patch E:\Github\UEVRJ\build\bin\uevr\dxil-patch.exe` when DXIL
+disassembly is available. SM4/SM5 DXBC still gets conservative reflection,
+signature, and opcode facts from RDEF/ISGN/OSGN/SHEX/SHDR chunks.
+
 ## Standard
 
 Use IDs in notes and commits:
@@ -183,6 +242,7 @@ Use IDs in notes and commits:
 - `finding:<SN2-FIND-0001>`
 - `experiment:<id>`
 - `rule:<name>`
+- `resource_instance_uid:<resource:0x...#gen:N>`
 
 That gives future sessions a queryable graph:
 

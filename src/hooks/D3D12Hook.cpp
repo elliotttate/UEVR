@@ -1430,6 +1430,28 @@ bool is_stereo_trace_enabled() {
 
 bool enable_d3d12_diagnostic_command_list_hooks() {
     static const bool enabled = []() {
+        const bool forensics_requested = env_flag_enabled_a("UEVR_STEREO_FORENSICS");
+        if (forensics_requested &&
+            !env_flag_enabled_a("UEVR_STEREO_FORENSICS_BIND_ONLY") &&
+            !env_flag_enabled_a("UEVR_STEREO_FORENSICS_DISABLE_COMMAND_LIST_HOOKS")) {
+            char legacy_value[32]{};
+            const auto legacy_len = GetEnvironmentVariableA(
+                "UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS",
+                legacy_value,
+                static_cast<DWORD>(sizeof(legacy_value)));
+            if (legacy_len > 0) {
+                const std::string_view raw{
+                    legacy_value,
+                    std::min<DWORD>(legacy_len, static_cast<DWORD>(sizeof(legacy_value) - 1))};
+                if (raw == "0" || raw == "false" || raw == "FALSE" || raw == "off" || raw == "OFF") {
+                    SPDLOG_WARN(
+                        "[StereoForensics] forcing command-list diagnostic hooks because UEVR_STEREO_FORENSICS=1; "
+                        "set UEVR_STEREO_FORENSICS_BIND_ONLY=1 to allow bind-only capture");
+                }
+            }
+            return true;
+        }
+
         char value[32]{};
         const auto len = GetEnvironmentVariableA(
             "UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS",
@@ -1445,6 +1467,20 @@ bool enable_d3d12_diagnostic_command_list_hooks() {
     }();
 
     return enabled;
+}
+
+bool stereo_forensics_keep_hook_detail_on_skipped_frames() {
+    static const bool enabled =
+        env_flag_enabled_a("UEVR_STEREO_FORENSICS_KEEP_HOOK_DETAIL_ON_SKIPPED_FRAMES") ||
+        env_flag_enabled_a("UEVR_STEREO_FORENSICS_RECORD_D3D12DIAG_ON_SKIPPED_FRAMES");
+    return enabled;
+}
+
+bool stereo_forensics_hook_detail_active() {
+    auto& forensics = render::StereoForensics::get();
+    return !forensics.is_enabled() ||
+        forensics.is_capturing_this_frame() ||
+        stereo_forensics_keep_hook_detail_on_skipped_frames();
 }
 
 // Separate env-var so the descriptor-table hook (which adds non-trivial cost
@@ -2735,6 +2771,15 @@ bool D3D12Hook::hook() {
                 read("UEVR_SN2_UPSTREAM_SKIP_LEFT_CRCS"),
                 read("UEVR_SN2_UPSTREAM_SKIP_RIGHT_CRCS"),
                 read("UEVR_SN2_UPSTREAM_SKIP_UNKNOWN_CRCS"));
+            spdlog::info("[D3D12] StereoForensics env: UEVR_STEREO_FORENSICS={} | UEVR_STEREO_FORENSICS_BIND_ONLY={} | UEVR_STEREO_FORENSICS_DISABLE_COMMAND_LIST_HOOKS={} | UEVR_STEREO_FORENSICS_FRAME_STRIDE={} | UEVR_STEREO_FORENSICS_MAX_CAPTURED_FRAMES={} | UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_FRAME={} | UEVR_STEREO_FORENSICS_MAX_TOTAL_EVENTS={} | UEVR_STEREO_FORENSICS_MAX_TOTAL_BYTES={}",
+                read("UEVR_STEREO_FORENSICS"),
+                read("UEVR_STEREO_FORENSICS_BIND_ONLY"),
+                read("UEVR_STEREO_FORENSICS_DISABLE_COMMAND_LIST_HOOKS"),
+                read("UEVR_STEREO_FORENSICS_FRAME_STRIDE"),
+                read("UEVR_STEREO_FORENSICS_MAX_CAPTURED_FRAMES"),
+                read("UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_FRAME"),
+                read("UEVR_STEREO_FORENSICS_MAX_TOTAL_EVENTS"),
+                read("UEVR_STEREO_FORENSICS_MAX_TOTAL_BYTES"));
             spdlog::info("[D3D12] is_subnautica2_process()={} command_list_diagnostics_enabled={}",
                 is_subnautica2_process(), command_list_diagnostics_enabled);
             if (is_subnautica2_process()) {
@@ -5804,8 +5849,11 @@ namespace sn2_upload_buf_map {
     static std::vector<Entry> g_entries; // small (~hundreds), linear scan is fine
 
     using MapFn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Resource*, UINT, const D3D12_RANGE*, void**);
+    using ReleaseFn = ULONG (STDMETHODCALLTYPE*)(ID3D12Resource*);
     static MapFn g_orig_map = nullptr;
+    static ReleaseFn g_orig_release = nullptr;
     static bool g_hook_installed = false;
+    static bool g_release_hook_installed = false;
 
     HRESULT STDMETHODCALLTYPE Map_Hook(ID3D12Resource* self, UINT sub, const D3D12_RANGE* read_range, void** data) {
         HRESULT hr = g_orig_map(self, sub, read_range, data);
@@ -5841,12 +5889,57 @@ namespace sn2_upload_buf_map {
         return hr;
     }
 
+    ULONG STDMETHODCALLTYPE Release_Hook(ID3D12Resource* self) {
+        auto* original = g_orig_release;
+        if (original == nullptr) {
+            return 0;
+        }
+        const ULONG refs = original(self);
+        const bool forensics_enabled = render::StereoForensics::get().is_enabled();
+        if (forensics_enabled) {
+            render::StereoForensics::get().record_resource_released(
+                "D3D12Hook::ID3D12Resource::Release",
+                self,
+                static_cast<uint32_t>(refs));
+        }
+        if (forensics_enabled && refs == 0) {
+            std::scoped_lock _{g_mutex};
+            // Tombstone in place instead of erasing. Older SN2 helpers assume
+            // stable vector positions, and compaction here can corrupt parallel
+            // resource-index maps in adjacent diagnostics paths.
+            for (auto& entry : g_entries) {
+                if (entry.res == self) {
+                    entry.res = nullptr;
+                    entry.gpu_va_base = 0;
+                    entry.size = 0;
+                    entry.cpu_ptr = nullptr;
+                }
+            }
+        }
+        return refs;
+    }
+
     // Patch the Map slot in ID3D12Resource's vtable. All instances sharing
     // this vtable (which on a given device is ALL of them) will route Map
     // calls through Map_Hook.
     bool install_map_hook(ID3D12Resource* sample_res) {
-        if (g_hook_installed || sample_res == nullptr) return g_hook_installed;
+        if (sample_res == nullptr) return g_hook_installed;
         void** vtbl = *(void***)sample_res;
+        if (render::StereoForensics::get().is_enabled() && !g_release_hook_installed) {
+            void** release_slot = &vtbl[2];
+            g_orig_release = (ReleaseFn)*release_slot;
+            if (g_orig_release != nullptr) {
+                DWORD old_prot = 0;
+                if (VirtualProtect(release_slot, sizeof(void*), PAGE_READWRITE, &old_prot)) {
+                    *release_slot = (void*)&Release_Hook;
+                    VirtualProtect(release_slot, sizeof(void*), old_prot, &old_prot);
+                    g_release_hook_installed = true;
+                    SPDLOG_WARN("[SN2-UploadBufMap] Resource Release vtable hook installed: orig=0x{:x} new=0x{:x}",
+                                (uintptr_t)g_orig_release, (uintptr_t)&Release_Hook);
+                }
+            }
+        }
+        if (g_hook_installed) return g_hook_installed;
         // ID3D12Resource::Map is at vtable index 8.
         void** slot = &vtbl[8];
         g_orig_map = (MapFn)*slot;
@@ -5949,7 +6042,13 @@ namespace sn2_upload_buf_map {
 
     size_t entry_count() {
         std::scoped_lock _{g_mutex};
-        return g_entries.size();
+        size_t count = 0;
+        for (const auto& entry : g_entries) {
+            if (entry.res != nullptr) {
+                ++count;
+            }
+        }
+        return count;
     }
 
     // 2026-05-18 SN2 SkyAtmosFix v2: hook ID3D12Device::CreateCommittedResource
@@ -7405,6 +7504,7 @@ namespace sn2_descriptor_registry {
             sn2_fog_compute_diag_enabled() ||
             sn2_fog_srv_redirect_mode() != 0 ||
             sn2_tail_srv_repair_mode() != 0 ||
+            env_flag_enabled_a("UEVR_STEREO_EXPERIMENTS") ||
             // Sn2EyePairing needs CPU descriptor -> resource resolution even
             // when none of the older diagnostics are active.
             sn2_eye_pairing::env_enabled() ||
@@ -8805,29 +8905,43 @@ inline void record_root_bind_event(
     UINT value_count = 0,
     uint64_t value_hash = 0
 ) {
+    auto& forensics = render::StereoForensics::get();
+    const bool forensics_enabled = forensics.is_enabled();
+    const bool forensics_capturing = forensics.is_capturing_this_frame();
+    const bool diagnostics_recording =
+        render::D3D12Diagnostics::get().is_enabled() &&
+        (!forensics_enabled || forensics_capturing || stereo_forensics_keep_hook_detail_on_skipped_frames());
+    if (!diagnostics_recording && !forensics_capturing) {
+        return;
+    }
+
     const int eye_bucket = cmdlist_eye_bucket(state);
-    render::D3D12Diagnostics::get().record_root_bind(
-        source,
-        reinterpret_cast<uintptr_t>(cl),
-        reinterpret_cast<uintptr_t>(state.current_pso),
-        eye_bucket,
-        graphics ? "graphics" : "compute",
-        kind,
-        root_param,
-        value,
-        value_count,
-        value_hash);
-    render::StereoForensics::get().record_root_bind(
-        source,
-        reinterpret_cast<uintptr_t>(cl),
-        reinterpret_cast<uintptr_t>(state.current_pso),
-        eye_bucket,
-        graphics,
-        kind,
-        root_param,
-        value,
-        value_count,
-        value_hash);
+    if (diagnostics_recording) {
+        render::D3D12Diagnostics::get().record_root_bind(
+            source,
+            reinterpret_cast<uintptr_t>(cl),
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            eye_bucket,
+            graphics ? "graphics" : "compute",
+            kind,
+            root_param,
+            value,
+            value_count,
+            value_hash);
+    }
+    if (forensics_capturing) {
+        forensics.record_root_bind(
+            source,
+            reinterpret_cast<uintptr_t>(cl),
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            eye_bucket,
+            graphics,
+            kind,
+            root_param,
+            value,
+            value_count,
+            value_hash);
+    }
 }
 
 inline void record_draw_event_from_state(
@@ -8842,6 +8956,16 @@ inline void record_draw_event_from_state(
     UINT arg4,
     bool executed = true
 ) {
+    auto& forensics = render::StereoForensics::get();
+    const bool forensics_enabled = forensics.is_enabled();
+    const bool forensics_capturing = forensics.is_capturing_this_frame();
+    const bool diagnostics_recording =
+        render::D3D12Diagnostics::get().is_enabled() &&
+        (!forensics_enabled || forensics_capturing || stereo_forensics_keep_hook_detail_on_skipped_frames());
+    if (!diagnostics_recording && !forensics_capturing) {
+        return;
+    }
+
     std::vector<render::D3D12Diagnostics::DescriptorReadInfo> descriptor_reads{};
     descriptor_reads.reserve(state.last_graphics_descriptor_reads.size() + state.last_compute_descriptor_reads.size());
     descriptor_reads.insert(
@@ -8859,87 +8983,91 @@ inline void record_draw_event_from_state(
         : state.last_graphics_root_signature;
     const int eye_bucket = cmdlist_eye_bucket(state);
 
-    render::D3D12Diagnostics::get().record_draw_event(
-        source,
-        kind,
-        reinterpret_cast<uintptr_t>(cl),
-        reinterpret_cast<uintptr_t>(state.current_pso),
-        root_signature,
-        eye_bucket,
-        executed,
-        state.has_viewport,
-        state.viewport_top_left_x,
-        state.viewport_top_left_y,
-        state.viewport_width,
-        state.viewport_height,
-        state.viewport_count,
-        state.has_scissor,
-        state.scissor0.left,
-        state.scissor0.top,
-        state.scissor0.right,
-        state.scissor0.bottom,
-        state.scissor_count,
-        arg0,
-        arg1,
-        arg2,
-        arg3,
-        arg4,
-        static_cast<uintptr_t>(state.last_rtv0_handle),
-        state.last_graphics_root_desc_tables,
-        state.last_compute_root_desc_tables,
-        state.last_graphics_root_cbv,
-        state.last_compute_root_cbv,
-        state.last_graphics_root_srv,
-        state.last_compute_root_srv,
-        state.last_graphics_root_uav,
-        state.last_compute_root_uav,
-        state.last_graphics_root_cbv_hash,
-        state.last_compute_root_cbv_hash,
-        state.last_graphics_root_constants_hash,
-        state.last_compute_root_constants_hash,
-        state.last_graphics_root_desc_table_resource_hash,
-        state.last_compute_root_desc_table_resource_hash,
-        descriptor_reads);
-    render::StereoForensics::get().record_draw_or_dispatch(
-        source,
-        kind,
-        reinterpret_cast<uintptr_t>(cl),
-        reinterpret_cast<uintptr_t>(state.current_pso),
-        root_signature,
-        eye_bucket,
-        executed,
-        state.has_viewport,
-        state.viewport_top_left_x,
-        state.viewport_top_left_y,
-        state.viewport_width,
-        state.viewport_height,
-        state.viewport_count,
-        state.has_scissor,
-        state.scissor0.left,
-        state.scissor0.top,
-        state.scissor0.right,
-        state.scissor0.bottom,
-        state.scissor_count,
-        arg0,
-        arg1,
-        arg2,
-        arg3,
-        arg4,
-        state.last_graphics_root_desc_tables,
-        state.last_compute_root_desc_tables,
-        state.last_graphics_root_cbv,
-        state.last_compute_root_cbv,
-        state.last_graphics_root_srv,
-        state.last_compute_root_srv,
-        state.last_graphics_root_uav,
-        state.last_compute_root_uav,
-        state.last_graphics_root_cbv_hash,
-        state.last_compute_root_cbv_hash,
-        state.last_graphics_root_constants_hash,
-        state.last_compute_root_constants_hash,
-        state.last_graphics_root_desc_table_resource_hash,
-        state.last_compute_root_desc_table_resource_hash,
-        descriptor_reads);
+    if (diagnostics_recording) {
+        render::D3D12Diagnostics::get().record_draw_event(
+            source,
+            kind,
+            reinterpret_cast<uintptr_t>(cl),
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            root_signature,
+            eye_bucket,
+            executed,
+            state.has_viewport,
+            state.viewport_top_left_x,
+            state.viewport_top_left_y,
+            state.viewport_width,
+            state.viewport_height,
+            state.viewport_count,
+            state.has_scissor,
+            state.scissor0.left,
+            state.scissor0.top,
+            state.scissor0.right,
+            state.scissor0.bottom,
+            state.scissor_count,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+            static_cast<uintptr_t>(state.last_rtv0_handle),
+            state.last_graphics_root_desc_tables,
+            state.last_compute_root_desc_tables,
+            state.last_graphics_root_cbv,
+            state.last_compute_root_cbv,
+            state.last_graphics_root_srv,
+            state.last_compute_root_srv,
+            state.last_graphics_root_uav,
+            state.last_compute_root_uav,
+            state.last_graphics_root_cbv_hash,
+            state.last_compute_root_cbv_hash,
+            state.last_graphics_root_constants_hash,
+            state.last_compute_root_constants_hash,
+            state.last_graphics_root_desc_table_resource_hash,
+            state.last_compute_root_desc_table_resource_hash,
+            descriptor_reads);
+    }
+    if (forensics_capturing) {
+        forensics.record_draw_or_dispatch(
+            source,
+            kind,
+            reinterpret_cast<uintptr_t>(cl),
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            root_signature,
+            eye_bucket,
+            executed,
+            state.has_viewport,
+            state.viewport_top_left_x,
+            state.viewport_top_left_y,
+            state.viewport_width,
+            state.viewport_height,
+            state.viewport_count,
+            state.has_scissor,
+            state.scissor0.left,
+            state.scissor0.top,
+            state.scissor0.right,
+            state.scissor0.bottom,
+            state.scissor_count,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+            state.last_graphics_root_desc_tables,
+            state.last_compute_root_desc_tables,
+            state.last_graphics_root_cbv,
+            state.last_compute_root_cbv,
+            state.last_graphics_root_srv,
+            state.last_compute_root_srv,
+            state.last_graphics_root_uav,
+            state.last_compute_root_uav,
+            state.last_graphics_root_cbv_hash,
+            state.last_compute_root_cbv_hash,
+            state.last_graphics_root_constants_hash,
+            state.last_compute_root_constants_hash,
+            state.last_graphics_root_desc_table_resource_hash,
+            state.last_compute_root_desc_table_resource_hash,
+            descriptor_reads);
+    }
 }
 
 static void sn2_log_override_bind_probe(
@@ -9692,18 +9820,23 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
 
     update_cmdlist_pso(command_list, pipeline_state);
     const auto pso_state = read_cmdlist_state(command_list);
-    const auto eye_bucket = static_cast<int>(pso_state.last_viewport_bucket);
+    const auto eye_bucket = cmdlist_eye_bucket(pso_state);
+    const bool record_forensics_pso_bind =
+        enable_d3d12_diagnostic_command_list_hooks() ||
+        env_flag_enabled_a("UEVR_STEREO_FORENSICS_BIND_ONLY_RECORD_PSO");
 
     auto& shader_registry = render::ShaderOverrideRegistry::get();
     if (!shader_registry.should_track_d3d12_pipelines()) {
-        render::StereoForensics::get().record_pso_bind(
-            "D3D12Hook::SetPipelineState",
-            reinterpret_cast<uintptr_t>(command_list),
-            reinterpret_cast<uintptr_t>(pipeline_state),
-            reinterpret_cast<uintptr_t>(pipeline_state),
-            pso_state.last_graphics_root_signature,
-            pso_state.last_compute_root_signature,
-            eye_bucket);
+        if (record_forensics_pso_bind) {
+            render::StereoForensics::get().record_pso_bind(
+                "D3D12Hook::SetPipelineState",
+                reinterpret_cast<uintptr_t>(command_list),
+                reinterpret_cast<uintptr_t>(pipeline_state),
+                reinterpret_cast<uintptr_t>(pipeline_state),
+                pso_state.last_graphics_root_signature,
+                pso_state.last_compute_root_signature,
+                eye_bucket);
+        }
         original(command_list, pipeline_state);
         return;
     }
@@ -9739,14 +9872,16 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
     // Draw* hooks can early-return without forwarding when the hunter wants
     // this PS hash suppressed. Also pass the current eye bucket so per-eye
     // selective skip (skip_left_only / skip_right_only) can fire.
-    render::StereoForensics::get().record_pso_bind(
-        "D3D12Hook::SetPipelineState",
-        reinterpret_cast<uintptr_t>(command_list),
-        reinterpret_cast<uintptr_t>(pipeline_state),
-        reinterpret_cast<uintptr_t>(bound_pipeline_state),
-        pso_state.last_graphics_root_signature,
-        pso_state.last_compute_root_signature,
-        eye_bucket);
+    if (record_forensics_pso_bind) {
+        render::StereoForensics::get().record_pso_bind(
+            "D3D12Hook::SetPipelineState",
+            reinterpret_cast<uintptr_t>(command_list),
+            reinterpret_cast<uintptr_t>(pipeline_state),
+            reinterpret_cast<uintptr_t>(bound_pipeline_state),
+            pso_state.last_graphics_root_signature,
+            pso_state.last_compute_root_signature,
+            eye_bucket);
+    }
     shader_registry.hunter_record_set_pipeline_state_with_eye(command_list, pipeline_state, eye_bucket);
     original(command_list, bound_pipeline_state);
     update_cmdlist_effective_pso(command_list, bound_pipeline_state);
@@ -10748,6 +10883,8 @@ static bool sn2_try_begin_eye_pairing_redirect(
 //   table slot for target eye.
 // - force_srv_array_slice: clone the current SRV descriptor with a forced array
 //   slice into a scratch table slot for target eye.
+// - neutralize_texture: clone the current descriptor table and replace one SRV
+//   slot with a same-shape D3D12 null descriptor for the target eye.
 //
 // Generic duplicate-draw/dispatch remains intentionally unsupported here; that
 // needs a complete replay packet, not just a one-slot state mutation.
@@ -11036,6 +11173,7 @@ std::string canonical_action_type(std::string action) {
     if (action == "force_srv_slice") return "force_srv_array_slice";
     if (action == "swap_descriptor") return "swap_descriptor_from_left";
     if (action == "swap_cbv") return "swap_cbv_left_to_right";
+    if (action == "neutralize_srv" || action == "null_srv") return "neutralize_texture";
     if (action == "duplicate_draw" || action == "duplicate_dispatch") return "duplicate_left_work_into_right_bucket";
     return action;
 }
@@ -11091,6 +11229,7 @@ void refresh_locked() {
             if (rule.action != "force_srv_array_slice" &&
                 rule.action != "swap_descriptor_from_left" &&
                 rule.action != "swap_cbv_left_to_right" &&
+                rule.action != "neutralize_texture" &&
                 rule.action != "duplicate_left_work_into_right_bucket") {
                 continue;
             }
@@ -11264,7 +11403,7 @@ static bool sn2_forensics_try_patch_descriptor_slot(
 
     D3D12_CPU_DESCRIPTOR_HANDLE patch_cpu{
         scratch_cpu + static_cast<SIZE_T>(rule.slot) * heap_state.stride};
-    if (forced_srv_desc != nullptr && forced_srv_resource != nullptr) {
+    if (forced_srv_desc != nullptr) {
         dev->CreateShaderResourceView(forced_srv_resource, forced_srv_desc, patch_cpu);
     } else if (source_descriptor_cpu != 0) {
         dev->CopyDescriptorsSimple(
@@ -11500,6 +11639,57 @@ static bool sn2_forensics_try_begin_mutations(
                 if (n <= 16 || (n % 600) == 0) {
                     SPDLOG_WARN("[StereoForensics-Mutate] force_slice#{} rule={} root={} slot={} slice={} res={:p}",
                         n, rule.name, rule.root, rule.slot, rule.array_slice, static_cast<void*>(srv_res));
+                }
+            } else {
+                sn2_forensics_mutations::note_observation(rule, "apply_failed", draw_kind, ps_crc, cs_crc, eye_bucket);
+            }
+        } else if (rule.action == "neutralize_texture") {
+            if (rule.root == UINT_MAX || rule.slot == UINT_MAX || rule.root >= state.last_graphics_root_desc_tables.size()) {
+                continue;
+            }
+            const uint64_t table_gpu = state.last_graphics_root_desc_tables[rule.root];
+            BindlessHeapState heap_state{};
+            SIZE_T cpu_base = 0;
+            if (table_gpu == 0 || !bindless_heap_registry().resolve_state(table_gpu, heap_state, cpu_base) || heap_state.stride == 0) {
+                continue;
+            }
+            const uint64_t off = table_gpu - heap_state.gpu_base;
+            const uint64_t heap_bytes = static_cast<uint64_t>(heap_state.stride) * heap_state.num_descriptors;
+            const UINT remaining_desc = (off < heap_bytes)
+                ? static_cast<UINT>((heap_bytes - off) / heap_state.stride)
+                : 0u;
+            if (remaining_desc == 0 || rule.slot >= remaining_desc) {
+                sn2_forensics_mutations::note_observation(rule, "descriptor_slot_out_of_range", draw_kind, ps_crc, cs_crc, eye_bucket);
+                continue;
+            }
+
+            const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(rule.slot) * heap_state.stride;
+            ID3D12Resource* srv_res = nullptr;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+            bool has_srv_desc = false;
+            if (!sn2_descriptor_registry::lookup_srv_by_cpu_ptr_or_hash(slot_cpu, srv_res, srv_desc, has_srv_desc) ||
+                srv_res == nullptr ||
+                !has_srv_desc) {
+                sn2_forensics_mutations::note_observation(rule, "descriptor_lookup_failed", draw_kind, ps_crc, cs_crc, eye_bucket);
+                continue;
+            }
+
+            if (scope.descriptor_scope.entry_count < scope.descriptor_scope.entries.size() &&
+                sn2_forensics_try_patch_descriptor_slot(
+                    command_list,
+                    state,
+                    rule,
+                    scope.descriptor_scope,
+                    0,
+                    &srv_desc,
+                    nullptr)) {
+                applied = true;
+                sn2_forensics_mutations::note_observation(rule, "applied", draw_kind, ps_crc, cs_crc, eye_bucket);
+                static std::atomic<uint64_t> neutralize_apply{0};
+                const auto n = neutralize_apply.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 16 || (n % 600) == 0) {
+                    SPDLOG_WARN("[StereoForensics-Mutate] neutralize_texture#{} rule={} root={} slot={} res={:p}",
+                        n, rule.name, rule.root, rule.slot, static_cast<void*>(srv_res));
                 }
             } else {
                 sn2_forensics_mutations::note_observation(rule, "apply_failed", draw_kind, ps_crc, cs_crc, eye_bucket);
@@ -14470,6 +14660,9 @@ inline void update_cmdlist_descriptor_reads(
     D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor
 ) {
     if (cl == nullptr || !root_param_in_range(root_param)) return;
+    if (!stereo_forensics_hook_detail_active()) {
+        return;
+    }
 
     std::vector<render::D3D12Diagnostics::DescriptorReadInfo> reads{};
     uint64_t resource_hash = 1469598103934665603ull;

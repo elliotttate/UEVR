@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 DEFAULT_DB = Path(os.environ.get("UEVR_STEREO_FORENSICS_DB", r"C:\tmp\uevr_forensics\forensics.db"))
 
 
@@ -114,6 +114,8 @@ CREATE TABLE IF NOT EXISTS resources (
   capture_id INTEGER NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
   resource_key TEXT NOT NULL,
   resource_hex TEXT,
+  resource_generation INTEGER,
+  resource_instance_uid TEXT,
   desc_key TEXT,
   dimension TEXT,
   width INTEGER,
@@ -122,6 +124,10 @@ CREATE TABLE IF NOT EXISTS resources (
   format INTEGER,
   alias_group TEXT,
   classification TEXT,
+  first_seen_frame INTEGER,
+  last_seen_frame INTEGER,
+  first_writer_frame INTEGER,
+  last_writer_frame INTEGER,
   json TEXT NOT NULL,
   UNIQUE(capture_id, resource_key)
 );
@@ -154,7 +160,13 @@ CREATE TABLE IF NOT EXISTS lineage_edges (
   descriptor_type TEXT,
   resource_key TEXT,
   resource_hex TEXT,
+  resource_generation INTEGER,
+  resource_instance_uid TEXT,
   view_key TEXT,
+  binding_type TEXT,
+  shader_register INTEGER,
+  shader_register_name TEXT,
+  register_space INTEGER,
   producer_event INTEGER,
   producer_kind TEXT,
   producer_eye_bucket INTEGER,
@@ -198,6 +210,8 @@ CREATE TABLE IF NOT EXISTS lineage_paths (
   root INTEGER,
   slot INTEGER,
   resource_hex TEXT,
+  resource_generation INTEGER,
+  resource_instance_uid TEXT,
   view_key TEXT,
   producer_event INTEGER,
   classification TEXT,
@@ -238,6 +252,8 @@ CREATE TABLE IF NOT EXISTS resource_lifetimes (
   id INTEGER PRIMARY KEY,
   capture_id INTEGER NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
   resource_hex TEXT,
+  resource_generation INTEGER,
+  resource_instance_uid TEXT,
   view_key TEXT,
   first_event INTEGER,
   last_event INTEGER,
@@ -246,7 +262,7 @@ CREATE TABLE IF NOT EXISTS resource_lifetimes (
   classification TEXT,
   alias_group TEXT,
   json TEXT NOT NULL DEFAULT '{}',
-  UNIQUE(capture_id, resource_hex, view_key)
+  UNIQUE(capture_id, resource_instance_uid, view_key)
 );
 
 CREATE TABLE IF NOT EXISTS shaders (
@@ -350,6 +366,22 @@ def init_db(con: sqlite3.Connection) -> None:
     ensure_column(con, "events", "shader_key", "TEXT")
     ensure_column(con, "events", "vs_crc", "TEXT")
     ensure_column(con, "events", "gs_crc", "TEXT")
+    ensure_column(con, "resources", "resource_generation", "INTEGER")
+    ensure_column(con, "resources", "resource_instance_uid", "TEXT")
+    ensure_column(con, "resources", "first_seen_frame", "INTEGER")
+    ensure_column(con, "resources", "last_seen_frame", "INTEGER")
+    ensure_column(con, "resources", "first_writer_frame", "INTEGER")
+    ensure_column(con, "resources", "last_writer_frame", "INTEGER")
+    ensure_column(con, "lineage_edges", "resource_generation", "INTEGER")
+    ensure_column(con, "lineage_edges", "resource_instance_uid", "TEXT")
+    ensure_column(con, "lineage_edges", "binding_type", "TEXT")
+    ensure_column(con, "lineage_edges", "shader_register", "INTEGER")
+    ensure_column(con, "lineage_edges", "shader_register_name", "TEXT")
+    ensure_column(con, "lineage_edges", "register_space", "INTEGER")
+    ensure_column(con, "lineage_paths", "resource_generation", "INTEGER")
+    ensure_column(con, "lineage_paths", "resource_instance_uid", "TEXT")
+    ensure_column(con, "resource_lifetimes", "resource_generation", "INTEGER")
+    ensure_column(con, "resource_lifetimes", "resource_instance_uid", "TEXT")
     con.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -436,8 +468,44 @@ def ingest_session(con: sqlite3.Connection, session: Path, game: str | None, ue_
     now = utc_now()
 
     existing = con.execute("SELECT id FROM captures WHERE session_dir=?", (str(session),)).fetchone()
-    if existing:
+    refresh_existing = existing is not None
+    if existing is None:
+        cur = con.execute(
+            """
+            INSERT OR IGNORE INTO captures(session_dir, schema, game, ue_version, executable_hash, latest_frame,
+              event_count, resource_count, descriptor_count, issue_count, created_at, ingested_at, manifest_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                str(session),
+                manifest.get("schema"),
+                game,
+                ue_version,
+                executable_hash,
+                manifest.get("latest_frame"),
+                len(events),
+                len(resources),
+                len(descriptors),
+                len(issues),
+                now,
+                now,
+                json_text(manifest),
+            ),
+        )
+        if cur.rowcount == 1:
+            capture_id = int(cur.lastrowid)
+        else:
+            # Another ingest process won the same session_dir between our
+            # SELECT and INSERT. Treat it as an update instead of failing.
+            existing = con.execute("SELECT id FROM captures WHERE session_dir=?", (str(session),)).fetchone()
+            if existing is None:
+                raise RuntimeError(f"failed to create or find capture row for {session}")
+            capture_id = int(existing["id"])
+            refresh_existing = True
+    else:
         capture_id = int(existing["id"])
+
+    if refresh_existing:
         for table in (
             "events",
             "resources",
@@ -471,30 +539,6 @@ def ingest_session(con: sqlite3.Connection, session: Path, game: str | None, ue_
                 capture_id,
             ),
         )
-    else:
-        cur = con.execute(
-            """
-            INSERT INTO captures(session_dir, schema, game, ue_version, executable_hash, latest_frame,
-              event_count, resource_count, descriptor_count, issue_count, created_at, ingested_at, manifest_json)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                str(session),
-                manifest.get("schema"),
-                game,
-                ue_version,
-                executable_hash,
-                manifest.get("latest_frame"),
-                len(events),
-                len(resources),
-                len(descriptors),
-                len(issues),
-                now,
-                now,
-                json_text(manifest),
-            ),
-        )
-        capture_id = int(cur.lastrowid)
 
     for event in events:
         con.execute(
@@ -534,14 +578,18 @@ def ingest_session(con: sqlite3.Connection, session: Path, game: str | None, ue_
         desc = res.get("desc", {})
         con.execute(
             """
-            INSERT OR REPLACE INTO resources(capture_id, resource_key, resource_hex, desc_key, dimension,
-              width, height, depth_or_array_size, format, alias_group, classification, json)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT OR REPLACE INTO resources(capture_id, resource_key, resource_hex, resource_generation,
+              resource_instance_uid, desc_key, dimension, width, height, depth_or_array_size, format,
+              alias_group, classification, first_seen_frame, last_seen_frame, first_writer_frame,
+              last_writer_frame, json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 capture_id,
-                str(res.get("resource", res.get("resource_hex"))),
+                str(res.get("resource_instance_uid") or res.get("resource") or res.get("resource_hex")),
                 res.get("resource_hex"),
+                res.get("resource_generation"),
+                res.get("resource_instance_uid"),
                 res.get("desc_key"),
                 desc.get("dimension"),
                 desc.get("width"),
@@ -550,6 +598,10 @@ def ingest_session(con: sqlite3.Connection, session: Path, game: str | None, ue_
                 desc.get("format"),
                 res.get("alias_group"),
                 res.get("classification"),
+                res.get("first_seen_frame"),
+                res.get("last_seen_frame"),
+                res.get("first_writer_frame"),
+                res.get("last_writer_frame"),
                 json_text(res),
             ),
         )
@@ -586,9 +638,11 @@ def ingest_session(con: sqlite3.Connection, session: Path, game: str | None, ue_
         con.execute(
             """
             INSERT INTO lineage_edges(capture_id, consumer_event, consumer_kind, consumer_eye_bucket,
-              root, slot, descriptor_type, resource_key, resource_hex, view_key, producer_event,
+              root, slot, descriptor_type, resource_key, resource_hex, resource_generation,
+              resource_instance_uid, view_key, binding_type, shader_register, shader_register_name,
+              register_space, producer_event,
               producer_kind, producer_eye_bucket, classification, json)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 capture_id,
@@ -598,9 +652,15 @@ def ingest_session(con: sqlite3.Connection, session: Path, game: str | None, ue_
                 edge.get("root"),
                 edge.get("slot"),
                 edge.get("descriptor_type"),
-                str(edge.get("resource", "")),
+                str(edge.get("resource_instance_uid") or edge.get("resource") or ""),
                 edge.get("resource_hex"),
+                edge.get("resource_generation"),
+                edge.get("resource_instance_uid"),
                 edge.get("view_key"),
+                edge.get("binding_type"),
+                edge.get("shader_register"),
+                edge.get("shader_register_name"),
+                edge.get("register_space"),
                 producer_event,
                 producer.get("kind"),
                 producer.get("eye_bucket"),
@@ -610,9 +670,9 @@ def ingest_session(con: sqlite3.Connection, session: Path, game: str | None, ue_
         )
         con.execute(
             """
-            INSERT INTO lineage_paths(capture_id, consumer_event, root, slot, resource_hex, view_key,
-              producer_event, classification, path_json)
-            VALUES(?,?,?,?,?,?,?,?,?)
+            INSERT INTO lineage_paths(capture_id, consumer_event, root, slot, resource_hex,
+              resource_generation, resource_instance_uid, view_key, producer_event, classification, path_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 capture_id,
@@ -620,6 +680,8 @@ def ingest_session(con: sqlite3.Connection, session: Path, game: str | None, ue_
                 edge.get("root"),
                 edge.get("slot"),
                 edge.get("resource_hex"),
+                edge.get("resource_generation"),
+                edge.get("resource_instance_uid"),
                 edge.get("view_key"),
                 producer_event,
                 classification_kind,
@@ -675,11 +737,14 @@ def ingest_session(con: sqlite3.Connection, session: Path, game: str | None, ue_
         view = item.get("view_key") or ""
         if not res:
             continue
-        key = (res, view)
+        instance_uid = item.get("resource_instance_uid")
+        key = (instance_uid or res, view)
         rec = lifetimes.setdefault(
             key,
             {
                 "resource_hex": res,
+                "resource_generation": item.get("resource_generation"),
+                "resource_instance_uid": instance_uid,
                 "view_key": view,
                 "first_event": None,
                 "last_event": None,
@@ -704,12 +769,15 @@ def ingest_session(con: sqlite3.Connection, session: Path, game: str | None, ue_
         view = edge.get("view_key") or ""
         if not res:
             continue
-        key = (res, view)
+        instance_uid = edge.get("resource_instance_uid")
+        key = (instance_uid or res, view)
         classification = edge.get("classification", {})
         rec = lifetimes.setdefault(
             key,
             {
                 "resource_hex": res,
+                "resource_generation": edge.get("resource_generation"),
+                "resource_instance_uid": instance_uid,
                 "view_key": view,
                 "first_event": None,
                 "last_event": None,
@@ -732,13 +800,16 @@ def ingest_session(con: sqlite3.Connection, session: Path, game: str | None, ue_
     for rec in lifetimes.values():
         con.execute(
             """
-            INSERT OR REPLACE INTO resource_lifetimes(capture_id, resource_hex, view_key, first_event,
-              last_event, writer_count, reader_count, classification, alias_group, json)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
+            INSERT OR REPLACE INTO resource_lifetimes(capture_id, resource_hex, resource_generation,
+              resource_instance_uid, view_key, first_event, last_event, writer_count, reader_count,
+              classification, alias_group, json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 capture_id,
                 rec.get("resource_hex"),
+                rec.get("resource_generation"),
+                rec.get("resource_instance_uid"),
                 rec.get("view_key"),
                 rec.get("first_event"),
                 rec.get("last_event"),
@@ -1013,23 +1084,29 @@ def infer_shader_stage(path: str, fallback: str | None = None) -> str:
 def classify_shader_roles(shader: dict[str, Any], stage: str) -> list[tuple[str, float, str]]:
     sem = shader.get("semantics", {})
     roles: list[tuple[str, float, str]] = []
-    if not sem.get("dxil"):
-        roles.append(("container_only", 0.25, "DXBC token-level semantic extraction is not available yet"))
+    semantic_source = "DXIL" if sem.get("dxil") else ("DXBC" if sem.get("dxbc") else "container")
+    if not sem.get("dxil") and not sem.get("dxbc"):
+        roles.append(("container_only", 0.25, "No shader semantic extraction was available"))
         return roles
     if sem.get("store_count", 0) > 0:
-        roles.append(("output_writer", 0.75, "shader writes outputs/UAVs/depth"))
+        roles.append(("output_writer", 0.72 if semantic_source == "DXBC" else 0.75, f"{semantic_source} indicates output/UAV/depth writes"))
     if stage == "ps" and (sem.get("sample_count", 0) > 0 or sem.get("texture_load_count", 0) > 0):
-        roles.append(("visible_texture_consumer", 0.72, "pixel shader samples or loads textures"))
+        roles.append(("visible_texture_consumer", 0.70 if semantic_source == "DXBC" else 0.72, f"{semantic_source} indicates pixel shader texture samples/loads"))
     elif sem.get("sample_count", 0) > 0 or sem.get("texture_load_count", 0) > 0:
-        roles.append(("texture_consumer", 0.62, "shader samples or loads textures"))
-    if sem.get("cbuffer_load_count", 0) > 0:
+        roles.append(("texture_consumer", 0.60 if semantic_source == "DXBC" else 0.62, f"{semantic_source} indicates texture samples/loads"))
+    if sem.get("cbuffer_load_count", 0) > 0 or sem.get("constant_buffer_count", 0) > 0:
         conf = 0.70 if sem.get("branch_count", 0) > 0 else 0.55
-        roles.append(("cb_driven", conf, "shader reads constant buffers; branch count suggests possible gating" if conf >= 0.70 else "shader reads constant buffers"))
+        reason = f"{semantic_source} indicates constant-buffer use"
+        if conf >= 0.70:
+            reason += "; branch count suggests possible gating"
+        roles.append(("cb_driven", conf, reason))
     if sem.get("uses_discard_or_clip"):
-        roles.append(("masked_or_discarding", 0.70, "shader contains discard/clip/kill indicators"))
+        roles.append(("masked_or_discarding", 0.70, f"{semantic_source} contains discard/clip/kill indicators"))
     if sem.get("branch_count", 0) > 0 and (sem.get("sample_count", 0) > 0 or sem.get("texture_load_count", 0) > 0):
-        roles.append(("branch_gated_texture_path", 0.68, "texture operations and branches coexist in the DXIL"))
-    return roles or [("unknown_dxil", 0.30, "DXIL parsed but no high-signal stereo role was inferred")]
+        roles.append(("branch_gated_texture_path", 0.66 if semantic_source == "DXBC" else 0.68, f"texture operations and branches coexist in {semantic_source}"))
+    if sem.get("resource_binding_count", 0) > 0:
+        roles.append(("has_reflection_bindings", 0.50, f"{semantic_source} reflection lists bound resources"))
+    return roles or [(f"unknown_{semantic_source.lower()}", 0.30, f"{semantic_source} parsed but no high-signal stereo role was inferred")]
 
 
 def import_shader_semantics(con: sqlite3.Connection, path: Path, stage: str | None = None) -> int:
@@ -1405,23 +1482,31 @@ def cmd_show_resource(args: argparse.Namespace) -> int:
             """
             SELECT captures.id AS capture_id, captures.session_dir, resources.*
             FROM resources JOIN captures ON captures.id=resources.capture_id
-            WHERE resources.resource_hex=? OR resources.desc_key=? OR resources.alias_group=?
+            WHERE resources.resource_hex=? OR resources.resource_instance_uid=? OR resources.desc_key=? OR resources.alias_group=?
             ORDER BY captures.id DESC LIMIT ?
             """,
-            (resource, args.resource, args.resource, args.limit),
+            (resource, args.resource, args.resource, args.resource, args.limit),
         ).fetchall()
         lifetimes = con.execute(
             """
             SELECT * FROM resource_lifetimes
-            WHERE resource_hex=? OR view_key=? OR alias_group=?
+            WHERE resource_hex=? OR resource_instance_uid=? OR view_key=? OR alias_group=?
             ORDER BY capture_id DESC, reader_count + writer_count DESC LIMIT ?
             """,
-            (resource, args.resource, args.resource, args.limit),
+            (resource, args.resource, args.resource, args.resource, args.limit),
         ).fetchall()
     for row in rows:
-        print(f"cap={row['capture_id']} res={row['resource_hex']} desc={row['desc_key']} alias={row['alias_group']} session={row['session_dir']}")
+        print(
+            f"cap={row['capture_id']} res={row['resource_hex']} gen={row['resource_generation']} "
+            f"uid={row['resource_instance_uid']} desc={row['desc_key']} class={row['classification']} "
+            f"alias={row['alias_group']} session={row['session_dir']}"
+        )
     for life in lifetimes:
-        print(f"  lifetime cap={life['capture_id']} res={life['resource_hex']} view={life['view_key']} writers={life['writer_count']} readers={life['reader_count']} events={life['first_event']}..{life['last_event']} class={life['classification']}")
+        print(
+            f"  lifetime cap={life['capture_id']} res={life['resource_hex']} gen={life['resource_generation']} "
+            f"uid={life['resource_instance_uid']} view={life['view_key']} writers={life['writer_count']} "
+            f"readers={life['reader_count']} events={life['first_event']}..{life['last_event']} class={life['classification']}"
+        )
     return 0
 
 
@@ -1449,9 +1534,24 @@ def cmd_explain_event(args: argparse.Namespace) -> int:
             print(f"event not found: capture={args.capture_id} event={args.event}", file=sys.stderr)
             return 1
         lineage = con.execute(
-            "SELECT * FROM lineage_paths WHERE capture_id=? AND consumer_event=? ORDER BY root, slot",
+            "SELECT * FROM lineage_edges WHERE capture_id=? AND consumer_event=? ORDER BY root, slot",
             (args.capture_id, args.event),
         ).fetchall()
+        shader_roles = []
+        for crc, stage in ((event["ps_crc"], "ps"), (event["cs_crc"], "cs"), (event["vs_crc"], "vs")):
+            if not crc:
+                continue
+            shader_roles.extend(
+                con.execute(
+                    """
+                    SELECT shader_crc, stage, role, confidence, reason
+                    FROM shader_roles
+                    WHERE shader_crc=? AND stage=?
+                    ORDER BY confidence DESC
+                    """,
+                    (crc, stage),
+                ).fetchall()
+            )
         writes = []
         doc = json.loads(event["json"] or "{}")
         for write in doc.get("writes", []):
@@ -1467,7 +1567,8 @@ def cmd_explain_event(args: argparse.Namespace) -> int:
     out = {
         "event": dict(event) | {"json": doc},
         "writes": writes,
-        "reads": [dict(row) | {"path_json": json.loads(row["path_json"] or "{}")} for row in lineage],
+        "reads": [dict(row) | {"json": json.loads(row["json"] or "{}")} for row in lineage],
+        "shader_roles": [dict(row) for row in shader_roles],
         "issues": [dict(row) | {"json": json.loads(row["json"] or "{}")} for row in issues],
     }
     print(pretty_json(out))

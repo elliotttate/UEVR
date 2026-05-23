@@ -99,7 +99,10 @@ def resource_label(resource: dict[str, Any]) -> str:
     fmt = desc.get("format", 0)
     alias = resource.get("alias_group") or ""
     name = resource.get("name") or ""
+    gen = resource.get("resource_generation")
     parts = [resource.get("resource_hex", "0x0"), dims, f"fmt={fmt}"]
+    if gen:
+        parts.append(f"gen={gen}")
     if alias:
         parts.append(f"alias={alias}")
     if name:
@@ -138,6 +141,7 @@ def cmd_summary(args: argparse.Namespace) -> int:
             if cs:
                 shader_counts[f"cs:{event.get('cs_crc_hex', hex(cs))}"] += 1
     diff = s.eye_diff()
+    lineage = s.lineage()
     issues = diff.get("issues", [])
     severities = Counter(i.get("severity", "?") for i in issues)
     print(f"session: {s.path}")
@@ -147,6 +151,17 @@ def cmd_summary(args: argparse.Namespace) -> int:
     print(f"resources: {len(s.resources())}")
     print(f"descriptors: {len(s.descriptors())}")
     print(f"issues: {len(issues)} {dict(severities)}")
+    if isinstance(lineage.get("validation"), dict):
+        validation = lineage["validation"]
+        print(
+            "lineage_validation: "
+            f"reads={validation.get('read_count', 0)} "
+            f"no_producer={validation.get('reads_without_producer', 0)} "
+            f"history={validation.get('reads_with_history_producer', 0)} "
+            f"static_candidates={validation.get('static_imported_candidates', 0)} "
+            f"alias_reads={validation.get('alias_reads', 0)} "
+            f"released_reads={validation.get('released_resource_reads', 0)}"
+        )
     print("top_shaders:")
     for shader, count in shader_counts.most_common(12):
         print(f"  {shader} count={count}")
@@ -164,8 +179,10 @@ def cmd_issues(args: argparse.Namespace) -> int:
         print_json(issues)
         return 0
     for issue in issues[: args.limit]:
-        left = issue.get("left_event") or issue.get("sample_left_event", {}).get("event_index")
-        right = issue.get("right_event") or issue.get("sample_right_event", {}).get("event_index")
+        sample_left = issue.get("sample_left_event") or {}
+        sample_right = issue.get("sample_right_event") or {}
+        left = issue.get("left_event") or sample_left.get("event_index")
+        right = issue.get("right_event") or sample_right.get("event_index")
         confidence = issue.get("pair_confidence")
         suffix = f" confidence={confidence:.2f}" if isinstance(confidence, (int, float)) else ""
         print(f"{issue.get('severity','?'):>6} {issue.get('kind','?')} left={left} right={right}{suffix}")
@@ -268,7 +285,15 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         desc = read.get("descriptor", {})
         print(f"event={args.event} root={read.get('root')} slot={read.get('slot')} type={read.get('descriptor_type')}")
         print(f"  descriptor={read.get('cpu_hex')} source={read.get('source_cpu_hex')}")
-        print(f"  resource={read.get('resource_hex')} desc_key={desc.get('resource_desc_key')}")
+        if read.get("shader_register_name"):
+            print(
+                f"  shader_binding={read.get('binding_type')} {read.get('shader_register_name')} "
+                f"space={read.get('register_space')}"
+            )
+        print(
+            f"  resource={read.get('resource_hex')} gen={read.get('resource_generation')} "
+            f"uid={read.get('resource_instance_uid')} desc_key={desc.get('resource_desc_key')}"
+        )
         print(f"  view_key={read.get('view_key') or desc.get('view_key')}")
         print(f"  mip={desc.get('most_detailed_mip', desc.get('mip_slice'))} slice={desc.get('first_array_slice')} plane={desc.get('plane_slice')}")
         print(f"  classification={read.get('classification', {})}")

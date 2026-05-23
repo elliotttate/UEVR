@@ -28,12 +28,14 @@ EXECUTABLE_ACTIONS = {
     "swap_cbv_left_to_right",
     "swap_descriptor_from_left",
     "force_srv_array_slice",
+    "neutralize_texture",
 }
 
 MUTATION_ACTIONS = {
     "swap_cbv_left_to_right",
     "swap_descriptor_from_left",
     "force_srv_array_slice",
+    "neutralize_texture",
 }
 
 UNSUPPORTED_ACTIONS = {

@@ -3,6 +3,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -27,6 +28,62 @@
 using json = nlohmann::json;
 
 namespace {
+
+bool should_log_forensics_exception(std::string_view api, uint64_t* out_count = nullptr) noexcept {
+    try {
+        static std::mutex mutex;
+        static std::unordered_map<std::string, uint64_t> counts;
+        uint64_t count = 0;
+        {
+            std::scoped_lock _{mutex};
+            count = ++counts[std::string{api}];
+        }
+        if (out_count != nullptr) {
+            *out_count = count;
+        }
+        return count <= 8 || (count % 256) == 0;
+    } catch (...) {
+        return false;
+    }
+}
+
+void log_forensics_exception(std::string_view api, const std::exception& e) noexcept {
+    try {
+        uint64_t count = 0;
+        if (should_log_forensics_exception(api, &count)) {
+            SPDLOG_WARN("[StereoForensics] {} failed; diagnostics event dropped: {} (count={})", api, e.what(), count);
+        }
+    } catch (...) {
+    }
+}
+
+void log_forensics_exception(std::string_view api) noexcept {
+    try {
+        uint64_t count = 0;
+        if (should_log_forensics_exception(api, &count)) {
+            SPDLOG_WARN("[StereoForensics] {} failed with unknown exception; diagnostics event dropped (count={})", api, count);
+        }
+    } catch (...) {
+    }
+}
+
+#define STEREO_FORENSICS_TRY(api_name) try
+#define STEREO_FORENSICS_CATCH_VOID(api_name) \
+    catch (const std::exception& e) { \
+        log_forensics_exception((api_name), e); \
+        return; \
+    } catch (...) { \
+        log_forensics_exception((api_name)); \
+        return; \
+    }
+#define STEREO_FORENSICS_CATCH_RETURN(api_name, fallback_value) \
+    catch (const std::exception& e) { \
+        log_forensics_exception((api_name), e); \
+        return (fallback_value); \
+    } catch (...) { \
+        log_forensics_exception((api_name)); \
+        return (fallback_value); \
+    }
 
 bool env_truthy(const char* name) {
     char value[32]{};
@@ -58,6 +115,22 @@ uint64_t env_u64(const char* name, uint64_t fallback) {
     return end != value.c_str() ? parsed : fallback;
 }
 
+template <typename T>
+T json_value_or(const json& object, const char* key, T fallback) {
+    if (!object.is_object()) {
+        return fallback;
+    }
+    const auto it = object.find(key);
+    if (it == object.end() || it->is_null()) {
+        return fallback;
+    }
+    try {
+        return it->get<T>();
+    } catch (...) {
+        return fallback;
+    }
+}
+
 std::string hex_u64(uint64_t value) {
     std::ostringstream ss;
     ss << "0x" << std::hex << std::uppercase << value;
@@ -76,8 +149,36 @@ std::string resource_uid(uint64_t resource) {
     return resource == 0 ? std::string{} : ("resource:" + hex_u64(resource));
 }
 
+std::string resource_instance_uid(uint64_t resource, uint64_t generation) {
+    if (resource == 0) {
+        return {};
+    }
+    return resource_uid(resource) + "#gen:" + std::to_string(std::max<uint64_t>(1, generation));
+}
+
+bool is_resource_create_source(std::string_view source) {
+    return source == "D3D12Hook::CreateCommittedResource" ||
+        source == "D3D12Hook::CreatePlacedResource";
+}
+
 std::string descriptor_view_uid(const std::string& view_key) {
     return view_key.empty() ? std::string{} : ("view:" + view_key);
+}
+
+const char* register_prefix_for_range_type(std::string_view type) {
+    if (type == "srv") {
+        return "t";
+    }
+    if (type == "uav") {
+        return "u";
+    }
+    if (type == "cbv") {
+        return "b";
+    }
+    if (type == "sampler") {
+        return "s";
+    }
+    return "";
 }
 
 std::string pso_uid(uint64_t pipeline_state) {
@@ -368,24 +469,168 @@ std::unordered_map<uint32_t, uint64_t> root_hash_map(const json& roots) {
     return out;
 }
 
+json root_signature_layout_json(uintptr_t root_signature, uintptr_t pipeline_state) {
+    auto& diagnostics = render::D3D12Diagnostics::get();
+    auto info = diagnostics.root_signature(root_signature);
+    if (!info.has_value() && pipeline_state != 0) {
+        info = diagnostics.root_signature_for_pipeline(pipeline_state);
+    }
+    if (!info.has_value()) {
+        return json::object();
+    }
+
+    json parameters = json::array();
+    for (const auto& parameter : info->parameters) {
+        json ranges = json::array();
+        uint32_t append_offset = 0;
+        for (const auto& range : parameter.ranges) {
+            const bool appends = range.offset_from_table_start == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+            const auto effective_offset = appends ? append_offset : range.offset_from_table_start;
+            ranges.push_back({
+                {"type", range.type},
+                {"base_shader_register", range.base_shader_register},
+                {"num_descriptors", range.num_descriptors},
+                {"register_space", range.register_space},
+                {"offset_from_table_start", range.offset_from_table_start},
+                {"effective_offset_from_table_start", effective_offset},
+                {"appended", appends}
+            });
+            if (range.num_descriptors == UINT_MAX) {
+                append_offset = UINT_MAX;
+            } else if (append_offset != UINT_MAX) {
+                append_offset = effective_offset + range.num_descriptors;
+            }
+        }
+
+        parameters.push_back({
+            {"index", parameter.index},
+            {"parameter_type", parameter.parameter_type},
+            {"visibility", parameter.visibility},
+            {"shader_register", parameter.shader_register},
+            {"register_space", parameter.register_space},
+            {"num_32bit_values", parameter.num_32bit_values},
+            {"ranges", std::move(ranges)}
+        });
+    }
+
+    return {
+        {"root_signature", info->pointer},
+        {"root_signature_hex", hex_u64(info->pointer)},
+        {"root_signature_hash", info->blob_hash},
+        {"root_signature_hash_hex", hex_u64(info->blob_hash)},
+        {"version", info->version},
+        {"flags", info->flags},
+        {"static_sampler_count", info->static_sampler_count},
+        {"parameter_count", parameters.size()},
+        {"parameters", std::move(parameters)}
+    };
+}
+
+json root_binding_json(uintptr_t root_signature, uintptr_t pipeline_state, uint32_t root_parameter, uint32_t descriptor_index) {
+    auto& diagnostics = render::D3D12Diagnostics::get();
+    auto info = diagnostics.root_signature(root_signature);
+    if (!info.has_value() && pipeline_state != 0) {
+        info = diagnostics.root_signature_for_pipeline(pipeline_state);
+    }
+    if (!info.has_value()) {
+        return json::object();
+    }
+
+    for (const auto& parameter : info->parameters) {
+        if (parameter.index != root_parameter) {
+            continue;
+        }
+
+        json out{
+            {"root", root_parameter},
+            {"root_signature_hash", info->blob_hash},
+            {"root_signature_hash_hex", hex_u64(info->blob_hash)},
+            {"parameter_type", parameter.parameter_type},
+            {"visibility", parameter.visibility},
+            {"register_space", parameter.register_space}
+        };
+
+        if (parameter.parameter_type == "descriptor_table") {
+            uint32_t append_offset = 0;
+            json ranges = json::array();
+            for (const auto& range : parameter.ranges) {
+                const bool appends = range.offset_from_table_start == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+                const auto effective_offset = appends ? append_offset : range.offset_from_table_start;
+                const uint64_t range_end = range.num_descriptors == UINT_MAX
+                    ? UINT64_MAX
+                    : static_cast<uint64_t>(effective_offset) + range.num_descriptors;
+                const bool in_range = descriptor_index >= effective_offset &&
+                    static_cast<uint64_t>(descriptor_index) < range_end;
+
+                ranges.push_back({
+                    {"type", range.type},
+                    {"base_shader_register", range.base_shader_register},
+                    {"num_descriptors", range.num_descriptors},
+                    {"register_space", range.register_space},
+                    {"offset_from_table_start", range.offset_from_table_start},
+                    {"effective_offset_from_table_start", effective_offset},
+                    {"appended", appends},
+                    {"contains_descriptor_index", in_range}
+                });
+
+                if (in_range) {
+                    const auto relative = descriptor_index - effective_offset;
+                    const auto shader_register = range.base_shader_register + relative;
+                    out["binding_type"] = range.type;
+                    out["descriptor_table_offset"] = descriptor_index;
+                    out["range_offset"] = effective_offset;
+                    out["range_relative_index"] = relative;
+                    out["shader_register"] = shader_register;
+                    out["register_space"] = range.register_space;
+                    const auto* prefix = register_prefix_for_range_type(range.type);
+                    if (*prefix != '\0') {
+                        out["shader_register_name"] = std::string{prefix} + std::to_string(shader_register);
+                    }
+                }
+
+                if (range.num_descriptors == UINT_MAX) {
+                    append_offset = UINT_MAX;
+                } else if (append_offset != UINT_MAX) {
+                    append_offset = effective_offset + range.num_descriptors;
+                }
+            }
+            out["ranges"] = std::move(ranges);
+            return out;
+        }
+
+        out["binding_type"] = parameter.parameter_type;
+        out["shader_register"] = parameter.shader_register;
+        if (parameter.parameter_type == "cbv") {
+            out["shader_register_name"] = "b" + std::to_string(parameter.shader_register);
+        } else if (parameter.parameter_type == "srv") {
+            out["shader_register_name"] = "t" + std::to_string(parameter.shader_register);
+        } else if (parameter.parameter_type == "uav") {
+            out["shader_register_name"] = "u" + std::to_string(parameter.shader_register);
+        }
+        return out;
+    }
+
+    return json{{"root", root_parameter}, {"missing_root_parameter", true}};
+}
+
 std::string descriptor_view_key(const json& descriptor, uint64_t fallback_resource = 0, std::string_view fallback_kind = {}) {
-    const auto resource = descriptor.value("resource", fallback_resource);
-    const auto kind = descriptor.value("kind", std::string{fallback_kind});
-    const auto format = descriptor.value("format", 0u);
-    const auto view_dimension = descriptor.value("view_dimension", 0u);
-    const auto mip = descriptor.contains("most_detailed_mip")
-        ? descriptor.value("most_detailed_mip", 0u)
-        : descriptor.value("mip_slice", 0u);
-    const auto mip_levels = descriptor.value("mip_levels", 0u);
-    const auto first_array_slice = descriptor.value("first_array_slice", 0u);
-    const auto array_size = descriptor.value("array_size", 0u);
-    const auto plane_slice = descriptor.value("plane_slice", 0u);
-    const auto first_w_slice = descriptor.value("first_w_slice", 0u);
-    const auto w_size = descriptor.value("w_size", 0u);
-    const auto first_element = descriptor.value("first_element", 0ull);
-    const auto num_elements = descriptor.value("num_elements", 0u);
-    const auto buffer_location = descriptor.value("buffer_location", 0ull);
-    const auto size_in_bytes = descriptor.value("size_in_bytes", 0u);
+    const auto resource = json_value_or<uint64_t>(descriptor, "resource", fallback_resource);
+    const auto kind = json_value_or<std::string>(descriptor, "kind", std::string{fallback_kind});
+    const auto format = json_value_or<uint32_t>(descriptor, "format", 0u);
+    const auto view_dimension = json_value_or<uint32_t>(descriptor, "view_dimension", 0u);
+    const auto mip = descriptor.is_object() && descriptor.contains("most_detailed_mip")
+        ? json_value_or<uint32_t>(descriptor, "most_detailed_mip", 0u)
+        : json_value_or<uint32_t>(descriptor, "mip_slice", 0u);
+    const auto mip_levels = json_value_or<uint32_t>(descriptor, "mip_levels", 0u);
+    const auto first_array_slice = json_value_or<uint32_t>(descriptor, "first_array_slice", 0u);
+    const auto array_size = json_value_or<uint32_t>(descriptor, "array_size", 0u);
+    const auto plane_slice = json_value_or<uint32_t>(descriptor, "plane_slice", 0u);
+    const auto first_w_slice = json_value_or<uint32_t>(descriptor, "first_w_slice", 0u);
+    const auto w_size = json_value_or<uint32_t>(descriptor, "w_size", 0u);
+    const auto first_element = json_value_or<uint64_t>(descriptor, "first_element", 0ull);
+    const auto num_elements = json_value_or<uint32_t>(descriptor, "num_elements", 0u);
+    const auto buffer_location = json_value_or<uint64_t>(descriptor, "buffer_location", 0ull);
+    const auto size_in_bytes = json_value_or<uint32_t>(descriptor, "size_in_bytes", 0u);
 
     std::ostringstream ss;
     ss << hex_u64(resource) << '|' << kind
@@ -520,17 +765,41 @@ struct StereoForensics::Impl {
     mutable std::recursive_mutex mutex;
     bool enabled{env_truthy("UEVR_STEREO_FORENSICS")};
     bool experiments_enabled{env_truthy("UEVR_STEREO_EXPERIMENTS")};
-    uint64_t max_events_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_FRAME", 100000)};
+    uint64_t max_events_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_FRAME", 5000)};
+    uint64_t frame_stride{std::max<uint64_t>(1, env_u64("UEVR_STEREO_FORENSICS_FRAME_STRIDE", 30))};
+    uint64_t start_frame{std::max<uint64_t>(1, env_u64("UEVR_STEREO_FORENSICS_START_FRAME", 1))};
+    uint64_t max_captured_frames{env_u64("UEVR_STEREO_FORENSICS_MAX_CAPTURED_FRAMES", 16)};
+    uint64_t max_total_events{env_u64("UEVR_STEREO_FORENSICS_MAX_TOTAL_EVENTS", 80000)};
+    uint64_t max_total_bytes{env_u64("UEVR_STEREO_FORENSICS_MAX_TOTAL_BYTES", 128ull * 1024ull * 1024ull)};
+    uint64_t max_events_per_kind_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_KIND_PER_FRAME", 3000)};
+    uint64_t max_pso_binds_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_SET_PSO_PER_FRAME", 256)};
+    uint64_t max_root_binds_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_ROOT_BINDS_PER_FRAME", 2048)};
+    uint64_t flush_every_captured_frames{std::max<uint64_t>(1, env_u64("UEVR_STEREO_FORENSICS_FLUSH_EVERY_CAPTURED_FRAMES", 1))};
     uint64_t max_descriptors{env_u64("UEVR_STEREO_FORENSICS_MAX_DESCRIPTORS", 262144)};
     uint64_t max_writer_history{env_u64("UEVR_STEREO_FORENSICS_MAX_WRITER_HISTORY", 100000)};
     std::filesystem::path base_dir{env_string("UEVR_STEREO_FORENSICS_DIR", "C:\\tmp\\uevr_forensics")};
+    std::filesystem::path arm_file{env_string("UEVR_STEREO_FORENSICS_ARM_FILE", "C:\\tmp\\uevr_forensics_arm.txt")};
     std::filesystem::path session;
+    std::ofstream events_stream;
     bool frame_started{};
+    bool capture_frame_active{};
+    bool capture_stopped{};
+    std::atomic<bool> capture_frame_active_atomic{false};
+    std::atomic<bool> capture_stopped_atomic{false};
+    bool capture_complete_logged{};
     uint64_t frame{};
     uint64_t event_index{};
     uint64_t dropped_events{};
+    uint64_t dropped_events_total{};
+    uint64_t captured_frames{};
+    uint64_t skipped_frames{};
+    uint64_t total_events_recorded{};
+    uint64_t total_events_written{};
+    uint64_t total_event_bytes{};
     json frame_context = json::object();
     std::vector<json> frame_events;
+    std::unordered_map<std::string, uint64_t> frame_event_kind_counts;
+    std::unordered_map<std::string, uint64_t> dropped_event_kind_counts;
     std::unordered_map<uintptr_t, json> resources;
     std::unordered_map<uintptr_t, json> descriptors;
     std::unordered_map<uintptr_t, json> descriptor_heaps;
@@ -548,7 +817,10 @@ struct StereoForensics::Impl {
             return false;
         }
         if (!session.empty()) {
-            return true;
+            if (!events_stream.is_open()) {
+                events_stream.open(session / "events.jsonl", std::ios::binary | std::ios::app);
+            }
+            return events_stream.is_open();
         }
 
         const auto now = std::chrono::system_clock::now();
@@ -570,24 +842,132 @@ struct StereoForensics::Impl {
             return false;
         }
 
+        events_stream.open(session / "events.jsonl", std::ios::binary | std::ios::app);
+        if (!events_stream) {
+            SPDLOG_WARN("[StereoForensics] failed to open events stream at {}", (session / "events.jsonl").string());
+            session.clear();
+            return false;
+        }
+
         SPDLOG_INFO("[StereoForensics] session started at {}", session.string());
         return true;
+    }
+
+    bool hard_capture_limit_reached_locked() const {
+        if (max_captured_frames != 0 && captured_frames >= max_captured_frames) {
+            return true;
+        }
+        if (max_total_events != 0 && total_events_recorded >= max_total_events) {
+            return true;
+        }
+        if (max_total_bytes != 0 && total_event_bytes >= max_total_bytes) {
+            return true;
+        }
+        return false;
+    }
+
+    bool should_capture_frame_locked(uint64_t frame_number) const {
+        if (!enabled || capture_stopped || hard_capture_limit_reached_locked()) {
+            return false;
+        }
+        if (frame_number < start_frame) {
+            return false;
+        }
+        return ((frame_number - start_frame) % frame_stride) == 0;
+    }
+
+    void set_capture_state_locked(bool active, bool stopped) {
+        capture_frame_active = active;
+        capture_stopped = stopped;
+        capture_frame_active_atomic.store(active, std::memory_order_relaxed);
+        capture_stopped_atomic.store(stopped, std::memory_order_relaxed);
+    }
+
+    void log_capture_complete_locked() {
+        if (capture_complete_logged) {
+            return;
+        }
+        capture_complete_logged = true;
+        SPDLOG_INFO(
+            "[StereoForensics] capture complete: captured_frames={} total_events={} bytes={} dropped={} session={}",
+            captured_frames,
+            total_events_written,
+            total_event_bytes,
+            dropped_events_total,
+            session.string());
+    }
+
+    void check_arm_file_locked() {
+        if (arm_file.empty()) {
+            return;
+        }
+        std::error_code ec;
+        if (!std::filesystem::exists(arm_file, ec)) {
+            return;
+        }
+        std::filesystem::remove(arm_file, ec);
+        captured_frames = 0;
+        start_frame = frame + 1;
+        capture_complete_logged = false;
+        set_capture_state_locked(false, false);
+        SPDLOG_INFO(
+            "[StereoForensics] capture armed by {}; next eligible frame={} stride={} max_captured_frames={}",
+            arm_file.string(),
+            start_frame,
+            frame_stride,
+            max_captured_frames);
+    }
+
+    uint64_t per_kind_cap_locked(const json& event) const {
+        const auto kind = event.value("kind", std::string{});
+        if (kind == "set_pso") {
+            return max_pso_binds_per_frame;
+        }
+        if (event.value("event_class", std::string{}) == "bind" && event.contains("root")) {
+            return max_root_binds_per_frame;
+        }
+        return max_events_per_kind_per_frame;
+    }
+
+    void drop_event_locked(const json& event) {
+        ++dropped_events;
+        ++dropped_events_total;
+        const auto kind = event.value("kind", std::string{"(unknown)"});
+        ++dropped_event_kind_counts[kind.empty() ? "(empty)" : kind];
     }
 
     uint64_t push_event_locked(json event) {
         if (!enabled || !ensure_session_locked()) {
             return 0;
         }
-        if (frame_events.size() >= max_events_per_frame) {
-            ++dropped_events;
+        if (!capture_frame_active || capture_stopped) {
             return 0;
         }
+        if (max_total_events != 0 && total_events_recorded >= max_total_events) {
+            set_capture_state_locked(capture_frame_active, true);
+            drop_event_locked(event);
+            return 0;
+        }
+        if (max_events_per_frame != 0 && frame_events.size() >= max_events_per_frame) {
+            drop_event_locked(event);
+            return 0;
+        }
+
+        const auto kind = event.value("kind", std::string{"(unknown)"});
+        const auto cap = per_kind_cap_locked(event);
+        auto& kind_count = frame_event_kind_counts[kind.empty() ? "(empty)" : kind];
+        if (cap != 0 && kind_count >= cap) {
+            drop_event_locked(event);
+            return 0;
+        }
+        ++kind_count;
 
         const auto index = ++event_index;
         event["frame"] = frame;
         event["event_index"] = index;
         event["event_uid"] = event_uid(frame, index);
         frame_events.emplace_back(std::move(event));
+        ++total_events_recorded;
         return index;
     }
 
@@ -602,6 +982,9 @@ struct StereoForensics::Impl {
                 {"resource", resource},
                 {"resource_hex", hex_u64(resource)},
                 {"resource_uid", resource_uid(resource)},
+                {"resource_generation", 1},
+                {"resource_instance_uid", resource_instance_uid(resource, 1)},
+                {"resource_reuse_detected", false},
                 {"first_seen_frame", frame},
                 {"last_seen_frame", frame},
                 {"desc", json::object()},
@@ -610,6 +993,12 @@ struct StereoForensics::Impl {
             it = resources.emplace(resource, std::move(rec)).first;
         } else {
             it->second["last_seen_frame"] = frame;
+            if (!it->second.contains("resource_generation")) {
+                it->second["resource_generation"] = 1;
+            }
+            it->second["resource_instance_uid"] = resource_instance_uid(
+                resource,
+                it->second.value("resource_generation", 1ull));
         }
         return it->second.value("id", 0ull);
     }
@@ -638,6 +1027,44 @@ struct StereoForensics::Impl {
         const auto key = reinterpret_cast<uintptr_t>(resource);
         const auto id = resource_id_locked(key);
         auto& rec = resources[key];
+        const auto new_desc = resource_desc_json(actual_desc);
+        json desc_holder{{"desc", new_desc}};
+        const auto new_desc_key = resource_desc_key(desc_holder);
+        const auto old_desc_key = rec.value("desc_key", std::string{});
+        const auto old_generation = std::max<uint64_t>(1, rec.value("resource_generation", 1ull));
+        auto generation = old_generation;
+        bool generation_bumped = false;
+        auto bump_generation = [&](const char* reason) {
+            if (!generation_bumped) {
+                generation = old_generation + 1;
+                generation_bumped = true;
+            }
+            rec["resource_reuse_detected"] = true;
+            rec["last_reuse_reason"] = reason;
+            rec["last_reuse_frame"] = frame;
+        };
+
+        const bool creation_source = is_resource_create_source(source);
+        const auto create_count = rec.value("create_count", 0ull);
+        if (creation_source) {
+            if (create_count > 0) {
+                bump_generation(rec.value("released", false)
+                    ? "create_after_final_release"
+                    : "create_reused_live_pointer");
+            }
+            rec["create_count"] = create_count + 1;
+            rec["last_create_frame"] = frame;
+            if (!rec.contains("first_create_frame")) {
+                rec["first_create_frame"] = frame;
+            }
+            rec["released"] = false;
+        }
+        if (!old_desc_key.empty() && old_desc_key != new_desc_key) {
+            rec["prior_desc_key"] = old_desc_key;
+            rec["desc_key_changed_frame"] = frame;
+            bump_generation("resource_desc_changed_for_pointer");
+        }
+
         const bool preserve_placement =
             !placed &&
             heap == 0 &&
@@ -647,6 +1074,8 @@ struct StereoForensics::Impl {
         rec["resource"] = key;
         rec["resource_hex"] = hex_u64(key);
         rec["resource_uid"] = resource_uid(key);
+        rec["resource_generation"] = generation;
+        rec["resource_instance_uid"] = resource_instance_uid(key, generation);
         rec["last_seen_frame"] = frame;
         rec["source"] = std::string{source};
         if (!preserve_placement) {
@@ -662,12 +1091,24 @@ struct StereoForensics::Impl {
                 rec["heap_type_id"] = static_cast<uint32_t>(heap_props->Type);
             }
         }
-        rec["desc"] = resource_desc_json(actual_desc);
-        rec["desc_key"] = resource_desc_key(rec);
+        rec["desc"] = new_desc;
+        rec["desc_key"] = new_desc_key;
         if (!preserve_placement) {
             rec["alias_group"] = placed
                 ? (hex_u64(heap) + "+" + hex_u64(heap_offset) + ":" + std::to_string(approx_resource_bytes(actual_desc)))
                 : "";
+        }
+        const std::string allocation_classification = placed
+            ? "placed_resource"
+            : (creation_source ? "committed_resource" : "descriptor_observed_resource");
+        rec["allocation_classification"] = allocation_classification;
+        if (placed && actual_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            rec["transient_pool_candidate"] = true;
+        }
+        if (rec.value("classification", std::string{}) != "frame_written") {
+            rec["classification"] = placed
+                ? "placed_transient_candidate"
+                : allocation_classification;
         }
         const auto name = try_debug_name(resource);
         if (!name.empty()) {
@@ -699,18 +1140,24 @@ struct StereoForensics::Impl {
             const auto rit = resources.find(resource);
             if (rit != resources.end()) {
                 rec["resource_desc_key"] = rit->second.value("desc_key", std::string{});
+                rec["resource_generation"] = rit->second.value("resource_generation", 1ull);
+                rec["resource_instance_uid"] = rit->second.value("resource_instance_uid", resource_instance_uid(resource, 1));
             }
         }
         return rec;
     }
 
     void publish_descriptor_locked(json rec) {
-        if (descriptors.size() >= max_descriptors && !descriptors.contains(rec.value("cpu", 0ull))) {
+        const auto cpu = json_value_or<uint64_t>(rec, "cpu", 0ull);
+        if (cpu == 0) {
+            return;
+        }
+        if (descriptors.size() >= max_descriptors && !descriptors.contains(cpu)) {
             return;
         }
         rec["view_key"] = descriptor_view_key(rec);
-        rec["descriptor_view_uid"] = descriptor_view_uid(rec.value("view_key", std::string{}));
-        descriptors[rec.value("cpu", 0ull)] = std::move(rec);
+        rec["descriptor_view_uid"] = descriptor_view_uid(json_value_or<std::string>(rec, "view_key", std::string{}));
+        descriptors[cpu] = std::move(rec);
     }
 
     std::optional<json> descriptor_for_cpu_locked(uintptr_t cpu) const {
@@ -721,7 +1168,10 @@ struct StereoForensics::Impl {
         return it->second;
     }
 
-    json descriptor_use_locked(const D3D12Diagnostics::DescriptorReadInfo& read) {
+    json descriptor_use_locked(
+        const D3D12Diagnostics::DescriptorReadInfo& read,
+        uintptr_t root_signature,
+        uintptr_t pipeline_state) {
         json use{
             {"root", read.root_parameter},
             {"slot", read.descriptor_index},
@@ -734,6 +1184,22 @@ struct StereoForensics::Impl {
             {"resource_id", resource_id_locked(read.resource)},
             {"descriptor_type", read.descriptor_type}
         };
+        auto binding = root_binding_json(root_signature, pipeline_state, read.root_parameter, read.descriptor_index);
+        if (!binding.empty()) {
+            use["root_binding"] = binding;
+            if (binding.contains("binding_type")) {
+                use["binding_type"] = binding["binding_type"];
+            }
+            if (binding.contains("shader_register")) {
+                use["shader_register"] = binding["shader_register"];
+            }
+            if (binding.contains("shader_register_name")) {
+                use["shader_register_name"] = binding["shader_register_name"];
+            }
+            if (binding.contains("register_space")) {
+                use["register_space"] = binding["register_space"];
+            }
+        }
 
         auto desc = descriptor_for_cpu_locked(read.descriptor_cpu);
         if (!desc.has_value() && read.descriptor_source_cpu != 0) {
@@ -748,7 +1214,12 @@ struct StereoForensics::Impl {
             }
         }
         if (use.value("resource", 0ull) != 0) {
-            use["resource_uid"] = resource_uid(use.value("resource", 0ull));
+            const auto resource = use.value("resource", 0ull);
+            use["resource_uid"] = resource_uid(resource);
+            if (const auto rit = resources.find(resource); rit != resources.end()) {
+                use["resource_generation"] = rit->second.value("resource_generation", 1ull);
+                use["resource_instance_uid"] = rit->second.value("resource_instance_uid", resource_instance_uid(resource, 1));
+            }
         }
 
         std::string view_key;
@@ -808,9 +1279,12 @@ struct StereoForensics::Impl {
 
     json classify_read_locked(uintptr_t resource, const std::string& view_key) const {
         json out{
-            {"kind", "static_or_imported"},
+            {"kind", "unknown"},
+            {"resource_known", false},
             {"has_resource_producer", false},
             {"has_view_producer", false},
+            {"has_current_frame_resource_producer", false},
+            {"has_current_frame_view_producer", false},
             {"alias_reused", false},
             {"alias_barrier_generation", 0}
         };
@@ -823,20 +1297,56 @@ struct StereoForensics::Impl {
         const auto view_producer = view_key.empty() ? last_writer_by_view.end() : last_writer_by_view.find(view_key);
         out["has_resource_producer"] = resource_producer != last_writer_by_resource.end();
         out["has_view_producer"] = view_producer != last_writer_by_view.end();
+        if (resource_producer != last_writer_by_resource.end()) {
+            out["resource_producer_frame"] = resource_producer->second.frame;
+            out["resource_producer_event"] = resource_producer->second.event_index;
+            out["has_current_frame_resource_producer"] = resource_producer->second.frame == frame;
+        }
         if (view_producer != last_writer_by_view.end()) {
-            out["kind"] = "frame_produced_view";
+            out["view_producer_frame"] = view_producer->second.frame;
+            out["view_producer_event"] = view_producer->second.event_index;
+            out["has_current_frame_view_producer"] = view_producer->second.frame == frame;
+        }
+        if (view_producer != last_writer_by_view.end()) {
+            out["kind"] = view_producer->second.frame == frame
+                ? "frame_produced_view"
+                : "history_produced_view";
         } else if (resource_producer != last_writer_by_resource.end()) {
-            out["kind"] = "frame_produced_resource";
+            out["kind"] = resource_producer->second.frame == frame
+                ? "frame_produced_resource"
+                : "history_produced_resource";
         }
 
         const auto resource_it = resources.find(resource);
         if (resource_it != resources.end()) {
+            out["resource_known"] = true;
+            out["resource_generation"] = resource_it->second.value("resource_generation", 1ull);
+            out["resource_instance_uid"] = resource_it->second.value("resource_instance_uid", resource_instance_uid(resource, 1));
+            out["resource_classification"] = resource_it->second.value("classification", std::string{});
+            out["resource_first_seen_frame"] = resource_it->second.value("first_seen_frame", 0ull);
+            out["resource_last_seen_frame"] = resource_it->second.value("last_seen_frame", 0ull);
+            out["created_this_frame"] = resource_it->second.value("first_seen_frame", 0ull) == frame;
+            out["seen_before_frame"] = resource_it->second.value("first_seen_frame", frame) < frame;
+            out["static_imported_candidate"] =
+                !out.value("has_resource_producer", false) &&
+                resource_it->second.value("first_seen_frame", frame) < frame;
+            if (out.value("kind", std::string{}) == "unknown") {
+                if (out.value("static_imported_candidate", false)) {
+                    out["kind"] = "static_or_imported";
+                } else if (out.value("created_this_frame", false)) {
+                    out["kind"] = "created_unwritten_this_frame";
+                } else {
+                    out["kind"] = "known_unproduced_resource";
+                }
+            }
             const auto alias = resource_it->second.value("alias_group", std::string{});
             if (!alias.empty()) {
                 out["alias_group"] = alias;
                 out["alias_reused"] = true;
             }
             out["resource_desc_key"] = resource_it->second.value("desc_key", std::string{});
+        } else if (out.value("kind", std::string{}) == "unknown") {
+            out["kind"] = "unknown_resource";
         }
         const auto gen_it = alias_barrier_generation_by_resource.find(resource);
         if (gen_it != alias_barrier_generation_by_resource.end()) {
@@ -892,6 +1402,8 @@ struct StereoForensics::Impl {
         const auto rit = resources.find(resource);
         if (rit != resources.end()) {
             write["resource_desc_key"] = rit->second.value("desc_key", std::string{});
+            write["resource_generation"] = rit->second.value("resource_generation", 1ull);
+            write["resource_instance_uid"] = rit->second.value("resource_instance_uid", resource_instance_uid(resource, 1));
             if (rit->second.contains("alias_group")) {
                 write["alias_group"] = rit->second["alias_group"];
             }
@@ -931,6 +1443,16 @@ struct StereoForensics::Impl {
             last_writer_by_resource[resource] = producer;
             if (!producer.view_key.empty()) {
                 last_writer_by_view[producer.view_key] = producer;
+            }
+            auto& resource_rec = resources[resource];
+            resource_rec["classification"] = "frame_written";
+            resource_rec["last_writer_frame"] = frame;
+            resource_rec["last_writer_event"] = pushed_index;
+            resource_rec["last_writer_kind"] = producer.kind;
+            resource_rec["last_writer_eye_bucket"] = producer.eye_bucket;
+            if (!resource_rec.contains("first_writer_frame")) {
+                resource_rec["first_writer_frame"] = frame;
+                resource_rec["first_writer_event"] = pushed_index;
             }
 
             json history = write;
@@ -1025,12 +1547,26 @@ struct StereoForensics::Impl {
     }
 
     void append_events_locked() {
-        std::ofstream out(session / "events.jsonl", std::ios::binary | std::ios::app);
-        if (!out) {
+        if (!events_stream.is_open()) {
+            events_stream.open(session / "events.jsonl", std::ios::binary | std::ios::app);
+        }
+        if (!events_stream) {
             return;
         }
         for (const auto& event : frame_events) {
-            out << event.dump() << '\n';
+            std::string line = event.dump();
+            const auto line_bytes = static_cast<uint64_t>(line.size() + 1);
+            if (max_total_bytes != 0 && total_event_bytes + line_bytes > max_total_bytes) {
+                set_capture_state_locked(capture_frame_active, true);
+                drop_event_locked(event);
+                break;
+            }
+            events_stream << line << '\n';
+            ++total_events_written;
+            total_event_bytes += line_bytes;
+        }
+        if ((captured_frames % flush_every_captured_frames) == 0) {
+            events_stream.flush();
         }
     }
 
@@ -1303,12 +1839,39 @@ struct StereoForensics::Impl {
 
     json build_lineage_locked() const {
         json edges = json::array();
+        std::unordered_map<std::string, uint64_t> classification_counts;
+        uint64_t read_count = 0;
+        uint64_t reads_without_producer = 0;
+        uint64_t reads_with_history_producer = 0;
+        uint64_t static_imported_candidates = 0;
+        uint64_t alias_reads = 0;
+        uint64_t released_resource_reads = 0;
         for (const auto& event : frame_events) {
             if (event.value("event_class", std::string{}) != "work") {
                 continue;
             }
             const auto consumer = event.value("event_index", 0ull);
             for (const auto& read : event.value("descriptor_reads", json::array())) {
+                ++read_count;
+                const auto classification = read.value("classification", json::object());
+                const auto class_kind = classification.value("kind", std::string{"unknown"});
+                ++classification_counts[class_kind];
+                if (!classification.value("has_resource_producer", false) &&
+                    !classification.value("has_view_producer", false)) {
+                    ++reads_without_producer;
+                }
+                if (class_kind == "history_produced_view" || class_kind == "history_produced_resource") {
+                    ++reads_with_history_producer;
+                }
+                if (classification.value("static_imported_candidate", false)) {
+                    ++static_imported_candidates;
+                }
+                if (classification.value("alias_reused", false)) {
+                    ++alias_reads;
+                }
+                if (classification.value("resource_classification", std::string{}) == "released") {
+                    ++released_resource_reads;
+                }
                 json edge{
                     {"consumer_event", consumer},
                     {"consumer_kind", event.value("kind", std::string{})},
@@ -1318,7 +1881,14 @@ struct StereoForensics::Impl {
                     {"descriptor_type", read.value("descriptor_type", std::string{})},
                     {"resource", read.value("resource", 0ull)},
                     {"resource_hex", read.value("resource_hex", std::string{})},
+                    {"resource_generation", read.value("resource_generation", 0ull)},
+                    {"resource_instance_uid", read.value("resource_instance_uid", std::string{})},
                     {"view_key", read.value("view_key", std::string{})},
+                    {"binding_type", read.value("binding_type", std::string{})},
+                    {"shader_register", read.value("shader_register", 0u)},
+                    {"shader_register_name", read.value("shader_register_name", std::string{})},
+                    {"register_space", read.value("register_space", 0u)},
+                    {"root_binding", read.value("root_binding", json::object())},
                     {"classification", read.value("classification", json::object())}
                 };
                 if (read.contains("descriptor")) {
@@ -1342,6 +1912,8 @@ struct StereoForensics::Impl {
             producers.push_back({
                 {"resource", resource},
                 {"resource_hex", hex_u64(resource)},
+                {"resource_generation", resources.contains(resource) ? resources.at(resource).value("resource_generation", 1ull) : 1ull},
+                {"resource_instance_uid", resources.contains(resource) ? resources.at(resource).value("resource_instance_uid", resource_instance_uid(resource, 1)) : resource_instance_uid(resource, 1)},
                 {"producer_frame", producer.frame},
                 {"producer_event", producer.event_index},
                 {"producer_kind", producer.kind},
@@ -1372,12 +1944,27 @@ struct StereoForensics::Impl {
             history.push_back(writer_history[i]);
         }
 
+        json class_counts_json = json::object();
+        for (const auto& [kind, count] : classification_counts) {
+            class_counts_json[kind] = count;
+        }
+
         return {
             {"frame", frame},
             {"read_edges", std::move(edges)},
             {"latest_resource_producers", std::move(producers)},
             {"latest_view_producers", std::move(view_producers)},
-            {"writer_history", std::move(history)}
+            {"writer_history", std::move(history)},
+            {"validation", {
+                {"read_count", read_count},
+                {"classification_counts", std::move(class_counts_json)},
+                {"reads_without_producer", reads_without_producer},
+                {"reads_with_history_producer", reads_with_history_producer},
+                {"static_imported_candidates", static_imported_candidates},
+                {"alias_reads", alias_reads},
+                {"released_resource_reads", released_resource_reads},
+                {"writer_history_count", writer_history.size()}
+            }}
         };
     }
 
@@ -1403,7 +1990,7 @@ struct StereoForensics::Impl {
         }
         return {
             {"enabled", experiments_enabled},
-            {"note", "v2 rule files are parsed. StereoForensics executes skip-style actions here; Sn2DebugColorOverride consumes color_override; D3D12Hook executes supported mutation actions (swap_cbv_left_to_right, swap_descriptor_from_left, force_srv_array_slice)."},
+            {"note", "v2 rule files are parsed. StereoForensics executes skip-style actions here; Sn2DebugColorOverride consumes color_override; D3D12Hook executes supported mutation actions (swap_cbv_left_to_right, swap_descriptor_from_left, force_srv_array_slice, neutralize_texture)."},
             {"runtime_capabilities", {
                 {"executable_actions", json::array({
                     "skip",
@@ -1412,12 +1999,14 @@ struct StereoForensics::Impl {
                     "color_override",
                     "swap_cbv_left_to_right",
                     "swap_descriptor_from_left",
-                    "force_srv_array_slice"
+                    "force_srv_array_slice",
+                    "neutralize_texture"
                 })},
                 {"mutation_actions", json::array({
                     "swap_cbv_left_to_right",
                     "swap_descriptor_from_left",
-                    "force_srv_array_slice"
+                    "force_srv_array_slice",
+                    "neutralize_texture"
                 })},
                 {"probe_actions", json::array({"color_override"})},
                 {"unsupported_actions", json::array({
@@ -1436,12 +2025,60 @@ struct StereoForensics::Impl {
         if (!enabled || !frame_started || !ensure_session_locked()) {
             return;
         }
+        if (!capture_frame_active) {
+            frame_events.clear();
+            frame_event_kind_counts.clear();
+            dropped_event_kind_counts.clear();
+            event_index = 0;
+            dropped_events = 0;
+            frame_started = false;
+            return;
+        }
+        bool final_capture_snapshot =
+            (max_captured_frames != 0 && captured_frames >= max_captured_frames) ||
+            (max_total_events != 0 && total_events_recorded >= max_total_events) ||
+            (max_total_bytes != 0 && total_event_bytes >= max_total_bytes);
 
         try {
             append_events_locked();
-            write_json_file_locked(session / "resources.json", {{"resources", resource_array_locked()}});
-            write_json_file_locked(session / "descriptors.json", {{"descriptors", descriptor_array_locked()}});
-            write_json_file_locked(session / "descriptor_heaps.json", {{"descriptor_heaps", descriptor_heap_array_locked()}});
+            if (hard_capture_limit_reached_locked()) {
+                set_capture_state_locked(capture_frame_active, true);
+                final_capture_snapshot = true;
+            }
+            json kind_counts = json::object();
+            for (const auto& [kind, count] : frame_event_kind_counts) {
+                kind_counts[kind] = count;
+            }
+            json dropped_kind_counts = json::object();
+            for (const auto& [kind, count] : dropped_event_kind_counts) {
+                dropped_kind_counts[kind] = count;
+            }
+            json limiter_status = {
+                {"capture_frame_active", capture_frame_active},
+                {"capture_stopped", capture_stopped},
+                {"frame_stride", frame_stride},
+                {"start_frame", start_frame},
+                {"captured_frames", captured_frames},
+                {"skipped_frames", skipped_frames},
+                {"max_captured_frames", max_captured_frames},
+                {"max_events_per_frame", max_events_per_frame},
+                {"max_events_per_kind_per_frame", max_events_per_kind_per_frame},
+                {"max_set_pso_per_frame", max_pso_binds_per_frame},
+                {"max_root_binds_per_frame", max_root_binds_per_frame},
+                {"max_total_events", max_total_events},
+                {"max_total_bytes", max_total_bytes},
+                {"total_events_recorded", total_events_recorded},
+                {"total_events_written", total_events_written},
+                {"total_event_bytes", total_event_bytes},
+                {"dropped_events_total", dropped_events_total},
+                {"frame_event_kind_counts", kind_counts},
+                {"dropped_event_kind_counts", dropped_kind_counts}
+            };
+            if (final_capture_snapshot) {
+                write_json_file_locked(session / "resources.json", {{"resources", resource_array_locked()}});
+                write_json_file_locked(session / "descriptors.json", {{"descriptors", descriptor_array_locked()}});
+                write_json_file_locked(session / "descriptor_heaps.json", {{"descriptor_heaps", descriptor_heap_array_locked()}});
+            }
             write_json_file_locked(session / "lineage.json", build_lineage_locked());
             write_json_file_locked(session / "eye_diff.json", build_eye_diff_locked());
             write_json_file_locked(session / "experiments.json", experiments_json_locked());
@@ -1451,6 +2088,7 @@ struct StereoForensics::Impl {
                 {"frame", frame},
                 {"event_count", frame_events.size()},
                 {"dropped_events", dropped_events},
+                {"limiter_status", limiter_status},
                 {"context", frame_context},
                 {"eye_diff_path", (session / "eye_diff.json").string()},
                 {"lineage_path", (session / "lineage.json").string()}
@@ -1462,6 +2100,7 @@ struct StereoForensics::Impl {
                 {"latest_frame", frame},
                 {"latest_frame_event_count", frame_events.size()},
                 {"dropped_events", dropped_events},
+                {"limiter_status", limiter_status},
                 {"events_jsonl", (session / "events.jsonl").string()},
                 {"resources", (session / "resources.json").string()},
                 {"descriptors", (session / "descriptors.json").string()},
@@ -1475,8 +2114,18 @@ struct StereoForensics::Impl {
         }
 
         frame_events.clear();
+        frame_event_kind_counts.clear();
+        dropped_event_kind_counts.clear();
         event_index = 0;
         dropped_events = 0;
+        set_capture_state_locked(false, capture_stopped);
+        if (capture_stopped) {
+            if (events_stream.is_open()) {
+                events_stream.flush();
+            }
+            log_capture_complete_locked();
+        }
+        frame_started = false;
     }
 };
 
@@ -1490,26 +2139,43 @@ StereoForensics::StereoForensics()
 }
 
 StereoForensics::~StereoForensics() {
+    STEREO_FORENSICS_TRY("~StereoForensics") {
     if (m_impl != nullptr) {
         std::scoped_lock _{m_impl->mutex};
         m_impl->finalize_frame_locked();
     }
+    } STEREO_FORENSICS_CATCH_VOID("~StereoForensics")
 }
 
 bool StereoForensics::is_enabled() const {
+    STEREO_FORENSICS_TRY("is_enabled") {
     return m_impl != nullptr && m_impl->enabled;
+    } STEREO_FORENSICS_CATCH_RETURN("is_enabled", false)
 }
 
 bool StereoForensics::experiments_enabled() const {
+    STEREO_FORENSICS_TRY("experiments_enabled") {
     return m_impl != nullptr && m_impl->experiments_enabled;
+    } STEREO_FORENSICS_CATCH_RETURN("experiments_enabled", false)
+}
+
+bool StereoForensics::is_capturing_this_frame() const {
+    STEREO_FORENSICS_TRY("is_capturing_this_frame") {
+    return m_impl != nullptr &&
+        m_impl->enabled &&
+        m_impl->capture_frame_active_atomic.load(std::memory_order_relaxed) &&
+        !m_impl->capture_stopped_atomic.load(std::memory_order_relaxed);
+    } STEREO_FORENSICS_CATCH_RETURN("is_capturing_this_frame", false)
 }
 
 std::filesystem::path StereoForensics::session_dir() const {
+    STEREO_FORENSICS_TRY("session_dir") {
     if (m_impl == nullptr) {
         return {};
     }
     std::scoped_lock _{m_impl->mutex};
     return m_impl->session;
+    } STEREO_FORENSICS_CATCH_RETURN("session_dir", std::filesystem::path())
 }
 
 void StereoForensics::begin_frame(
@@ -1522,14 +2188,29 @@ void StereoForensics::begin_frame(
     uint32_t display_height,
     bool proton_swapchain,
     bool framegen_swapchain) {
+    STEREO_FORENSICS_TRY("begin_frame") {
     if (!is_enabled()) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    m_impl->ensure_session_locked();
+    if (!m_impl->ensure_session_locked()) {
+        return;
+    }
     m_impl->finalize_frame_locked();
+    m_impl->check_arm_file_locked();
     ++m_impl->frame;
     m_impl->frame_started = true;
+    m_impl->set_capture_state_locked(m_impl->should_capture_frame_locked(m_impl->frame), m_impl->capture_stopped);
+    if (m_impl->capture_frame_active) {
+        ++m_impl->captured_frames;
+        m_impl->frame_events.reserve(static_cast<size_t>(std::min<uint64_t>(m_impl->max_events_per_frame, 8192)));
+    } else {
+        if (m_impl->hard_capture_limit_reached_locked()) {
+            m_impl->set_capture_state_locked(false, true);
+            m_impl->log_capture_complete_locked();
+        }
+        ++m_impl->skipped_frames;
+    }
     m_impl->frame_context = {
         {"device", reinterpret_cast<uintptr_t>(device)},
         {"device_hex", hex_u64(reinterpret_cast<uintptr_t>(device))},
@@ -1542,10 +2223,13 @@ void StereoForensics::begin_frame(
         {"display_width", display_width},
         {"display_height", display_height},
         {"proton_swapchain", proton_swapchain},
-        {"framegen_swapchain", framegen_swapchain}
+        {"framegen_swapchain", framegen_swapchain},
+        {"capture_frame_active", m_impl->capture_frame_active},
+        {"capture_stopped", m_impl->capture_stopped}
     };
     m_impl->load_experiments_locked();
     m_impl->push_event_locked({{"event_class", "frame"}, {"kind", "begin_frame"}, {"context", m_impl->frame_context}});
+    } STEREO_FORENSICS_CATCH_VOID("begin_frame")
 }
 
 void StereoForensics::record_descriptor_heap_created(
@@ -1553,10 +2237,14 @@ void StereoForensics::record_descriptor_heap_created(
     ID3D12DescriptorHeap* heap,
     const D3D12_DESCRIPTOR_HEAP_DESC* desc,
     UINT descriptor_stride) {
+    STEREO_FORENSICS_TRY("record_descriptor_heap_created") {
     if (!is_enabled() || heap == nullptr || desc == nullptr) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (m_impl->capture_stopped) {
+        return;
+    }
     const auto key = reinterpret_cast<uintptr_t>(heap);
     const auto cpu_base = heap->GetCPUDescriptorHandleForHeapStart().ptr;
     const auto gpu_base = (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0
@@ -1584,6 +2272,7 @@ void StereoForensics::record_descriptor_heap_created(
     }
     m_impl->descriptor_heaps[key] = rec;
     m_impl->push_event_locked({{"event_class", "create"}, {"kind", "create_descriptor_heap"}, {"source", std::string{source}}, {"heap", rec}});
+    } STEREO_FORENSICS_CATCH_VOID("record_descriptor_heap_created")
 }
 
 void StereoForensics::record_resource_created(
@@ -1593,13 +2282,18 @@ void StereoForensics::record_resource_created(
     const D3D12_HEAP_PROPERTIES* heap_props,
     D3D12_HEAP_FLAGS heap_flags,
     D3D12_RESOURCE_STATES initial_state) {
+    STEREO_FORENSICS_TRY("record_resource_created") {
     if (!is_enabled() || resource == nullptr) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (m_impl->capture_stopped) {
+        return;
+    }
     m_impl->update_resource_locked(source, resource, desc, false, 0, 0, heap_props, heap_flags, initial_state);
     const auto key = reinterpret_cast<uintptr_t>(resource);
     m_impl->push_event_locked({{"event_class", "create"}, {"kind", "create_committed_resource"}, {"source", std::string{source}}, {"resource", m_impl->resources[key]}});
+    } STEREO_FORENSICS_CATCH_VOID("record_resource_created")
 }
 
 void StereoForensics::record_placed_resource_created(
@@ -1609,6 +2303,7 @@ void StereoForensics::record_placed_resource_created(
     uint64_t heap_offset,
     const D3D12_RESOURCE_DESC* desc,
     D3D12_RESOURCE_STATES initial_state) {
+    STEREO_FORENSICS_TRY("record_placed_resource_created") {
     if (!is_enabled() || resource == nullptr) {
         return;
     }
@@ -1620,25 +2315,78 @@ void StereoForensics::record_placed_resource_created(
         heap_flags = heap_desc.Flags;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (m_impl->capture_stopped) {
+        return;
+    }
     m_impl->update_resource_locked(source, resource, desc, true, reinterpret_cast<uintptr_t>(heap), heap_offset, &heap_props, heap_flags, initial_state);
     const auto key = reinterpret_cast<uintptr_t>(resource);
     m_impl->push_event_locked({{"event_class", "create"}, {"kind", "create_placed_resource"}, {"source", std::string{source}}, {"resource", m_impl->resources[key]}});
+    } STEREO_FORENSICS_CATCH_VOID("record_placed_resource_created")
+}
+
+void StereoForensics::record_resource_released(
+    std::string_view source,
+    ID3D12Resource* resource,
+    uint32_t ref_count_after_release) {
+    STEREO_FORENSICS_TRY("record_resource_released") {
+    if (!is_enabled() || resource == nullptr) {
+        return;
+    }
+    std::scoped_lock _{m_impl->mutex};
+    if (m_impl->capture_stopped) {
+        return;
+    }
+    const auto key = reinterpret_cast<uintptr_t>(resource);
+    const auto id = m_impl->resource_id_locked(key);
+    auto& rec = m_impl->resources[key];
+    rec["id"] = id;
+    rec["resource"] = key;
+    rec["resource_hex"] = hex_u64(key);
+    rec["resource_uid"] = resource_uid(key);
+    if (!rec.contains("resource_generation")) {
+        rec["resource_generation"] = 1;
+    }
+    rec["resource_instance_uid"] = resource_instance_uid(key, rec.value("resource_generation", 1ull));
+    rec["last_release_frame"] = m_impl->frame;
+    rec["last_release_refcount"] = ref_count_after_release;
+    rec["release_count"] = rec.value("release_count", 0ull) + 1;
+    if (ref_count_after_release == 0) {
+        rec["released"] = true;
+        rec["final_release_frame"] = m_impl->frame;
+        rec["classification"] = "released";
+    }
+    m_impl->push_event_locked({
+        {"event_class", "lifetime"},
+        {"kind", ref_count_after_release == 0 ? "resource_final_release" : "resource_release"},
+        {"source", std::string{source}},
+        {"resource", key},
+        {"resource_hex", hex_u64(key)},
+        {"resource_generation", rec.value("resource_generation", 1ull)},
+        {"resource_instance_uid", rec.value("resource_instance_uid", resource_instance_uid(key, 1))},
+        {"ref_count_after_release", ref_count_after_release}
+    });
+    } STEREO_FORENSICS_CATCH_VOID("record_resource_released")
 }
 
 void StereoForensics::record_cbv_descriptor(
     std::string_view source,
     const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
     D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    STEREO_FORENSICS_TRY("record_cbv_descriptor") {
     if (!is_enabled() || desc == nullptr || handle.ptr == 0) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (m_impl->capture_stopped) {
+        return;
+    }
     auto rec = m_impl->descriptor_base_locked(DescriptorKind::CBV, handle, 0);
     rec["source"] = std::string{source};
     rec["buffer_location"] = desc->BufferLocation;
     rec["buffer_location_hex"] = hex_u64(desc->BufferLocation);
     rec["size_in_bytes"] = desc->SizeInBytes;
     m_impl->publish_descriptor_locked(std::move(rec));
+    } STEREO_FORENSICS_CATCH_VOID("record_cbv_descriptor")
 }
 
 void StereoForensics::record_srv_descriptor(
@@ -1646,10 +2394,14 @@ void StereoForensics::record_srv_descriptor(
     ID3D12Resource* resource,
     const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
     D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    STEREO_FORENSICS_TRY("record_srv_descriptor") {
     if (!is_enabled() || resource == nullptr || handle.ptr == 0) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (m_impl->capture_stopped) {
+        return;
+    }
     m_impl->update_resource_locked(source, resource, nullptr, false, 0, 0, nullptr, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
     auto rec = m_impl->descriptor_base_locked(DescriptorKind::SRV, handle, reinterpret_cast<uintptr_t>(resource));
     rec["source"] = std::string{source};
@@ -1683,6 +2435,7 @@ void StereoForensics::record_srv_descriptor(
         }
     }
     m_impl->publish_descriptor_locked(std::move(rec));
+    } STEREO_FORENSICS_CATCH_VOID("record_srv_descriptor")
 }
 
 void StereoForensics::record_uav_descriptor(
@@ -1690,10 +2443,14 @@ void StereoForensics::record_uav_descriptor(
     ID3D12Resource* resource,
     const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
     D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    STEREO_FORENSICS_TRY("record_uav_descriptor") {
     if (!is_enabled() || resource == nullptr || handle.ptr == 0) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (m_impl->capture_stopped) {
+        return;
+    }
     m_impl->update_resource_locked(source, resource, nullptr, false, 0, 0, nullptr, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
     auto rec = m_impl->descriptor_base_locked(DescriptorKind::UAV, handle, reinterpret_cast<uintptr_t>(resource));
     rec["source"] = std::string{source};
@@ -1726,6 +2483,7 @@ void StereoForensics::record_uav_descriptor(
         }
     }
     m_impl->publish_descriptor_locked(std::move(rec));
+    } STEREO_FORENSICS_CATCH_VOID("record_uav_descriptor")
 }
 
 void StereoForensics::record_rtv_descriptor(
@@ -1733,10 +2491,14 @@ void StereoForensics::record_rtv_descriptor(
     ID3D12Resource* resource,
     const D3D12_RENDER_TARGET_VIEW_DESC* desc,
     D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    STEREO_FORENSICS_TRY("record_rtv_descriptor") {
     if (!is_enabled() || resource == nullptr || handle.ptr == 0) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (m_impl->capture_stopped) {
+        return;
+    }
     m_impl->update_resource_locked(source, resource, nullptr, false, 0, 0, nullptr, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
     auto rec = m_impl->descriptor_base_locked(DescriptorKind::RTV, handle, reinterpret_cast<uintptr_t>(resource));
     rec["source"] = std::string{source};
@@ -1754,6 +2516,7 @@ void StereoForensics::record_rtv_descriptor(
         }
     }
     m_impl->publish_descriptor_locked(std::move(rec));
+    } STEREO_FORENSICS_CATCH_VOID("record_rtv_descriptor")
 }
 
 void StereoForensics::record_dsv_descriptor(
@@ -1761,10 +2524,14 @@ void StereoForensics::record_dsv_descriptor(
     ID3D12Resource* resource,
     const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
     D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    STEREO_FORENSICS_TRY("record_dsv_descriptor") {
     if (!is_enabled() || resource == nullptr || handle.ptr == 0) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (m_impl->capture_stopped) {
+        return;
+    }
     m_impl->update_resource_locked(source, resource, nullptr, false, 0, 0, nullptr, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
     auto rec = m_impl->descriptor_base_locked(DescriptorKind::DSV, handle, reinterpret_cast<uintptr_t>(resource));
     rec["source"] = std::string{source};
@@ -1774,16 +2541,21 @@ void StereoForensics::record_dsv_descriptor(
         rec["flags"] = static_cast<uint32_t>(desc->Flags);
     }
     m_impl->publish_descriptor_locked(std::move(rec));
+    } STEREO_FORENSICS_CATCH_VOID("record_dsv_descriptor")
 }
 
 void StereoForensics::record_descriptor_copy(
     std::string_view source,
     D3D12_CPU_DESCRIPTOR_HANDLE dst,
     D3D12_CPU_DESCRIPTOR_HANDLE src) {
+    STEREO_FORENSICS_TRY("record_descriptor_copy") {
     if (!is_enabled() || dst.ptr == 0 || src.ptr == 0) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (m_impl->capture_stopped) {
+        return;
+    }
     json rec;
     const auto src_it = m_impl->descriptors.find(static_cast<uintptr_t>(src.ptr));
     if (src_it != m_impl->descriptors.end()) {
@@ -1813,6 +2585,7 @@ void StereoForensics::record_descriptor_copy(
         {"src_cpu", static_cast<uintptr_t>(src.ptr)},
         {"src_cpu_hex", hex_u64(src.ptr)}
     });
+    } STEREO_FORENSICS_CATCH_VOID("record_descriptor_copy")
 }
 
 void StereoForensics::record_descriptor_heaps_set(
@@ -1820,10 +2593,14 @@ void StereoForensics::record_descriptor_heaps_set(
     uintptr_t command_list,
     uint32_t count,
     ID3D12DescriptorHeap* const* heaps) {
+    STEREO_FORENSICS_TRY("record_descriptor_heaps_set") {
     if (!is_enabled()) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (!m_impl->capture_frame_active || m_impl->capture_stopped) {
+        return;
+    }
     json arr = json::array();
     for (uint32_t i = 0; i < count && heaps != nullptr; ++i) {
         auto* heap = heaps[i];
@@ -1837,6 +2614,7 @@ void StereoForensics::record_descriptor_heaps_set(
         }
     }
     m_impl->push_event_locked({{"event_class", "bind"}, {"kind", "set_descriptor_heaps"}, {"source", std::string{source}}, {"command_list", command_list}, {"command_list_hex", hex_u64(command_list)}, {"heaps", std::move(arr)}});
+    } STEREO_FORENSICS_CATCH_VOID("record_descriptor_heaps_set")
 }
 
 void StereoForensics::record_render_targets_set(
@@ -1847,6 +2625,7 @@ void StereoForensics::record_render_targets_set(
     bool single_handle_range,
     uint32_t rtv_stride,
     const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
+    STEREO_FORENSICS_TRY("record_render_targets_set") {
     if (!is_enabled() || command_list == 0) {
         return;
     }
@@ -1874,7 +2653,11 @@ void StereoForensics::record_render_targets_set(
         targets.dsv = static_cast<uintptr_t>(dsv->ptr);
     }
     m_impl->targets_by_command_list[command_list] = std::move(targets);
+    if (!m_impl->capture_frame_active || m_impl->capture_stopped) {
+        return;
+    }
     m_impl->push_event_locked({{"event_class", "bind"}, {"kind", "om_set_render_targets"}, {"source", std::string{source}}, {"command_list", command_list}, {"command_list_hex", hex_u64(command_list)}, {"rtvs", std::move(rtv_json)}, {"dsv", dsv != nullptr ? static_cast<uintptr_t>(dsv->ptr) : 0}});
+    } STEREO_FORENSICS_CATCH_VOID("record_render_targets_set")
 }
 
 void StereoForensics::record_root_bind(
@@ -1888,10 +2671,14 @@ void StereoForensics::record_root_bind(
     uintptr_t value,
     uint32_t value_count,
     uint64_t value_hash) {
+    STEREO_FORENSICS_TRY("record_root_bind") {
     if (!is_enabled()) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (!m_impl->capture_frame_active || m_impl->capture_stopped) {
+        return;
+    }
     m_impl->push_event_locked({
         {"event_class", "bind"},
         {"kind", "root_bind"},
@@ -1910,6 +2697,7 @@ void StereoForensics::record_root_bind(
         {"value_hash", value_hash},
         {"value_hash_hex", hex_u64(value_hash)}
     });
+    } STEREO_FORENSICS_CATCH_VOID("record_root_bind")
 }
 
 void StereoForensics::record_pso_bind(
@@ -1920,10 +2708,14 @@ void StereoForensics::record_pso_bind(
     uintptr_t graphics_root_signature,
     uintptr_t compute_root_signature,
     int32_t eye_bucket) {
+    STEREO_FORENSICS_TRY("record_pso_bind") {
     if (!is_enabled()) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (!m_impl->capture_frame_active || m_impl->capture_stopped) {
+        return;
+    }
     auto& registry = ShaderOverrideRegistry::get();
     const auto vs_crc = registry.d3d12_pso_vertex_crc32(bound_pipeline_state);
     const auto ps_crc = registry.d3d12_pso_pixel_crc32(bound_pipeline_state);
@@ -1967,6 +2759,7 @@ void StereoForensics::record_pso_bind(
         {"shader_uid", shader_uid_json(vs_crc, ps_crc, gs_crc, cs_crc)},
         {"shader_key", stable_shader_key}
     });
+    } STEREO_FORENSICS_CATCH_VOID("record_pso_bind")
 }
 
 void StereoForensics::record_resource_barriers(
@@ -1974,10 +2767,14 @@ void StereoForensics::record_resource_barriers(
     uintptr_t command_list,
     uint32_t count,
     const D3D12_RESOURCE_BARRIER* barriers) {
+    STEREO_FORENSICS_TRY("record_resource_barriers") {
     if (!is_enabled() || barriers == nullptr || count == 0) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (!m_impl->capture_frame_active || m_impl->capture_stopped) {
+        return;
+    }
     json arr = json::array();
     for (uint32_t i = 0; i < count; ++i) {
         const auto& b = barriers[i];
@@ -2016,6 +2813,7 @@ void StereoForensics::record_resource_barriers(
         arr.push_back(std::move(item));
     }
     m_impl->push_event_locked({{"event_class", "barrier"}, {"kind", "resource_barrier"}, {"source", std::string{source}}, {"command_list", command_list}, {"command_list_hex", hex_u64(command_list)}, {"barriers", std::move(arr)}});
+    } STEREO_FORENSICS_CATCH_VOID("record_resource_barriers")
 }
 
 void StereoForensics::record_rtv_clear(
@@ -2026,10 +2824,14 @@ void StereoForensics::record_rtv_clear(
     D3D12_CPU_DESCRIPTOR_HANDLE rtv,
     const FLOAT color_rgba[4],
     uint32_t rect_count) {
+    STEREO_FORENSICS_TRY("record_rtv_clear") {
     if (!is_enabled() || rtv.ptr == 0) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (!m_impl->capture_frame_active || m_impl->capture_stopped) {
+        return;
+    }
     const auto cpu = static_cast<uintptr_t>(rtv.ptr);
     uintptr_t resource = 0;
     if (auto desc = m_impl->descriptor_for_cpu_locked(cpu); desc.has_value()) {
@@ -2051,7 +2853,10 @@ void StereoForensics::record_rtv_clear(
     };
     event["writes"] = json::array({m_impl->write_json_locked("clear_rtv", cpu, resource, 0)});
     const auto pushed = m_impl->push_event_locked(event);
-    m_impl->note_writes_locked(event, pushed);
+    if (pushed != 0) {
+        m_impl->note_writes_locked(event, pushed);
+    }
+    } STEREO_FORENSICS_CATCH_VOID("record_rtv_clear")
 }
 
 void StereoForensics::record_resource_copy(
@@ -2068,10 +2873,14 @@ void StereoForensics::record_resource_copy(
     uint32_t depth,
     uint64_t dst_byte_offset,
     uint64_t src_byte_offset) {
+    STEREO_FORENSICS_TRY("record_resource_copy") {
     if (!is_enabled() || (dst_resource == 0 && src_resource == 0)) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (!m_impl->capture_frame_active || m_impl->capture_stopped) {
+        return;
+    }
     json reads = json::array();
     if (src_resource != 0) {
         json read{{"resource", src_resource}, {"resource_hex", hex_u64(src_resource)}, {"resource_id", m_impl->resource_id_locked(src_resource)}, {"subresource", src_subresource}, {"descriptor_type", "RESOURCE"}};
@@ -2106,7 +2915,10 @@ void StereoForensics::record_resource_copy(
         {"writes", std::move(writes)}
     };
     const auto pushed = m_impl->push_event_locked(event);
-    m_impl->note_writes_locked(event, pushed);
+    if (pushed != 0) {
+        m_impl->note_writes_locked(event, pushed);
+    }
+    } STEREO_FORENSICS_CATCH_VOID("record_resource_copy")
 }
 
 void StereoForensics::record_draw_or_dispatch(
@@ -2149,10 +2961,14 @@ void StereoForensics::record_draw_or_dispatch(
     const D3D12Diagnostics::RootHashArray& graphics_root_descriptor_table_resource_hash,
     const D3D12Diagnostics::RootHashArray& compute_root_descriptor_table_resource_hash,
     const std::vector<D3D12Diagnostics::DescriptorReadInfo>& descriptor_reads) {
+    STEREO_FORENSICS_TRY("record_draw_or_dispatch") {
     if (!is_enabled()) {
         return;
     }
     std::scoped_lock _{m_impl->mutex};
+    if (!m_impl->capture_frame_active || m_impl->capture_stopped) {
+        return;
+    }
     auto& registry = ShaderOverrideRegistry::get();
     const auto vs_crc = registry.d3d12_pso_vertex_crc32(pipeline_state);
     const auto ps_crc = registry.d3d12_pso_pixel_crc32(pipeline_state);
@@ -2163,7 +2979,7 @@ void StereoForensics::record_draw_or_dispatch(
 
     json reads = json::array();
     for (const auto& read : descriptor_reads) {
-        reads.push_back(m_impl->descriptor_use_locked(read));
+        reads.push_back(m_impl->descriptor_use_locked(read, root_signature, pipeline_state));
     }
 
     json writes = json::array();
@@ -2209,6 +3025,7 @@ void StereoForensics::record_draw_or_dispatch(
         {"root_signature_hex", hex_u64(root_signature)},
         {"root_signature_hash", root_signature_hash},
         {"root_signature_hash_hex", hex_u64(root_signature_hash)},
+        {"root_signature_layout", root_signature_layout_json(root_signature, pipeline_state)},
         {"eye_bucket", eye_bucket},
         {"executed", executed},
         {"vs_crc", vs_crc},
@@ -2249,7 +3066,10 @@ void StereoForensics::record_draw_or_dispatch(
         {"writes", std::move(writes)}
     };
     const auto pushed = m_impl->push_event_locked(event);
-    m_impl->note_writes_locked(event, pushed);
+    if (pushed != 0) {
+        m_impl->note_writes_locked(event, pushed);
+    }
+    } STEREO_FORENSICS_CATCH_VOID("record_draw_or_dispatch")
 }
 
 bool StereoForensics::should_skip_event(
@@ -2257,6 +3077,7 @@ bool StereoForensics::should_skip_event(
     uint32_t ps_crc,
     uint32_t cs_crc,
     int32_t eye_bucket) {
+    STEREO_FORENSICS_TRY("should_skip_event") {
     if (!is_enabled() || !experiments_enabled()) {
         return false;
     }
@@ -2297,6 +3118,7 @@ bool StereoForensics::should_skip_event(
         return true;
     }
     return false;
+    } STEREO_FORENSICS_CATCH_RETURN("should_skip_event", false)
 }
 
 void StereoForensics::record_experiment_observation(
@@ -2307,6 +3129,7 @@ void StereoForensics::record_experiment_observation(
     uint32_t ps_crc,
     uint32_t cs_crc,
     int32_t eye_bucket) {
+    STEREO_FORENSICS_TRY("record_experiment_observation") {
     if (!is_enabled() || !experiments_enabled()) {
         return;
     }
@@ -2350,6 +3173,7 @@ void StereoForensics::record_experiment_observation(
         {"eye_bucket", eye_bucket},
         {"count", rec.value("count", 0ull)}
     });
+    } STEREO_FORENSICS_CATCH_VOID("record_experiment_observation")
 }
 
 } // namespace render

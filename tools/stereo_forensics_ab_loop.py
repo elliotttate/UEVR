@@ -35,6 +35,7 @@ MUTATION_ACTIONS = {
     "swap_cbv_left_to_right",
     "swap_descriptor_from_left",
     "force_srv_array_slice",
+    "neutralize_texture",
 }
 CONFIRMATION_ACTIONS = {
     "skip",
@@ -134,13 +135,24 @@ def capture_pair(args: argparse.Namespace, out_dir: Path, prefix: str) -> dict[s
     shot_dir.mkdir(parents=True, exist_ok=True)
     trigger.parent.mkdir(parents=True, exist_ok=True)
 
-    for stale in (done, trigger):
+    stale_files = [
+        done,
+        trigger,
+        shot_dir / "left_sample.json",
+        shot_dir / "right_sample.json",
+    ]
+    for stale in stale_files:
         try:
             stale.unlink()
         except FileNotFoundError:
             pass
 
-    trigger.write_text(f"stereo-forensics {prefix} {utc_now()}\n", encoding="utf-8")
+    trigger_text = f"stereo-forensics {prefix} {utc_now()}\n"
+    if args.score_mode == "sample-json":
+        if not args.sample_roi:
+            raise ValueError("--score-mode sample-json requires --sample-roi x,y,w,h")
+        trigger_text += f"sample={args.sample_roi}\n"
+    trigger.write_text(trigger_text, encoding="utf-8")
     deadline = time.time() + args.capture_timeout
     while time.time() < deadline:
         if done.exists():
@@ -164,6 +176,13 @@ def capture_pair(args: argparse.Namespace, out_dir: Path, prefix: str) -> dict[s
         dst = out_dir / f"{prefix}_backbuffer.ppm"
         shutil.copyfile(backbuffer, dst)
         outputs["backbuffer"] = dst
+
+    for eye in ("left", "right"):
+        src = shot_dir / f"{eye}_sample.json"
+        if src.exists():
+            dst = out_dir / f"{prefix}_{eye}_sample.json"
+            shutil.copyfile(src, dst)
+            outputs[f"{eye}_sample"] = dst
 
     try:
         done.unlink()
@@ -305,37 +324,68 @@ def score_trial(
         if not observations.get("available"):
             untrusted_reason = str(observations.get("reason") or "runtime observations unavailable")
 
-    cmd = [
-        sys.executable,
-        str(Path(__file__).with_name("stereo_forensics_experiment.py")),
-        "score",
-        "--experiment",
-        name,
-        "--baseline-left",
-        str(baseline["left"]),
-        "--baseline-right",
-        str(baseline["right"]),
-        "--trial-left",
-        str(trial["left"]),
-        "--trial-right",
-        str(trial["right"]),
-        "--roi",
-        roi,
-        "--left-penalty",
-        str(args.left_penalty),
-        "--threshold",
-        str(args.threshold),
-        "--min-right-delta",
-        str(args.min_right_delta),
-        "--out",
-        str(score_file),
-        "--rule",
-        str(rule_file),
-        "--applied-count",
-        str(applied),
-        "--confirmed-count",
-        str(confirmed),
-    ]
+    if args.score_mode == "sample-json":
+        cmd = [
+            sys.executable,
+            str(Path(__file__).with_name("stereo_forensics_experiment.py")),
+            "score-samples",
+            "--experiment",
+            name,
+            "--baseline-left-json",
+            str(baseline["left_sample"]),
+            "--baseline-right-json",
+            str(baseline["right_sample"]),
+            "--trial-left-json",
+            str(trial["left_sample"]),
+            "--trial-right-json",
+            str(trial["right_sample"]),
+            "--left-penalty",
+            str(args.left_penalty),
+            "--threshold",
+            str(args.threshold),
+            "--min-right-delta",
+            str(args.min_right_delta),
+            "--out",
+            str(score_file),
+            "--rule",
+            str(rule_file),
+            "--applied-count",
+            str(applied),
+            "--confirmed-count",
+            str(confirmed),
+        ]
+    else:
+        cmd = [
+            sys.executable,
+            str(Path(__file__).with_name("stereo_forensics_experiment.py")),
+            "score",
+            "--experiment",
+            name,
+            "--baseline-left",
+            str(baseline["left"]),
+            "--baseline-right",
+            str(baseline["right"]),
+            "--trial-left",
+            str(trial["left"]),
+            "--trial-right",
+            str(trial["right"]),
+            "--roi",
+            roi,
+            "--left-penalty",
+            str(args.left_penalty),
+            "--threshold",
+            str(args.threshold),
+            "--min-right-delta",
+            str(args.min_right_delta),
+            "--out",
+            str(score_file),
+            "--rule",
+            str(rule_file),
+            "--applied-count",
+            str(applied),
+            "--confirmed-count",
+            str(confirmed),
+        ]
     if not trusted:
         cmd.extend(["--untrusted-score", "--untrusted-reason", untrusted_reason])
     if args.db:
@@ -377,6 +427,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         write_rules(rules_file, [], "baseline disabled")
         time.sleep(args.settle_seconds)
         if args.baseline_mode == "once":
+            if args.score_mode == "sample-json":
+                raise ValueError("--score-mode sample-json requires --baseline-mode per-rule so each rule can use the requested sample ROI")
             shared_baseline = capture_pair(args, out_dir, "baseline")
 
         for index, rule in enumerate(rules, 1):
@@ -438,6 +490,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         "rules_file": str(rules_file),
         "baseline_mode": args.baseline_mode,
         "roi": args.roi,
+        "score_mode": args.score_mode,
+        "sample_roi": args.sample_roi,
         "runtime_actions": {
             "mutation": sorted(runtime_actions["mutation"]),
             "confirmation": sorted(runtime_actions["confirmation"]),
@@ -469,6 +523,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--post-capture-delay", type=float, default=0.5)
     p.add_argument("--baseline-mode", choices=["per-rule", "once"], default="per-rule")
     p.add_argument("--roi", default="auto", help="x,y,w,h, all, or auto from the candidate event viewport/scissor")
+    p.add_argument("--score-mode", choices=["ppm", "sample-json"], default="ppm")
+    p.add_argument("--sample-roi", help="x,y,w,h eye-local ROI for runtime uevr_render_diag_eye_region_sample_json sidecars")
     p.add_argument("--left-penalty", type=float, default=1.0)
     p.add_argument("--threshold", type=float, default=0.05)
     p.add_argument("--min-right-delta", type=float, default=0.02)

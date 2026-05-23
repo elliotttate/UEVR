@@ -46,6 +46,8 @@ ACTION_ALIASES = {
     "force_srv_slice": "force_srv_array_slice",
     "swap_descriptor": "swap_descriptor_from_left",
     "swap_cbv": "swap_cbv_left_to_right",
+    "neutralize_srv": "neutralize_texture",
+    "null_srv": "neutralize_texture",
     "duplicate_draw": "duplicate_left_work_into_right_bucket",
     "duplicate_dispatch": "duplicate_left_work_into_right_bucket",
 }
@@ -98,6 +100,10 @@ def cmd_compile(args: argparse.Namespace) -> int:
         action["root"] = root
         action["slot"] = slot
         action["source_eye"] = args.to or "left"
+        action["target_eye"] = args.eye or "right"
+    elif action_type == "neutralize_texture":
+        action["root"] = root
+        action["slot"] = slot
         action["target_eye"] = args.eye or "right"
     elif action_type == "swap_cbv_left_to_right":
         action["root"] = root
@@ -174,6 +180,9 @@ def build_parser() -> argparse.ArgumentParser:
         "force_srv_array_slice",
         "swap_descriptor",
         "swap_descriptor_from_left",
+        "neutralize_srv",
+        "null_srv",
+        "neutralize_texture",
         "swap_cbv",
         "swap_cbv_left_to_right",
         "replace_ps_bytecode",

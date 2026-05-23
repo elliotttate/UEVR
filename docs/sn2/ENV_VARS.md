@@ -6,7 +6,7 @@ Every UEVR_SN2_* env var, what it does, where it's read.
 
 | Env Var | Type | Default | Purpose |
 |---|---|---|---|
-| `UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS` | bool | `0` | Required for most Sn2 modules (state tracking) |
+| `UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS` | bool | `0` | Required for draw/dispatch/viewport/barrier tracing. Auto-enabled when `UEVR_STEREO_FORENSICS=1` unless bind-only opt-out is set |
 | `UEVR_SN2_DUP_CONFIG_FILE` | path | (none) | Path to dup_cfg JSON |
 | `UEVR_SN2_DUPLICATE_SLW_BASEPASS_RIGHT` | bool | `0` | Enable the dup function |
 
@@ -34,7 +34,22 @@ Every UEVR_SN2_* env var, what it does, where it's read.
 |---|---|---|
 | `UEVR_STEREO_FORENSICS` | bool | Enable the unified D3D12 frame/event database |
 | `UEVR_STEREO_FORENSICS_DIR` | path | Output root for `session_*` bundles (default `C:\tmp\uevr_forensics`) |
-| `UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_FRAME` | int | Per-frame event cap before truncation (default 100000) |
+| `UEVR_STEREO_FORENSICS_FRAME_STRIDE` | int | Capture every Nth frame (default 30) |
+| `UEVR_STEREO_FORENSICS_START_FRAME` | int | First frame eligible for capture (default 1) |
+| `UEVR_STEREO_FORENSICS_MAX_CAPTURED_FRAMES` | int | Captured-frame burst cap, `0` for unlimited (default 16) |
+| `UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_FRAME` | int | Per-captured-frame event cap before truncation, `0` for unlimited (default 5000) |
+| `UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_KIND_PER_FRAME` | int | Per-kind event cap, `0` for unlimited (default 3000) |
+| `UEVR_STEREO_FORENSICS_MAX_SET_PSO_PER_FRAME` | int | Per-frame `set_pso` bind cap, `0` for unlimited (default 256) |
+| `UEVR_STEREO_FORENSICS_MAX_ROOT_BINDS_PER_FRAME` | int | Per-frame root-bind cap, `0` for unlimited (default 2048) |
+| `UEVR_STEREO_FORENSICS_MAX_TOTAL_EVENTS` | int | Session event cap, `0` for unlimited (default 80000) |
+| `UEVR_STEREO_FORENSICS_MAX_TOTAL_BYTES` | int | Approximate `events.jsonl` byte cap, `0` for unlimited (default 134217728) |
+| `UEVR_STEREO_FORENSICS_FLUSH_EVERY_CAPTURED_FRAMES` | int | Flush JSONL after N captured frames (default 1) |
+| `UEVR_STEREO_FORENSICS_ARM_FILE` | path | Sentinel file that rearms a new capture burst when created (default `C:\tmp\uevr_forensics_arm.txt`) |
+| `UEVR_STEREO_FORENSICS_KEEP_HOOK_DETAIL_ON_SKIPPED_FRAMES` | bool | Keep expensive descriptor-read/draw detail collection on skipped/stopped frames; normally off |
+| `UEVR_STEREO_FORENSICS_RECORD_D3D12DIAG_ON_SKIPPED_FRAMES` | bool | Alias for keeping legacy D3D12Diagnostics draw/root records on skipped/stopped frames |
+| `UEVR_STEREO_FORENSICS_BIND_ONLY` | bool | Emergency opt-out that prevents forensics from forcing command-list hooks |
+| `UEVR_STEREO_FORENSICS_DISABLE_COMMAND_LIST_HOOKS` | bool | Alias emergency opt-out for command-list hooks |
+| `UEVR_STEREO_FORENSICS_BIND_ONLY_RECORD_PSO` | bool | In bind-only mode, explicitly keep `set_pso` events; off by default to avoid useless floods |
 | `UEVR_STEREO_FORENSICS_MAX_DESCRIPTORS` | int | Descriptor side-table cap (default 262144) |
 | `UEVR_STEREO_FORENSICS_MAX_WRITER_HISTORY` | int | View/resource writer history cap for lineage DAG output (default 100000) |
 | `UEVR_STEREO_EXPERIMENTS` | bool | Enable live experiment rules inside Stereo Forensics |

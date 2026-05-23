@@ -228,6 +228,8 @@ def cmd_write_rule(args: argparse.Namespace) -> int:
         "force_srv_slice": "force_srv_array_slice",
         "swap_descriptor": "swap_descriptor_from_left",
         "swap_cbv": "swap_cbv_left_to_right",
+        "neutralize_srv": "neutralize_texture",
+        "null_srv": "neutralize_texture",
     }.get(args.action, args.action)
     action: dict[str, Any] = {"type": action_type}
     if action_type == "color_override" and args.rgb:
@@ -311,9 +313,12 @@ def build_parser() -> argparse.ArgumentParser:
         "swap_cbv_left_to_right",
         "swap_descriptor_from_left",
         "force_srv_array_slice",
+        "neutralize_texture",
         "force_srv_slice",
         "swap_descriptor",
         "swap_cbv",
+        "neutralize_srv",
+        "null_srv",
     ])
     p.add_argument("--rgb", default="255,0,255")
     p.add_argument("--out")

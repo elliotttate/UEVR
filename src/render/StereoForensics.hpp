@@ -34,6 +34,7 @@ public:
 
     bool is_enabled() const;
     bool experiments_enabled() const;
+    bool is_capturing_this_frame() const;
     std::filesystem::path session_dir() const;
 
     void begin_frame(
@@ -68,6 +69,11 @@ public:
         uint64_t heap_offset,
         const D3D12_RESOURCE_DESC* desc,
         D3D12_RESOURCE_STATES initial_state);
+
+    void record_resource_released(
+        std::string_view source,
+        ID3D12Resource* resource,
+        uint32_t ref_count_after_release);
 
     void record_cbv_descriptor(
         std::string_view source,

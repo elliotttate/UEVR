@@ -42,6 +42,14 @@ The layer is disabled by default. Enable it with:
 set UEVR_STEREO_FORENSICS=1
 ```
 
+`UEVR_STEREO_FORENSICS=1` now forces the D3D12 command-list diagnostic hooks
+needed for draw/dispatch work events, even if an older launch script sets
+`UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS=0`. Use
+`UEVR_STEREO_FORENSICS_BIND_ONLY=1` only as a crash-isolation opt-out; bind-only
+captures are not useful for left/right diffing unless
+`UEVR_STEREO_FORENSICS_BIND_ONLY_RECORD_PSO=1` is also set for a targeted PSO
+bind investigation.
+
 Optional output directory:
 
 ```bat
@@ -69,6 +77,29 @@ Current output files:
 The render analysis export bundle now also includes `stereo_forensics.json`,
 which points at the active session paths and reports whether forensics and
 experiments are enabled.
+
+Stability guardrail: all public `StereoForensics` record/query entrypoints are
+now exception-isolated. A JSON/filesystem/allocation edge case logs and drops
+the diagnostics event instead of unwinding through the D3D12 hook into the game.
+
+Flood guardrails: forensics is now a bounded burst sampler by default. It
+captures every 30th frame, stops after 16 captured frames, caps captured frames
+at 5000 events, caps `set_pso` binds at 256 per frame, caps root binds at 2048
+per frame, and stops the session around 80k events or 128 MiB of JSONL. The
+current limiter state is written into `manifest.json` and each
+`frames/frame_<N>_summary.json`.
+
+Load guardrail: the D3D12 draw/root hooks now query
+`StereoForensics::is_capturing_this_frame()` before building descriptor-read
+detail or recording legacy D3D12Diagnostics draw/root rows. On skipped frames
+and after the burst stops, the hook path is cheap by default. Set
+`UEVR_STEREO_FORENSICS_KEEP_HOOK_DETAIL_ON_SKIPPED_FRAMES=1` only when a legacy
+D3D12Diagnostics capture explicitly needs full-session draw/root detail.
+
+Scene-targeting guardrail: create `C:\tmp\uevr_forensics_arm.txt` while the game
+is in the scene you care about to re-arm a fresh capture burst. The sentinel
+resets `captured_frames`, clears the stopped latch, and starts capturing on the
+next frame.
 
 ## Checklist against the full plan
 
@@ -177,8 +208,19 @@ Implemented:
 - records aliasing barriers
 - records alias barrier generation on affected resources
 - includes SRV/UAV/RTV slice/mip metadata in descriptor records
+- stamps resources, descriptor reads, writes, lineage edges, and DB rows with
+  `resource_generation` plus `resource_instance_uid` so COM pointer reuse is
+  visible instead of silently merging identities
 - classifies sampled resources as `frame_produced_view`,
-  `frame_produced_resource`, `static_or_imported`, or alias-related where known
+  `frame_produced_resource`, `history_produced_view`,
+  `history_produced_resource`, `static_or_imported`,
+  `created_unwritten_this_frame`, or alias-related where known
+- records first/last seen and first/last writer frames for resources in the
+  runtime JSON and SQLite DB
+- records `ID3D12Resource::Release`/final-release observations when forensics is
+  enabled. The release hook is gated behind `UEVR_STEREO_FORENSICS`, uses the
+  pointer only as an identity key after calling the real `Release`, and
+  tombstones upload-buffer cache entries instead of compacting vectors.
 
 Still missing:
 
@@ -223,6 +265,7 @@ Current supported actions:
 - `swap_cbv_left_to_right`
 - `swap_descriptor_from_left`
 - `force_srv_array_slice`
+- `neutralize_texture`
 
 Current rule fields:
 
@@ -266,29 +309,35 @@ New offline tools:
 - `tools/stereo_forensics_compile_rule.py` compiles a captured event into a
   durable v2 rule skeleton.
 - `tools/stereo_forensics_shader_semantics.py` produces lightweight DXBC/DXIL
-  shader semantic summaries, with richer DXIL results when `dxil-patch` is
-  available for disassembly, and can import roles into the DB.
+  shader semantic summaries, extracts conservative SM4/SM5 DXBC reflection and
+  token facts when RDEF/SHEX/SHDR chunks are present, uses `dxil-patch` for
+  richer DXIL disassembly when available, and can import roles into the DB.
 
 Still missing:
 
 - PS bytecode replacement
 - CB byte patch
-- neutralize texture
 - duplicate draw into right bucket
 - duplicate dispatch
 - clamp CB value/range
-- C-API in-engine ROI sampling in the closed-loop driver
+- automatic per-rule ROI selection for `sample-json` mode
 
 Current value:
 
 The forensics layer now has a control plane for interventions, a v2 rule file
 shape, live skip/color probes, closed-loop screenshot A/B scoring, persistent
 suspect ranking, candidate experiment generation, and a first generic D3D12
-mutation runner for CBV swaps, descriptor swaps, and forced SRV array slices.
+mutation runner for CBV swaps, descriptor swaps, forced SRV array slices, and
+same-shape null-SRV texture neutralization.
 Descriptor sources are snapshotted into UEVR scratch descriptors, CBV sources
 are snapshotted into UEVR upload memory, and stale-source applications are
 rejected instead of scored as real failures. Duplicate-work and bytecode/byte-
 patch actions still need deeper replay or patch infrastructure.
+
+The SN2 eye screenshot trigger can also request runtime C-API ROI sidecars with
+`sample=x,y,w,h`; the A/B loop exposes this as `--score-mode sample-json
+--sample-roi x,y,w,h` for in-engine region summaries instead of Python PPM
+pixel loops.
 
 ### 5. Shader semantic analysis service
 
@@ -308,15 +357,18 @@ Implemented offline:
 - identify DXIL containers
 - when `dxil-patch` is supplied, disassemble DXIL and list createHandle,
   cbufferLoad, sample/textureLoad, store, branch, and discard/clip hints
+- for SM4/SM5 DXBC, parse RDEF reflection where present, including constant
+  buffers, variable byte ranges, SRV/UAV/sampler bindings, input/output
+  signatures, and conservative SHEX/SHDR opcode counts for sample/load/branch/
+  discard/output hints
 - import semantic summaries into SQLite as shader roles such as
   `visible_texture_consumer`, `cb_driven`, `branch_gated_texture_path`, or
-  `container_only`
+  `has_reflection_bindings`
 
 Still needed:
 
-- DXBC SM4/SM5 token-level semantic extraction
-- exact CB byte ranges, not just DXIL load indices
-- exact sampled SRV/UAV slots after root-signature binding resolution
+- validate DXBC token/reflection parsing across a larger set of UE shaders
+- map exact sampled SRV/UAV slots through root-signature binding resolution
 - list output targets and depth writes
 - identify discard/clip paths
 - identify branch predicates tied to CB values
@@ -453,25 +505,15 @@ For the current right-eye fog case, the most important immediate tests are:
 
 ## Highest-value next work
 
-### Next 1: Capture validation and query tooling
+### Next 1: Live capture validation
 
-Build a small reader for the new bundle:
+Run a real SN2 capture with `UEVR_STEREO_FORENSICS=1` and verify:
 
-```text
-tools/stereo_forensics_query.py
-```
-
-First commands:
-
-- list frames
-- list issues from `eye_diff.json`
-- find events by shader CRC
-- show descriptors read by an event
-- show latest producer for a descriptor/resource
-- show alias group members
-
-This should happen before adding many more hooks, because it will expose schema
-gaps quickly.
+- no exception guard trips during D3D12 init
+- `Release`/final-release lifetime events appear only when forensics is enabled
+- `lineage.json.validation` counts match expectations for static/imported,
+  alias, and history-produced reads
+- `neutralize_texture` rules produce `applied` observations before scoring
 
 ### Next 2: Upgrade lineage from latest-writer to view DAG
 
@@ -484,41 +526,41 @@ resource + view type + mip + array slice + plane
 Then keep writer history intervals, not just latest writer. This is required
 for RDG transient aliasing and Texture2DArray stereo cases.
 
-### Next 3: Add screenshot/ROI experiment scoring
+### Next 3: Improve automated ROI selection
 
-Connect the experiment runner to existing screenshot/RT diff/ROI scripts so a
-rule can produce:
+`--roi auto` uses event viewport/scissor today, and `sample-json` uses a manual
+eye-local ROI. Next step is deriving tighter per-rule ROIs from diff hotspots or
+the localized issue evidence so small fog/water fixes are not diluted by
+whole-frame scoring.
 
-```text
-right ROI changed 38%, left ROI changed 0.4%, likely causal
-```
+### Next 4: Runtime shader semantic enrichment
 
-This is the first step that will make shader hunting less manual.
-
-### Next 4: Add shader semantic summaries
-
-Feed dumped DXBC/DXIL through a parser and attach:
+The offline parser exists. Next step is attaching its DB rows back onto runtime
+events and candidates:
 
 - CB ranges read
 - SRV/UAV slots sampled
 - output/depth behavior
 - branch/discard gates
 
-Then shader hunter can suppress or demote shaders that cannot affect the
-visible target.
+Then shader hunter can suppress or demote shaders that cannot affect the visible
+target.
 
-### Next 5: UE/RDG bridge
+### Next 5: UE/RDG bridge and broader mutators
 
-Attach pass/view/resource names from UE 5.6.1 where possible. This is brittle,
-but it is the difference between D3D12 evidence and UE-causal evidence.
+Attach pass/view/resource names from UE 5.6.1 where possible, then continue
+adding durable actions that need deeper infrastructure: bytecode replacement,
+CB byte patch/clamp, duplicate draw/dispatch replay, and copy/transition
+insertion.
 
 ## Bottom line
 
-Items 1-4 are now started inside UEVR, with item 1 being the strongest. Item 5
-has an offline first pass. Items 6-8 remain mostly future work, except for the
-new rule compiler skeleton for item 8.
+Items 1-4 are now functional inside UEVR. Item 5 has an offline first pass.
+Items 6-7 remain mostly future work, and item 8 has a shared rule schema,
+candidate generation, scoring, and promotion path but still needs the heavier
+executor actions.
 
 The important architectural shift is done: new SN2 findings should feed the
 Stereo Forensics bundle instead of becoming more isolated one-off logs. The
-next milestone is to run captures, build query tooling, and use real output to
-drive the next schema/intervention upgrades.
+next milestone is to run a live SN2 capture, validate the new stability/lifetime
+signals, and use real output to drive the next schema/intervention upgrades.

@@ -37,11 +37,11 @@ All tools live in `E:\Github\Subnautica 2\moddingkit\tools\`. They process outpu
 ### Stereo Forensics
 - `E:\Github\UEVRJ\tools\stereo_forensics_query.py` — inspect `UEVR_STEREO_FORENSICS` session bundles by issue, event, shader, lineage slot, or alias group
 - `E:\Github\UEVRJ\tools\stereo_forensics_db.py` — persistent SQLite knowledge DB for captures, event pairs, lineage paths, resource lifetimes, suspects, findings, evidence, experiments, shader roles, and fix rules
-- `E:\Github\UEVRJ\tools\stereo_forensics_experiment.py` — emit v2 experiment rules and score left/right PPM ROI deltas
+- `E:\Github\UEVRJ\tools\stereo_forensics_experiment.py` — emit v2 experiment rules and score left/right PPM or C-API sample JSON ROI deltas
 - `E:\Github\UEVRJ\tools\stereo_forensics_run_experiments.py` — generate ranked probe/mutation rule candidates from DB suspects
 - `E:\Github\UEVRJ\tools\stereo_forensics_ab_loop.py` — run closed-loop baseline/trial screenshot experiments against hot-reloaded rule files
-- `E:\Github\UEVRJ\tools\stereo_forensics_compile_rule.py` — compile a captured event into a durable v2 rule skeleton
-- `E:\Github\UEVRJ\tools\stereo_forensics_shader_semantics.py` — build lightweight DXBC/DXIL semantic summaries and import shader roles into the DB
+- `E:\Github\UEVRJ\tools\stereo_forensics_compile_rule.py` — compile a captured event into a durable v2 rule skeleton, including descriptor-slot mutations such as `neutralize_texture`
+- `E:\Github\UEVRJ\tools\stereo_forensics_shader_semantics.py` — build lightweight DXBC/DXIL semantic summaries, including DXBC RDEF/signature/token facts and richer DXIL disassembly when `dxil-patch` is available, then import shader roles into the DB
 
 ---
 

@@ -36,6 +36,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include "render/RenderDiagnosticsCAPI.hpp"
+
 // Phase AA: sidecar emission for UEVR↔RD bridge
 namespace sn2_capture_sidecar {
 void emit(uint64_t seq);
@@ -109,6 +111,11 @@ struct State {
     bool got_right{false};
     bool got_bb{false};
     int poll_frames_remaining{0};  // request times out after N polled frames
+    bool sample_enabled{false};
+    int sample_x{0};
+    int sample_y{0};
+    int sample_w{0};
+    int sample_h{0};
 
     // Private CL+allocator for our own snapshot work.
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc;
@@ -141,6 +148,33 @@ bool trigger_file_present() {
     const DWORD attrs = GetFileAttributesA(p.c_str());
     return attrs != INVALID_FILE_ATTRIBUTES &&
            !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+std::string read_trigger_file() {
+    const auto& p = trigger_path();
+    if (p.empty()) return {};
+    FILE* f = nullptr;
+    fopen_s(&f, p.c_str(), "rb");
+    if (f == nullptr) return {};
+    char buf[512]{};
+    const auto n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    return std::string{buf, n};
+}
+
+bool parse_roi_token(const std::string& text, int& x, int& y, int& w, int& h) {
+    const char* keys[] = {"sample=", "roi="};
+    for (const char* key : keys) {
+        const auto pos = text.find(key);
+        if (pos == std::string::npos) {
+            continue;
+        }
+        const char* start = text.c_str() + pos + std::strlen(key);
+        if (std::sscanf(start, "%d,%d,%d,%d", &x, &y, &w, &h) == 4 && w > 0 && h > 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Scan temp_dir for a file beginning with `prefix`. Return absolute path or
@@ -192,9 +226,33 @@ void write_text_file(const std::string& path, const std::string& contents) {
     std::fclose(f);
 }
 
+void write_sample_sidecars() {
+    auto& s = state();
+    if (!s.sample_enabled) {
+        return;
+    }
+    ensure_output_dir();
+    const auto left = uevr_render_diag_eye_region_sample_json(0, s.sample_x, s.sample_y, s.sample_w, s.sample_h);
+    const std::string left_text = left != nullptr ? left : "{}";
+    const auto right = uevr_render_diag_eye_region_sample_json(1, s.sample_x, s.sample_y, s.sample_w, s.sample_h);
+    const std::string right_text = right != nullptr ? right : "{}";
+    write_text_file(output_dir() + "\\left_sample.json", left_text + "\n");
+    write_text_file(output_dir() + "\\right_sample.json", right_text + "\n");
+    SPDLOG_WARN("[SN2-EyeShot] wrote C-API ROI samples x={} y={} w={} h={}",
+                s.sample_x, s.sample_y, s.sample_w, s.sample_h);
+}
+
 void start_request(IDXGISwapChain3* swap_chain) {
     auto& s = state();
     if (swap_chain == nullptr) return;
+    const auto trigger_text = read_trigger_file();
+    int sample_x = 0, sample_y = 0, sample_w = 0, sample_h = 0;
+    const bool sample_enabled = parse_roi_token(trigger_text, sample_x, sample_y, sample_w, sample_h);
+    s.sample_enabled = sample_enabled;
+    s.sample_x = sample_x;
+    s.sample_y = sample_y;
+    s.sample_w = sample_w;
+    s.sample_h = sample_h;
 
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     if (FAILED(swap_chain->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
@@ -239,6 +297,8 @@ void start_request(IDXGISwapChain3* swap_chain) {
         SPDLOG_WARN("[SN2-EyeShot] could not obtain command queue; aborting request");
         return;
     }
+
+    write_sample_sidecars();
 
     // Build the request.
     const uint64_t seq = s.seq.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -383,6 +443,8 @@ void poll_request_completion() {
         s.expected_bb_prefix.clear();
         s.got_left = s.got_right = s.got_bb = false;
         s.poll_frames_remaining = 0;
+        s.sample_enabled = false;
+        s.sample_x = s.sample_y = s.sample_w = s.sample_h = 0;
         // Clear cached per-eye RTs so a fresh frame's tagging populates them.
         std::scoped_lock _{s.mu};
         s.latest_left = nullptr;
