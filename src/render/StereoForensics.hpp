@@ -35,6 +35,8 @@ public:
     bool is_enabled() const;
     bool experiments_enabled() const;
     bool is_capturing_this_frame() const;
+    bool should_track_lightweight_producers() const;
+    bool arm_capture(std::string_view reason = {});
     std::filesystem::path session_dir() const;
 
     void begin_frame(
@@ -123,6 +125,15 @@ public:
         bool single_handle_range,
         uint32_t rtv_stride,
         const D3D12_CPU_DESCRIPTOR_HANDLE* dsv);
+
+    void record_render_target_writes_hint(
+        std::string_view source,
+        std::string_view kind,
+        uintptr_t command_list,
+        uintptr_t pipeline_state,
+        int32_t eye_bucket,
+        const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs,
+        uint32_t rtv_count);
 
     void record_root_bind(
         std::string_view source,

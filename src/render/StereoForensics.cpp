@@ -24,6 +24,7 @@
 
 #include "render/ShaderOverrideRegistry.hpp"
 #include "render/StereoEye.hpp"
+#include "render/Sn2IssuerStack.hpp"
 
 using json = nlohmann::json;
 
@@ -765,18 +766,20 @@ struct StereoForensics::Impl {
     mutable std::recursive_mutex mutex;
     bool enabled{env_truthy("UEVR_STEREO_FORENSICS")};
     bool experiments_enabled{env_truthy("UEVR_STEREO_EXPERIMENTS")};
-    uint64_t max_events_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_FRAME", 5000)};
+    uint64_t max_events_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_FRAME", 12000)};
     uint64_t frame_stride{std::max<uint64_t>(1, env_u64("UEVR_STEREO_FORENSICS_FRAME_STRIDE", 30))};
     uint64_t start_frame{std::max<uint64_t>(1, env_u64("UEVR_STEREO_FORENSICS_START_FRAME", 1))};
-    uint64_t max_captured_frames{env_u64("UEVR_STEREO_FORENSICS_MAX_CAPTURED_FRAMES", 16)};
-    uint64_t max_total_events{env_u64("UEVR_STEREO_FORENSICS_MAX_TOTAL_EVENTS", 80000)};
-    uint64_t max_total_bytes{env_u64("UEVR_STEREO_FORENSICS_MAX_TOTAL_BYTES", 128ull * 1024ull * 1024ull)};
-    uint64_t max_events_per_kind_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_KIND_PER_FRAME", 3000)};
-    uint64_t max_pso_binds_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_SET_PSO_PER_FRAME", 256)};
-    uint64_t max_root_binds_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_ROOT_BINDS_PER_FRAME", 2048)};
+    uint64_t max_captured_frames{env_u64("UEVR_STEREO_FORENSICS_MAX_CAPTURED_FRAMES", 4)};
+    uint64_t max_total_events{env_u64("UEVR_STEREO_FORENSICS_MAX_TOTAL_EVENTS", 120000)};
+    uint64_t max_total_bytes{env_u64("UEVR_STEREO_FORENSICS_MAX_TOTAL_BYTES", 256ull * 1024ull * 1024ull)};
+    uint64_t max_events_per_kind_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_KIND_PER_FRAME", 8000)};
+    uint64_t max_pso_binds_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_SET_PSO_PER_FRAME", 768)};
+    uint64_t max_root_binds_per_frame{env_u64("UEVR_STEREO_FORENSICS_MAX_ROOT_BINDS_PER_FRAME", 4096)};
     uint64_t flush_every_captured_frames{std::max<uint64_t>(1, env_u64("UEVR_STEREO_FORENSICS_FLUSH_EVERY_CAPTURED_FRAMES", 1))};
     uint64_t max_descriptors{env_u64("UEVR_STEREO_FORENSICS_MAX_DESCRIPTORS", 262144)};
     uint64_t max_writer_history{env_u64("UEVR_STEREO_FORENSICS_MAX_WRITER_HISTORY", 100000)};
+    bool track_side_tables_after_stop{env_u64("UEVR_STEREO_FORENSICS_TRACK_SIDE_TABLES_AFTER_STOP", 1) != 0};
+    bool track_producers_on_skipped_frames{env_u64("UEVR_STEREO_FORENSICS_TRACK_PRODUCERS_ON_SKIPPED_FRAMES", 1) != 0};
     std::filesystem::path base_dir{env_string("UEVR_STEREO_FORENSICS_DIR", "C:\\tmp\\uevr_forensics")};
     std::filesystem::path arm_file{env_string("UEVR_STEREO_FORENSICS_ARM_FILE", "C:\\tmp\\uevr_forensics_arm.txt")};
     std::filesystem::path session;
@@ -796,6 +799,8 @@ struct StereoForensics::Impl {
     uint64_t total_events_recorded{};
     uint64_t total_events_written{};
     uint64_t total_event_bytes{};
+    uint64_t rearm_count{};
+    std::string last_arm_reason{};
     json frame_context = json::object();
     std::vector<json> frame_events;
     std::unordered_map<std::string, uint64_t> frame_event_kind_counts;
@@ -897,6 +902,31 @@ struct StereoForensics::Impl {
             session.string());
     }
 
+    bool side_table_updates_allowed_locked() const {
+        return !capture_stopped || track_side_tables_after_stop;
+    }
+
+    bool arm_capture_locked(std::string_view reason) {
+        if (!enabled || !ensure_session_locked()) {
+            return false;
+        }
+        captured_frames = 0;
+        total_events_recorded = 0;
+        total_event_bytes = 0;
+        start_frame = frame + 1;
+        capture_complete_logged = false;
+        last_arm_reason = reason.empty() ? "runtime" : std::string{reason};
+        ++rearm_count;
+        set_capture_state_locked(false, false);
+        SPDLOG_INFO(
+            "[StereoForensics] capture armed by {}; next eligible frame={} stride={} max_captured_frames={}",
+            last_arm_reason,
+            start_frame,
+            frame_stride,
+            max_captured_frames);
+        return true;
+    }
+
     void check_arm_file_locked() {
         if (arm_file.empty()) {
             return;
@@ -906,16 +936,7 @@ struct StereoForensics::Impl {
             return;
         }
         std::filesystem::remove(arm_file, ec);
-        captured_frames = 0;
-        start_frame = frame + 1;
-        capture_complete_logged = false;
-        set_capture_state_locked(false, false);
-        SPDLOG_INFO(
-            "[StereoForensics] capture armed by {}; next eligible frame={} stride={} max_captured_frames={}",
-            arm_file.string(),
-            start_frame,
-            frame_stride,
-            max_captured_frames);
+        arm_capture_locked(std::string{"file:"} + arm_file.string());
     }
 
     uint64_t per_kind_cap_locked(const json& event) const {
@@ -1440,6 +1461,14 @@ struct StereoForensics::Impl {
                 write.value("descriptor", 0ull),
                 write.value("view_key", std::string{})
             };
+            const auto previous = last_writer_by_resource.find(resource);
+            const bool producer_changed =
+                previous == last_writer_by_resource.end() ||
+                previous->second.kind != producer.kind ||
+                previous->second.pipeline_state != producer.pipeline_state ||
+                previous->second.eye_bucket != producer.eye_bucket ||
+                previous->second.descriptor != producer.descriptor ||
+                previous->second.view_key != producer.view_key;
             last_writer_by_resource[resource] = producer;
             if (!producer.view_key.empty()) {
                 last_writer_by_view[producer.view_key] = producer;
@@ -1455,6 +1484,10 @@ struct StereoForensics::Impl {
                 resource_rec["first_writer_event"] = pushed_index;
             }
 
+            if (pushed_index == 0 && !producer_changed) {
+                continue;
+            }
+
             json history = write;
             history["producer"] = producer_json_locked(producer);
             history["producer_frame"] = producer.frame;
@@ -1465,6 +1498,88 @@ struct StereoForensics::Impl {
             if (writer_history.size() > max_writer_history) {
                 const auto erase_count = std::max<size_t>(1, writer_history.size() / 4);
                 writer_history.erase(writer_history.begin(), writer_history.begin() + static_cast<std::ptrdiff_t>(erase_count));
+            }
+        }
+    }
+
+    void note_lightweight_rtv_writes_locked(
+        std::string_view source,
+        std::string_view kind,
+        uintptr_t command_list,
+        uintptr_t pipeline_state,
+        int32_t eye_bucket,
+        const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs,
+        uint32_t rtv_count) {
+        if (!track_producers_on_skipped_frames || capture_frame_active || rtvs == nullptr || rtv_count == 0) {
+            return;
+        }
+
+        const uint32_t max_slots = std::min<uint32_t>(rtv_count, 8);
+        for (uint32_t i = 0; i < max_slots; ++i) {
+            const auto descriptor = static_cast<uintptr_t>(rtvs[i].ptr);
+            if (descriptor == 0) {
+                continue;
+            }
+            uintptr_t resource = 0;
+            if (auto desc = descriptor_for_cpu_locked(descriptor); desc.has_value()) {
+                resource = desc->value("resource", 0ull);
+            }
+            if (resource == 0) {
+                continue;
+            }
+
+            auto write = write_json_locked(kind, descriptor, resource, i);
+            Producer producer{
+                frame,
+                0,
+                std::string{kind},
+                pipeline_state,
+                eye_bucket,
+                descriptor,
+                write.value("view_key", std::string{})
+            };
+
+            const auto previous = last_writer_by_resource.find(resource);
+            const bool producer_changed =
+                previous == last_writer_by_resource.end() ||
+                previous->second.kind != producer.kind ||
+                previous->second.pipeline_state != producer.pipeline_state ||
+                previous->second.eye_bucket != producer.eye_bucket ||
+                previous->second.descriptor != producer.descriptor ||
+                previous->second.view_key != producer.view_key;
+
+            last_writer_by_resource[resource] = producer;
+            if (!producer.view_key.empty()) {
+                last_writer_by_view[producer.view_key] = producer;
+            }
+
+            auto& resource_rec = resources[resource];
+            resource_rec["classification"] = "frame_written";
+            resource_rec["last_writer_frame"] = frame;
+            resource_rec["last_writer_event"] = 0;
+            resource_rec["last_writer_kind"] = producer.kind;
+            resource_rec["last_writer_eye_bucket"] = producer.eye_bucket;
+            resource_rec["last_writer_lightweight"] = true;
+            if (!resource_rec.contains("first_writer_frame")) {
+                resource_rec["first_writer_frame"] = frame;
+                resource_rec["first_writer_event"] = 0;
+            }
+
+            if (producer_changed) {
+                write["lightweight"] = true;
+                write["source"] = std::string{source};
+                write["command_list"] = command_list;
+                write["command_list_hex"] = hex_u64(command_list);
+                write["producer"] = producer_json_locked(producer);
+                write["producer_frame"] = producer.frame;
+                write["producer_event"] = producer.event_index;
+                write["producer_kind"] = producer.kind;
+                write["producer_eye_bucket"] = producer.eye_bucket;
+                writer_history.push_back(std::move(write));
+                if (writer_history.size() > max_writer_history) {
+                    const auto erase_count = std::max<size_t>(1, writer_history.size() / 4);
+                    writer_history.erase(writer_history.begin(), writer_history.begin() + static_cast<std::ptrdiff_t>(erase_count));
+                }
             }
         }
     }
@@ -2067,6 +2182,11 @@ struct StereoForensics::Impl {
                 {"max_root_binds_per_frame", max_root_binds_per_frame},
                 {"max_total_events", max_total_events},
                 {"max_total_bytes", max_total_bytes},
+                {"track_side_tables_after_stop", track_side_tables_after_stop},
+                {"track_producers_on_skipped_frames", track_producers_on_skipped_frames},
+                {"arm_file", arm_file.string()},
+                {"rearm_count", rearm_count},
+                {"last_arm_reason", last_arm_reason},
                 {"total_events_recorded", total_events_recorded},
                 {"total_events_written", total_events_written},
                 {"total_event_bytes", total_event_bytes},
@@ -2168,6 +2288,25 @@ bool StereoForensics::is_capturing_this_frame() const {
     } STEREO_FORENSICS_CATCH_RETURN("is_capturing_this_frame", false)
 }
 
+bool StereoForensics::should_track_lightweight_producers() const {
+    STEREO_FORENSICS_TRY("should_track_lightweight_producers") {
+    return m_impl != nullptr &&
+        m_impl->enabled &&
+        m_impl->track_producers_on_skipped_frames &&
+        !m_impl->capture_frame_active_atomic.load(std::memory_order_relaxed);
+    } STEREO_FORENSICS_CATCH_RETURN("should_track_lightweight_producers", false)
+}
+
+bool StereoForensics::arm_capture(std::string_view reason) {
+    STEREO_FORENSICS_TRY("arm_capture") {
+    if (m_impl == nullptr || !m_impl->enabled) {
+        return false;
+    }
+    std::scoped_lock _{m_impl->mutex};
+    return m_impl->arm_capture_locked(reason);
+    } STEREO_FORENSICS_CATCH_RETURN("arm_capture", false)
+}
+
 std::filesystem::path StereoForensics::session_dir() const {
     STEREO_FORENSICS_TRY("session_dir") {
     if (m_impl == nullptr) {
@@ -2242,7 +2381,7 @@ void StereoForensics::record_descriptor_heap_created(
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (m_impl->capture_stopped) {
+    if (!m_impl->side_table_updates_allowed_locked()) {
         return;
     }
     const auto key = reinterpret_cast<uintptr_t>(heap);
@@ -2287,7 +2426,7 @@ void StereoForensics::record_resource_created(
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (m_impl->capture_stopped) {
+    if (!m_impl->side_table_updates_allowed_locked()) {
         return;
     }
     m_impl->update_resource_locked(source, resource, desc, false, 0, 0, heap_props, heap_flags, initial_state);
@@ -2315,7 +2454,7 @@ void StereoForensics::record_placed_resource_created(
         heap_flags = heap_desc.Flags;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (m_impl->capture_stopped) {
+    if (!m_impl->side_table_updates_allowed_locked()) {
         return;
     }
     m_impl->update_resource_locked(source, resource, desc, true, reinterpret_cast<uintptr_t>(heap), heap_offset, &heap_props, heap_flags, initial_state);
@@ -2333,7 +2472,7 @@ void StereoForensics::record_resource_released(
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (m_impl->capture_stopped) {
+    if (!m_impl->side_table_updates_allowed_locked()) {
         return;
     }
     const auto key = reinterpret_cast<uintptr_t>(resource);
@@ -2377,7 +2516,7 @@ void StereoForensics::record_cbv_descriptor(
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (m_impl->capture_stopped) {
+    if (!m_impl->side_table_updates_allowed_locked()) {
         return;
     }
     auto rec = m_impl->descriptor_base_locked(DescriptorKind::CBV, handle, 0);
@@ -2399,7 +2538,7 @@ void StereoForensics::record_srv_descriptor(
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (m_impl->capture_stopped) {
+    if (!m_impl->side_table_updates_allowed_locked()) {
         return;
     }
     m_impl->update_resource_locked(source, resource, nullptr, false, 0, 0, nullptr, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
@@ -2448,7 +2587,7 @@ void StereoForensics::record_uav_descriptor(
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (m_impl->capture_stopped) {
+    if (!m_impl->side_table_updates_allowed_locked()) {
         return;
     }
     m_impl->update_resource_locked(source, resource, nullptr, false, 0, 0, nullptr, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
@@ -2496,7 +2635,7 @@ void StereoForensics::record_rtv_descriptor(
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (m_impl->capture_stopped) {
+    if (!m_impl->side_table_updates_allowed_locked()) {
         return;
     }
     m_impl->update_resource_locked(source, resource, nullptr, false, 0, 0, nullptr, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
@@ -2529,7 +2668,7 @@ void StereoForensics::record_dsv_descriptor(
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (m_impl->capture_stopped) {
+    if (!m_impl->side_table_updates_allowed_locked()) {
         return;
     }
     m_impl->update_resource_locked(source, resource, nullptr, false, 0, 0, nullptr, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
@@ -2553,7 +2692,7 @@ void StereoForensics::record_descriptor_copy(
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (m_impl->capture_stopped) {
+    if (!m_impl->side_table_updates_allowed_locked()) {
         return;
     }
     json rec;
@@ -2658,6 +2797,30 @@ void StereoForensics::record_render_targets_set(
     }
     m_impl->push_event_locked({{"event_class", "bind"}, {"kind", "om_set_render_targets"}, {"source", std::string{source}}, {"command_list", command_list}, {"command_list_hex", hex_u64(command_list)}, {"rtvs", std::move(rtv_json)}, {"dsv", dsv != nullptr ? static_cast<uintptr_t>(dsv->ptr) : 0}});
     } STEREO_FORENSICS_CATCH_VOID("record_render_targets_set")
+}
+
+void StereoForensics::record_render_target_writes_hint(
+    std::string_view source,
+    std::string_view kind,
+    uintptr_t command_list,
+    uintptr_t pipeline_state,
+    int32_t eye_bucket,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs,
+    uint32_t rtv_count) {
+    STEREO_FORENSICS_TRY("record_render_target_writes_hint") {
+    if (!is_enabled() || rtvs == nullptr || rtv_count == 0) {
+        return;
+    }
+    std::scoped_lock _{m_impl->mutex};
+    m_impl->note_lightweight_rtv_writes_locked(
+        source,
+        kind,
+        command_list,
+        pipeline_state,
+        eye_bucket,
+        rtvs,
+        rtv_count);
+    } STEREO_FORENSICS_CATCH_VOID("record_render_target_writes_hint")
 }
 
 void StereoForensics::record_root_bind(
@@ -2772,7 +2935,8 @@ void StereoForensics::record_resource_barriers(
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (!m_impl->capture_frame_active || m_impl->capture_stopped) {
+    const bool record_event = m_impl->capture_frame_active && !m_impl->capture_stopped;
+    if (!record_event && !m_impl->track_side_tables_after_stop) {
         return;
     }
     json arr = json::array();
@@ -2810,9 +2974,13 @@ void StereoForensics::record_resource_barriers(
             item["resource"] = reinterpret_cast<uintptr_t>(b.UAV.pResource);
             item["resource_hex"] = hex_u64(reinterpret_cast<uintptr_t>(b.UAV.pResource));
         }
-        arr.push_back(std::move(item));
+        if (record_event) {
+            arr.push_back(std::move(item));
+        }
     }
-    m_impl->push_event_locked({{"event_class", "barrier"}, {"kind", "resource_barrier"}, {"source", std::string{source}}, {"command_list", command_list}, {"command_list_hex", hex_u64(command_list)}, {"barriers", std::move(arr)}});
+    if (record_event) {
+        m_impl->push_event_locked({{"event_class", "barrier"}, {"kind", "resource_barrier"}, {"source", std::string{source}}, {"command_list", command_list}, {"command_list_hex", hex_u64(command_list)}, {"barriers", std::move(arr)}});
+    }
     } STEREO_FORENSICS_CATCH_VOID("record_resource_barriers")
 }
 
@@ -2829,7 +2997,8 @@ void StereoForensics::record_rtv_clear(
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (!m_impl->capture_frame_active || m_impl->capture_stopped) {
+    const bool record_event = m_impl->capture_frame_active && !m_impl->capture_stopped;
+    if (!record_event && !m_impl->track_producers_on_skipped_frames) {
         return;
     }
     const auto cpu = static_cast<uintptr_t>(rtv.ptr);
@@ -2852,9 +3021,13 @@ void StereoForensics::record_rtv_clear(
         {"color", color_rgba != nullptr ? json::array({color_rgba[0], color_rgba[1], color_rgba[2], color_rgba[3]}) : json::array()}
     };
     event["writes"] = json::array({m_impl->write_json_locked("clear_rtv", cpu, resource, 0)});
-    const auto pushed = m_impl->push_event_locked(event);
-    if (pushed != 0) {
-        m_impl->note_writes_locked(event, pushed);
+    if (record_event) {
+        const auto pushed = m_impl->push_event_locked(event);
+        if (pushed != 0) {
+            m_impl->note_writes_locked(event, pushed);
+        }
+    } else {
+        m_impl->note_writes_locked(event, 0);
     }
     } STEREO_FORENSICS_CATCH_VOID("record_rtv_clear")
 }
@@ -2878,7 +3051,8 @@ void StereoForensics::record_resource_copy(
         return;
     }
     std::scoped_lock _{m_impl->mutex};
-    if (!m_impl->capture_frame_active || m_impl->capture_stopped) {
+    const bool record_event = m_impl->capture_frame_active && !m_impl->capture_stopped;
+    if (!record_event && !m_impl->track_producers_on_skipped_frames) {
         return;
     }
     json reads = json::array();
@@ -2914,9 +3088,13 @@ void StereoForensics::record_resource_copy(
         {"descriptor_reads", std::move(reads)},
         {"writes", std::move(writes)}
     };
-    const auto pushed = m_impl->push_event_locked(event);
-    if (pushed != 0) {
-        m_impl->note_writes_locked(event, pushed);
+    if (record_event) {
+        const auto pushed = m_impl->push_event_locked(event);
+        if (pushed != 0) {
+            m_impl->note_writes_locked(event, pushed);
+        }
+    } else {
+        m_impl->note_writes_locked(event, 0);
     }
     } STEREO_FORENSICS_CATCH_VOID("record_resource_copy")
 }
@@ -3065,6 +3243,7 @@ void StereoForensics::record_draw_or_dispatch(
         {"descriptor_reads", std::move(reads)},
         {"writes", std::move(writes)}
     };
+    sn2_issuer_stack::attach(event);  // adds issuer_stack[]+module_base when UEVR_STEREO_FORENSICS_STACKS=1
     const auto pushed = m_impl->push_event_locked(event);
     if (pushed != 0) {
         m_impl->note_writes_locked(event, pushed);

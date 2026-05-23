@@ -89,6 +89,10 @@ UEVR_RENDER_CAPI const char* uevr_render_diag_export_bundle(
 // {enabled, experiments_enabled, session_dir, manifest, eye_diff, lineage}.
 UEVR_RENDER_CAPI const char* uevr_render_diag_stereo_forensics_json();
 
+// Re-arm Stereo Forensics to capture the next eligible frame burst now. Returns
+// {ok, enabled, session_dir, manifest, events_jsonl, eye_diff, lineage}.
+UEVR_RENDER_CAPI const char* uevr_render_diag_stereo_forensics_arm_json();
+
 // ── Stereo / one-eye-bug diagnostics ─────────────────────────────────
 
 // Walks the resource list + PSO aggregates and surfaces per-eye stats with

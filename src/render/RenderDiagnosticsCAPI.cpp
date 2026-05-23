@@ -1615,6 +1615,27 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_stereo_forensics_json()
     }
 }
 
+extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_stereo_forensics_arm_json() {
+    try {
+        auto& forensics = render::StereoForensics::get();
+        const bool ok = forensics.arm_capture("capi");
+        const auto dir = forensics.session_dir();
+        return publish(json{
+            {"ok", ok},
+            {"enabled", forensics.is_enabled()},
+            {"experiments_enabled", forensics.experiments_enabled()},
+            {"session_dir", dir.string()},
+            {"manifest", dir.empty() ? std::string{} : (dir / "manifest.json").string()},
+            {"events_jsonl", dir.empty() ? std::string{} : (dir / "events.jsonl").string()},
+            {"eye_diff", dir.empty() ? std::string{} : (dir / "eye_diff.json").string()},
+            {"lineage", dir.empty() ? std::string{} : (dir / "lineage.json").string()},
+            {"experiments", dir.empty() ? std::string{} : (dir / "experiments.json").string()}
+        });
+    } catch (const std::exception& e) {
+        return publish(json{{"ok", false}, {"enabled", false}, {"error", e.what()}});
+    }
+}
+
 // ── Stereo / one-eye-bug diagnostics ────────────────────────────────
 
 namespace {

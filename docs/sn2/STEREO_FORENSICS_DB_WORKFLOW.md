@@ -26,11 +26,12 @@ left/right diff.
 
 Default capture limiters are intentionally conservative for live games:
 `UEVR_STEREO_FORENSICS_FRAME_STRIDE=30`,
-`UEVR_STEREO_FORENSICS_MAX_CAPTURED_FRAMES=16`,
-`UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_FRAME=5000`,
-`UEVR_STEREO_FORENSICS_MAX_TOTAL_EVENTS=80000`, and
-`UEVR_STEREO_FORENSICS_MAX_TOTAL_BYTES=134217728`. Raise these only for a
-specific capture.
+`UEVR_STEREO_FORENSICS_MAX_CAPTURED_FRAMES=4`,
+`UEVR_STEREO_FORENSICS_MAX_EVENTS_PER_FRAME=12000`,
+`UEVR_STEREO_FORENSICS_MAX_TOTAL_EVENTS=120000`, and
+`UEVR_STEREO_FORENSICS_MAX_TOTAL_BYTES=268435456`. Raise these only for a
+specific capture. The defaults favor a short dense gameplay burst over a long
+startup/menu capture.
 
 To capture the active scene instead of startup/menu frames, re-arm a fresh burst
 while the game is already in the target state:
@@ -43,6 +44,19 @@ The runtime consumes the sentinel, resets the captured-frame burst counter, and
 starts the next eligible captured frame immediately. Skipped and stopped frames
 also skip expensive descriptor-read/draw-detail collection unless
 `UEVR_STEREO_FORENSICS_KEEP_HOOK_DETAIL_ON_SKIPPED_FRAMES=1` is set.
+They still keep descriptor/resource side tables and lightweight producer
+history current by default, so a later re-armed gameplay burst can classify
+static imports, frame-produced targets, and recent RTV/copy producers.
+
+If the UEVR MCP plugin is loaded, the same re-arm can be triggered without a
+file:
+
+```bat
+curl -X POST http://localhost:8899/api/render/stereo-forensics/arm
+```
+
+The MCP tool name is `uevr_render_stereo_forensics_arm`, and the dashboard has
+an `Arm Capture` button on the Stereo Forensics card.
 
 All commands also accept:
 

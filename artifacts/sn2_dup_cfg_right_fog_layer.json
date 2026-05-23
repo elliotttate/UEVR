@@ -1,0 +1,41 @@
+{
+  "schema": "uevr.sn2.dup_config.v1",
+  "description": "2026-05-23: targeted right-eye replay for the SN2 fog/water layer while keeping all older sky-atmos overrides off. Replays the left-only volume producers with a synthesized right View CB and replays the foreground composite draws into the right viewport.",
+  "default_view_cb_delta": -10240,
+  "default_view_cb_roots": [],
+  "entries": {
+    "0x9d14fcf0": {
+      "mode": "synthesize_right_cb",
+      "view_cb_roots": [3, 6, 8],
+      "note": "VoxelizePS, left-only 50x26x48 fog volume writer. Roots are stage b0 View CBs for PS/VS/GS; no viewport shift."
+    },
+    "0x89872979": {
+      "mode": "synthesize_right_cb",
+      "view_cb_roots": [2, 7],
+      "note": "Left-only 24x24x24 foreground fog-volume DrawInstanced writer. Roots are PS b0 and VS b0."
+    },
+    "0x5e1e86ce": {
+      "mode": "synthesize_right_cb",
+      "view_cb_roots": [2, 6],
+      "note": "Left-only 24x24x24 foreground fog-volume DrawInstanced writer. Roots are PS b0 and VS b0."
+    },
+    "0xde7c3822": {
+      "mode": "viewport_shift",
+      "view_cb_roots": [4, 11],
+      "view_cb_delta": -10240,
+      "note": "Left-only foreground fog/water composite in the current live capture. Shift to right viewport and remap PS/VS b0 View CBs."
+    },
+    "0x32040a0d": {
+      "mode": "viewport_shift",
+      "view_cb_roots": [4, 11],
+      "view_cb_delta": -10240,
+      "note": "Left-only foreground fog/water composite sibling of DE7C3822."
+    },
+    "0xb9be2499": {
+      "mode": "viewport_shift",
+      "view_cb_roots": [4, 11],
+      "view_cb_delta": -10240,
+      "note": "Left-only foreground fog/water composite sibling of DE7C3822."
+    }
+  }
+}

@@ -17,6 +17,7 @@
 //   "entries": {
 //     "0x13b00f0c": {
 //       "view_cb_roots": [4, 6],
+//       "view_cb_delta": -10240,
 //       "mode": "viewport_shift",
 //       "note": "MainPS — BasePass scene color, both PS b0 and VS b0 read View"
 //     },
@@ -94,6 +95,7 @@ inline std::string_view mode_to_string(DupMode m) {
 
 struct Entry {
     std::vector<uint32_t> view_cb_roots{};
+    std::optional<int64_t> view_cb_delta{};
     DupMode mode{DupMode::ViewportShift};
     std::string note{};
 };
@@ -165,6 +167,12 @@ inline void load_config_locked() {
                             e.view_cb_roots.push_back(r.get<uint32_t>());
                         }
                     }
+                }
+                if (v.contains("view_cb_delta") && v["view_cb_delta"].is_number_integer()) {
+                    e.view_cb_delta = v["view_cb_delta"].get<int64_t>();
+                } else if (v.contains("delta") && v["delta"].is_number_integer()) {
+                    // Back-compat with the older docs/tooling name.
+                    e.view_cb_delta = v["delta"].get<int64_t>();
                 }
                 if (v.contains("mode") && v["mode"].is_string()) {
                     e.mode = mode_from_string(v["mode"].get<std::string>());
@@ -242,6 +250,22 @@ inline int64_t view_cb_delta() {
     const auto& c = config();
     if (file_path_set()) return c.default_view_cb_delta;
     return sn2_water_basepass_dup::view_cb_offset_delta();
+}
+
+inline int64_t view_cb_delta_for(uint32_t crc) {
+    const auto& c = config();
+    const auto it = c.entries.find(crc);
+    if (it != c.entries.end() && it->second.view_cb_delta.has_value()) {
+        return *it->second.view_cb_delta;
+    }
+    return view_cb_delta();
+}
+
+inline uint64_t compute_right_view_va_for(uint32_t crc, uint64_t left_va) {
+    if (left_va == 0) return 0;
+    const int64_t delta = view_cb_delta_for(crc);
+    if (delta < 0 && left_va < static_cast<uint64_t>(-delta)) return 0;
+    return static_cast<uint64_t>(static_cast<int64_t>(left_va) + delta);
 }
 
 }  // namespace sn2_dup_config

@@ -83,9 +83,9 @@ now exception-isolated. A JSON/filesystem/allocation edge case logs and drops
 the diagnostics event instead of unwinding through the D3D12 hook into the game.
 
 Flood guardrails: forensics is now a bounded burst sampler by default. It
-captures every 30th frame, stops after 16 captured frames, caps captured frames
-at 5000 events, caps `set_pso` binds at 256 per frame, caps root binds at 2048
-per frame, and stops the session around 80k events or 128 MiB of JSONL. The
+captures every 30th frame, stops after 4 captured frames, caps captured frames
+at 12000 events, caps `set_pso` binds at 768 per frame, caps root binds at 4096
+per frame, and stops the burst around 120k events or 256 MiB of JSONL. The
 current limiter state is written into `manifest.json` and each
 `frames/frame_<N>_summary.json`.
 
@@ -99,7 +99,12 @@ D3D12Diagnostics capture explicitly needs full-session draw/root detail.
 Scene-targeting guardrail: create `C:\tmp\uevr_forensics_arm.txt` while the game
 is in the scene you care about to re-arm a fresh capture burst. The sentinel
 resets `captured_frames`, clears the stopped latch, and starts capturing on the
-next frame.
+next frame. The UEVR MCP plugin now exposes the same operation as
+`POST /api/render/stereo-forensics/arm`, the MCP tool
+`uevr_render_stereo_forensics_arm`, and the dashboard `Arm Capture` button.
+Side-table metadata and lightweight producer history stay current after a burst
+stops, so re-armed gameplay captures are not limited to startup/menu resource
+knowledge.
 
 ## Checklist against the full plan
 
