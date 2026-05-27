@@ -40,6 +40,236 @@
 constexpr auto ENGINE_SRC_DEPTH = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 constexpr auto ENGINE_SRC_COLOR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
+namespace sn2_openxr_array_diag {
+    static bool env_on(const char* name) {
+        char b[16]{};
+        const auto n = GetEnvironmentVariableA(name, b, sizeof(b));
+        return n != 0 && n < sizeof(b) && b[0] && b[0] != '0';
+    }
+
+    static UINT env_u32(const char* name, UINT fallback) {
+        char b[32]{};
+        const auto n = GetEnvironmentVariableA(name, b, sizeof(b));
+        if (n == 0 || n >= sizeof(b)) {
+            return fallback;
+        }
+        char* end = nullptr;
+        const auto v = std::strtoul(b, &end, 0);
+        return end != b ? static_cast<UINT>(v) : fallback;
+    }
+
+    struct RtvRing {
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap{};
+        UINT stride{0};
+        UINT next{0};
+        UINT capacity{64};
+        ID3D12Device* device{nullptr};
+        std::mutex mutex{};
+    };
+
+    static RtvRing& rtv_ring() {
+        static RtvRing s{};
+        return s;
+    }
+
+    static bool ensure_rtv_ring(ID3D12Device* device) {
+        auto& r = rtv_ring();
+        std::scoped_lock lock{r.mutex};
+        if (r.heap != nullptr && r.device == device) {
+            return true;
+        }
+
+        r.heap.Reset();
+        r.device = nullptr;
+        r.next = 0;
+        r.stride = 0;
+
+        if (device == nullptr) {
+            return false;
+        }
+
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = r.capacity;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&r.heap))) || r.heap == nullptr) {
+            SPDLOG_WARN("[SN2-OpenXRArrayDiag] CreateDescriptorHeap(RTV ring) failed");
+            return false;
+        }
+        r.device = device;
+        r.stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        SPDLOG_WARN("[SN2-OpenXRArrayDiag] RTV ring ready capacity={} stride={}", r.capacity, r.stride);
+        return true;
+    }
+
+    static bool clear_slice_if_enabled(d3d12::CommandContext& commands, ID3D12Resource* dst) {
+        if (!env_on("UEVR_SN2_OPENXR_ARRAY_CLEAR")) {
+            return false;
+        }
+        if (dst == nullptr || commands.cmd_list == nullptr || g_framework == nullptr || g_framework->get_d3d12_hook() == nullptr) {
+            return false;
+        }
+
+        auto* device = g_framework->get_d3d12_hook()->get_device();
+        if (!ensure_rtv_ring(device)) {
+            return false;
+        }
+
+        const UINT slice = env_u32("UEVR_SN2_OPENXR_ARRAY_CLEAR_EYE", 1);
+        const auto desc = dst->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || slice >= desc.DepthOrArraySize) {
+            SPDLOG_WARN_ONCE("[SN2-OpenXRArrayDiag] clear skipped: dim={} array={} requested_slice={}",
+                static_cast<unsigned>(desc.Dimension),
+                static_cast<unsigned>(desc.DepthOrArraySize),
+                slice);
+            return false;
+        }
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) == 0) {
+            SPDLOG_WARN_ONCE("[SN2-OpenXRArrayDiag] clear skipped: OpenXR array image is not RT-capable flags=0x{:x}",
+                static_cast<unsigned>(desc.Flags));
+            return false;
+        }
+
+        D3D12_CPU_DESCRIPTOR_HANDLE handle{};
+        {
+            auto& r = rtv_ring();
+            std::scoped_lock lock{r.mutex};
+            const UINT idx = r.next++ % r.capacity;
+            handle = r.heap->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += static_cast<SIZE_T>(idx) * static_cast<SIZE_T>(r.stride);
+
+            D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+            rtv.Format = desc.Format;
+            rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+            rtv.Texture2DArray.MipSlice = 0;
+            rtv.Texture2DArray.FirstArraySlice = slice;
+            rtv.Texture2DArray.ArraySize = 1;
+            rtv.Texture2DArray.PlaneSlice = 0;
+            device->CreateRenderTargetView(dst, &rtv, handle);
+        }
+
+        const float magenta[4]{1.0f, 0.0f, 1.0f, 1.0f};
+        commands.cmd_list->ClearRenderTargetView(handle, magenta, 0, nullptr);
+        commands.has_commands = true;
+
+        static uint64_t s_count = 0;
+        ++s_count;
+        if (s_count <= 16 || (s_count % 600) == 0) {
+            SPDLOG_WARN("[SN2-OpenXRArrayDiag] cleared OpenXR native array slice={} dst=0x{:x} {}x{} array={} fmt={} n={}",
+                slice,
+                reinterpret_cast<uintptr_t>(dst),
+                static_cast<unsigned>(desc.Width),
+                static_cast<unsigned>(desc.Height),
+                static_cast<unsigned>(desc.DepthOrArraySize),
+                static_cast<unsigned>(desc.Format),
+                s_count);
+        }
+        return true;
+    }
+
+    static bool clear_source_box_if_enabled(
+        d3d12::CommandContext& commands,
+        ID3D12Resource* src,
+        const D3D12_BOX& box,
+        D3D12_RESOURCE_STATES src_state)
+    {
+        if (!env_on("UEVR_SN2_OPENXR_SOURCE_CLEAR")) {
+            return false;
+        }
+        // This mutates the game's source backbuffer from UEVR's OpenXR copy
+        // command context. It device-removed once in SN2 (DXGI_ERROR_INVALID_CALL),
+        // so require a second explicit opt-in and keep it diagnostic-only.
+        if (!env_on("UEVR_SN2_OPENXR_SOURCE_CLEAR_UNSAFE")) {
+            SPDLOG_WARN_ONCE("[SN2-OpenXRArrayDiag] UEVR_SN2_OPENXR_SOURCE_CLEAR requested but ignored; set UEVR_SN2_OPENXR_SOURCE_CLEAR_UNSAFE=1 to run the known-risk source mutation probe");
+            return false;
+        }
+        if (src == nullptr || commands.cmd_list == nullptr || g_framework == nullptr || g_framework->get_d3d12_hook() == nullptr) {
+            return false;
+        }
+
+        auto* device = g_framework->get_d3d12_hook()->get_device();
+        if (!ensure_rtv_ring(device)) {
+            return false;
+        }
+
+        const auto desc = src->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+            SPDLOG_WARN_ONCE("[SN2-OpenXRArrayDiag] source clear skipped: dim={}",
+                static_cast<unsigned>(desc.Dimension));
+            return false;
+        }
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) == 0) {
+            SPDLOG_WARN_ONCE("[SN2-OpenXRArrayDiag] source clear skipped: source is not RT-capable flags=0x{:x}",
+                static_cast<unsigned>(desc.Flags));
+            return false;
+        }
+
+        D3D12_CPU_DESCRIPTOR_HANDLE handle{};
+        {
+            auto& r = rtv_ring();
+            std::scoped_lock lock{r.mutex};
+            const UINT idx = r.next++ % r.capacity;
+            handle = r.heap->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += static_cast<SIZE_T>(idx) * static_cast<SIZE_T>(r.stride);
+
+            D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+            rtv.Format = desc.Format;
+            if (desc.DepthOrArraySize > 1) {
+                rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                rtv.Texture2DArray.MipSlice = 0;
+                rtv.Texture2DArray.FirstArraySlice = 0;
+                rtv.Texture2DArray.ArraySize = 1;
+                rtv.Texture2DArray.PlaneSlice = 0;
+            } else {
+                rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                rtv.Texture2D.MipSlice = 0;
+                rtv.Texture2D.PlaneSlice = 0;
+            }
+            device->CreateRenderTargetView(src, &rtv, handle);
+        }
+
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = src;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = src_state;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if (src_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+            commands.cmd_list->ResourceBarrier(1, &barrier);
+        }
+
+        const D3D12_RECT rect{
+            static_cast<LONG>(box.left),
+            static_cast<LONG>(box.top),
+            static_cast<LONG>(box.right),
+            static_cast<LONG>(box.bottom)
+        };
+        const float magenta[4]{1.0f, 0.0f, 1.0f, 1.0f};
+        commands.cmd_list->ClearRenderTargetView(handle, magenta, 1, &rect);
+
+        if (src_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter = src_state;
+            commands.cmd_list->ResourceBarrier(1, &barrier);
+        }
+        commands.has_commands = true;
+
+        static uint64_t s_count = 0;
+        ++s_count;
+        if (s_count <= 16 || (s_count % 600) == 0) {
+            SPDLOG_WARN("[SN2-OpenXRArrayDiag] cleared OpenXR source box src=0x{:x} {}x{} fmt={} state={} rect=({}, {}, {}, {}) n={}",
+                reinterpret_cast<uintptr_t>(src),
+                static_cast<unsigned>(desc.Width),
+                static_cast<unsigned>(desc.Height),
+                static_cast<unsigned>(desc.Format),
+                static_cast<unsigned>(src_state),
+                rect.left, rect.top, rect.right, rect.bottom,
+                s_count);
+        }
+        return true;
+    }
+}
+
 // 2026-05-24 SN2 RIGHT-EYE COLOR TRANSFER (present-time cosmetic fix).
 // The right eye renders the scene above-water (warm) while the left renders it underwater (teal);
 // the per-view divergence is in the basepass lighting and not reachable from a runtime hook. This
@@ -2141,6 +2371,23 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                             m_backbuffer_size[1],
                             (uint32_t)scene_source_state,
                             use_native_split_submit ? "per-eye" : "array");
+                        {
+                            static std::atomic<uint64_t> native_submit_seq{0};
+                            const auto nsn = native_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if (nsn <= 32 || (nsn % 600) == 0) {
+                                SPDLOG_INFO("[NativeStereoDebug] Split submit#{} source=0x{:x} size={}x{} fmt={} flags=0x{:x} configured={}x{} state={} mode={}",
+                                    nsn,
+                                    reinterpret_cast<uintptr_t>(backbuffer.Get()),
+                                    backbuffer_desc.Width,
+                                    backbuffer_desc.Height,
+                                    static_cast<unsigned>(backbuffer_desc.Format),
+                                    static_cast<unsigned>(backbuffer_desc.Flags),
+                                    m_backbuffer_size[0],
+                                    m_backbuffer_size[1],
+                                    static_cast<unsigned>(scene_source_state),
+                                    use_native_split_submit ? "per-eye" : "array");
+                            }
+                        }
 
                         D3D12_BOX left_src_box{};
                         left_src_box.left = 0;
@@ -2204,6 +2451,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                                 native_stereo_array_swapchain,
                                 nullptr,
                                 [backbuffer, left_src_box, right_src_box, left_top_src_box, scene_source_state, mirror = mirror_top_half](d3d12::CommandContext& commands, ID3D12Resource* dst) mutable {
+                                    sn2_openxr_array_diag::clear_source_box_if_enabled(
+                                        commands,
+                                        backbuffer.Get(),
+                                        right_src_box,
+                                        scene_source_state);
                                     // Slice 0 (left eye): full left half
                                     commands.copy_region_to_subresource(
                                         backbuffer.Get(),
@@ -2231,6 +2483,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                                             scene_source_state,
                                             D3D12_RESOURCE_STATE_RENDER_TARGET);
                                     }
+                                    sn2_openxr_array_diag::clear_slice_if_enabled(commands, dst);
                                 },
                                 std::nullopt,
                                 D3D12_RESOURCE_STATE_RENDER_TARGET,

@@ -432,6 +432,24 @@ void Framework::hook_monitor() {
         return;
     }
 
+    // Embedded RenderDoc capture mode installs RenderDoc and the D3D12 hook
+    // before the game's main thread resumes. The normal "no Present yet"
+    // recovery path can race that startup by unhooking/re-hooking D3D12 a
+    // second time, which is exactly the fragile window this mode avoids.
+    if (capture_only_d3d12_mode() && env_flag_enabled("UEVR_RENDERDOC_BOOTSTRAP")) {
+        m_last_present_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        m_last_message_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        m_last_chance_time = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        m_has_last_chance = true;
+
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            spdlog::info("[CaptureOnlyD3D12] Suppressing hook-monitor D3D rehook in embedded RenderDoc capture mode.");
+        }
+
+        return;
+    }
+
     if (g_framework->m_wnd != nullptr) {
         // Check if window is minimzed and just return if it is
         // Because some games don't continuously call present when minimized

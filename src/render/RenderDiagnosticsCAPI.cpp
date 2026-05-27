@@ -28,6 +28,7 @@
 
 #include "Framework.hpp"
 #include "hooks/D3D12Hook.hpp"
+#include "hooks/Sn2CaptureSidecar.hpp"
 #include "mods/RenderInspector.hpp"
 #include "mods/VR.hpp"
 #include "mods/vr/CVarManager.hpp"
@@ -43,6 +44,7 @@ using json = nlohmann::json;
 template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
 extern "C" int sn2_get_current_fog_view();
+extern "C" void sn2_capture_truth_on_renderdoc_trigger(uint64_t seq);
 
 namespace {
 
@@ -2226,6 +2228,32 @@ namespace {
 std::thread g_renderdoc_watcher_thread{};
 std::atomic<bool> g_renderdoc_watcher_stop{false};
 std::atomic<bool> g_renderdoc_watcher_started{false};
+std::atomic<uint64_t> g_renderdoc_watcher_capture_seq{0};
+
+bool renderdoc_watcher_emit_sn2_sidecar() {
+    return rdc::env_truthy_w(L"UEVR_SN2_RD_CAPTURE_ALSO_EMIT_SIDECAR") ||
+           rdc::env_truthy_w(L"UEVR_RENDERDOC_EMIT_SN2_SIDECAR");
+}
+
+bool renderdoc_watcher_notify_sn2_capture() {
+    return rdc::env_truthy_w(L"UEVR_SN2_CAPTURE_TRUTH") ||
+           rdc::env_truthy_w(L"UEVR_SN2_TARGET_STATE_DUMP") ||
+           rdc::env_truthy_w(L"UEVR_SN2_RESOURCE_LINEAGE") ||
+           rdc::env_truthy_w(L"UEVR_SN2_DESCRIPTOR_HEAP_SNAPSHOT") ||
+           rdc::env_truthy_w(L"UEVR_SN2_PROBE_POINTS") ||
+           renderdoc_watcher_emit_sn2_sidecar();
+}
+
+uint64_t renderdoc_watcher_sn2_prearm_ms() {
+    static const uint64_t ms = []() {
+        const auto raw = rdc::env_string_a("UEVR_SN2_RENDERDOC_PREARM_MS");
+        if (raw.empty()) return 0ull;
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(raw.c_str(), &end, 0);
+        return end != raw.c_str() ? static_cast<uint64_t>(value) : 0ull;
+    }();
+    return ms;
+}
 
 void renderdoc_capture_watcher_loop() {
     namespace fs = std::filesystem;
@@ -2282,6 +2310,17 @@ void renderdoc_capture_watcher_loop() {
             rdc::set_capture_template(capture_template);
             spdlog::info("[RenderDoc] watcher: capture template -> {}", capture_template);
         }
+        const uint64_t sn2_seq = g_renderdoc_watcher_capture_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        const bool notify_sn2 = renderdoc_watcher_notify_sn2_capture();
+        if (notify_sn2) {
+            sn2_capture_truth_on_renderdoc_trigger(sn2_seq);
+            spdlog::info("[RenderDoc] watcher: notified SN2 capture truth seq={}", sn2_seq);
+            const uint64_t prearm_ms = renderdoc_watcher_sn2_prearm_ms();
+            if (prearm_ms > 0) {
+                spdlog::info("[RenderDoc] watcher: SN2 prearm sleep {} ms before capture", prearm_ms);
+                std::this_thread::sleep_for(std::chrono::milliseconds(prearm_ms));
+            }
+        }
         if (frames > 1) {
             api->TriggerMultiFrameCapture(static_cast<uint32_t>(frames));
             spdlog::info("[RenderDoc] watcher: triggered {} frames", frames);
@@ -2289,6 +2328,10 @@ void renderdoc_capture_watcher_loop() {
             const auto attempt = renderdoc_capture_prefer_active_pair(std::chrono::milliseconds(250));
             spdlog::info("[RenderDoc] watcher: capture mode={} ended={} newest='{}'",
                          attempt.mode, attempt.ended, rdc::newest_capture_path());
+        }
+        if (notify_sn2 && renderdoc_watcher_emit_sn2_sidecar() && sn2_capture_sidecar::env_enabled()) {
+            sn2_capture_sidecar::emit(sn2_seq);
+            spdlog::info("[RenderDoc] watcher: emitted SN2 sidecar seq={}", sn2_seq);
         }
     }
 }

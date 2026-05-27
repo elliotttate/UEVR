@@ -34,6 +34,9 @@ struct State {
     bool init_attempted{};
     bool loaded{};
     std::atomic<bool> trigger_pending{false};
+    std::atomic<bool> prearm_pending{false};
+    std::atomic<uint64_t> prearm_countdown{0};
+    std::atomic<uint64_t> prearmed_seq{0};
     std::atomic<bool> end_capture_pending{false};
     std::atomic<uint64_t> capture_count_{0};
     rdc::CapturePair pending_pair{};
@@ -119,6 +122,31 @@ uint64_t autocapture_every() {
     return k;
 }
 
+uint64_t prearm_frames() {
+    static const uint64_t k = env_u64("UEVR_SN2_RD_CAPTURE_PREARM_FRAMES");
+    return k;
+}
+
+void queue_capture_request(const char* reason) {
+    auto& s = state();
+    if (!s.loaded) return;
+    const uint64_t prearm = prearm_frames();
+    if (prearm == 0) {
+        s.trigger_pending.store(true, std::memory_order_release);
+        return;
+    }
+
+    bool expected = false;
+    if (s.prearm_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        const uint64_t seq = s.capture_count_.load(std::memory_order_relaxed) + 1;
+        s.prearmed_seq.store(seq, std::memory_order_release);
+        s.prearm_countdown.store(prearm, std::memory_order_release);
+        sn2_capture_truth_on_renderdoc_trigger(seq);
+        SPDLOG_WARN("[SN2-RdCapture] pre-armed SN2 truth gate seq={} frames={} reason={}",
+                    seq, prearm, reason != nullptr ? reason : "");
+    }
+}
+
 bool init() {
     if (!env_enabled()) return false;
 
@@ -180,11 +208,23 @@ void on_present(uint64_t frame_count, void* d3d12_device, void* hwnd) {
     const rdc::CapturePair pair = normalise_pair(d3d12_device, hwnd);
     rdc::set_active_window(pair);
 
+    if (s.prearm_pending.load(std::memory_order_acquire)) {
+        const uint64_t left = s.prearm_countdown.load(std::memory_order_acquire);
+        if (left <= 1) {
+            s.prearm_countdown.store(0, std::memory_order_release);
+            s.prearm_pending.store(false, std::memory_order_release);
+            s.trigger_pending.store(true, std::memory_order_release);
+            SPDLOG_WARN("[SN2-RdCapture] pre-arm complete; starting RenderDoc on this present");
+        } else {
+            s.prearm_countdown.store(left - 1, std::memory_order_release);
+        }
+    }
+
     if ((frame_count % 30) == 0) {
         DWORD attrs = GetFileAttributesA(trigger_file_path().c_str());
         if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-            s.trigger_pending.store(true, std::memory_order_release);
             DeleteFileA(trigger_file_path().c_str());
+            queue_capture_request("trigger_file");
         }
     }
 
@@ -199,7 +239,7 @@ void on_present(uint64_t frame_count, void* d3d12_device, void* hwnd) {
         if (fire) {
             SPDLOG_WARN("[SN2-RdCapture] autocapture trigger at internal frame {} (N={} every={})",
                         af, one_shot, every);
-            s.trigger_pending.store(true, std::memory_order_release);
+            queue_capture_request("autocapture");
         }
     }
 
@@ -239,7 +279,10 @@ void on_present(uint64_t frame_count, void* d3d12_device, void* hwnd) {
     if (s.trigger_pending.exchange(false, std::memory_order_acq_rel)) {
         SPDLOG_WARN("[SN2-RdCapture] arming capture at frame {} ({})",
                     frame_count, pair_string(pair));
-        sn2_capture_truth_on_renderdoc_trigger(s.capture_count_.load(std::memory_order_relaxed) + 1);
+        const uint64_t prearmed = s.prearmed_seq.exchange(0, std::memory_order_acq_rel);
+        if (prearmed == 0) {
+            sn2_capture_truth_on_renderdoc_trigger(s.capture_count_.load(std::memory_order_relaxed) + 1);
+        }
         if (rdc::start_capture(pair)) {
             {
                 std::scoped_lock _{s.mu};

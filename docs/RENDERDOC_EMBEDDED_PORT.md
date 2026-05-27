@@ -228,6 +228,43 @@ Open the capture directly in qrenderdoc:
 E:\Github\renderdoc\x64\Development\qrenderdoc.exe <capture.rdc>
 ```
 
+### SN2 Sidecar / Truth-Pack Capture
+
+For Subnautica 2, do **not** enable the full truth-pack scanners from frame 0
+while RenderDoc is embedded. Full descriptor heap snapshots, CBV slab dumps,
+lineage JSONL, probe rows, and bindless candidate scans can drop startup to
+single-digit or sub-1 FPS before the menu appears.
+
+Use the deferred-heavy path instead:
+
+```powershell
+& "E:\Github\Subnautica 2\moddingkit\runs\capture_bindless_truth_pack.ps1" `
+  -RenderDocLaunch `
+  -CaptureOnlyD3D12 `
+  -DescriptorSnapshot `
+  -SceneWaitSec 90 `
+  -OutDir "E:\Github\Subnautica 2\moddingkit\runs\embedded_truth_<stamp>"
+```
+
+That wrapper sets:
+
+- `UEVR_SN2_CAPTURE_DEFER_HEAVY=1`
+- `UEVR_SN2_CAPTURE_ARM_MS=45000`
+- `UEVR_RENDERDOC_BOOTSTRAP=1`
+- `UEVR_RENDERDOC_TRACK_ACTIVE_PAIR=1`
+- `UEVR_RENDERDOC_EMIT_SN2_SIDECAR=1`
+
+With defer enabled, the cheap startup state still runs: RenderDoc is resident
+before D3D12, descriptor/resource registries populate, and default-CBV shadowing
+records GPU-default View UB copies. The expensive rows are inactive until the
+watcher receives `%TEMP%\uevr_renderdoc_capture.req`; at that moment UEVR logs
+`[SN2-CaptureGate] armed ...`, emits the descriptor snapshot and sidecar, then
+captures the requested RenderDoc frame.
+
+`-SceneWaitSec` is now a warmup delay for embedded RenderDoc launches, not a
+pre-capture trace wait. Set it long enough for the target scene/menu to appear,
+then the wrapper arms the heavy path and requests the capture.
+
 ## MCP Capture Surface
 
 `E:\Github\uevr-mcp` exposes the full host-side capture flow so an MCP agent can

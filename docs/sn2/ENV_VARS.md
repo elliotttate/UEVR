@@ -125,11 +125,18 @@ Wrapper fallback behavior:
 
 ## Sky atmosphere / pre-built skip lists
 
+These are diagnostic-only visual masks. They are ignored unless
+`UEVR_SN2_ALLOW_SKYATMOS_DIAGNOSTICS=1` is also set. Keep the allow flag off for
+real right-eye fog validation.
+
 | Env Var | Type | Purpose |
 |---|---|---|
-| `UEVR_SN2_SKYATMOS_SKIP_RIGHT` | bool | Skip 5 hardcoded sky-atmos CRCs on right eye |
-| `UEVR_SN2_SKYATMOS_CB_REDIRECT` | bool | Sky atmos CB redirect (older approach) |
-| `UEVR_SN2_RIGHT_SKIP_CRCS` | csv | Additional right-eye CRC skip list |
+| `UEVR_SN2_ALLOW_SKYATMOS_DIAGNOSTICS` | bool | Required second gate for any sky/atmos mutation below |
+| `UEVR_SN2_SKYATMOS_SKIP_RIGHT` | bool | Skip 5 hardcoded sky-atmos CRCs on right eye, only when allow gate is set |
+| `UEVR_SN2_SKYATMOS_CB_REDIRECT` | bool | Sky atmos CB redirect (older approach), only when allow gate is set |
+| `UEVR_SN2_RIGHT_SKIP_CRCS` | csv | Additional right-eye CRC skip list, only when allow gate is set |
+| `UEVR_SN2_SKY_ATMOS_INLINE_FIX` | bool | Old inline sky-atmos CB fix, only when allow gate is set |
+| `UEVR_SN2_SKYATMOS_RIGHT_TABLE_SWAP` | bool | Old sky-atmos descriptor table swap/copy, only when allow gate is set |
 | `UEVR_SN2_FOG_SRV_REDIRECT` | int | Older fog SRV redirect mode (1=enable) |
 | `UEVR_SN2_FOG_SRV_REDIRECT_ROOT` | int | Root param to redirect |
 | `UEVR_SN2_FOG_SRV_REDIRECT_SLOTS` | csv | Slot indices |
