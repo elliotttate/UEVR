@@ -21,6 +21,8 @@ void emit(uint64_t seq);
 bool env_enabled();
 }
 
+extern "C" void sn2_capture_truth_on_renderdoc_trigger(uint64_t seq);
+
 namespace sn2_rd_capture {
 
 namespace {
@@ -358,6 +360,7 @@ void on_present(uint64_t frame_count, void* d3d12_device, void* hwnd) {
     // RD did latch a window/device pair.
     if (s.trigger_pending.exchange(false, std::memory_order_acq_rel)) {
         SPDLOG_WARN("[SN2-RdCapture] arming capture at frame {} (Start + Trigger)", frame_count);
+        sn2_capture_truth_on_renderdoc_trigger(s.capture_count_.load(std::memory_order_relaxed) + 1);
         if (s.api && s.api->StartFrameCapture) {
             s.api->StartFrameCapture(nullptr, nullptr);
         }

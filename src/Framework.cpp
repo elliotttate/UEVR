@@ -2,6 +2,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <string_view>
 #include <thread>
 
 #include <windows.h>
@@ -48,6 +49,24 @@ std::unique_ptr<Framework> g_framework{};
 namespace {
 constexpr auto D3D12_INIT_RETRY_INITIAL_BACKOFF = 50ms;
 constexpr auto D3D12_INIT_RETRY_MAX_BACKOFF = 250ms;
+
+bool env_flag_enabled(const char* name) {
+    char value[32]{};
+    const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+    if (len == 0 || len >= sizeof(value)) {
+        return false;
+    }
+
+    std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
+    return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+}
+
+bool capture_only_d3d12_mode() {
+    static const bool enabled =
+        env_flag_enabled("UEVR_CAPTURE_ONLY_D3D12") ||
+        env_flag_enabled("UEVR_SN2_CAPTURE_ONLY_D3D12");
+    return enabled;
+}
 
 // Result of try_load_pix_gpu_capturer:
 //   was_preloaded == true  -> WinPixGpuCapturer.dll was already loaded before
@@ -1035,6 +1054,16 @@ void Framework::on_frame_d3d12() {
 
     m_renderer_type = RendererType::D3D12;
 
+    if (capture_only_d3d12_mode()) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            spdlog::warn(
+                "[CaptureOnlyD3D12] Framework D3D12/VR frame initialization is disabled; "
+                "the D3D12 hook, RenderDoc bridge, and SN2 sidecar dumping remain active.");
+        }
+        return;
+    }
+
     auto command_queue = m_d3d12_hook->get_command_queue();
     //spdlog::debug("on_frame (D3D12)");
     
@@ -1200,6 +1229,10 @@ void Framework::on_frame_d3d12() {
 }
 
 void Framework::on_post_present_d3d12() {
+    if (capture_only_d3d12_mode()) {
+        return;
+    }
+
     if (!m_error.empty() || !m_initialized || !m_game_data_initialized) {
         if (m_last_present_time <= std::chrono::steady_clock::now()){
             m_last_present_time = std::chrono::steady_clock::now();

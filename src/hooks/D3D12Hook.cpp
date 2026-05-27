@@ -1743,6 +1743,78 @@ bool enable_d3d12_resource_lineage_hook() {
 }
 } // anonymous namespace
 
+namespace sn2_capture_truth {
+    void record_committed_resource(ID3D12Resource* resource,
+                                   const D3D12_HEAP_PROPERTIES* heap_props,
+                                   D3D12_HEAP_FLAGS heap_flags,
+                                   const D3D12_RESOURCE_DESC* desc,
+                                   D3D12_RESOURCE_STATES initial_state,
+                                   uintptr_t callsite);
+    void record_placed_resource(ID3D12Resource* resource,
+                                ID3D12Heap* heap,
+                                UINT64 heap_offset,
+                                const D3D12_RESOURCE_DESC* desc,
+                                D3D12_RESOURCE_STATES initial_state,
+                                uintptr_t callsite);
+    void record_cbv_descriptor(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
+                               D3D12_CPU_DESCRIPTOR_HANDLE cpu);
+    void record_descriptor_view(const char* kind,
+                                ID3D12Resource* resource,
+                                D3D12_CPU_DESCRIPTOR_HANDLE cpu);
+    void record_descriptor_copy(const char* op,
+                                D3D12_CPU_DESCRIPTOR_HANDLE dst,
+                                D3D12_CPU_DESCRIPTOR_HANDLE src,
+                                uint32_t count);
+    void record_copy_buffer(ID3D12GraphicsCommandList* command_list,
+                            const CommandListCorrelationState& state,
+                            ID3D12Resource* dst,
+                            UINT64 dst_offset,
+                            ID3D12Resource* src,
+                            UINT64 src_offset,
+                            UINT64 num_bytes);
+    void record_copy_texture(ID3D12GraphicsCommandList* command_list,
+                             const CommandListCorrelationState& state,
+                             const D3D12_TEXTURE_COPY_LOCATION* dst,
+                             UINT dst_x,
+                             UINT dst_y,
+                             UINT dst_z,
+                             const D3D12_TEXTURE_COPY_LOCATION* src,
+                             const D3D12_BOX* src_box);
+    void record_copy_resource(ID3D12GraphicsCommandList* command_list,
+                              const CommandListCorrelationState& state,
+                              ID3D12Resource* dst,
+                              ID3D12Resource* src);
+    void record_clear_rtv(ID3D12GraphicsCommandList* command_list,
+                          const CommandListCorrelationState& state,
+                          D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                          const FLOAT color_rgba[4],
+                          UINT num_rects);
+    void record_barriers(ID3D12GraphicsCommandList* command_list,
+                         const CommandListCorrelationState& state,
+                         UINT num_barriers,
+                         const D3D12_RESOURCE_BARRIER* barriers);
+    void emit_target_draw(ID3D12GraphicsCommandList* command_list,
+                          const CommandListCorrelationState& state,
+                          uint32_t ps_crc,
+                          uint32_t vs_crc,
+                          uint32_t gs_crc,
+                          const char* draw_kind,
+                          uint32_t index_count,
+                          uint32_t instance_count,
+                          uint32_t start_index,
+                          int32_t base_vertex,
+                          uint32_t start_instance,
+                          uintptr_t callsite);
+    void emit_target_dispatch(ID3D12GraphicsCommandList* command_list,
+                              const CommandListCorrelationState& state,
+                              uint32_t cs_crc,
+                              uint32_t x,
+                              uint32_t y,
+                              uint32_t z,
+                              uintptr_t callsite);
+    void on_capture_trigger(uint64_t seq);
+}
+
 // 2026-05-18: forward declarations for the upload-buffer Map vtable hook
 // system defined later in this file. Placed at GLOBAL scope (outside the
 // anonymous namespace above) so the linker resolves to the global-scope
@@ -5484,6 +5556,7 @@ void WINAPI D3D12Hook::create_constant_buffer_view(
         desc,
         descriptor);
     sn2_descriptor_registry::record_cbv(desc, descriptor);
+    ::sn2_capture_truth::record_cbv_descriptor(desc, descriptor);
 }
 
 void WINAPI D3D12Hook::create_render_target_view(
@@ -5509,6 +5582,7 @@ void WINAPI D3D12Hook::create_render_target_view(
         desc,
         descriptor);
     sn2_rt_snapshot::record_rtv(static_cast<uint64_t>(descriptor.ptr), resource);
+    ::sn2_capture_truth::record_descriptor_view("rtv", resource, descriptor);
 }
 
 // 2026-05-16 SN2 fog SRV tracker. Hooks ID3D12Device::CreateShaderResourceView
@@ -6527,6 +6601,13 @@ namespace sn2_upload_buf_map {
                 heap_props,
                 heap_flags,
                 initial_state);
+            ::sn2_capture_truth::record_committed_resource(
+                reinterpret_cast<ID3D12Resource*>(*ppv),
+                heap_props,
+                heap_flags,
+                desc,
+                initial_state,
+                reinterpret_cast<uintptr_t>(_ReturnAddress()));
 
             // RenderDoc/PIX/Nsight legibility: name the resource at creation so
             // the capture shows what it is instead of a numeric ID. Gated by
@@ -6675,6 +6756,13 @@ namespace sn2_upload_buf_map {
                 heap_offset,
                 desc,
                 initial_state);
+            ::sn2_capture_truth::record_placed_resource(
+                reinterpret_cast<ID3D12Resource*>(*ppv),
+                heap,
+                heap_offset,
+                desc,
+                initial_state,
+                reinterpret_cast<uintptr_t>(_ReturnAddress()));
 
             // RenderDoc/PIX/Nsight legibility (placed path): name + heap offset.
             // The heap offset makes placed-heap aliasing legible — two aliased
@@ -8870,12 +8958,15 @@ namespace sn2_descriptor_registry {
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
         Kind kind{Kind::Unknown};
         uint64_t descriptor_hash{};
+        uint64_t source_descriptor_hash{};
         uint64_t last_seen_tick{};
         uint64_t generation{};
         bool has_resource_desc{};
         bool has_cbv_desc{};
         bool has_srv_desc{};
         bool has_uav_desc{};
+        bool copy_source_known{};
+        bool copy_source_unknown{};
     };
 
     static std::mutex g_mutex;
@@ -8914,6 +9005,11 @@ namespace sn2_descriptor_registry {
             env_flag_enabled_a("UEVR_SN2_VIEWUB_TABLE_CBV_SCAN") ||
             env_flag_enabled_a("UEVR_SN2_VIEWUB_FIX") ||
             env_flag_enabled_a("UEVR_SN2_BINDLESS_FOG_TRACE") ||
+            env_flag_enabled_a("UEVR_SN2_CAPTURE_TRUTH") ||
+            env_flag_enabled_a("UEVR_SN2_TARGET_STATE_DUMP") ||
+            env_flag_enabled_a("UEVR_SN2_RESOURCE_LINEAGE") ||
+            env_flag_enabled_a("UEVR_SN2_DESCRIPTOR_HEAP_SNAPSHOT") ||
+            env_flag_enabled_a("UEVR_SN2_PROBE_POINTS") ||
             env_flag_enabled_a("UEVR_SN2_LIGHTSCATTER_BIND_PROBE") ||
             // Fog producer/consumer lineage needs the same descriptor
             // resolution but without forcing expensive texture readbacks.
@@ -9365,12 +9461,28 @@ namespace sn2_descriptor_registry {
         // non-tracked copy sources).
         Entry src_entry{};
         if (!lookup(src, src_entry)) {
-            if (fog_only_mode()) return;   // src not tracked → skip the hash fallback
             const auto src_hash = descriptor_memory_hash(src);
-            if (!lookup_by_descriptor_hash(src_hash, src_entry)) return;
+            if (src_hash == 0 || !lookup_by_descriptor_hash(src_hash, src_entry)) {
+                // The destination slot was overwritten, but the source descriptor
+                // was not created/copied while our registry was active. Publish an
+                // explicit Unknown entry so later bindless scans do not resolve a
+                // stale SRV/UAV that used to live at this destination handle.
+                Entry unknown{};
+                unknown.cpu_handle = dst;
+                unknown.source_cpu_handle = src;
+                unknown.kind = Kind::Unknown;
+                unknown.source_descriptor_hash = src_hash;
+                unknown.descriptor_hash = descriptor_memory_hash(dst);
+                unknown.copy_source_unknown = true;
+                publish(unknown);
+                return;
+            }
         }
         src_entry.cpu_handle = dst;
         src_entry.source_cpu_handle = src;
+        src_entry.source_descriptor_hash = descriptor_memory_hash(src);
+        src_entry.copy_source_known = true;
+        src_entry.copy_source_unknown = false;
         src_entry.descriptor_hash = descriptor_memory_hash(dst);
         publish(src_entry);
     }
@@ -9599,6 +9711,7 @@ void WINAPI D3D12Hook::create_shader_resource_view(
         desc,
         descriptor);
     sn2_descriptor_registry::record_srv(resource, desc, descriptor);
+    ::sn2_capture_truth::record_descriptor_view("srv", resource, descriptor);
 }
 
 // 2026-05-17 SN2 FOG-FIX Task #43: tag fog-volume UAVs by view at creation.
@@ -9664,6 +9777,7 @@ void WINAPI D3D12Hook::create_unordered_access_view(
         desc,
         descriptor);
     sn2_descriptor_registry::record_uav(resource, desc, descriptor);
+    ::sn2_capture_truth::record_descriptor_view("uav", resource, descriptor);
 }
 
 // 2026-05-17 SN2 FOG-FIX Task #46 — CopyDescriptorsSimple hook. Each call
@@ -9733,6 +9847,7 @@ void WINAPI D3D12Hook::copy_descriptors_simple(
                 "D3D12Hook::CopyDescriptorsSimple",
                 dst,
                 src);
+            ::sn2_capture_truth::record_descriptor_copy("copy_descriptors_simple", dst, src, 1);
         }
     }
 
@@ -9877,6 +9992,7 @@ void WINAPI D3D12Hook::copy_descriptors(
                 "D3D12Hook::CopyDescriptors",
                 dst,
                 src);
+            ::sn2_capture_truth::record_descriptor_copy("copy_descriptors", dst, src, 1);
 
             ++dst_within;
             ++src_within;
@@ -9945,6 +10061,7 @@ void WINAPI D3D12Hook::create_depth_stencil_view(
         resource,
         desc,
         descriptor);
+    ::sn2_capture_truth::record_descriptor_view("dsv", resource, descriptor);
 }
 
 namespace {
@@ -14397,6 +14514,17 @@ namespace sn2_bindless_fog_trace {
         return v;
     }
 
+    inline bool candidate_rows_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_BINDLESS_FOG_TRACE_CANDIDATES");
+        return e;
+    }
+
+    inline uint32_t max_candidate_rows_per_draw() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_BINDLESS_FOG_TRACE_MAX_CANDIDATES_PER_DRAW", 128)));
+        return v;
+    }
+
     inline bool scan_table_cbvs_enabled() {
         static const bool e = env_flag_enabled_a("UEVR_SN2_BINDLESS_FOG_TRACE_TABLE_CBV");
         return e;
@@ -14423,6 +14551,40 @@ namespace sn2_bindless_fog_trace {
         return p;
     }
 
+    inline std::string artifact_dir() {
+        static const std::string d = []() {
+            char buf[MAX_PATH * 2]{};
+            const DWORD n = GetEnvironmentVariableA("UEVR_SN2_CAPTURE_ARTIFACT_DIR", buf, sizeof(buf));
+            if (n > 0 && n < sizeof(buf)) {
+                return std::string(buf, buf + n);
+            }
+            try {
+                std::filesystem::path p{path()};
+                return (p.parent_path() / "sn2_capture_artifacts").string();
+            } catch (...) {
+                return std::string{"C:\\tmp\\sn2_capture_artifacts"};
+            }
+        }();
+        return d;
+    }
+
+    inline uint32_t max_cbv_slabs() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_BINDLESS_FOG_TRACE_MAX_CBV_SLABS", 512)));
+        return v;
+    }
+
+    inline uint32_t descriptor_snapshot_max_slots() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_DESCRIPTOR_HEAP_SNAPSHOT_MAX_SLOTS", 131072)));
+        return v;
+    }
+
+    inline bool descriptor_snapshot_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_DESCRIPTOR_HEAP_SNAPSHOT");
+        return e;
+    }
+
     inline std::string hex_u64(uint64_t v) {
         char buf[32]{};
         std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(v));
@@ -14441,6 +14603,11 @@ namespace sn2_bindless_fog_trace {
         uint32_t cbv_mapped = 0;
         uint32_t cbv_shadow_mapped = 0;
         uint32_t cbv_unmapped = 0;
+        uint32_t candidate_rows = 0;
+        uint32_t unknown_descriptors = 0;
+        uint32_t srv_descriptors = 0;
+        uint32_t uav_descriptors = 0;
+        uint32_t non_ils_descriptors = 0;
         uint32_t first_fog_idx = 0;
         uintptr_t first_resource = 0;
         uint64_t first_width = 0;
@@ -14546,6 +14713,301 @@ namespace sn2_bindless_fog_trace {
         return false;
     }
 
+    std::string safe_token(const char* s) {
+        std::string out;
+        if (s == nullptr || *s == '\0') {
+            return "unknown";
+        }
+        for (const char* p = s; *p != '\0' && out.size() < 48; ++p) {
+            const char c = *p;
+            const bool ok =
+                (c >= 'a' && c <= 'z') ||
+                (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') ||
+                c == '_' || c == '-';
+            out.push_back(ok ? c : '_');
+        }
+        return out.empty() ? "unknown" : out;
+    }
+
+    inline uint32_t cbv_slab_candidate_cap() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_CBV_SLAB_MAX_INDEX_CANDIDATES", 160)));
+        return v;
+    }
+
+    uint64_t hash_bytes(const uint8_t* data, uint32_t size) {
+        uint64_t h = 1469598103934665603ull;
+        if (data == nullptr) return h;
+        for (uint32_t i = 0; i < size; ++i) {
+            h ^= static_cast<uint64_t>(data[i]);
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+
+    uint32_t read_u32_unaligned(const uint8_t* data, uint32_t off, uint32_t size) {
+        uint32_t v = 0;
+        if (data != nullptr && off + sizeof(v) <= size) {
+            std::memcpy(&v, data + off, sizeof(v));
+        }
+        return v;
+    }
+
+    float read_f32_unaligned(const uint8_t* data, uint32_t off, uint32_t size) {
+        float v = 0.0f;
+        if (data != nullptr && off + sizeof(v) <= size) {
+            std::memcpy(&v, data + off, sizeof(v));
+        }
+        return v;
+    }
+
+    bool local_ils_desc(const D3D12_RESOURCE_DESC& d) {
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+               d.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
+               d.Width >= 8 && d.Width <= 256 &&
+               d.Height >= 8 && d.Height <= 160 &&
+               d.DepthOrArraySize >= 8 && d.DepthOrArraySize <= 96;
+    }
+
+    nlohmann::json decoded_viewub_fields_json(const uint8_t* cpu, uint32_t window) {
+        nlohmann::json j;
+        if (cpu == nullptr) return j;
+        auto vec4 = [&](uint32_t off) {
+            return nlohmann::json::array({
+                read_f32_unaligned(cpu, off + 0, window),
+                read_f32_unaligned(cpu, off + 4, window),
+                read_f32_unaligned(cpu, off + 8, window),
+                read_f32_unaligned(cpu, off + 12, window)
+            });
+        };
+        if (window >= 0x960) {
+            j["view_rect_min_reg148"] = vec4(0x940);
+            j["view_size_reg149"] = vec4(0x950);
+        }
+        if (window >= 0x1010) {
+            j["volumetric_fog_block_0xfc0"] = vec4(0xFC0);
+            j["volumetric_fog_block_0xfd0"] = vec4(0xFD0);
+            j["volumetric_fog_block_0xfe0"] = vec4(0xFE0);
+            j["volumetric_fog_block_0xff0"] = vec4(0xFF0);
+        }
+        return j;
+    }
+
+    nlohmann::json cbv_index_candidates_json(const uint8_t* cpu, uint32_t window) {
+        nlohmann::json arr = nlohmann::json::array();
+        if (cpu == nullptr || window < 4 || cbv_slab_candidate_cap() == 0) return arr;
+        const bool include_unknown = env_flag_enabled_a("UEVR_SN2_CBV_SLAB_INCLUDE_UNKNOWN_INDICES");
+        uint32_t emitted = 0;
+        std::scoped_lock _{bindless_heap_registry().mu};
+        for (uint32_t off = 0; off + 4 <= window && emitted < cbv_slab_candidate_cap(); off += 4) {
+            const uint32_t value = read_u32_unaligned(cpu, off, window);
+            if (value == 0) continue;
+            for (size_t hi = 0; hi < bindless_heap_registry().heaps.size() && emitted < cbv_slab_candidate_cap(); ++hi) {
+                const auto& h = bindless_heap_registry().heaps[hi];
+                if (h.cpu_base == 0 || h.stride == 0 || h.num_descriptors == 0 || value >= h.num_descriptors) continue;
+                const SIZE_T desc_cpu = h.cpu_base + static_cast<SIZE_T>(value) * h.stride;
+                sn2_descriptor_registry::Entry e{};
+                const bool known = sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(desc_cpu, e);
+                if (!known && !include_unknown) continue;
+                nlohmann::json c;
+                c["byte_off"] = off;
+                c["u32"] = value;
+                c["heap_ordinal"] = hi;
+                c["descriptor_cpu"] = hex_u64(static_cast<uint64_t>(desc_cpu));
+                c["known"] = known;
+                if (known) {
+                    c["descriptor_kind"] = sn2_descriptor_registry::kind_name(e.kind);
+                    c["resource"] = hex_u64(reinterpret_cast<uintptr_t>(e.resource));
+                    c["descriptor_hash"] = hex_u64(e.descriptor_hash);
+                    if (e.has_resource_desc) {
+                        c["dimension"] = static_cast<uint32_t>(e.resource_desc.Dimension);
+                        c["width"] = static_cast<uint64_t>(e.resource_desc.Width);
+                        c["height"] = static_cast<uint32_t>(e.resource_desc.Height);
+                        c["depth"] = static_cast<uint32_t>(e.resource_desc.DepthOrArraySize);
+                        c["format"] = static_cast<uint32_t>(e.resource_desc.Format);
+                        c["flags"] = static_cast<uint32_t>(e.resource_desc.Flags);
+                        c["is_ils_like"] = local_ils_desc(e.resource_desc);
+                        float score = 0.0f;
+                        if (local_ils_desc(e.resource_desc) &&
+                            sn2_litness::lookup_score(value, reinterpret_cast<uintptr_t>(e.resource), score)) {
+                            c["litness_score"] = score;
+                        }
+                    }
+                    if (e.has_cbv_desc) {
+                        c["cbv_gpu_va"] = hex_u64(e.cbv_desc.BufferLocation);
+                        c["cbv_size"] = e.cbv_desc.SizeInBytes;
+                    }
+                }
+                arr.push_back(std::move(c));
+                ++emitted;
+            }
+        }
+        return arr;
+    }
+
+    void maybe_dump_cbv_slab(int eye,
+                             uint32_t ps_crc,
+                             const char* draw_kind,
+                             const char* source,
+                             int root,
+                             int slot,
+                             uint32_t cbv_idx,
+                             D3D12_GPU_VIRTUAL_ADDRESS cbv_va,
+                             const uint8_t* cpu,
+                             uint32_t window,
+                             bool from_shadow) {
+        if (cpu == nullptr || window == 0 || max_cbv_slabs() == 0) return;
+
+        static std::atomic<uint64_t> seq_counter{0};
+        const uint64_t seq = seq_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (seq > max_cbv_slabs()) return;
+
+        try {
+            const std::filesystem::path dir{artifact_dir()};
+            std::filesystem::create_directories(dir);
+            char name[256]{};
+            std::snprintf(
+                name,
+                sizeof(name),
+                "cbv_slab_%04llu_ps%08x_eye%d_%s_r%d_s%d_idx%u.bin",
+                static_cast<unsigned long long>(seq),
+                ps_crc,
+                eye,
+                safe_token(source).c_str(),
+                root,
+                slot,
+                cbv_idx);
+            const std::filesystem::path file = dir / name;
+            {
+                std::ofstream out(file, std::ios::binary);
+                if (!out.good()) return;
+                out.write(reinterpret_cast<const char*>(cpu), static_cast<std::streamsize>(window));
+            }
+
+            nlohmann::json j;
+            j["event"] = "bindless_fog_cbv_slab";
+            j["eye"] = eye;
+            j["draw"] = draw_kind != nullptr ? draw_kind : "?";
+            j["ps_crc"] = hex_u64(ps_crc);
+            j["source"] = source != nullptr ? source : "?";
+            j["root"] = root;
+            j["slot"] = slot;
+            j["cbv_bindless_idx"] = cbv_idx;
+            j["cbv_gpu_va"] = hex_u64(cbv_va);
+            j["bytes"] = window;
+            j["from_shadow"] = from_shadow;
+            j["byte_hash"] = hex_u64(hash_bytes(cpu, window));
+            auto decoded = decoded_viewub_fields_json(cpu, window);
+            if (!decoded.empty()) {
+                j["decoded_fields"] = std::move(decoded);
+            }
+            auto candidates = cbv_index_candidates_json(cpu, window);
+            j["index_candidate_count"] = candidates.size();
+            if (!candidates.empty()) {
+                j["index_candidates"] = std::move(candidates);
+            }
+            j["file"] = file.string();
+            write_json_line(std::move(j));
+        } catch (...) {
+        }
+    }
+
+    nlohmann::json descriptor_entry_json(const sn2_descriptor_registry::Entry& e) {
+        nlohmann::json j;
+        j["known"] = true;
+        j["descriptor_kind"] = sn2_descriptor_registry::kind_name(e.kind);
+        j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(e.resource));
+        j["descriptor_generation"] = e.generation;
+        j["descriptor_source_cpu"] = hex_u64(static_cast<uint64_t>(e.source_cpu_handle.ptr));
+        j["descriptor_hash"] = hex_u64(e.descriptor_hash);
+        j["source_descriptor_hash"] = hex_u64(e.source_descriptor_hash);
+        j["copy_source_known"] = e.copy_source_known;
+        j["copy_source_unknown"] = e.copy_source_unknown;
+        if (e.has_resource_desc) {
+            j["width"] = static_cast<uint64_t>(e.resource_desc.Width);
+            j["height"] = static_cast<uint32_t>(e.resource_desc.Height);
+            j["depth"] = static_cast<uint32_t>(e.resource_desc.DepthOrArraySize);
+            j["format"] = static_cast<int>(e.resource_desc.Format);
+            j["dimension"] = static_cast<int>(e.resource_desc.Dimension);
+            j["flags"] = static_cast<uint32_t>(e.resource_desc.Flags);
+        }
+        if (e.has_cbv_desc) {
+            j["cbv_gpu_va"] = hex_u64(e.cbv_desc.BufferLocation);
+            j["cbv_size"] = e.cbv_desc.SizeInBytes;
+        }
+        return j;
+    }
+
+    void maybe_dump_descriptor_snapshot(uint32_t ps_crc, int eye) {
+        if (!descriptor_snapshot_enabled()) return;
+        if (env_flag_enabled_a("UEVR_SN2_CAPTURE_TRUTH")) return; // capture-truth dumps all registered heaps at the capture trigger.
+        static std::atomic<bool> done{false};
+        bool expected = false;
+        if (!done.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            return;
+        }
+
+        const BindlessHeapState heap = tls_bindless_heap;
+        if (heap.cpu_base == 0 || heap.stride == 0 || heap.num_descriptors == 0) return;
+
+        uint32_t slots = descriptor_snapshot_max_slots();
+        if (slots == 0) return;
+        slots = std::min<uint32_t>(slots, heap.num_descriptors);
+
+        uint32_t known = 0;
+        uint32_t srvs = 0;
+        uint32_t uavs = 0;
+        uint32_t cbvs = 0;
+        uint32_t unknown = 0;
+
+        try {
+            const std::filesystem::path dir{artifact_dir()};
+            std::filesystem::create_directories(dir);
+            const std::filesystem::path file = dir / "descriptor_heap_snapshot.jsonl";
+            std::ofstream out(file, std::ios::binary);
+            if (!out.good()) return;
+
+            for (uint32_t slot = 0; slot < slots; ++slot) {
+                const SIZE_T cpu = heap.cpu_base + static_cast<SIZE_T>(slot) * static_cast<SIZE_T>(heap.stride);
+                sn2_descriptor_registry::Entry e{};
+                nlohmann::json j;
+                j["event"] = "descriptor_heap_slot";
+                j["slot"] = slot;
+                j["cpu"] = hex_u64(static_cast<uint64_t>(cpu));
+                j["hash"] = hex_u64(sn2_descriptor_registry::descriptor_memory_hash(D3D12_CPU_DESCRIPTOR_HANDLE{cpu}));
+                if (sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(cpu, e)) {
+                    ++known;
+                    if (e.kind == sn2_descriptor_registry::Kind::SRV) ++srvs;
+                    else if (e.kind == sn2_descriptor_registry::Kind::UAV) ++uavs;
+                    else if (e.kind == sn2_descriptor_registry::Kind::CBV) ++cbvs;
+                    else ++unknown;
+                    for (auto& item : descriptor_entry_json(e).items()) {
+                        j[item.key()] = item.value();
+                    }
+                } else {
+                    j["known"] = false;
+                }
+                out << j.dump() << '\n';
+            }
+
+            nlohmann::json summary;
+            summary["event"] = "bindless_fog_descriptor_heap_snapshot";
+            summary["ps_crc"] = hex_u64(ps_crc);
+            summary["eye"] = eye;
+            summary["file"] = file.string();
+            summary["slots"] = slots;
+            summary["heap_num_descriptors"] = heap.num_descriptors;
+            summary["known"] = known;
+            summary["srvs"] = srvs;
+            summary["uavs"] = uavs;
+            summary["cbvs"] = cbvs;
+            summary["unknown"] = unknown;
+            write_json_line(std::move(summary));
+        } catch (...) {
+        }
+    }
+
     void write_hit(int eye,
                    uint32_t ps_crc,
                    const char* draw_kind,
@@ -14579,6 +15041,12 @@ namespace sn2_bindless_fog_trace {
         j["fog_cpu"] = hex_u64(static_cast<uint64_t>(fog_cpu));
         j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(fog.resource));
         j["descriptor_kind"] = sn2_descriptor_registry::kind_name(fog.kind);
+        j["descriptor_generation"] = fog.generation;
+        j["descriptor_source_cpu"] = hex_u64(static_cast<uint64_t>(fog.source_cpu_handle.ptr));
+        j["descriptor_hash"] = hex_u64(fog.descriptor_hash);
+        j["source_descriptor_hash"] = hex_u64(fog.source_descriptor_hash);
+        j["copy_source_known"] = fog.copy_source_known;
+        j["copy_source_unknown"] = fog.copy_source_unknown;
         j["width"] = static_cast<uint64_t>(fog.resource_desc.Width);
         j["height"] = static_cast<uint32_t>(fog.resource_desc.Height);
         j["depth"] = static_cast<uint32_t>(fog.resource_desc.DepthOrArraySize);
@@ -14612,6 +15080,55 @@ namespace sn2_bindless_fog_trace {
         }
     }
 
+    void write_candidate(int eye,
+                         uint32_t ps_crc,
+                         const char* draw_kind,
+                         const char* source,
+                         int root,
+                         int slot,
+                         int word,
+                         uint32_t byte_off,
+                         uint32_t cbv_idx,
+                         uint64_t cbv_va,
+                         uint32_t fog_idx,
+                         SIZE_T fog_cpu,
+                         const sn2_descriptor_registry::Entry* entry,
+                         const char* reason) {
+        if (!candidate_rows_enabled()) return;
+        nlohmann::json j;
+        j["event"] = "bindless_fog_candidate";
+        j["eye"] = eye;
+        j["draw"] = draw_kind != nullptr ? draw_kind : "?";
+        j["ps_crc"] = hex_u64(ps_crc);
+        j["source"] = source != nullptr ? source : "?";
+        j["root"] = root;
+        j["slot"] = slot;
+        j["word"] = word;
+        j["byte_off"] = byte_off;
+        j["cbv_bindless_idx"] = cbv_idx;
+        j["cbv_gpu_va"] = hex_u64(cbv_va);
+        j["fog_bindless_idx"] = fog_idx;
+        j["fog_cpu"] = hex_u64(static_cast<uint64_t>(fog_cpu));
+        j["reason"] = reason != nullptr ? reason : "unknown";
+        if (entry != nullptr) {
+            j["descriptor_kind"] = sn2_descriptor_registry::kind_name(entry->kind);
+            j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(entry->resource));
+            j["descriptor_generation"] = entry->generation;
+            j["descriptor_source_cpu"] = hex_u64(static_cast<uint64_t>(entry->source_cpu_handle.ptr));
+            j["descriptor_hash"] = hex_u64(entry->descriptor_hash);
+            j["source_descriptor_hash"] = hex_u64(entry->source_descriptor_hash);
+            j["copy_source_known"] = entry->copy_source_known;
+            j["copy_source_unknown"] = entry->copy_source_unknown;
+            if (entry->has_resource_desc) {
+                j["width"] = static_cast<uint64_t>(entry->resource_desc.Width);
+                j["height"] = static_cast<uint32_t>(entry->resource_desc.Height);
+                j["depth"] = static_cast<uint32_t>(entry->resource_desc.DepthOrArraySize);
+                j["format"] = static_cast<int>(entry->resource_desc.Format);
+            }
+        }
+        write_json_line(std::move(j));
+    }
+
     void write_draw_summary(ID3D12GraphicsCommandList* cl,
                             const CommandListCorrelationState& s,
                             int eye,
@@ -14637,6 +15154,11 @@ namespace sn2_bindless_fog_trace {
         j["cbv_mapped"] = c.cbv_mapped;
         j["cbv_shadow_mapped"] = c.cbv_shadow_mapped;
         j["cbv_unmapped"] = c.cbv_unmapped;
+        j["candidate_rows"] = c.candidate_rows;
+        j["unknown_descriptors"] = c.unknown_descriptors;
+        j["srv_descriptors"] = c.srv_descriptors;
+        j["uav_descriptors"] = c.uav_descriptors;
+        j["non_ils_descriptors"] = c.non_ils_descriptors;
         j["viewport"] = {
             {"x", s.viewport0.TopLeftX},
             {"y", s.viewport0.TopLeftY},
@@ -14663,14 +15185,15 @@ namespace sn2_bindless_fog_trace {
             std::snprintf(
                 detail,
                 sizeof(detail),
-                "SN2BF ps=0x%08x hits=%u cand=%u resolved=%u root_cbv=%u shadow=%u tbl=%u first_idx=%u first_res=0x%llx",
+                "SN2BF ps=0x%08x hits=%u cand=%u resolved=%u unk=%u srv=%u uav=%u shadow=%u first_idx=%u first_res=0x%llx",
                 ps_crc,
                 c.hits,
                 c.words,
                 c.resolved,
-                c.root_cbvs,
+                c.unknown_descriptors,
+                c.srv_descriptors,
+                c.uav_descriptors,
                 c.cbv_shadow_mapped,
-                c.tables,
                 c.have_first ? c.first_fog_idx : 0,
                 static_cast<unsigned long long>(c.first_resource));
             sn2_rdoc_tags::mark(cl, eye == 0 ? 1 : eye == 1 ? 2 : 0, detail);
@@ -14705,6 +15228,7 @@ namespace sn2_bindless_fog_trace {
         if (from_shadow) {
             ++c.cbv_shadow_mapped;
         }
+        maybe_dump_cbv_slab(eye, ps_crc, draw_kind, source, root, slot, cbv_idx, cbv_va, cpu, window, from_shadow);
 
         const uint32_t words = window / 4;
         for (uint32_t wi = 0; wi < words && c.hits < max_hits_per_draw(); ++wi) {
@@ -14712,9 +15236,45 @@ namespace sn2_bindless_fog_trace {
             std::memcpy(&fog_idx, cpu + static_cast<size_t>(wi) * 4, sizeof(fog_idx));
             if (fog_idx == 0 || fog_idx >= tls_bindless_heap.num_descriptors) continue;
             ++c.words;
+            const SIZE_T fog_cpu = tls_bindless_heap.cpu_base +
+                static_cast<SIZE_T>(fog_idx) * static_cast<SIZE_T>(tls_bindless_heap.stride);
             sn2_descriptor_registry::Entry fog{};
-            SIZE_T fog_cpu = 0;
-            if (!resolve_ils_index(fog_idx, fog, fog_cpu)) continue;
+            if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(fog_cpu, fog)) {
+                if (c.candidate_rows < max_candidate_rows_per_draw()) {
+                    ++c.candidate_rows;
+                    write_candidate(eye, ps_crc, draw_kind, source, root, slot, static_cast<int>(wi),
+                                    wi * 4, cbv_idx, static_cast<uint64_t>(cbv_va),
+                                    fog_idx, fog_cpu, nullptr, "no_registry_entry");
+                }
+                continue;
+            }
+            if (fog.kind == sn2_descriptor_registry::Kind::SRV) {
+                ++c.srv_descriptors;
+            } else if (fog.kind == sn2_descriptor_registry::Kind::UAV) {
+                ++c.uav_descriptors;
+            } else {
+                ++c.unknown_descriptors;
+            }
+            if (fog.resource == nullptr || !fog.has_resource_desc) {
+                if (c.candidate_rows < max_candidate_rows_per_draw()) {
+                    ++c.candidate_rows;
+                    write_candidate(eye, ps_crc, draw_kind, source, root, slot, static_cast<int>(wi),
+                                    wi * 4, cbv_idx, static_cast<uint64_t>(cbv_va),
+                                    fog_idx, fog_cpu, &fog,
+                                    fog.copy_source_unknown ? "copy_source_unknown" : "no_resource_desc");
+                }
+                continue;
+            }
+            if (!sn2_viewub_decode::is_ils_volume(fog.resource_desc)) {
+                ++c.non_ils_descriptors;
+                if (c.candidate_rows < max_candidate_rows_per_draw()) {
+                    ++c.candidate_rows;
+                    write_candidate(eye, ps_crc, draw_kind, source, root, slot, static_cast<int>(wi),
+                                    wi * 4, cbv_idx, static_cast<uint64_t>(cbv_va),
+                                    fog_idx, fog_cpu, &fog, "not_ils_volume");
+                }
+                continue;
+            }
             ++c.resolved;
             ++c.ils;
             ++c.hits;
@@ -14741,6 +15301,8 @@ namespace sn2_bindless_fog_trace {
         if (!enabled() || !target_ps(ps_crc) || !sn2_past_init_race()) return;
         const BindlessHeapState heap = tls_bindless_heap;
         if (heap.cpu_base == 0 || heap.stride == 0 || heap.num_descriptors == 0) return;
+
+        maybe_dump_descriptor_snapshot(ps_crc, eye);
 
         Counters c{};
 
@@ -16340,6 +16902,1065 @@ static std::string sn2_root_binding_label(
     }
 
     return "root_not_found";
+}
+
+namespace sn2_capture_truth {
+    inline bool any_enabled() {
+        static const bool e =
+            env_flag_enabled_a("UEVR_SN2_CAPTURE_TRUTH") ||
+            env_flag_enabled_a("UEVR_SN2_TARGET_STATE_DUMP") ||
+            env_flag_enabled_a("UEVR_SN2_RESOURCE_LINEAGE") ||
+            env_flag_enabled_a("UEVR_SN2_DESCRIPTOR_HEAP_SNAPSHOT") ||
+            env_flag_enabled_a("UEVR_SN2_PHASE_MARKERS") ||
+            env_flag_enabled_a("UEVR_SN2_PROBE_POINTS") ||
+            env_flag_enabled_a("UEVR_SN2_BINDLESS_FOG_TRACE");
+        return e && !sn2_hooks_disabled_by_env();
+    }
+
+    inline bool target_state_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_TARGET_STATE_DUMP");
+        return e && !sn2_hooks_disabled_by_env();
+    }
+
+    inline bool lineage_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_RESOURCE_LINEAGE");
+        return e && !sn2_hooks_disabled_by_env();
+    }
+
+    inline bool phase_markers_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_PHASE_MARKERS") || env_flag_enabled_a("UEVR_SN2_RDOC_TAGS");
+        return e && !sn2_hooks_disabled_by_env();
+    }
+
+    inline bool probe_points_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_PROBE_POINTS");
+        return e && !sn2_hooks_disabled_by_env();
+    }
+
+    inline bool probe_snapshot_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_PROBE_POINTS_SNAPSHOT");
+        return e && !sn2_hooks_disabled_by_env();
+    }
+
+    inline uint32_t max_probe_snapshots() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_PROBE_POINTS_MAX_SNAPSHOTS", 32)));
+        return v;
+    }
+
+    inline uint32_t max_table_slots() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::clamp(env_int_a("UEVR_SN2_TARGET_STATE_TABLE_SLOTS", 64), 0, 4096));
+        return v;
+    }
+
+    inline uint64_t max_rows() {
+        static const uint64_t v = static_cast<uint64_t>(
+            std::max(1, env_int_a("UEVR_SN2_CAPTURE_TRUTH_MAX_ROWS", 300000)));
+        return v;
+    }
+
+    inline uint32_t descriptor_snapshot_max_slots() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_DESCRIPTOR_HEAP_SNAPSHOT_MAX_SLOTS", 131072)));
+        return v;
+    }
+
+    inline std::string default_path() {
+        return "C:\\Users\\ellio\\AppData\\Roaming\\UnrealVRMod\\Subnautica2-Win64-Shipping\\sn2_bindless_fog_trace.jsonl";
+    }
+
+    inline std::string path() {
+        static const std::string p = []() {
+            char buf[MAX_PATH * 2]{};
+            DWORD n = GetEnvironmentVariableA("UEVR_SN2_CAPTURE_TRUTH_PATH", buf, sizeof(buf));
+            if (n > 0 && n < sizeof(buf)) return std::string(buf, buf + n);
+            n = GetEnvironmentVariableA("UEVR_SN2_BINDLESS_FOG_TRACE_PATH", buf, sizeof(buf));
+            if (n > 0 && n < sizeof(buf)) return std::string(buf, buf + n);
+            return default_path();
+        }();
+        return p;
+    }
+
+    inline std::string artifact_dir() {
+        static const std::string d = []() {
+            char buf[MAX_PATH * 2]{};
+            DWORD n = GetEnvironmentVariableA("UEVR_SN2_CAPTURE_ARTIFACT_DIR", buf, sizeof(buf));
+            if (n > 0 && n < sizeof(buf)) return std::string(buf, buf + n);
+            try {
+                std::filesystem::path p{path()};
+                return (p.parent_path() / "sn2_capture_artifacts").string();
+            } catch (...) {
+                return std::string{"C:\\tmp\\sn2_capture_artifacts"};
+            }
+        }();
+        return d;
+    }
+
+    inline std::string hex_u64(uint64_t v) {
+        char buf[32]{};
+        std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(v));
+        return std::string(buf);
+    }
+
+    inline std::string hex_u32(uint32_t v) {
+        char buf[16]{};
+        std::snprintf(buf, sizeof(buf), "0x%08x", v);
+        return std::string(buf);
+    }
+
+    std::mutex& file_mutex() {
+        static std::mutex m;
+        return m;
+    }
+
+    std::atomic<uint64_t>& row_counter() {
+        static std::atomic<uint64_t> c{0};
+        return c;
+    }
+
+    bool write_json_line(nlohmann::json&& j) {
+        if (!any_enabled()) return false;
+        const uint64_t row = row_counter().fetch_add(1, std::memory_order_relaxed) + 1;
+        if (row > max_rows()) return false;
+        j["truth_row"] = row;
+        j["time_ms"] = static_cast<uint64_t>(GetTickCount64());
+        j["frame"] = sn2_rt_snapshot::g_frame_counter.load(std::memory_order_relaxed);
+        try {
+            const std::filesystem::path p{path()};
+            if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path());
+            std::scoped_lock _{file_mutex()};
+            std::ofstream f(path(), std::ios::app | std::ios::binary);
+            if (!f.good()) return false;
+            f << j.dump() << '\n';
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    nlohmann::json resource_desc_json(const D3D12_RESOURCE_DESC& d) {
+        nlohmann::json j;
+        j["dimension"] = static_cast<uint32_t>(d.Dimension);
+        j["width"] = static_cast<uint64_t>(d.Width);
+        j["height"] = static_cast<uint32_t>(d.Height);
+        j["depth_or_array"] = static_cast<uint32_t>(d.DepthOrArraySize);
+        j["mips"] = static_cast<uint32_t>(d.MipLevels);
+        j["format"] = static_cast<uint32_t>(d.Format);
+        j["sample_count"] = static_cast<uint32_t>(d.SampleDesc.Count);
+        j["layout"] = static_cast<uint32_t>(d.Layout);
+        j["flags"] = static_cast<uint32_t>(d.Flags);
+        return j;
+    }
+
+    bool interesting_resource_desc(const D3D12_RESOURCE_DESC& d) {
+        if (env_flag_enabled_a("UEVR_SN2_RESOURCE_LINEAGE_ALL")) return true;
+        if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+            d.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
+            d.Width >= 8 && d.Width <= 256 &&
+            d.Height >= 8 && d.Height <= 160 &&
+            d.DepthOrArraySize >= 8 && d.DepthOrArraySize <= 96) {
+            return true;
+        }
+        if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            d.Width >= 256 && d.Width <= 4096 &&
+            d.Height >= 128 && d.Height <= 2160 &&
+            (d.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
+             d.Format == DXGI_FORMAT_R8_UNORM ||
+             d.Format == DXGI_FORMAT_R16_FLOAT ||
+             d.Format == DXGI_FORMAT_R32_FLOAT ||
+             (static_cast<uint32_t>(d.Flags) & (static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) |
+                                                static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) != 0)) {
+            return true;
+        }
+        return false;
+    }
+
+    bool is_ils_like_desc(const D3D12_RESOURCE_DESC& d) {
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+               d.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
+               d.Width >= 8 && d.Width <= 256 &&
+               d.Height >= 8 && d.Height <= 160 &&
+               d.DepthOrArraySize >= 8 && d.DepthOrArraySize <= 96;
+    }
+
+    uint64_t hash_bytes(const uint8_t* data, uint32_t size) {
+        uint64_t h = 1469598103934665603ull;
+        if (data == nullptr) return h;
+        for (uint32_t i = 0; i < size; ++i) {
+            h ^= static_cast<uint64_t>(data[i]);
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+
+    bool heap_index_from_cpu(SIZE_T cpu, uint32_t& out_index, uint64_t& out_heap_gpu_base) {
+        out_index = 0;
+        out_heap_gpu_base = 0;
+        std::scoped_lock _{bindless_heap_registry().mu};
+        for (const auto& h : bindless_heap_registry().heaps) {
+            if (h.cpu_base == 0 || h.stride == 0 || h.num_descriptors == 0) continue;
+            const SIZE_T begin = h.cpu_base;
+            const SIZE_T end = h.cpu_base + static_cast<SIZE_T>(h.num_descriptors) * h.stride;
+            if (cpu < begin || cpu >= end) continue;
+            const SIZE_T delta = cpu - h.cpu_base;
+            if ((delta % h.stride) != 0) continue;
+            out_index = static_cast<uint32_t>(delta / h.stride);
+            out_heap_gpu_base = h.gpu_base;
+            return true;
+        }
+        return false;
+    }
+
+    struct LatestResourceEvent {
+        std::string op;
+        std::string phase;
+        std::string crc;
+        uint64_t frame = 0;
+        uint64_t time_ms = 0;
+        int eye = -1;
+        uint64_t seq = 0;
+    };
+
+    std::mutex& latest_resource_mutex() {
+        static std::mutex m;
+        return m;
+    }
+
+    std::unordered_map<uintptr_t, LatestResourceEvent>& latest_resource_events() {
+        static std::unordered_map<uintptr_t, LatestResourceEvent> m;
+        return m;
+    }
+
+    void note_latest_resource_event(ID3D12Resource* resource,
+                                    const char* op,
+                                    int eye = -1,
+                                    const char* phase = nullptr,
+                                    const char* crc = nullptr) {
+        if (resource == nullptr || op == nullptr || op[0] == '\0') return;
+        static std::atomic<uint64_t> seq{0};
+        LatestResourceEvent e;
+        e.op = op;
+        e.phase = phase != nullptr ? phase : "";
+        e.crc = crc != nullptr ? crc : "";
+        e.frame = sn2_rt_snapshot::g_frame_counter.load(std::memory_order_relaxed);
+        e.time_ms = static_cast<uint64_t>(GetTickCount64());
+        e.eye = eye;
+        e.seq = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::scoped_lock _{latest_resource_mutex()};
+        latest_resource_events()[reinterpret_cast<uintptr_t>(resource)] = std::move(e);
+    }
+
+    nlohmann::json latest_resource_event_json(ID3D12Resource* resource) {
+        nlohmann::json j;
+        if (resource == nullptr) return j;
+        std::scoped_lock _{latest_resource_mutex()};
+        const auto it = latest_resource_events().find(reinterpret_cast<uintptr_t>(resource));
+        if (it == latest_resource_events().end()) return j;
+        const auto& e = it->second;
+        j["op"] = e.op;
+        j["phase"] = e.phase;
+        j["crc"] = e.crc;
+        j["frame"] = e.frame;
+        j["time_ms"] = e.time_ms;
+        j["eye"] = e.eye;
+        j["seq"] = e.seq;
+        return j;
+    }
+
+    nlohmann::json descriptor_entry_json(const sn2_descriptor_registry::Entry& e) {
+        nlohmann::json j;
+        j["known"] = true;
+        j["descriptor_kind"] = sn2_descriptor_registry::kind_name(e.kind);
+        j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(e.resource));
+        j["descriptor_generation"] = e.generation;
+        j["descriptor_hash"] = hex_u64(e.descriptor_hash);
+        j["source_descriptor_hash"] = hex_u64(e.source_descriptor_hash);
+        j["source_cpu"] = hex_u64(static_cast<uint64_t>(e.source_cpu_handle.ptr));
+        j["copy_source_known"] = e.copy_source_known;
+        j["copy_source_unknown"] = e.copy_source_unknown;
+        if (e.has_resource_desc) {
+            j["resource_desc"] = resource_desc_json(e.resource_desc);
+            if (is_ils_like_desc(e.resource_desc)) {
+                uint32_t idx = 0;
+                uint64_t heap_gpu = 0;
+                if (heap_index_from_cpu(e.source_cpu_handle.ptr, idx, heap_gpu)) {
+                    j["bindless_index"] = idx;
+                    j["heap_gpu_base"] = hex_u64(heap_gpu);
+                    float score = 0.0f;
+                    if (sn2_litness::lookup_score(idx, reinterpret_cast<uintptr_t>(e.resource), score)) {
+                        j["litness_score"] = score;
+                    }
+                }
+            }
+            if (e.resource != nullptr) {
+                auto latest = latest_resource_event_json(e.resource);
+                if (!latest.is_null() && !latest.empty()) {
+                    j["latest_resource_event"] = std::move(latest);
+                }
+            }
+        }
+        if (e.has_cbv_desc) {
+            j["cbv_gpu_va"] = hex_u64(e.cbv_desc.BufferLocation);
+            j["cbv_size"] = e.cbv_desc.SizeInBytes;
+        }
+        return j;
+    }
+
+    std::unordered_set<uint32_t> parse_crc_set(const char* env_name, std::initializer_list<uint32_t> defaults) {
+        std::unordered_set<uint32_t> out;
+        char buf[1024]{};
+        const DWORD n = GetEnvironmentVariableA(env_name, buf, sizeof(buf));
+        if (n > 0 && n < sizeof(buf)) {
+            char* ctx = nullptr;
+            for (char* tok = strtok_s(buf, ",; \t", &ctx); tok != nullptr; tok = strtok_s(nullptr, ",; \t", &ctx)) {
+                const uint32_t v = static_cast<uint32_t>(std::strtoul(tok, nullptr, 0));
+                if (v != 0) out.insert(v);
+            }
+        }
+        if (out.empty()) {
+            for (const uint32_t v : defaults) out.insert(v);
+        }
+        return out;
+    }
+
+    bool target_ps(uint32_t crc) {
+        static const std::unordered_set<uint32_t> targets = parse_crc_set(
+            "UEVR_SN2_TARGET_STATE_PS_CRCS",
+            {0xB9BE2499u, 0xDE7C3822u, 0x32040A0Du, 0x4E86DC09u, 0x9D14FCF0u, 0x13B00F0Cu});
+        return targets.find(crc) != targets.end();
+    }
+
+    bool target_cs(uint32_t crc) {
+        static const std::unordered_set<uint32_t> targets = parse_crc_set(
+            "UEVR_SN2_TARGET_STATE_CS_CRCS",
+            {0xD1D94ED1u, 0xD1F85C42u, 0x3402487Cu, 0xF996B96Bu, 0x0930DD4Eu, 0x5AF52812u});
+        return targets.find(crc) != targets.end();
+    }
+
+    const char* phase_for_ps(uint32_t crc) {
+        switch (crc) {
+        case 0x9D14FCF0u: return "VoxelizePS";
+        case 0xB9BE2499u: return "SLW_MainPS";
+        case 0xDE7C3822u: return "SLW_MainPS";
+        case 0x32040A0Du: return "SLW_NoFog";
+        case 0x4E86DC09u: return "ExponentialPixelMain";
+        case 0x13B00F0Cu: return "UnderwaterTealDraw";
+        default: return "";
+        }
+    }
+
+    const char* phase_for_cs(uint32_t crc) {
+        switch (crc) {
+        case 0xD1D94ED1u: return "MaterialSetupCS";
+        case 0xD1F85C42u: return "LightScatteringCS";
+        case 0x3402487Cu: return "FinalIntegrationCS";
+        case 0xF996B96Bu: return "UWEFogReconstructCS";
+        case 0x0930DD4Eu: return "UWEFogResolveCS";
+        case 0x5AF52812u: return "MainCS";
+        default: return "";
+        }
+    }
+
+    int state_eye(const CommandListCorrelationState& s) {
+        const int b = cmdlist_eye_bucket(s);
+        return b == 1 ? 0 : b == 2 ? 1 : -1;
+    }
+
+    nlohmann::json root_values_json(const CommandListCorrelationState::RootSlotArray& values) {
+        nlohmann::json a = nlohmann::json::array();
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (values[i] == 0) continue;
+            a.push_back({{"root", i}, {"value", hex_u64(static_cast<uint64_t>(values[i]))}});
+        }
+        return a;
+    }
+
+    nlohmann::json root_constants_json(const CommandListCorrelationState::RootConstantCountArray& counts,
+                                       const CommandListCorrelationState::RootConstantValuesArray& values) {
+        nlohmann::json a = nlohmann::json::array();
+        for (size_t root = 0; root < counts.size(); ++root) {
+            const uint32_t count = counts[root];
+            if (count == 0) continue;
+            nlohmann::json words = nlohmann::json::array();
+            for (uint32_t i = 0; i < count && i < CommandListCorrelationState::MAX_ROOT_CONSTANT_DWORDS; ++i) {
+                words.push_back(values[root][i]);
+            }
+            a.push_back({{"root", root}, {"count", count}, {"values", words}});
+        }
+        return a;
+    }
+
+    nlohmann::json descriptor_table_json(const CommandListCorrelationState& s,
+                                         bool graphics,
+                                         uintptr_t root_signature,
+                                         uintptr_t pso) {
+        const auto& tables = graphics ? s.last_graphics_root_desc_tables : s.last_compute_root_desc_tables;
+        nlohmann::json out = nlohmann::json::array();
+        const uint32_t max_slots = max_table_slots();
+        for (uint32_t root = 0; root < tables.size(); ++root) {
+            const uint64_t table_gpu = tables[root];
+            if (table_gpu == 0) continue;
+            BindlessHeapState heap{};
+            SIZE_T cpu_base = 0;
+            const bool resolved = bindless_heap_registry().resolve_state(table_gpu, heap, cpu_base);
+            nlohmann::json t;
+            t["root"] = root;
+            t["gpu"] = hex_u64(table_gpu);
+            t["resolved_heap"] = resolved;
+            if (resolved) {
+                t["heap_cpu_base"] = hex_u64(static_cast<uint64_t>(heap.cpu_base));
+                t["heap_gpu_base"] = hex_u64(heap.gpu_base);
+                t["heap_stride"] = heap.stride;
+                t["heap_num_descriptors"] = heap.num_descriptors;
+                if (heap.stride != 0 && cpu_base >= heap.cpu_base) {
+                    t["heap_start_index"] = static_cast<uint64_t>((cpu_base - heap.cpu_base) / heap.stride);
+                }
+            }
+            nlohmann::json slots = nlohmann::json::array();
+            if (resolved && heap.stride != 0 && max_slots > 0) {
+                for (uint32_t slot = 0; slot < max_slots; ++slot) {
+                    const SIZE_T cpu = cpu_base + static_cast<SIZE_T>(slot) * heap.stride;
+                    sn2_descriptor_registry::Entry e{};
+                    nlohmann::json sj;
+                    sj["slot"] = slot;
+                    sj["cpu"] = hex_u64(static_cast<uint64_t>(cpu));
+                    sj["binding"] = sn2_root_binding_label(root_signature, pso, root, slot);
+                    sj["descriptor_hash"] = hex_u64(sn2_descriptor_registry::descriptor_memory_hash(D3D12_CPU_DESCRIPTOR_HANDLE{cpu}));
+                    if (heap.cpu_base != 0 && heap.stride != 0 && cpu >= heap.cpu_base) {
+                        sj["heap_index"] = static_cast<uint64_t>((cpu - heap.cpu_base) / heap.stride);
+                    }
+                    if (sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(cpu, e)) {
+                        for (auto& item : descriptor_entry_json(e).items()) {
+                            sj[item.key()] = item.value();
+                        }
+                    } else {
+                        sj["known"] = false;
+                    }
+                    slots.push_back(std::move(sj));
+                }
+            }
+            t["slots"] = std::move(slots);
+            out.push_back(std::move(t));
+        }
+        return out;
+    }
+
+    nlohmann::json render_targets_json(const CommandListCorrelationState& s) {
+        nlohmann::json rtvs = nlohmann::json::array();
+        for (size_t i = 0; i < s.last_rtv_handles.size(); ++i) {
+            const uint64_t h = s.last_rtv_handles[i];
+            if (h == 0) continue;
+            nlohmann::json r;
+            r["slot"] = i;
+            r["cpu"] = hex_u64(h);
+            if (ID3D12Resource* res = sn2_rt_snapshot::lookup_rtv(h)) {
+                r["resource"] = hex_u64(reinterpret_cast<uintptr_t>(res));
+                r["resource_desc"] = resource_desc_json(res->GetDesc());
+            }
+            rtvs.push_back(std::move(r));
+        }
+        return rtvs;
+    }
+
+    void add_common_state(nlohmann::json& j,
+                          const CommandListCorrelationState& s,
+                          bool graphics,
+                          uintptr_t root_signature,
+                          uintptr_t pso) {
+        j["eye"] = state_eye(s);
+        j["eye_bucket"] = cmdlist_eye_bucket(s);
+        j["pso"] = hex_u64(reinterpret_cast<uintptr_t>(s.current_pso));
+        j["effective_pso"] = hex_u64(reinterpret_cast<uintptr_t>(s.effective_pso));
+        j["root_signature"] = hex_u64(root_signature);
+        j["viewport"] = {
+            {"has", s.has_viewport},
+            {"count", s.viewport_count},
+            {"x", s.viewport0.TopLeftX},
+            {"y", s.viewport0.TopLeftY},
+            {"w", s.viewport0.Width},
+            {"h", s.viewport0.Height}
+        };
+        j["scissor"] = {
+            {"has", s.has_scissor},
+            {"count", s.scissor_count},
+            {"left", s.scissor0.left},
+            {"top", s.scissor0.top},
+            {"right", s.scissor0.right},
+            {"bottom", s.scissor0.bottom}
+        };
+        j["descriptor_heaps"] = nlohmann::json::array();
+        for (size_t i = 0; i < s.descriptor_heaps.size(); ++i) {
+            if (s.descriptor_heaps[i] == nullptr) continue;
+            j["descriptor_heaps"].push_back({{"type", i}, {"heap", hex_u64(reinterpret_cast<uintptr_t>(s.descriptor_heaps[i]))}});
+        }
+        j["root_cbvs"] = root_values_json(graphics ? s.last_graphics_root_cbv : s.last_compute_root_cbv);
+        j["root_srvs"] = root_values_json(graphics ? s.last_graphics_root_srv : s.last_compute_root_srv);
+        j["root_uavs"] = root_values_json(graphics ? s.last_graphics_root_uav : s.last_compute_root_uav);
+        j["root_tables"] = root_values_json(graphics ? s.last_graphics_root_desc_tables : s.last_compute_root_desc_tables);
+        j["root_constants"] = root_constants_json(
+            graphics ? s.last_graphics_root_constants_count : s.last_compute_root_constants_count,
+            graphics ? s.last_graphics_root_constants : s.last_compute_root_constants);
+        j["descriptor_table_sample"] = descriptor_table_json(s, graphics, root_signature, pso);
+        j["rtvs"] = render_targets_json(s);
+        j["dsv_cpu"] = hex_u64(s.last_dsv_handle);
+        j["has_dsv"] = s.has_dsv;
+    }
+
+    void emit_phase_marker(ID3D12GraphicsCommandList* command_list,
+                           const CommandListCorrelationState& state,
+                           const char* phase,
+                           uint32_t crc) {
+        if (!phase_markers_enabled() || !sn2_rdoc_tags::markers_enabled() || command_list == nullptr ||
+            phase == nullptr || phase[0] == '\0') {
+            return;
+        }
+        char detail[160]{};
+        std::snprintf(detail, sizeof(detail), "SN2PHASE %s crc=0x%08x", phase, crc);
+        sn2_rdoc_tags::mark(command_list, cmdlist_eye_bucket(state), detail);
+    }
+
+    void record_committed_resource(ID3D12Resource* resource,
+                                   const D3D12_HEAP_PROPERTIES* heap_props,
+                                   D3D12_HEAP_FLAGS heap_flags,
+                                   const D3D12_RESOURCE_DESC* desc,
+                                   D3D12_RESOURCE_STATES initial_state,
+                                   uintptr_t callsite) {
+        if (!lineage_enabled() || resource == nullptr || desc == nullptr || !interesting_resource_desc(*desc)) return;
+        nlohmann::json j;
+        j["event"] = "resource_lineage";
+        j["op"] = "create_committed";
+        j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(resource));
+        j["resource_desc"] = resource_desc_json(*desc);
+        j["heap_type"] = heap_props != nullptr ? static_cast<uint32_t>(heap_props->Type) : 0u;
+        j["heap_flags"] = static_cast<uint32_t>(heap_flags);
+        j["initial_state"] = static_cast<uint32_t>(initial_state);
+        j["fog_view"] = sn2_get_current_fog_view();
+        j["src"] = sn2_rdoc_tags::format_rva(callsite);
+        write_json_line(std::move(j));
+    }
+
+    void record_placed_resource(ID3D12Resource* resource,
+                                ID3D12Heap* heap,
+                                UINT64 heap_offset,
+                                const D3D12_RESOURCE_DESC* desc,
+                                D3D12_RESOURCE_STATES initial_state,
+                                uintptr_t callsite) {
+        if (!lineage_enabled() || resource == nullptr || desc == nullptr || !interesting_resource_desc(*desc)) return;
+        nlohmann::json j;
+        j["event"] = "resource_lineage";
+        j["op"] = "create_placed";
+        j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(resource));
+        j["heap"] = hex_u64(reinterpret_cast<uintptr_t>(heap));
+        j["heap_offset"] = heap_offset;
+        j["resource_desc"] = resource_desc_json(*desc);
+        j["initial_state"] = static_cast<uint32_t>(initial_state);
+        j["fog_view"] = sn2_get_current_fog_view();
+        j["src"] = sn2_rdoc_tags::format_rva(callsite);
+        write_json_line(std::move(j));
+    }
+
+    void record_cbv_descriptor(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
+                               D3D12_CPU_DESCRIPTOR_HANDLE cpu) {
+        if (!lineage_enabled() || desc == nullptr || cpu.ptr == 0) return;
+        nlohmann::json j;
+        j["event"] = "resource_lineage";
+        j["op"] = "create_cbv";
+        j["cpu"] = hex_u64(static_cast<uint64_t>(cpu.ptr));
+        j["cbv_gpu_va"] = hex_u64(desc->BufferLocation);
+        j["cbv_size"] = desc->SizeInBytes;
+        write_json_line(std::move(j));
+    }
+
+    void record_descriptor_view(const char* kind,
+                                ID3D12Resource* resource,
+                                D3D12_CPU_DESCRIPTOR_HANDLE cpu) {
+        if (!lineage_enabled() || cpu.ptr == 0) return;
+        nlohmann::json j;
+        j["event"] = "resource_lineage";
+        j["op"] = std::string("create_") + (kind != nullptr ? kind : "descriptor");
+        j["cpu"] = hex_u64(static_cast<uint64_t>(cpu.ptr));
+        j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(resource));
+        if (resource != nullptr) {
+            const auto rd = resource->GetDesc();
+            if (!interesting_resource_desc(rd) && !env_flag_enabled_a("UEVR_SN2_RESOURCE_LINEAGE_ALL")) return;
+            j["resource_desc"] = resource_desc_json(rd);
+        }
+        write_json_line(std::move(j));
+    }
+
+    void record_descriptor_copy(const char* op,
+                                D3D12_CPU_DESCRIPTOR_HANDLE dst,
+                                D3D12_CPU_DESCRIPTOR_HANDLE src,
+                                uint32_t count) {
+        if (!lineage_enabled() || dst.ptr == 0 || src.ptr == 0) return;
+        nlohmann::json j;
+        j["event"] = "resource_lineage";
+        j["op"] = op != nullptr ? op : "copy_descriptor";
+        j["dst_cpu"] = hex_u64(static_cast<uint64_t>(dst.ptr));
+        j["src_cpu"] = hex_u64(static_cast<uint64_t>(src.ptr));
+        j["count"] = count;
+        sn2_descriptor_registry::Entry dst_entry{};
+        sn2_descriptor_registry::Entry src_entry{};
+        if (sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(dst.ptr, dst_entry)) {
+            j["dst_entry"] = descriptor_entry_json(dst_entry);
+        }
+        if (sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(src.ptr, src_entry)) {
+            j["src_entry"] = descriptor_entry_json(src_entry);
+        }
+        write_json_line(std::move(j));
+    }
+
+    nlohmann::json copy_box_json(const D3D12_BOX* box) {
+        nlohmann::json j;
+        if (box == nullptr) {
+            j["has_box"] = false;
+            return j;
+        }
+        j["has_box"] = true;
+        j["left"] = box->left;
+        j["top"] = box->top;
+        j["front"] = box->front;
+        j["right"] = box->right;
+        j["bottom"] = box->bottom;
+        j["back"] = box->back;
+        return j;
+    }
+
+    bool should_log_copy_or_clear(ID3D12Resource* a, ID3D12Resource* b = nullptr) {
+        if (env_flag_enabled_a("UEVR_SN2_RESOURCE_LINEAGE_ALL")) return true;
+        if (a != nullptr && interesting_resource_desc(a->GetDesc())) return true;
+        if (b != nullptr && interesting_resource_desc(b->GetDesc())) return true;
+        return false;
+    }
+
+    void record_copy_buffer(ID3D12GraphicsCommandList* command_list,
+                            const CommandListCorrelationState& state,
+                            ID3D12Resource* dst,
+                            UINT64 dst_offset,
+                            ID3D12Resource* src,
+                            UINT64 src_offset,
+                            UINT64 num_bytes) {
+        if (!lineage_enabled() || !should_log_copy_or_clear(dst, src)) return;
+        nlohmann::json j;
+        j["event"] = "resource_lineage";
+        j["op"] = "copy_buffer";
+        j["cmdlist"] = hex_u64(reinterpret_cast<uintptr_t>(command_list));
+        j["eye"] = state_eye(state);
+        j["dst"] = hex_u64(reinterpret_cast<uintptr_t>(dst));
+        j["src"] = hex_u64(reinterpret_cast<uintptr_t>(src));
+        j["dst_offset"] = dst_offset;
+        j["src_offset"] = src_offset;
+        j["bytes"] = num_bytes;
+        if (dst != nullptr) j["dst_desc"] = resource_desc_json(dst->GetDesc());
+        if (src != nullptr) j["src_desc"] = resource_desc_json(src->GetDesc());
+        note_latest_resource_event(dst, "copy_buffer_dst", state_eye(state));
+        write_json_line(std::move(j));
+    }
+
+    void record_copy_texture(ID3D12GraphicsCommandList* command_list,
+                             const CommandListCorrelationState& state,
+                             const D3D12_TEXTURE_COPY_LOCATION* dst,
+                             UINT dst_x,
+                             UINT dst_y,
+                             UINT dst_z,
+                             const D3D12_TEXTURE_COPY_LOCATION* src,
+                             const D3D12_BOX* src_box) {
+        ID3D12Resource* dst_res = dst != nullptr ? dst->pResource : nullptr;
+        ID3D12Resource* src_res = src != nullptr ? src->pResource : nullptr;
+        if (!lineage_enabled() || !should_log_copy_or_clear(dst_res, src_res)) return;
+        nlohmann::json j;
+        j["event"] = "resource_lineage";
+        j["op"] = "copy_texture_region";
+        j["cmdlist"] = hex_u64(reinterpret_cast<uintptr_t>(command_list));
+        j["eye"] = state_eye(state);
+        j["dst"] = hex_u64(reinterpret_cast<uintptr_t>(dst_res));
+        j["src"] = hex_u64(reinterpret_cast<uintptr_t>(src_res));
+        j["dst_x"] = dst_x;
+        j["dst_y"] = dst_y;
+        j["dst_z"] = dst_z;
+        j["src_box"] = copy_box_json(src_box);
+        if (dst != nullptr) {
+            j["dst_type"] = static_cast<uint32_t>(dst->Type);
+            j["dst_subresource"] = dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? dst->SubresourceIndex : 0u;
+        }
+        if (src != nullptr) {
+            j["src_type"] = static_cast<uint32_t>(src->Type);
+            j["src_subresource"] = src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? src->SubresourceIndex : 0u;
+        }
+        if (dst_res != nullptr) j["dst_desc"] = resource_desc_json(dst_res->GetDesc());
+        if (src_res != nullptr) j["src_desc"] = resource_desc_json(src_res->GetDesc());
+        note_latest_resource_event(dst_res, "copy_texture_dst", state_eye(state));
+        write_json_line(std::move(j));
+    }
+
+    void record_copy_resource(ID3D12GraphicsCommandList* command_list,
+                              const CommandListCorrelationState& state,
+                              ID3D12Resource* dst,
+                              ID3D12Resource* src) {
+        if (!lineage_enabled() || !should_log_copy_or_clear(dst, src)) return;
+        nlohmann::json j;
+        j["event"] = "resource_lineage";
+        j["op"] = "copy_resource";
+        j["cmdlist"] = hex_u64(reinterpret_cast<uintptr_t>(command_list));
+        j["eye"] = state_eye(state);
+        j["dst"] = hex_u64(reinterpret_cast<uintptr_t>(dst));
+        j["src"] = hex_u64(reinterpret_cast<uintptr_t>(src));
+        if (dst != nullptr) j["dst_desc"] = resource_desc_json(dst->GetDesc());
+        if (src != nullptr) j["src_desc"] = resource_desc_json(src->GetDesc());
+        note_latest_resource_event(dst, "copy_resource_dst", state_eye(state));
+        write_json_line(std::move(j));
+    }
+
+    void record_clear_rtv(ID3D12GraphicsCommandList* command_list,
+                          const CommandListCorrelationState& state,
+                          D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                          const FLOAT color_rgba[4],
+                          UINT num_rects) {
+        ID3D12Resource* res = sn2_rt_snapshot::lookup_rtv(rtv.ptr);
+        if (!lineage_enabled() || !should_log_copy_or_clear(res)) return;
+        nlohmann::json j;
+        j["event"] = "resource_lineage";
+        j["op"] = "clear_rtv";
+        j["cmdlist"] = hex_u64(reinterpret_cast<uintptr_t>(command_list));
+        j["eye"] = state_eye(state);
+        j["rtv_cpu"] = hex_u64(static_cast<uint64_t>(rtv.ptr));
+        j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(res));
+        if (res != nullptr) j["resource_desc"] = resource_desc_json(res->GetDesc());
+        if (color_rgba != nullptr) {
+            j["color"] = {color_rgba[0], color_rgba[1], color_rgba[2], color_rgba[3]};
+        }
+        j["num_rects"] = num_rects;
+        note_latest_resource_event(res, "clear_rtv", state_eye(state));
+        write_json_line(std::move(j));
+    }
+
+    void emit_resource_binding_lineage(const CommandListCorrelationState& s,
+                                       bool graphics,
+                                       const char* phase,
+                                       uint32_t crc) {
+        if (!lineage_enabled()) return;
+        const int eye = state_eye(s);
+        const auto& tables = graphics ? s.last_graphics_root_desc_tables : s.last_compute_root_desc_tables;
+        for (uint32_t root = 0; root < tables.size(); ++root) {
+            const uint64_t table_gpu = tables[root];
+            if (table_gpu == 0) continue;
+            BindlessHeapState heap{};
+            SIZE_T cpu_base = 0;
+            if (!bindless_heap_registry().resolve_state(table_gpu, heap, cpu_base) || heap.stride == 0) continue;
+            const uint32_t limit = std::min<uint32_t>(max_table_slots(), std::min<uint32_t>(heap.num_descriptors, 256));
+            for (uint32_t slot = 0; slot < limit; ++slot) {
+                const SIZE_T cpu = cpu_base + static_cast<SIZE_T>(slot) * heap.stride;
+                sn2_descriptor_registry::Entry e{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(cpu, e) ||
+                    e.resource == nullptr || !e.has_resource_desc || !interesting_resource_desc(e.resource_desc)) {
+                    continue;
+                }
+                const bool is_write = e.kind == sn2_descriptor_registry::Kind::UAV;
+                const bool is_read = e.kind == sn2_descriptor_registry::Kind::SRV;
+                if (!is_write && !is_read) continue;
+                nlohmann::json j;
+                j["event"] = "resource_lineage";
+                j["op"] = is_write ? "bind_write_uav" : "bind_read_srv";
+                j["phase"] = phase != nullptr ? phase : "";
+                j["crc"] = hex_u32(crc);
+                j["eye"] = eye;
+                j["graphics"] = graphics;
+                j["root"] = root;
+                j["slot"] = slot;
+                j["cpu"] = hex_u64(static_cast<uint64_t>(cpu));
+                j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(e.resource));
+                j["entry"] = descriptor_entry_json(e);
+                if (is_write) {
+                    note_latest_resource_event(e.resource, "bind_write_uav", eye, phase, hex_u32(crc).c_str());
+                }
+                write_json_line(std::move(j));
+            }
+        }
+        if (graphics) {
+            for (size_t i = 0; i < s.last_rtv_handles.size(); ++i) {
+                const uint64_t h = s.last_rtv_handles[i];
+                if (h == 0) continue;
+                ID3D12Resource* res = sn2_rt_snapshot::lookup_rtv(h);
+                if (res == nullptr || !interesting_resource_desc(res->GetDesc())) continue;
+                nlohmann::json j;
+                j["event"] = "resource_lineage";
+                j["op"] = "bind_write_rtv";
+                j["phase"] = phase != nullptr ? phase : "";
+                j["crc"] = hex_u32(crc);
+                j["eye"] = eye;
+                j["slot"] = i;
+                j["rtv_cpu"] = hex_u64(h);
+                j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(res));
+                j["resource_desc"] = resource_desc_json(res->GetDesc());
+                note_latest_resource_event(res, "bind_write_rtv", eye, phase, hex_u32(crc).c_str());
+                write_json_line(std::move(j));
+            }
+        }
+    }
+
+    void record_barriers(ID3D12GraphicsCommandList* command_list,
+                         const CommandListCorrelationState& state,
+                         UINT num_barriers,
+                         const D3D12_RESOURCE_BARRIER* barriers) {
+        if (!lineage_enabled() || barriers == nullptr || num_barriers == 0) return;
+        for (UINT i = 0; i < num_barriers; ++i) {
+            const auto& b = barriers[i];
+            nlohmann::json j;
+            j["event"] = "resource_lineage";
+            j["op"] = "barrier";
+            j["barrier_type"] = static_cast<uint32_t>(b.Type);
+            j["flags"] = static_cast<uint32_t>(b.Flags);
+            j["cmdlist"] = hex_u64(reinterpret_cast<uintptr_t>(command_list));
+            j["eye"] = state_eye(state);
+            if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+                ID3D12Resource* res = b.Transition.pResource;
+                if (res == nullptr) continue;
+                const auto rd = res->GetDesc();
+                if (!interesting_resource_desc(rd)) continue;
+                j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(res));
+                j["resource_desc"] = resource_desc_json(rd);
+                j["subresource"] = b.Transition.Subresource;
+                j["state_before"] = static_cast<uint32_t>(b.Transition.StateBefore);
+                j["state_after"] = static_cast<uint32_t>(b.Transition.StateAfter);
+                note_latest_resource_event(res, "barrier_transition", state_eye(state));
+            } else if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
+                ID3D12Resource* res = b.UAV.pResource;
+                if (res == nullptr) continue;
+                const auto rd = res->GetDesc();
+                if (!interesting_resource_desc(rd)) continue;
+                j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(res));
+                j["resource_desc"] = resource_desc_json(rd);
+                note_latest_resource_event(res, "barrier_uav", state_eye(state));
+            } else if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+                ID3D12Resource* before = b.Aliasing.pResourceBefore;
+                ID3D12Resource* after = b.Aliasing.pResourceAfter;
+                bool interesting = false;
+                if (before != nullptr) interesting = interesting || interesting_resource_desc(before->GetDesc());
+                if (after != nullptr) interesting = interesting || interesting_resource_desc(after->GetDesc());
+                if (!interesting) continue;
+                j["before"] = hex_u64(reinterpret_cast<uintptr_t>(before));
+                j["after"] = hex_u64(reinterpret_cast<uintptr_t>(after));
+                if (before != nullptr) j["before_desc"] = resource_desc_json(before->GetDesc());
+                if (after != nullptr) j["after_desc"] = resource_desc_json(after->GetDesc());
+                note_latest_resource_event(after, "barrier_alias_after", state_eye(state));
+            }
+            write_json_line(std::move(j));
+        }
+    }
+
+    void emit_probe_points(const CommandListCorrelationState& state,
+                           bool graphics,
+                           const char* phase,
+                           uint32_t crc) {
+        if (!probe_points_enabled()) return;
+        static std::atomic<uint64_t> probe_seq{0};
+        static std::atomic<uint32_t> snapshot_count{0};
+        const auto& tables = graphics ? state.last_graphics_root_desc_tables : state.last_compute_root_desc_tables;
+        for (uint32_t root = 0; root < tables.size(); ++root) {
+            const uint64_t table_gpu = tables[root];
+            if (table_gpu == 0) continue;
+            SIZE_T cpu_base = 0;
+            UINT stride = 0;
+            if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) continue;
+            for (uint32_t slot = 0; slot < std::min<uint32_t>(max_table_slots(), 128); ++slot) {
+                const SIZE_T cpu = cpu_base + static_cast<SIZE_T>(slot) * stride;
+                sn2_descriptor_registry::Entry e{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(cpu, e) ||
+                    e.resource == nullptr || !e.has_resource_desc ||
+                    !interesting_resource_desc(e.resource_desc)) {
+                    continue;
+                }
+                nlohmann::json j;
+                j["event"] = "sn2_probe_point";
+                j["phase"] = phase != nullptr ? phase : "";
+                j["crc"] = hex_u32(crc);
+                j["eye"] = state_eye(state);
+                j["root"] = root;
+                j["slot"] = slot;
+                j["cpu"] = hex_u64(static_cast<uint64_t>(cpu));
+                j["entry"] = descriptor_entry_json(e);
+                j["note"] = "capture-only manifest: stable resource/index to sample offline or with the optional SN2Probe snapshot path";
+                if (probe_snapshot_enabled() && e.resource != nullptr) {
+                    const uint32_t cur = snapshot_count.fetch_add(1, std::memory_order_relaxed);
+                    if (cur < max_probe_snapshots()) {
+                        const int eye = state_eye(state);
+                        const char eye_char = eye == 0 ? 'L' : eye == 1 ? 'R' : 'U';
+                        const uint64_t seq = probe_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                        sn2_rt_snapshot::queue_intent_named(e.resource, "SN2Probe", eye_char, seq);
+                        j["snapshot_queued"] = true;
+                        j["snapshot_seq"] = seq;
+                    } else {
+                        j["snapshot_queued"] = false;
+                        j["snapshot_skip_reason"] = "max_snapshots";
+                    }
+                }
+                write_json_line(std::move(j));
+            }
+        }
+    }
+
+    void emit_target_draw(ID3D12GraphicsCommandList* command_list,
+                          const CommandListCorrelationState& state,
+                          uint32_t ps_crc,
+                          uint32_t vs_crc,
+                          uint32_t gs_crc,
+                          const char* draw_kind,
+                          uint32_t index_count,
+                          uint32_t instance_count,
+                          uint32_t start_index,
+                          int32_t base_vertex,
+                          uint32_t start_instance,
+                          uintptr_t callsite) {
+        const char* phase = phase_for_ps(ps_crc);
+        if (!target_state_enabled() && !phase_markers_enabled() && !probe_points_enabled()) return;
+        if (!target_ps(ps_crc) && (phase == nullptr || phase[0] == '\0')) return;
+        emit_phase_marker(command_list, state, phase, ps_crc);
+        if (target_state_enabled() && target_ps(ps_crc)) {
+            nlohmann::json j;
+            j["event"] = "target_state";
+            j["kind"] = "draw";
+            j["phase"] = phase;
+            j["draw"] = draw_kind != nullptr ? draw_kind : "?";
+            j["ps_crc"] = hex_u32(ps_crc);
+            j["vs_crc"] = hex_u32(vs_crc);
+            j["gs_crc"] = hex_u32(gs_crc);
+            j["src"] = sn2_rdoc_tags::format_rva(callsite);
+            j["draw_args"] = {
+                {"index_count", index_count},
+                {"instance_count", instance_count},
+                {"start_index", start_index},
+                {"base_vertex", base_vertex},
+                {"start_instance", start_instance}
+            };
+            add_common_state(j, state, true, state.last_graphics_root_signature, reinterpret_cast<uintptr_t>(state.current_pso));
+            write_json_line(std::move(j));
+        }
+        emit_resource_binding_lineage(state, true, phase, ps_crc);
+        emit_probe_points(state, true, phase, ps_crc);
+    }
+
+    void emit_target_dispatch(ID3D12GraphicsCommandList* command_list,
+                              const CommandListCorrelationState& state,
+                              uint32_t cs_crc,
+                              uint32_t x,
+                              uint32_t y,
+                              uint32_t z,
+                              uintptr_t callsite) {
+        const char* phase = phase_for_cs(cs_crc);
+        if (!target_state_enabled() && !phase_markers_enabled() && !probe_points_enabled()) return;
+        if (!target_cs(cs_crc) && (phase == nullptr || phase[0] == '\0')) return;
+        emit_phase_marker(command_list, state, phase, cs_crc);
+        if (target_state_enabled() && target_cs(cs_crc)) {
+            nlohmann::json j;
+            j["event"] = "target_state";
+            j["kind"] = "dispatch";
+            j["phase"] = phase;
+            j["cs_crc"] = hex_u32(cs_crc);
+            j["src"] = sn2_rdoc_tags::format_rva(callsite);
+            j["dispatch_args"] = {{"x", x}, {"y", y}, {"z", z}};
+            add_common_state(j, state, false, state.last_compute_root_signature, reinterpret_cast<uintptr_t>(state.current_pso));
+            write_json_line(std::move(j));
+        }
+        emit_resource_binding_lineage(state, false, phase, cs_crc);
+        emit_probe_points(state, false, phase, cs_crc);
+    }
+
+    void dump_descriptor_snapshot(uint64_t seq, const char* reason) {
+        if (!env_flag_enabled_a("UEVR_SN2_DESCRIPTOR_HEAP_SNAPSHOT") || descriptor_snapshot_max_slots() == 0) return;
+        static std::atomic<uint64_t> dumps{0};
+        const uint64_t dump_seq = dumps.fetch_add(1, std::memory_order_relaxed) + 1;
+        const uint32_t max_slots = descriptor_snapshot_max_slots();
+        try {
+            const std::filesystem::path dir{artifact_dir()};
+            std::filesystem::create_directories(dir);
+            char name[128]{};
+            std::snprintf(name, sizeof(name), "descriptor_heap_snapshot_seq%04llu.jsonl",
+                          static_cast<unsigned long long>(seq != 0 ? seq : dump_seq));
+            const auto file = dir / name;
+            std::ofstream out(file, std::ios::binary);
+            if (!out.good()) return;
+
+            uint64_t heap_count = 0;
+            uint64_t slot_rows = 0;
+            uint64_t known = 0;
+            uint64_t srvs = 0;
+            uint64_t uavs = 0;
+            uint64_t cbvs = 0;
+            {
+                std::scoped_lock _{bindless_heap_registry().mu};
+                heap_count = bindless_heap_registry().heaps.size();
+                for (size_t hi = 0; hi < bindless_heap_registry().heaps.size(); ++hi) {
+                    const auto h = bindless_heap_registry().heaps[hi];
+                    if (h.cpu_base == 0 || h.stride == 0 || h.num_descriptors == 0) continue;
+                    const uint32_t slots = std::min<uint32_t>(max_slots, h.num_descriptors);
+                    for (uint32_t slot = 0; slot < slots; ++slot) {
+                        const SIZE_T cpu = h.cpu_base + static_cast<SIZE_T>(slot) * h.stride;
+                        nlohmann::json j;
+                        j["event"] = "descriptor_heap_slot";
+                        j["snapshot_seq"] = seq;
+                        j["heap_ordinal"] = hi;
+                        j["heap"] = hex_u64(reinterpret_cast<uintptr_t>(h.heap));
+                        j["heap_cpu_base"] = hex_u64(static_cast<uint64_t>(h.cpu_base));
+                        j["heap_gpu_base"] = hex_u64(h.gpu_base);
+                        j["heap_stride"] = h.stride;
+                        j["heap_num_descriptors"] = h.num_descriptors;
+                        j["slot"] = slot;
+                        j["cpu"] = hex_u64(static_cast<uint64_t>(cpu));
+                        j["descriptor_hash"] = hex_u64(sn2_descriptor_registry::descriptor_memory_hash(D3D12_CPU_DESCRIPTOR_HANDLE{cpu}));
+                        sn2_descriptor_registry::Entry e{};
+                        if (sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(cpu, e)) {
+                            ++known;
+                            if (e.kind == sn2_descriptor_registry::Kind::SRV) ++srvs;
+                            else if (e.kind == sn2_descriptor_registry::Kind::UAV) ++uavs;
+                            else if (e.kind == sn2_descriptor_registry::Kind::CBV) ++cbvs;
+                            for (auto& item : descriptor_entry_json(e).items()) {
+                                j[item.key()] = item.value();
+                            }
+                            if (e.resource != nullptr && e.has_resource_desc && is_ils_like_desc(e.resource_desc)) {
+                                float score = 0.0f;
+                                if (sn2_litness::lookup_score(slot, reinterpret_cast<uintptr_t>(e.resource), score)) {
+                                    j["litness_score"] = score;
+                                }
+                            }
+                        } else {
+                            j["known"] = false;
+                        }
+                        ++slot_rows;
+                        out << j.dump() << '\n';
+                    }
+                }
+            }
+
+            nlohmann::json summary;
+            summary["event"] = "descriptor_heap_snapshot";
+            summary["snapshot_seq"] = seq;
+            summary["reason"] = reason != nullptr ? reason : "";
+            summary["file"] = file.string();
+            summary["heaps"] = heap_count;
+            summary["slots"] = slot_rows;
+            summary["known"] = known;
+            summary["srvs"] = srvs;
+            summary["uavs"] = uavs;
+            summary["cbvs"] = cbvs;
+            write_json_line(std::move(summary));
+        } catch (...) {
+        }
+    }
+
+    void on_capture_trigger(uint64_t seq) {
+        dump_descriptor_snapshot(seq, "renderdoc_capture_trigger");
+        nlohmann::json j;
+        j["event"] = "capture_trigger";
+        j["seq"] = seq;
+        j["artifact_dir"] = artifact_dir();
+        j["trace_path"] = path();
+        write_json_line(std::move(j));
+    }
+}
+
+extern "C" void sn2_capture_truth_on_renderdoc_trigger(uint64_t seq) {
+    ::sn2_capture_truth::on_capture_trigger(seq);
 }
 
 namespace sn2_fog_resolve_shadow {
@@ -21477,6 +23098,24 @@ void WINAPI D3D12Hook::draw_instanced(
                       forensics_ps_crc, vertex_count_per_instance, instance_count, src.c_str());
         sn2_rdoc_tags::mark(command_list, eye_bucket, detail);
     }
+    {
+        const uintptr_t pso_key = reinterpret_cast<uintptr_t>(s.current_pso);
+        const uint32_t vs_crc = pso_key != 0 ? reg.d3d12_pso_vertex_crc32(pso_key) : 0;
+        const uint32_t gs_crc = pso_key != 0 ? reg.d3d12_pso_geometry_crc32(pso_key) : 0;
+        ::sn2_capture_truth::emit_target_draw(
+            command_list,
+            s,
+            forensics_ps_crc,
+            vs_crc,
+            gs_crc,
+            "DrawInstanced",
+            vertex_count_per_instance,
+            instance_count,
+            start_vertex_location,
+            0,
+            start_instance_location,
+            reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    }
 
     // 2026-05-24 FULLSCREEN per-eye probe. The right eye lacks the underwater teal CAST (a uniform
     // full-image tint = a fullscreen color-grade post-process). Find fullscreen pixel shaders
@@ -21857,6 +23496,24 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         std::snprintf(detail, sizeof(detail), "DRAWIDX ps=0x%08x idx=%u i=%u src=%s",
                       forensics_ps_crc, index_count_per_instance, instance_count, src.c_str());
         sn2_rdoc_tags::mark(command_list, eye_bucket2, detail);
+    }
+    {
+        const uintptr_t pso_key = reinterpret_cast<uintptr_t>(s2.current_pso);
+        const uint32_t vs_crc = pso_key != 0 ? reg2.d3d12_pso_vertex_crc32(pso_key) : 0;
+        const uint32_t gs_crc = pso_key != 0 ? reg2.d3d12_pso_geometry_crc32(pso_key) : 0;
+        ::sn2_capture_truth::emit_target_draw(
+            command_list,
+            s2,
+            forensics_ps_crc,
+            vs_crc,
+            gs_crc,
+            "DrawIndexedInstanced",
+            index_count_per_instance,
+            instance_count,
+            start_index_location,
+            base_vertex_location,
+            start_instance_location,
+            reinterpret_cast<uintptr_t>(_ReturnAddress()));
     }
 
     // 2026-05-24 LIVE fog-CONSUMER per-eye counter. After ruling out the fog producer/volume
@@ -23662,6 +25319,14 @@ void WINAPI D3D12Hook::dispatch(
                       thread_group_count_z, src.c_str());
         sn2_rdoc_tags::mark(command_list, dispatch_eye_bucket, detail);
     }
+    ::sn2_capture_truth::emit_target_dispatch(
+        command_list,
+        dispatch_state,
+        current_cs_crc,
+        thread_group_count_x,
+        thread_group_count_y,
+        thread_group_count_z,
+        reinterpret_cast<uintptr_t>(_ReturnAddress()));
     // === StereoScope event ledger: "dispatch" event (2026-05-25) ===
     // Additive, default OFF (UEVR_SN2_EVENT_LEDGER=1). Read-only scan of the
     // recorded compute root tables -> one JSON line with thread-group dims.
@@ -24744,6 +26409,12 @@ void WINAPI D3D12Hook::copy_buffer_region(
         dst_offset,
         src_offset);
 
+    {
+        const auto truth_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
+        ::sn2_capture_truth::record_copy_buffer(
+            command_list, truth_state, dst_buffer, dst_offset, src_buffer, src_offset, num_bytes);
+    }
+
     // 2026-05-27: passive default-CBV shadowing. If this is a CPU-upload -> GPU-default
     // copy of a CBV-sized region, shadow the destination bytes (read from the mapped upload
     // source) keyed by destination GPU VA, so the chain scan can later read the View UB
@@ -24837,6 +26508,12 @@ void WINAPI D3D12Hook::copy_texture_region(
         0,
         0);
 
+    {
+        const auto truth_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
+        ::sn2_capture_truth::record_copy_texture(
+            command_list, truth_state, dst, dst_x, dst_y, dst_z, src, src_box);
+    }
+
     if (original != nullptr) {
         original(command_list, dst, dst_x, dst_y, dst_z, src, src_box);
     }
@@ -24888,6 +26565,11 @@ void WINAPI D3D12Hook::copy_resource(
         depth,
         0,
         0);
+
+    {
+        const auto truth_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
+        ::sn2_capture_truth::record_copy_resource(command_list, truth_state, dst_resource, src_resource);
+    }
 
     if (original != nullptr) {
         original(command_list, dst_resource, src_resource);
@@ -25472,6 +27154,7 @@ void WINAPI D3D12Hook::clear_render_target_view(
         render_target_view,
         color_rgba,
         num_rects);
+    ::sn2_capture_truth::record_clear_rtv(command_list, state, render_target_view, color_rgba, num_rects);
 
     if (original != nullptr) {
         original(command_list, render_target_view, color_rgba, num_rects, rects);
@@ -25501,6 +27184,8 @@ void WINAPI D3D12Hook::resource_barrier(
         reinterpret_cast<uintptr_t>(command_list),
         num_barriers,
         barriers);
+    const auto truth_barrier_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
+    ::sn2_capture_truth::record_barriers(command_list, truth_barrier_state, num_barriers, barriers);
 
     // Aliasing-barrier publish tracker. UE5 RDG transient textures can be
     // rebound through aliasing barriers on the same placed heap. Feed that

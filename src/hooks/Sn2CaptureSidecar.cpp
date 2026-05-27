@@ -116,6 +116,10 @@ void emit(uint64_t seq) {
 
     // Debug color override file (if active)
     doc["debug_color_override_file"] = env_str("UEVR_SN2_DEBUG_COLOR_OVERRIDE_FILE");
+    doc["capture_artifact_dir"] = env_str("UEVR_SN2_CAPTURE_ARTIFACT_DIR");
+    doc["capture_truth_path"] = env_str("UEVR_SN2_CAPTURE_TRUTH_PATH").empty()
+        ? env_str("UEVR_SN2_BINDLESS_FOG_TRACE_PATH")
+        : env_str("UEVR_SN2_CAPTURE_TRUTH_PATH");
 
     // Active mirrors inventory.
     {
