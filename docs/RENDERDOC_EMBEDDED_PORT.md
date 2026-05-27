@@ -1,12 +1,13 @@
 # RenderDoc Embedded Port
 
-This fork is the workspace for integrating full RenderDoc capture into UEVR
-without disturbing the main `uevrj` checkout.
+This document describes UEVRJ's embedded RenderDoc capture path: how it makes
+RenderDoc resident before the first D3D12/DXGI objects, how captures are
+triggered, and how to validate that the resulting `.rdc` opens in RenderDoc.
 
 ## Workspace
 
-- UEVR fork: `E:\github\uevrj-renderdoc`
-- Branch: `renderdoc-embedded-port`
+- UEVR checkout: `E:\github\uevrj`
+- Branch: `ue57performance`
 - RenderDoc source: `E:\Github\renderdoc`
 
 ## Current Integration Layer
@@ -127,6 +128,145 @@ Late injection into an already-running game remains degraded by design; no code
 can retroactively make RenderDoc own objects that were created before RenderDoc
 was present.
 
+## How It Works
+
+The stable path is deliberately RenderDoc-first:
+
+1. `UEVRRenderDocLauncher.exe` creates the game process suspended.
+2. The launcher injects `renderdoc.dll` first, then `UEVRBackend.dll`.
+3. The launcher sets the embedded-proof environment:
+   `UEVR_RENDERDOC_BOOTSTRAP=1`, `UEVR_RENDERDOC_PREHOOK_D3D12=1`,
+   `UEVR_RENDERDOC_LAUNCHED_SUSPENDED=1`, and a private
+   `UEVR_RENDERDOC_READY_EVENT`.
+4. UEVR's startup thread queries RenderDoc's in-app API, calls the
+   UEVR-specific `RENDERDOC_UEVR_RefreshHooks()` export, installs the optional
+   DXGI/D3D12 ownership proof, and constructs `Framework`.
+5. `Framework` starts the RenderDoc capture watcher and, when requested by the
+   launcher, installs UEVR's D3D12 prehook before the game main thread resumes.
+6. The launcher waits for UEVR to signal the ready event, then resumes the game.
+7. On the first game Present, UEVR records the active
+   `{ID3D12Device*, HWND}` pair and proves that the device, factory, swapchain,
+   command queue, command list, resources, descriptor heap, root signature, and
+   PSO observed by UEVR are RenderDoc wrappers.
+8. A capture request writes `%TEMP%\uevr_renderdoc_capture.req`. The watcher
+   reads the first line as the capture path template and `frames=N` from later
+   lines, then calls RenderDoc Start/EndFrameCapture using the exact active
+   pair when available.
+9. The produced `.rdc` is a native RenderDoc capture. Validation uses
+   `renderdoccmd index-capture` and `renderdoccmd thumb` from the same
+   `E:\Github\renderdoc` checkout.
+
+UEVR still layers its D3D12 vtable hooks over RenderDoc's wrapper objects in
+this mode. The important invariant is that UEVR calls the wrapper originals, not
+the raw runtime exports, so RenderDoc's serializer remains in the call chain.
+
+## Setup And Capture
+
+Build UEVRJ and full RenderDoc:
+
+```powershell
+cd E:\github\uevrj
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+  -DUEVR_RENDERDOC_SOURCE_DIR=E:/Github/renderdoc
+cmake --build build --config Release --target uevr
+```
+
+The build writes these files to `build\bin\uevr`:
+
+- `UEVRBackend.dll`
+- `UEVRRenderDocLauncher.exe`
+- `UEVRRenderDocSmoke.exe`
+- `renderdoc.dll`
+- `renderdoc.pdb`
+
+Run the smoke validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+  -File tools\run_renderdoc_smoke_capture.ps1 `
+  -Launcher E:\Github\UEVRJ\build\bin\uevr\UEVRRenderDocLauncher.exe `
+  -Smoke E:\Github\UEVRJ\build\bin\uevr\UEVRRenderDocSmoke.exe `
+  -SmokeSeconds 25 `
+  -CaptureTimeoutSeconds 45 `
+  -StartupDelaySeconds 7
+```
+
+Launch a game through the suspended launcher:
+
+```powershell
+$launcher = "E:\Github\UEVRJ\build\bin\uevr\UEVRRenderDocLauncher.exe"
+$game = "E:\Github\Subnautica 2\Subnautica2\Binaries\Win64\Subnautica2-Win64-Shipping.exe"
+$cwd = "E:\Github\Subnautica 2"
+$env:XR_RUNTIME_JSON = "E:\Github\OpenXR-Simulator\bin\openxr_simulator.json"
+
+& $launcher --exe $game --cwd $cwd --ready-timeout-ms 30000 -- --dx12
+```
+
+Request and validate a capture from that running game:
+
+```powershell
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$template = Join-Path $env:TEMP "uevr_renderdoc_live\sn2_$stamp"
+
+powershell -ExecutionPolicy Bypass `
+  -File tools\capture_and_validate_renderdoc.ps1 `
+  -CaptureTemplate $template `
+  -TimeoutSeconds 120 `
+  -RenderDocRoot E:\Github\renderdoc
+```
+
+The script writes `%TEMP%\uevr_renderdoc_capture.req`, waits for the newest
+`$template*.rdc`, then runs:
+
+```powershell
+E:\Github\renderdoc\x64\Development\renderdoccmd.exe index-capture --out <out_dir> <capture.rdc>
+```
+
+Open the capture directly in qrenderdoc:
+
+```powershell
+E:\Github\renderdoc\x64\Development\qrenderdoc.exe <capture.rdc>
+```
+
+## MCP Capture Surface
+
+`E:\Github\uevr-mcp` exposes the full host-side capture flow so an MCP agent can
+launch, capture, validate, and list captures without hand-running PowerShell:
+
+- `uevr_renderdoc_paths` resolves UEVRJ, RenderDoc, launcher, backend, smoke,
+  `renderdoc.dll`, `renderdoccmd.exe`, and the sentinel path.
+- `uevr_renderdoc_launch_game` launches a target through
+  `UEVRRenderDocLauncher.exe`.
+- `uevr_renderdoc_request_capture` writes the sentinel for an already-running
+  embedded session and validates the produced `.rdc`.
+- `uevr_renderdoc_capture_game` performs launch + wait + capture + validate in
+  one call.
+- `uevr_renderdoc_validate_capture` indexes and thumbnails any existing `.rdc`.
+- `uevr_renderdoc_list_captures` lists recent `.rdc` files.
+
+Example MCP call shape:
+
+```json
+{
+  "tool": "uevr_renderdoc_capture_game",
+  "arguments": {
+    "gameExe": "E:\\Github\\Subnautica 2\\Subnautica2\\Binaries\\Win64\\Subnautica2-Win64-Shipping.exe",
+    "cwd": "E:\\Github\\Subnautica 2",
+    "gameArgs": "--dx12",
+    "xrRuntimeJson": "E:\\Github\\OpenXR-Simulator\\bin\\openxr_simulator.json",
+    "startupDelaySeconds": 75,
+    "captureTimeoutSeconds": 120,
+    "uevrRoot": "E:\\Github\\UEVRJ",
+    "renderDocRoot": "E:\\Github\\renderdoc",
+    "stopAfterCapture": false
+  }
+}
+```
+
+The MCP result includes the launcher output, game PID when the launcher reports
+it, the `.rdc` path, file size, validation output directory, action/event/state
+counts, and thumbnail path.
+
 ## Compatibility Target
 
 "100% compatible with RenderDoc" means:
@@ -240,7 +380,7 @@ Status: implemented for watcher and SN2 trigger paths.
 
 ### Phase 7 - Validation
 
-Status: automated smoke validation implemented.
+Status: automated smoke validation and live SN2 validation implemented.
 
 - Build UEVR + full RenderDoc.
 - Launch a minimal D3D12 sample with UEVR/RenderDoc resident before device
@@ -251,8 +391,8 @@ Status: automated smoke validation implemented.
   open and index the produced capture.
 - For a running game, run `tools\capture_and_validate_renderdoc.ps1` to request
   a watcher capture and validate the newest `.rdc` automatically.
-- Remaining game validation: repeat on a UE D3D12 title.
-- Remaining game validation: repeat on SN2 with shader replacement enabled.
+- SN2 validation produced a native D3D12 `.rdc` that `renderdoccmd` indexed
+  successfully with populated actions/events/state/resources and a thumbnail.
 - Negative test late-load mode and verify status reports degraded capture.
 - Use renderdoccmd/qrenderdoc to open the capture produced by UEVR and confirm
   no repair/import path is required.
@@ -267,8 +407,8 @@ Status: automated smoke validation implemented.
   registry that cannot store wrappers.
 - Single-backend-injection mode (`--backend-load-renderdoc`) captures and
   validates but is not the default until its smoke teardown crash is fixed.
-- UE title and SN2 shader-replacement validation still need to be run against
-  real game workloads.
+- Broader shader-replacement validation still needs to be run against real game
+  workloads.
 
 ## Remaining Hardening
 
@@ -293,7 +433,7 @@ Status: automated smoke validation implemented.
 
 ## Next Steps
 
-1. Run the launcher path against a UE D3D12 title and SN2.
+1. Keep validating the launcher path against more UE D3D12 titles.
 2. Fix or remove `--backend-load-renderdoc` after resolving its teardown crash.
 3. Route UEVR shader replacement through RenderDoc-owned wrapper callbacks, or
    explicitly order the UEVR hooks after RenderDoc's wrapped interfaces.
