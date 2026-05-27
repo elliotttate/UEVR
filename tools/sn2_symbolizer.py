@@ -210,13 +210,22 @@ class Symbolizer:
             return out
         sym_rva = self._rvas[i]
         name = self._names[i]
+        offset = rva - sym_rva
+        # An offset larger than any real function (≈0.5MB) means the address is
+        # between symbols / not in this image (e.g. a UEVRBackend.dll frame whose
+        # EXE-relative RVA is meaningless). Flag it so callers can skip it.
+        plausible = 0 <= offset < 0x80000
         out.update({
-            "symbol": name,
-            "demangled": light_demangle(name),
+            "symbol": name if plausible else None,
+            "nearest_symbol": name,
+            "demangled": light_demangle(name) if plausible else None,
             "sym_rva": hex(sym_rva),
-            "offset": rva - sym_rva,
-            "via": "binfold",
+            "offset": offset,
+            "plausible": plausible,
+            "via": "binfold" if plausible else "unmapped",
         })
+        if not plausible:
+            return out
         # Enrich with a curated entry if the nearest dict fn covers this addr.
         # (Best-effort: nearest dict rva <= query.)
         if self._dict:

@@ -560,6 +560,14 @@ bool D3D12Diagnostics::is_enabled() const {
     return m_enabled.load(std::memory_order_relaxed);
 }
 
+void D3D12Diagnostics::set_lightweight(bool lightweight) {
+    m_lightweight.store(lightweight, std::memory_order_relaxed);
+}
+
+bool D3D12Diagnostics::is_lightweight() const {
+    return m_lightweight.load(std::memory_order_relaxed);
+}
+
 void D3D12Diagnostics::begin_frame(
     ID3D12Device* device,
     IDXGISwapChain3* swapchain,
@@ -1011,7 +1019,10 @@ void D3D12Diagnostics::record_descriptor_heaps_set(
     uint32_t count,
     ID3D12DescriptorHeap* const* heaps
 ) {
-    if (!is_enabled()) {
+    // High-frequency (per SetDescriptorHeaps) + builds a detail string each call.
+    // Skip in lightweight mode; the Shader Hunter resolves RT names from RTV/DSV
+    // creation, not from the active descriptor-heap set.
+    if (!is_enabled() || is_lightweight()) {
         return;
     }
 
@@ -1062,7 +1073,8 @@ void D3D12Diagnostics::record_resource_barriers(
     uint32_t count,
     const D3D12_RESOURCE_BARRIER* barriers
 ) {
-    if (!is_enabled()) {
+    // High-frequency; skip in lightweight mode (Shader Hunter doesn't need barriers).
+    if (!is_enabled() || is_lightweight()) {
         return;
     }
 
@@ -1210,7 +1222,10 @@ void D3D12Diagnostics::record_root_bind(
     uint32_t value_count,
     uint64_t value_hash
 ) {
-    if (!is_enabled()) {
+    // Highest-frequency recorder (runs on every SetGraphics/ComputeRootDescriptorTable
+    // and root CBV/SRV/UAV bind). Skip entirely in lightweight mode — the per-call
+    // mutex + string work here is the dominant cost when the Shader Hunter is open.
+    if (!is_enabled() || is_lightweight()) {
         return;
     }
 
@@ -1311,7 +1326,11 @@ void D3D12Diagnostics::record_draw_event(
     const RootHashArray& compute_root_descriptor_table_resource_hash,
     const std::vector<DescriptorReadInfo>& descriptor_reads
 ) {
-    if (!is_enabled()) {
+    // Per-draw recorder (builds a full DrawEvent with root-table/CBV/SRV/UAV
+    // snapshots). Skip in lightweight mode — the Shader Hunter maintains its own
+    // collected map via ShaderOverrideRegistry::hunter_record_draw_event and does
+    // not consume D3D12Diagnostics DrawEvents.
+    if (!is_enabled() || is_lightweight()) {
         return;
     }
 

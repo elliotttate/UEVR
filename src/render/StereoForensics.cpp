@@ -1677,6 +1677,11 @@ struct StereoForensics::Impl {
                 break;
             }
             events_stream << line << '\n';
+            if (!events_stream) {
+                SPDLOG_WARN("[StereoForensics] failed to append events.jsonl; stopping capture at frame {}", frame);
+                set_capture_state_locked(capture_frame_active, true);
+                break;
+            }
             ++total_events_written;
             total_event_bytes += line_bytes;
         }
@@ -2242,6 +2247,7 @@ struct StereoForensics::Impl {
         if (capture_stopped) {
             if (events_stream.is_open()) {
                 events_stream.flush();
+                events_stream.close();
             }
             log_capture_complete_locked();
         }

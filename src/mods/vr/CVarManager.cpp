@@ -582,9 +582,9 @@ void CVarManager::on_draw_ui() {
             }
         }
 
-        if (ImGui::Button("Dump All CVars")) {
+        if (ImGui::Button("Dump All (CVars + Shader Types)")) {
             GameThreadWorker::get().enqueue([this]() {
-                dump_commands();
+                dump_all();
             });
         }
 
@@ -629,6 +629,22 @@ void CVarManager::on_draw_ui() {
 }
 
 void CVarManager::on_frame() {
+    // Env-gated one-shot unified dump (UEVR_SN2_DUMP_ALL=1): fire dump_all() once
+    // after ~600 frames, so cvars + shader types are fully registered. Scriptable
+    // alternative to the "Dump All" button.
+    if (!m_dump_all_done) {
+        static const bool want = []() {
+            char v[8]{};
+            GetEnvironmentVariableA("UEVR_SN2_DUMP_ALL", v, sizeof(v));
+            return v[0] != '\0' && v[0] != '0';
+        }();
+        if (want && ++m_dump_all_frames >= 600) {
+            m_dump_all_done = true;
+            SPDLOG_INFO("[SN2-Dump] UEVR_SN2_DUMP_ALL: firing dump_all()");
+            GameThreadWorker::get().enqueue([this]() { dump_all(); });
+        }
+    }
+
     if (!g_framework->is_drawing_ui()) {
         m_cvar_ui_open_this_frame = false;
     }
@@ -693,8 +709,21 @@ void CVarManager::dump_commands() {
         auto& entry = json[utility::narrow(obj.key)];
         
         entry["description"] = "";
-        //entry["address"] = (std::stringstream{} << std::hex << (uintptr_t)obj.value).str();
-        //entry["vtable"] = (std::stringstream{} << std::hex << *(uintptr_t*)obj.value).str();
+        // Emit the backing IConsoleVariable object address + its RVA relative to the
+        // game exe base (ASLR-correct). For statically-registered engine cvars this
+        // object is a module global, so the RVA names the cvar global in IDA — then
+        // xref that global to find the render functions that read the cvar.
+        {
+            const uintptr_t exe_base = (uintptr_t)GetModuleHandleW(nullptr);
+            const uintptr_t addr = (uintptr_t)obj.value;
+            std::stringstream as; as << "0x" << std::hex << addr;
+            entry["address"] = as.str();
+            entry["vtable"] = (std::stringstream{} << "0x" << std::hex << *(uintptr_t*)obj.value).str();
+            if (addr >= exe_base && addr < exe_base + 0x20000000ull) {
+                std::stringstream rs; rs << "0x" << std::hex << (addr - exe_base);
+                entry["rva"] = rs.str();
+            }
+        }
 
         bool is_command = false;
 
@@ -734,6 +763,78 @@ void CVarManager::dump_commands() {
 
         SPDLOG_INFO("Dumped CVars to {}", (persistent_dir / "cvardump.json").string());
     }
+}
+
+// Walk the global FShaderType registry and dump each shader type's name +
+// frequency + the FShaderType*'s RVA (for naming in IDA). The registry head is
+// FShaderType::GetTypeList()'s static pointer; pass its RVA via
+// UEVR_SN2_SHADERTYPE_RVA (after Diaphora names GetTypeList, decompile it to get
+// the static). FShaderType field offsets are the editor-PDB layout, sanity-checked
+// by reading the name; override with UEVR_SN2_SHADERTYPE_OFFS="<nameHex>,<freqHex>"
+// if the shipping layout diverges.
+void CVarManager::dump_shader_types() {
+    nlohmann::json j;
+    const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+    j["module_base"] = (std::stringstream{} << "0x" << std::hex << base).str();
+
+    char rva_env[32]{};
+    GetEnvironmentVariableA("UEVR_SN2_SHADERTYPE_RVA", rva_env, sizeof(rva_env));
+    if (rva_env[0] == '\0') {
+        j["error"] = "UEVR_SN2_SHADERTYPE_RVA not set (RVA of FShaderType::GetTypeList's static head; resolve after Diaphora names GetTypeList)";
+    } else {
+        const uintptr_t list_rva = (uintptr_t)std::strtoull(rva_env, nullptr, 16);
+        size_t OFF_NAME = 0x18, OFF_FREQ = 0x60;   // editor PDB layout
+        char off_env[64]{};
+        if (GetEnvironmentVariableA("UEVR_SN2_SHADERTYPE_OFFS", off_env, sizeof(off_env)) > 0) {
+            unsigned long long a = 0, b = 0;
+            std::sscanf(off_env, "%llx,%llx", &a, &b);
+            if (a) OFF_NAME = (size_t)a;
+            if (b) OFF_FREQ = (size_t)b;
+        }
+        void** head = (void**)(base + list_rva);
+        void* node = (!IsBadReadPtr(head, sizeof(void*))) ? *head : nullptr;
+        int walked = 0, named = 0;
+        auto& types = j["shadertypes"];
+        while (node != nullptr && walked < 30000) {
+            ++walked;
+            if (IsBadReadPtr(node, 16)) break;
+            void* ft = *(void**)node;                          // TLinkedList::Element = FShaderType*
+            void* next = *(void**)((char*)node + 8);           // TLinkedList::NextLink
+            if (ft != nullptr && !IsBadReadPtr(ft, OFF_FREQ + 4)) {
+                wchar_t* name = *(wchar_t**)((char*)ft + OFF_NAME);
+                const int freq = *(int*)((char*)ft + OFF_FREQ);
+                if (name != nullptr && !IsBadReadPtr(name, 4)) {
+                    std::wstring wn;
+                    for (int i = 0; i < 128 && name[i] != 0; ++i) wn.push_back(name[i]);
+                    if (!wn.empty()) {
+                        try {
+                            auto& e = types[utility::narrow(wn)];
+                            e["frequency"] = freq;
+                            e["ft_rva"] = (std::stringstream{} << "0x" << std::hex << ((uintptr_t)ft - base)).str();
+                            ++named;
+                        } catch (...) {}
+                    }
+                }
+            }
+            node = next;
+        }
+        j["walked"] = walked;
+        j["named"] = named;
+    }
+
+    const auto persistent_dir = g_framework->get_persistent_dir();
+    std::ofstream f(persistent_dir / "shadertypes.json");
+    if (f.is_open()) {
+        f << j.dump(2);
+        f.close();
+        SPDLOG_INFO("[SN2-Dump] shadertypes.json written (named={})", j.value("named", 0));
+    }
+}
+
+// One-shot unified dump: cvars (with backing addresses) + shader types.
+void CVarManager::dump_all() {
+    dump_commands();
+    dump_shader_types();
 }
 
 // Use ImGui to display a homebrew console.

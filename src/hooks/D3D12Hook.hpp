@@ -314,6 +314,12 @@ protected:
     std::unordered_set<uintptr_t> m_set_pipeline_state_slots{};
     std::unordered_set<uintptr_t> m_command_list_diagnostic_slots{};
     std::unique_ptr<VtableHook> m_swapchain_hook{};
+    // 2026-05-23 SN2 right-eye fog fix: per-object vtable hook on the present command queue's
+    // ExecuteCommandLists (vtable idx 10). Lets us patch the secondary-eye fog "view" UB at
+    // SUBMIT time (UBs written, GPU not yet executing) — binding-agnostic (the UB is bound via a
+    // descriptor table, not a root CBV, so the per-dispatch hook can't reach it).
+    std::unique_ptr<VtableHook> m_command_queue_hook{};
+    bool m_command_queue_hooked{ false };
     //std::unique_ptr<FunctionHook> m_create_swap_chain_hook{};
 
     OnPresentFn m_on_present{ nullptr };
@@ -324,6 +330,7 @@ protected:
     
     static HRESULT present_internal(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags, DXGI_PRESENT_PARAMETERS* params, bool present1 = false);
 
+    static void WINAPI execute_command_lists(ID3D12CommandQueue* queue, UINT num_command_lists, ID3D12CommandList* const* lists);
     static HRESULT WINAPI present(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags);
     static HRESULT WINAPI present1(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags, DXGI_PRESENT_PARAMETERS* params);
     static HRESULT WINAPI create_graphics_pipeline_state(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** pipeline_state);
@@ -359,6 +366,9 @@ protected:
     static void WINAPI execute_bundle(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList* bundle);
     static void WINAPI execute_indirect(ID3D12GraphicsCommandList* command_list, ID3D12CommandSignature* command_signature, UINT max_command_count, ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset, ID3D12Resource* count_buffer, UINT64 count_buffer_offset);
     static void WINAPI dispatch_mesh(ID3D12GraphicsCommandList6* command_list, UINT thread_group_count_x, UINT thread_group_count_y, UINT thread_group_count_z);
+    static void WINAPI ia_set_primitive_topology(ID3D12GraphicsCommandList* command_list, D3D_PRIMITIVE_TOPOLOGY primitive_topology);
+    static void WINAPI ia_set_index_buffer(ID3D12GraphicsCommandList* command_list, const D3D12_INDEX_BUFFER_VIEW* view);
+    static void WINAPI ia_set_vertex_buffers(ID3D12GraphicsCommandList* command_list, UINT start_slot, UINT num_views, const D3D12_VERTEX_BUFFER_VIEW* views);
     static void WINAPI rs_set_viewports(ID3D12GraphicsCommandList* command_list, UINT num_viewports, const D3D12_VIEWPORT* viewports);
     static void WINAPI rs_set_scissor_rects(ID3D12GraphicsCommandList* command_list, UINT num_rects, const D3D12_RECT* rects);
     static void WINAPI om_set_render_targets(ID3D12GraphicsCommandList* command_list, UINT num_render_target_descriptors, const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors, BOOL rts_single_handle_to_descriptor_range, const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor);

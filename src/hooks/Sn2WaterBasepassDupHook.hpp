@@ -90,6 +90,14 @@
 
 namespace sn2_water_basepass_dup {
 
+inline bool right_eye_underwater_fix_enabled() {
+    static const bool e = []() {
+        const char* v = std::getenv("UEVR_SN2_FIX_RIGHT_EYE_UNDERWATER");
+        return v && v[0] && v[0] != '0';
+    }();
+    return e;
+}
+
 // Default PS CRC32 list — identified in the May 21 Cpp2025 capture as the
 // LEFT-only PSOs in the 7-MRT basepass region (CommandList04.cpp lines
 // 4148-4626).
@@ -110,6 +118,7 @@ inline constexpr std::array<uint32_t, 2> k_default_view_cb_roots = {4u, 6u};
 
 inline bool env_enabled() {
     static const bool e = []() {
+        if (right_eye_underwater_fix_enabled()) return true;
         const char* v = std::getenv("UEVR_SN2_DUPLICATE_SLW_BASEPASS_RIGHT");
         return v && v[0] && v[0] != '0';
     }();
@@ -199,6 +208,9 @@ inline const std::vector<uint32_t>& any_mrt_ps_crcs() {
         if (env && *env) {
             out = parse_csv_u32(env);
         }
+        if (right_eye_underwater_fix_enabled()) {
+            out.push_back(0x13B00F0Cu);
+        }
         return out;
     }();
     return set;
@@ -255,6 +267,13 @@ inline const std::vector<uint32_t>& active_view_cb_roots() {
 
 inline bool is_water_basepass_ps_crc(uint32_t crc) {
     if (crc == 0) return false;
+    // The current right-eye underwater fix is deliberately narrower than the
+    // old water-basepass replay experiment: replay only 0x13b00f0c via the
+    // any-MRT path. Replaying the legacy default list reintroduces known
+    // confounds, so suppress it unless the caller explicitly set a CRC list.
+    if (right_eye_underwater_fix_enabled() && std::getenv("UEVR_SN2_WATER_BASEPASS_PS_CRCS") == nullptr) {
+        return false;
+    }
     for (const uint32_t c : active_ps_crcs()) {
         if (c == crc) return true;
     }

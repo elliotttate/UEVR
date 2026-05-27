@@ -864,13 +864,21 @@ void RenderInspector::on_present() {
         g_framework->is_sidebar_entry_selected("Shaders") ||
         g_framework->is_sidebar_entry_selected("Shader Hunter") ||
         m_force_shader_tracking.load();
+    // Only the explicit diagnostics/eye-diff tabs need the FULL per-call event
+    // stream (root binds, barriers, draw events). The Shader Hunter / PSO
+    // Profiler / Shaders tabs only need PSO tracking + the current render-target
+    // bind context — so they run diagnostics in LIGHTWEIGHT mode, which skips the
+    // high-frequency per-call recording that otherwise collapses the framerate.
+    const auto heavy_diagnostics_active =
+        g_framework->is_sidebar_entry_selected("DX12 Diagnostics") ||
+        g_framework->is_sidebar_entry_selected("Eye Diff") ||
+        m_force_d3d12_diagnostics.load();
     const auto dx12_diagnostics_active =
         g_framework->is_dx12() &&
-        (g_framework->is_sidebar_entry_selected("DX12 Diagnostics") ||
-         shader_tracking_active ||
-         m_force_d3d12_diagnostics.load());
+        (heavy_diagnostics_active || shader_tracking_active);
 
     render::D3D12Diagnostics::get().set_enabled(dx12_diagnostics_active);
+    render::D3D12Diagnostics::get().set_lightweight(dx12_diagnostics_active && !heavy_diagnostics_active);
     render::ShaderOverrideRegistry::get().set_inspector_tracking_enabled(shader_tracking_active);
     render::ShaderOverrideRegistry::get().on_present(*g_framework);
 

@@ -90,25 +90,32 @@ inline bool env_enabled() {
     return e;
 }
 
-// Pass -> name cache: populated by SetupParameterPass hook. A separate
-// ExecutePass-style hook must bracket actual RDG execution before dispatches
-// can be associated with a current pass.
+inline uint32_t setup_log_max() {
+    static const uint32_t v = []() {
+        const char* raw = std::getenv("UEVR_SN2_RDG_PASS_LOG_MAX");
+        if (raw == nullptr || raw[0] == '\0') return 512u;
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(raw, &end, 0);
+        return end != raw ? static_cast<uint32_t>(parsed) : 512u;
+    }();
+    return v;
+}
+
+// ExecutePass hook target resolved from the binfold symbol bridge:
+//   ?ExecutePass@FRDGBuilder@@CAXAEAVFRHIComputeCommandList@@PEAVFRDGPass@@@Z
+// It brackets the real pass execution, which is the point where RHI work is
+// enqueued on the translate thread.
+inline constexpr uint64_t SUBNAUTICA2_FRDG_EXECUTE_PASS_RVA = 0x32974B0;
+
+// Pass -> name cache: populated by SetupParameterPass hook. ExecutePass
+// brackets actual RDG execution so D3D12 work can inherit the pass name.
 //
 // CURRENT WIRING STATUS (2026-05-21):
 //   - Producer (SetupParameterPass)        : INSTALLED   — Sn2HooksInstall.cpp
-//   - Producer (ExecutePass begin/end)     : MISSING     — see TODO below
+//   - Producer (ExecutePass begin/end)     : INSTALLED   — Sn2HooksInstall.cpp
 //   - Consumer (D3D12 Dispatch hook)       : INSTALLED   — D3D12Hook::dispatch
-//   - Consumer (log emit lookup)           : NOT YET CALLED
-//
-// Until the ExecutePass producer is wired, s_tls_current_rdg_pass stays 0 in
-// every D3D12 dispatch, so on_dispatch() is a no-op and pso_to_pass_name()
-// stays empty. To finish:
-//
-//   1. Find FRDGBuilder::ExecutePassInternal (or equivalent) in the game's
-//      RENDERCORE; record the RVA + a prologue fingerprint.
-//   2. Install a safetyhook around it that calls on_execute_pass_begin(pass)
-//      on entry and on_execute_pass_end(pass) on exit.
-//   3. Confirm s_tls_current_rdg_pass is non-zero on a typical Dispatch.
+//   - Consumer (D3D12 ExecuteIndirect hook): INSTALLED   — D3D12Hook::execute_indirect
+//   - Consumer (log emit lookup)           : PARTIAL     — pso map is logged and queryable
 inline std::mutex& pass_name_mu() { static std::mutex m; return m; }
 inline std::unordered_map<uintptr_t, std::string>& pass_name_table() {
     static std::unordered_map<uintptr_t, std::string> m; return m;
@@ -130,11 +137,26 @@ inline void on_setup_parameter_pass(uintptr_t pass_ptr, const wchar_t* name_tcha
             else name.push_back('?');
         }
     }
+    bool first_sighting = false;
     {
         std::scoped_lock _{pass_name_mu()};
-        pass_name_table()[pass_ptr] = name;
+        auto [it, inserted] = pass_name_table().insert_or_assign(pass_ptr, name);
+        (void)it;
+        first_sighting = inserted;
     }
-    SPDLOG_INFO("[SN2-RDGPass] setup pass=0x{:x} name=\"{}\"", pass_ptr, name);
+    if (first_sighting) {
+        static std::atomic<uint32_t> log_count{0};
+        const uint32_t n = log_count.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t max_logs = setup_log_max();
+        if (n == max_logs) {
+            SPDLOG_WARN("[SN2-RDGPass] setup log cap reached ({}); set UEVR_SN2_RDG_PASS_LOG_MAX to raise it", max_logs);
+            return;
+        }
+        if (n > max_logs) {
+            return;
+        }
+        SPDLOG_INFO("[SN2-RDGPass] setup pass=0x{:x} name=\"{}\"", pass_ptr, name);
+    }
 }
 
 inline void on_execute_pass_begin(uintptr_t pass_ptr) {
@@ -148,6 +170,11 @@ inline void on_execute_pass_begin(uintptr_t pass_ptr) {
     }
     s_tls_current_rdg_pass = pass_ptr;
     s_tls_current_rdg_pass_name = it->second;
+}
+
+inline std::string current_pass_name() {
+    if (!env_enabled() || s_tls_current_rdg_pass == 0) return {};
+    return s_tls_current_rdg_pass_name;
 }
 
 inline void on_execute_pass_end(uintptr_t pass_ptr) {

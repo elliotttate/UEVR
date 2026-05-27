@@ -105,10 +105,17 @@ def symbolize_stack(sym, ev: dict[str, Any]) -> list[dict[str, Any]]:
 
 def first_engine_frame(frames: list[dict[str, Any]]) -> dict[str, Any] | None:
     for fr in frames:
+        if fr.get("plausible") is False:
+            continue  # mis-resolved (UEVR DLL frame / between symbols)
         d = (fr.get("demangled") or fr.get("symbol") or "")
-        if d and "uevr" not in d.lower() and "Sn2" not in d and "StereoForensics" not in d:
+        low = d.lower()
+        if d and "uevr" not in low and "sn2" not in low and "stereoforensics" not in low \
+                and "_fac_tidy" not in low and "atexit" not in low:
             return fr
-    return frames[0] if frames else None
+    for fr in frames:  # fallback: first plausibly-resolved frame
+        if fr.get("plausible") is not False and (fr.get("demangled") or fr.get("symbol")):
+            return fr
+    return None
 
 
 HYPOTHESIS = {
@@ -134,25 +141,44 @@ HYPOTHESIS = {
 def trace_issue(issue: dict[str, Any], events: dict[int, dict[str, Any]],
                 producers: dict[str, Any], sym, shadermap: dict[str, Any]) -> dict[str, Any]:
     kind = issue.get("kind", "")
-    le = issue.get("left_event")
-    re_ = issue.get("right_event")
+
+    # Resolve the per-eye event object. eye_event_count_mismatch embeds the full
+    # sample event (with issuer_stack) as sample_{left,right}_event; other kinds
+    # reference it by index in {left,right}_event (looked up from events.jsonl).
+    def resolve_ev(label: str) -> dict[str, Any] | None:
+        s = issue.get(f"sample_{label}_event")
+        if isinstance(s, dict) and s:
+            return s
+        idx = issue.get(f"{label}_event")
+        return events.get(idx) if isinstance(idx, int) else None
+
+    left_ev = resolve_ev("left")
+    right_ev = resolve_ev("right")
     out: dict[str, Any] = {
         "kind": kind,
         "severity": issue.get("severity"),
         "key": issue.get("key"),
         "root": issue.get("root"),
         "slot": issue.get("slot"),
-        "left_event": le,
-        "right_event": re_,
+        "left_event": (left_ev or {}).get("event_index", issue.get("left_event")),
+        "right_event": (right_ev or {}).get("event_index", issue.get("right_event")),
+        "left_count": issue.get("left_count"),
+        "right_count": issue.get("right_count"),
         "symptom": HYPOTHESIS.get(kind, "Per-eye divergence."),
         "shaders": {},
         "code_sites": {},
     }
 
-    for label, ei in (("left", le), ("right", re_)):
-        ev = events.get(ei) if ei is not None else None
+    for label, ev in (("left", left_ev), ("right", right_ev)):
         if not ev:
             continue
+        # work dims: for dispatch/dispatch_mesh arg0/1/2 are thread-group X/Y/Z;
+        # for draws they're index/instance counts. Shows what the absent eye is missing.
+        out.setdefault("work", {})[label] = {
+            "kind": ev.get("kind"),
+            "arg0": ev.get("arg0"), "arg1": ev.get("arg1"), "arg2": ev.get("arg2"),
+            "eye_bucket": ev.get("eye_bucket"),
+        }
         # shader/code map
         for crc_key in ("ps_crc_hex", "ps_crc", "cs_crc_hex", "cs_crc"):
             crc = ev.get(crc_key)
@@ -172,7 +198,7 @@ def trace_issue(issue: dict[str, Any], events: dict[int, dict[str, Any]],
                 "issuer_offset": (top or {}).get("offset"),
                 "source": (top or {}).get("source"),
                 "role": (top or {}).get("role"),
-                "stack": [f.get("demangled") or f.get("symbol") for f in frames[:8]],
+                "stack": [s for f in frames if (s := (f.get("demangled") or f.get("symbol")))][:10],
             }
 
     # lineage producer of the resource (if the issue names one)

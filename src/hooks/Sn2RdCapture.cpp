@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -59,7 +60,7 @@ typedef void (*pRENDERDOC_StartFrameCapture)(void* device, void* wndHandle);
 typedef uint32_t (*pRENDERDOC_EndFrameCapture)(void* device, void* wndHandle);
 
 // Late-injected RD needs SetActiveWindow(device, hwnd) before it can latch
-// the API pair. For D3D12 the "device" pointer is the COMMAND QUEUE.
+// the API pair. For D3D12 the "device" pointer is ID3D12Device*.
 typedef void (*pRENDERDOC_SetActiveWindow)(void* device, void* hwnd);
 
 // Minimal API struct — same offsets as official renderdoc_app.h. Only fields
@@ -188,6 +189,27 @@ bool also_emit_sidecar() {
     return b;
 }
 
+namespace {
+uint64_t env_u64(const char* name) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return 0;
+    char* end = nullptr;
+    const unsigned long long n = std::strtoull(v, &end, 0);  // base 0: hex/dec
+    if (end == v) return 0;
+    return static_cast<uint64_t>(n);
+}
+}  // namespace
+
+uint64_t autocapture_frame() {
+    static const uint64_t f = env_u64("UEVR_SN2_RDC_AUTOCAPTURE");
+    return f;
+}
+
+uint64_t autocapture_every() {
+    static const uint64_t k = env_u64("UEVR_SN2_RDC_AUTOCAPTURE_EVERY");
+    return k;
+}
+
 bool init() {
     if (!env_enabled()) return false;
     auto& s = state();
@@ -252,7 +274,7 @@ void request_capture_next_frame() {
     s.trigger_pending.store(true, std::memory_order_release);
 }
 
-void on_present(uint64_t frame_count, void* d3d12_queue, void* hwnd) {
+void on_present(uint64_t frame_count, void* d3d12_device, void* hwnd) {
     if (!env_enabled()) return;
     auto& s = state();
     if (!s.loaded) {
@@ -266,8 +288,8 @@ void on_present(uint64_t frame_count, void* d3d12_queue, void* hwnd) {
     // Tell RD which (queue, window) pair is active. Required for late-injected
     // sessions where RD didn't auto-detect the API pair at device-create time.
     // Cheap to call every frame — RD only does work when the pair changes.
-    if (d3d12_queue != nullptr && hwnd != nullptr && s.api && s.api->SetActiveWindow) {
-        s.api->SetActiveWindow(d3d12_queue, hwnd);
+    if (d3d12_device != nullptr && hwnd != nullptr && s.api && s.api->SetActiveWindow) {
+        s.api->SetActiveWindow(d3d12_device, hwnd);
     }
 
     // Poll trigger file every 30 frames (~0.5s @ 60fps).
@@ -277,6 +299,26 @@ void on_present(uint64_t frame_count, void* d3d12_queue, void* hwnd) {
             !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
             s.trigger_pending.store(true, std::memory_order_release);
             DeleteFileA(trigger_file_path().c_str());
+        }
+    }
+
+    // Automated trigger: UEVR_SN2_RDC_AUTOCAPTURE=N captures on internal frame N
+    // (no trigger file), and UEVR_SN2_RDC_AUTOCAPTURE_EVERY=K captures every K
+    // frames. Uses a module-internal monotonic counter so the decision is
+    // deterministic regardless of which present path forwards here (each path
+    // owns a separate frame_count).
+    {
+        static std::atomic<uint64_t> autocap_frame{0};
+        const uint64_t af = autocap_frame.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t one_shot = autocapture_frame();
+        const uint64_t every = autocapture_every();
+        bool fire = false;
+        if (one_shot != 0 && af == one_shot) fire = true;
+        if (every != 0 && af != 0 && (af % every) == 0) fire = true;
+        if (fire) {
+            SPDLOG_WARN("[SN2-RdCapture] autocapture trigger at internal frame {} "
+                        "(N={} every={})", af, one_shot, every);
+            s.trigger_pending.store(true, std::memory_order_release);
         }
     }
 

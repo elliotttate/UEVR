@@ -19,6 +19,7 @@
 
 #include "Framework.hpp"
 #include "render/D3D12Diagnostics.hpp"
+#include "render/ShaderCompiler.hpp"
 #include "../GameSpecific.hpp"
 #include "../VR.hpp"
 
@@ -39,6 +40,203 @@
 constexpr auto ENGINE_SRC_DEPTH = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 constexpr auto ENGINE_SRC_COLOR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
+// 2026-05-24 SN2 RIGHT-EYE COLOR TRANSFER (present-time cosmetic fix).
+// The right eye renders the scene above-water (warm) while the left renders it underwater (teal);
+// the per-view divergence is in the basepass lighting and not reachable from a runtime hook. This
+// compute pass, run on the final SBS image before the per-eye OpenXR copy, gives the RIGHT half the
+// LEFT half's color (chroma) while keeping the right's own luminance — so the right eye gains the
+// underwater tint but keeps its geometry/parallax. Gated by UEVR_SN2_RIGHT_EYE_COLOR_TRANSFER.
+namespace sn2_color_transfer {
+    template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
+    static bool env_on() {
+        static const bool v = []() {
+            char b[8]{}; const auto n = GetEnvironmentVariableA("UEVR_SN2_RIGHT_EYE_COLOR_TRANSFER", b, sizeof(b));
+            return n != 0 && n < sizeof(b) && b[0] && b[0] != '0';
+        }();
+        return v;
+    }
+    static float strength() {
+        static const float s = []() {
+            char b[16]{}; const auto n = GetEnvironmentVariableA("UEVR_SN2_COLOR_TRANSFER_STRENGTH", b, sizeof(b));
+            if (n == 0 || n >= sizeof(b)) return 1.0f;
+            const float f = (float)atof(b); return (f < 0.0f) ? 0.0f : (f > 1.0f ? 1.0f : f);
+        }();
+        return s;
+    }
+
+    static bool g_attempted = false;
+    static bool g_ok = false;
+    static ComPtr<ID3D12RootSignature> g_rs{};
+    static ComPtr<ID3D12PipelineState> g_pso{};
+    static ComPtr<ID3D12DescriptorHeap> g_heap{};
+    static ComPtr<ID3D12Resource> g_cb{};
+    static uint8_t* g_cb_ptr = nullptr;
+    static ComPtr<ID3D12Resource> g_temp{};
+    static UINT g_tw = 0, g_th = 0;
+    static DXGI_FORMAT g_tfmt = DXGI_FORMAT_UNKNOWN;
+    static d3d12::CommandContext g_cmd{};
+
+    static bool ensure_init(ID3D12Device* device) {
+        if (g_attempted) return g_ok;
+        g_attempted = true;
+        // Compile the transfer shader (runtime HLSL->DXIL via dxc).
+        render::ShaderCompileRequest req{};
+        char path[512]{};
+        const auto n = GetEnvironmentVariableA("UEVR_SN2_COLOR_TRANSFER_SHADER", path, sizeof(path));
+        req.source_path = (n != 0 && n < sizeof(path))
+            ? std::filesystem::path(path)
+            : std::filesystem::path(L"E:/Github/Subnautica 2/moddingkit/shaders/sn2_right_eye_color_transfer.hlsl");
+        req.entry_point = "main";
+        req.profile = "cs_6_0";
+        req.warnings_as_errors = false;
+        const auto res = render::compile_shader_file(req);
+        if (!res.succeeded || res.bytecode.empty()) {
+            SPDLOG_ERROR("[SN2-ColorTransfer] shader compile FAILED: {}", res.error);
+            return false;
+        }
+        D3D12_DESCRIPTOR_RANGE uav_range{};
+        uav_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        uav_range.NumDescriptors = 1; uav_range.BaseShaderRegister = 0; uav_range.RegisterSpace = 0;
+        uav_range.OffsetInDescriptorsFromTableStart = 0;
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor.ShaderRegister = 0; params[0].Descriptor.RegisterSpace = 0;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable.NumDescriptorRanges = 1;
+        params[1].DescriptorTable.pDescriptorRanges = &uav_range;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2; rsd.pParameters = params; rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        ComPtr<ID3DBlob> sig{}, err{};
+        if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
+            SPDLOG_ERROR("[SN2-ColorTransfer] root sig serialize failed"); return false;
+        }
+        if (FAILED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_rs)))) {
+            SPDLOG_ERROR("[SN2-ColorTransfer] CreateRootSignature failed"); return false;
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = g_rs.Get();
+        pd.CS.pShaderBytecode = res.bytecode.data(); pd.CS.BytecodeLength = res.bytecode.size();
+        if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_pso)))) {
+            SPDLOG_ERROR("[SN2-ColorTransfer] CreateComputePipelineState failed"); return false;
+        }
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 1;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_heap)))) {
+            SPDLOG_ERROR("[SN2-ColorTransfer] CreateDescriptorHeap failed"); return false;
+        }
+        D3D12_HEAP_PROPERTIES up{}; up.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC cbd{};
+        cbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; cbd.Width = 256; cbd.Height = 1;
+        cbd.DepthOrArraySize = 1; cbd.MipLevels = 1; cbd.Format = DXGI_FORMAT_UNKNOWN;
+        cbd.SampleDesc.Count = 1; cbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &cbd,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cb)))) {
+            SPDLOG_ERROR("[SN2-ColorTransfer] CB create failed"); return false;
+        }
+        D3D12_RANGE rr{0, 0};
+        if (FAILED(g_cb->Map(0, &rr, reinterpret_cast<void**>(&g_cb_ptr)))) {
+            SPDLOG_ERROR("[SN2-ColorTransfer] CB map failed"); return false;
+        }
+        if (!g_cmd.setup(L"SN2 color transfer")) {
+            SPDLOG_ERROR("[SN2-ColorTransfer] command context setup failed"); return false;
+        }
+        g_ok = true;
+        SPDLOG_WARN("[SN2-ColorTransfer] initialized OK (strength={})", strength());
+        return true;
+    }
+
+    static DXGI_FORMAT uav_typed_format(DXGI_FORMAT f) {
+        switch (f) {
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:    return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:    return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:   return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:  return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        default:                                  return f; // already a typed UAV-capable format
+        }
+    }
+
+    static bool ensure_temp(ID3D12Device* device, UINT w, UINT h, DXGI_FORMAT fmt) {
+        if (g_temp && g_tw == w && g_th == h && g_tfmt == fmt) return true;
+        D3D12_HEAP_PROPERTIES dp{}; dp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; td.Width = w; td.Height = h;
+        td.DepthOrArraySize = 1; td.MipLevels = 1; td.Format = fmt; td.SampleDesc.Count = 1;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        ComPtr<ID3D12Resource> t{};
+        if (FAILED(device->CreateCommittedResource(&dp, D3D12_HEAP_FLAG_NONE, &td,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t)))) {
+            SPDLOG_ERROR("[SN2-ColorTransfer] temp tex create failed (fmt={})", (int)fmt);
+            return false;
+        }
+        g_temp = t; g_tw = w; g_th = h; g_tfmt = fmt;
+        // The resource keeps the (possibly typeless) backbuffer format for CopyResource compatibility,
+        // but the UAV must be a fully-typed format the compute can load/store.
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = uav_typed_format(fmt); ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device->CreateUnorderedAccessView(g_temp.Get(), nullptr, &ud, g_heap->GetCPUDescriptorHandleForHeapStart());
+        SPDLOG_WARN("[SN2-ColorTransfer] temp created {}x{} resFmt={} uavFmt={}", w, h, (int)fmt, (int)ud.Format);
+        return true;
+    }
+
+    static void barrier(ID3D12GraphicsCommandList* cl, ID3D12Resource* r,
+                        D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER br{}; br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        br.Transition.pResource = r; br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        br.Transition.StateBefore = a; br.Transition.StateAfter = b;
+        cl->ResourceBarrier(1, &br);
+    }
+
+    static void run(ID3D12Resource* sbs, D3D12_RESOURCE_STATES sbs_state, UINT w, UINT h) {
+        if (!env_on() || sbs == nullptr || w < 2 || h == 0) return;
+        auto* device = g_framework->get_d3d12_hook()->get_device();
+        if (device == nullptr) return;
+        if (!ensure_init(device)) return;
+        const auto desc = sbs->GetDesc();
+        w = static_cast<UINT>(desc.Width); h = desc.Height; // authoritative dims from the resource
+        if (w < 2 || h == 0) return;
+        if (!ensure_temp(device, w, h, desc.Format)) return;
+
+        struct Params { uint32_t W, H, Half; float Strength; } p{ w, h, w / 2u, strength() };
+        memcpy(g_cb_ptr, &p, sizeof(p));
+
+        g_cmd.wait(INFINITE); // wait for previous + reset list ready to record
+        auto* cl = g_cmd.cmd_list.Get();
+        if (cl == nullptr) return;
+
+        barrier(cl, sbs, sbs_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(cl, g_temp.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl->CopyResource(g_temp.Get(), sbs);
+        barrier(cl, g_temp.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap* heaps[] = { g_heap.Get() };
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetComputeRootSignature(g_rs.Get());
+        cl->SetPipelineState(g_pso.Get());
+        cl->SetComputeRootConstantBufferView(0, g_cb->GetGPUVirtualAddress());
+        cl->SetComputeRootDescriptorTable(1, g_heap->GetGPUDescriptorHandleForHeapStart());
+        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        barrier(cl, g_temp.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(cl, sbs, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl->CopyResource(sbs, g_temp.Get());
+        barrier(cl, sbs, D3D12_RESOURCE_STATE_COPY_DEST, sbs_state);
+        barrier(cl, g_temp.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+
+        g_cmd.has_commands = true;
+        g_cmd.execute();
+        g_cmd.wait(INFINITE); // block until processed, before the eye copies read the backbuffer
+
+        static std::atomic<uint64_t> rn{0};
+        const auto cnt = rn.fetch_add(1, std::memory_order_relaxed);
+        if (cnt < 8 || (cnt % 600) == 0) {
+            SPDLOG_WARN("[SN2-ColorTransfer] ran #{} sbs={}x{} fmt={} half={}", cnt + 1, w, h, (int)desc.Format, w / 2);
+        }
+    }
+} // namespace sn2_color_transfer
+
 namespace vrmod {
 namespace {
 constexpr auto FRAME_TIMING_LOG_INTERVAL = std::chrono::seconds(5);
@@ -54,6 +252,11 @@ bool sn2_env_truthy(const char* name) {
 
     std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
     return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+}
+
+bool frame_profiler_log_enabled() {
+    static const bool enabled = sn2_env_truthy("UEVR_D3D12_FRAME_PROFILER_LOG");
+    return enabled;
 }
 
 enum SwapchainRecreateReason : uint32_t {
@@ -1755,6 +1958,13 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         scene_depth_tex.Reset();
     }
 
+    // 2026-05-24 SN2 RIGHT-EYE COLOR TRANSFER: process the SBS backbuffer's right half (give it the
+    // left half's underwater color while keeping its own luminance) before the per-eye copies, so the
+    // right eye displays underwater like the left. Gated by UEVR_SN2_RIGHT_EYE_COLOR_TRANSFER; no-op
+    // otherwise. Runs synchronously (its own command context + fence wait) so the eye copies that read
+    // `backbuffer` below see the processed image.
+    ::sn2_color_transfer::run(backbuffer.Get(), scene_source_state, m_backbuffer_size[0], m_backbuffer_size[1]);
+
     // If m_frame_count is even, we're rendering the left eye.
     if (is_left_eye_frame) {
         m_submitted_left_eye = true;
@@ -2227,6 +2437,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 }
 
 void D3D12Component::log_frame_timing_stats_if_needed(VR* vr) {
+    if (!frame_profiler_log_enabled()) {
+        return;
+    }
+
     const auto now = std::chrono::steady_clock::now();
 
     if (m_last_frame_timing_log.time_since_epoch().count() == 0) {

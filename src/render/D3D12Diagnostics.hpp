@@ -293,6 +293,17 @@ public:
     void set_enabled(bool enabled);
     bool is_enabled() const;
 
+    // Lightweight mode: keep cheap, low-frequency tracking that consumers like
+    // the Shader Hunter need (current render-target bind context, resolved via
+    // OMSetRenderTargets + RTV/DSV creation), but SKIP the high-frequency
+    // per-call event recording (root binds on every SetGraphicsRootDescriptorTable,
+    // resource barriers, descriptor-heap detail strings). That per-call work —
+    // mutex + ostringstream string-building thousands of times per frame — is
+    // what tanks the framerate when the Shader Hunter tab is open. The heavy
+    // DX12-Diagnostics / Eye-Diff tabs clear this flag to get full recording.
+    void set_lightweight(bool lightweight);
+    bool is_lightweight() const;
+
     void begin_frame(
         ID3D12Device* device,
         IDXGISwapChain3* swapchain,
@@ -569,6 +580,7 @@ private:
     void clear_state_locked();
 
     std::atomic_bool m_enabled{false};
+    std::atomic_bool m_lightweight{false};
     mutable std::recursive_mutex m_mutex{};
     std::unordered_map<uintptr_t, HeapInfo> m_heaps{};
     std::unordered_map<uintptr_t, ResourceInfo> m_resources{};

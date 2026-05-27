@@ -26,6 +26,8 @@ public:
     void on_config_load(const utility::Config& cfg, bool set_defaults) override;
 
     void dump_commands();
+    void dump_shader_types();   // walk FShaderType registry -> shadertypes.json (needs UEVR_SN2_SHADERTYPE_RVA)
+    void dump_all();            // cvars(+addresses) + shader types in one shot
     void spawn_console();
 
     void execute_console_script(sdk::UGameEngine* engine, const std::string& filename);
@@ -237,6 +239,9 @@ private:
     
     bool m_wants_display_console{false};
     bool m_native_console_spawned{false};
+    // env-gated auto-dump (UEVR_SN2_DUMP_ALL=1): fire dump_all() once after a few hundred frames
+    bool m_dump_all_done{false};
+    uint64_t m_dump_all_frames{0};
     bool m_should_execute_console_script{false};
     bool m_has_frozen_cvars{false};
     bool m_needs_full_refresh{true};

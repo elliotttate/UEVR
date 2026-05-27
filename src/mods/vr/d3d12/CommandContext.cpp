@@ -1,6 +1,7 @@
 #include <spdlog/spdlog.h>
 #include <utility/String.hpp>
 #include <chrono>
+#include <cstdlib>
 #include <string_view>
 
 #include "Framework.hpp"
@@ -64,6 +65,16 @@ FenceProfilerState& fence_profiler() {
     return state;
 }
 
+bool fence_profiler_log_enabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("UEVR_D3D12_FENCE_PROFILER_LOG");
+        return v != nullptr && v[0] != '\0' && v[0] != '0' &&
+            std::string_view{v} != "false" && std::string_view{v} != "FALSE" &&
+            std::string_view{v} != "off" && std::string_view{v} != "OFF";
+    }();
+    return enabled;
+}
+
 void maybe_log_fence_profiler_locked(FenceProfilerState& state, std::chrono::steady_clock::time_point now) {
     if (state.last_log.time_since_epoch().count() == 0) {
         state.last_log = now;
@@ -71,6 +82,12 @@ void maybe_log_fence_profiler_locked(FenceProfilerState& state, std::chrono::ste
     }
 
     if (now - state.last_log < FENCE_PROFILER_LOG_INTERVAL) {
+        return;
+    }
+
+    if (!fence_profiler_log_enabled()) {
+        state.last_log = now;
+        state.reset();
         return;
     }
 
@@ -127,7 +144,7 @@ void record_fence_wait(
         }
     }
 
-    if (duration_ms >= 10.0) {
+    if (fence_profiler_log_enabled() && duration_ms >= 10.0) {
         ++state.long_wait;
         const auto context_name = utility::narrow(std::wstring{name.begin(), name.end()});
         spdlog::warn(
@@ -163,7 +180,7 @@ void record_fence_execute_signal(
         ++state.pending_after_execute;
     }
 
-    if (duration_ms >= 10.0) {
+    if (fence_profiler_log_enabled() && duration_ms >= 10.0) {
         const auto context_name = utility::narrow(std::wstring{name.begin(), name.end()});
         spdlog::warn(
             "[D3D12][fence-profiler] ExecuteCommandLists/Signal took {:.2f}ms context={} fence={} completed_after_signal={}",

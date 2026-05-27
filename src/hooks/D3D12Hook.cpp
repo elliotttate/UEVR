@@ -2,10 +2,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <iomanip>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -27,8 +29,11 @@
 #include "Framework.hpp"
 #include "render/D3D12Diagnostics.hpp"
 #include "render/ShaderOverrideRegistry.hpp"
+#include "render/ShaderCompiler.hpp"
 #include "render/StereoEye.hpp"
 #include "render/StereoForensics.hpp"
+#include <filesystem>
+#include <fstream>
 
 #include "D3D12Hook.hpp"
 #include "Sn2DrawLogV2.hpp"
@@ -48,7 +53,9 @@
 #include "Sn2ResourceReadback.hpp"
 #include "Sn2FixRuleEngine.hpp"
 #include "Sn2UweFogComputeDupHook.hpp"
+#include "Sn2PerViewLightInject.hpp"
 #include "Sn2UweFogMirrorHook.hpp"
+#include "Sn2FogRightVolRedirect.hpp"
 #include "Sn2EyePairingHook.hpp"
 #include "Sn2DebugColorOverride.hpp"
 #include "Sn2WaterBasepassDupHook.hpp"
@@ -56,8 +63,20 @@
 #include "Sn2MissingPassDiffHook.hpp"
 #include "Sn2DupConfigFile.hpp"
 #include "Sn2LayeredDiagsHook.hpp"
+#include "Sn2EventLedger.hpp"
+#include "Sn2LiveMutate.hpp"
+#include "Sn2ViewUbDecode.hpp"
+#include "Sn2DyeFill.hpp"
+#include "Sn2RenderDocTags.hpp"
 
 static D3D12Hook* g_d3d12_hook = nullptr;
+
+// 2026-05-23 SN2 right-eye fog fix: original ID3D12CommandQueue::ExecuteCommandLists, captured
+// from the raw vtable at hook time and stored GLOBALLY so D3D12Hook::execute_command_lists can
+// always call through — independent of D3D12Hook instance re-creation (phase-1 re-hooks reassign
+// g_d3d12_hook). Storing it before activating the hook also closes the startup recursion window.
+using Sn2EclFn = void(WINAPI*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+static std::atomic<Sn2EclFn> g_sn2_ecl_original{ nullptr };
 
 // 2026-05-17 evening: published by FFakeStereoRenderingHook's lightscat
 // midhook on every view-0 compute_volumetric_fog call. Read here by the
@@ -70,6 +89,22 @@ extern std::atomic<uintptr_t> g_subnautica2_water_context_color;
 extern std::atomic<uintptr_t> g_subnautica2_water_context_depth;
 extern "C" void uevr_sn2_try_install_early_volumetric_fog_per_view_hook();
 extern "C" void uevr_sn2_install_render_hooks();
+extern "C" int sn2_consume_queued_fog_view();
+extern "C" uint32_t sn2_queued_fog_view_count();
+
+// Producer-side content-copy experiment for SN2 underwater fog. The full
+// implementation lives later in this file; these declarations let descriptor
+// creation and compute-dispatch paths feed it without depending on the old
+// DE7C3822 graphics-root scan.
+namespace sn2_fog_xeye {
+    bool enabled();
+    bool is_ils_volume(const D3D12_RESOURCE_DESC& d);
+    void note_resource(const char* source, int eye, ID3D12Resource* vol, const D3D12_RESOURCE_DESC* desc);
+    void note_compute_resource(uint32_t cs_crc, uint32_t root, uint32_t slot, int eye, ID3D12Resource* vol, const D3D12_RESOURCE_DESC& desc);
+    void begin_dispatch_capture();
+    bool consume_post_dispatch_copy_request();
+    void apply_copy(ID3D12GraphicsCommandList* cl, const char* reason, uint32_t cs_crc, int fog_eye);
+}
 
 // 2026-05-17 evening: tiny VirtualQuery wrapper for the byte-scan path —
 // avoids importing FFakeStereoRenderingHook's helpers. Returns true iff
@@ -87,6 +122,12 @@ static inline bool is_readable_process_range_d3d12(uintptr_t address, size_t siz
 
 namespace {
 using render::StereoTraceBucket;
+
+// Defined later (~sn2_rootbind_bookkeeping_required): true once UEVR is past its
+// D3D12 init race. Forward-declared inside this anonymous namespace so the
+// descriptor registry (earlier in the file) can lazy-activate the composite-shift
+// fix's recording only after init (recording during init destabilizes UEVR).
+inline bool sn2_past_init_race();
 
 constexpr size_t CREATE_GRAPHICS_PIPELINE_STATE_VTABLE_INDEX = 10;
 constexpr size_t CREATE_COMPUTE_PIPELINE_STATE_VTABLE_INDEX = 11;
@@ -115,6 +156,7 @@ constexpr size_t COPY_BUFFER_REGION_VTABLE_INDEX = 15;
 constexpr size_t COPY_TEXTURE_REGION_VTABLE_INDEX = 16;
 constexpr size_t COPY_RESOURCE_VTABLE_INDEX = 17;
 constexpr size_t RESOLVE_SUBRESOURCE_VTABLE_INDEX = 19;
+constexpr size_t IA_SET_PRIMITIVE_TOPOLOGY_VTABLE_INDEX = 20;
 constexpr size_t RS_SET_VIEWPORTS_VTABLE_INDEX = 21;
 constexpr size_t RS_SET_SCISSOR_RECTS_VTABLE_INDEX = 22;
 constexpr size_t SET_PIPELINE_STATE_VTABLE_INDEX = 25;
@@ -140,6 +182,8 @@ constexpr size_t SET_COMPUTE_ROOT_SHADER_RESOURCE_VIEW_VTABLE_INDEX = 39;
 constexpr size_t SET_GRAPHICS_ROOT_SHADER_RESOURCE_VIEW_VTABLE_INDEX = 40;
 constexpr size_t SET_COMPUTE_ROOT_UNORDERED_ACCESS_VIEW_VTABLE_INDEX = 41;
 constexpr size_t SET_GRAPHICS_ROOT_UNORDERED_ACCESS_VIEW_VTABLE_INDEX = 42;
+constexpr size_t IA_SET_INDEX_BUFFER_VTABLE_INDEX = 43;
+constexpr size_t IA_SET_VERTEX_BUFFERS_VTABLE_INDEX = 44;
 constexpr size_t OM_SET_RENDER_TARGETS_VTABLE_INDEX = 46;
 constexpr size_t CLEAR_RENDER_TARGET_VIEW_VTABLE_INDEX = 48;
 constexpr size_t EXECUTE_INDIRECT_VTABLE_INDEX = 59;
@@ -188,6 +232,11 @@ std::atomic<uint64_t> g_sn2_d3d12_present_frame_index{0};
 struct CommandListCorrelationState {
     using RootSlotArray = render::D3D12Diagnostics::RootSlotArray;
     using RootHashArray = render::D3D12Diagnostics::RootHashArray;
+    static constexpr size_t MAX_ROOT_CONSTANT_DWORDS = 64;
+    using RootConstantCountArray = std::array<uint8_t, render::D3D12Diagnostics::MAX_ROOT_BIND_SLOTS>;
+    using RootConstantValuesArray = std::array<
+        std::array<uint32_t, MAX_ROOT_CONSTANT_DWORDS>,
+        render::D3D12Diagnostics::MAX_ROOT_BIND_SLOTS>;
 
     void*    current_pso = nullptr;
     void*    effective_pso = nullptr;
@@ -201,6 +250,16 @@ struct CommandListCorrelationState {
     D3D12_RECT scissor0{};
     UINT scissor_count = 0;
     bool has_scissor = false;
+    D3D_PRIMITIVE_TOPOLOGY primitive_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    bool has_primitive_topology = false;
+    D3D12_INDEX_BUFFER_VIEW index_buffer_view{};
+    bool has_index_buffer = false;
+    static constexpr size_t MAX_TRACKED_VERTEX_BUFFERS = 16;
+    std::array<D3D12_VERTEX_BUFFER_VIEW, MAX_TRACKED_VERTEX_BUFFERS> vertex_buffer_views{};
+    std::array<bool, MAX_TRACKED_VERTEX_BUFFERS> has_vertex_buffer{};
+    UINT max_vertex_buffer_slot = 0;
+    std::array<ID3D12DescriptorHeap*, D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES> descriptor_heaps{};
+    UINT descriptor_heap_count = 0;
     uintptr_t last_graphics_root_signature = 0;
     uintptr_t last_compute_root_signature = 0;
     // === Eye-Diff fingerprints (captured on bind, read at draw) ===
@@ -223,6 +282,10 @@ struct CommandListCorrelationState {
     RootHashArray last_compute_root_cbv_hash{};
     RootHashArray last_graphics_root_constants_hash{};
     RootHashArray last_compute_root_constants_hash{};
+    RootConstantCountArray last_graphics_root_constants_count{};
+    RootConstantCountArray last_compute_root_constants_count{};
+    RootConstantValuesArray last_graphics_root_constants{};
+    RootConstantValuesArray last_compute_root_constants{};
     RootHashArray last_graphics_root_desc_table_resource_hash{};
     RootHashArray last_compute_root_desc_table_resource_hash{};
     std::vector<render::D3D12Diagnostics::DescriptorReadInfo> last_graphics_descriptor_reads{};
@@ -478,6 +541,29 @@ struct Sn2EyePairingRedirectScope {
     }
 };
 
+struct Sn2MirrorRtvRedirectScope {
+    bool active = false;
+    ID3D12GraphicsCommandList* command_list = nullptr;
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> restore_rtvs{};
+    UINT restore_rtv_count = 0;
+    bool restore_has_dsv = false;
+    D3D12_CPU_DESCRIPTOR_HANDLE restore_dsv{};
+
+    Sn2MirrorRtvRedirectScope() = default;
+    Sn2MirrorRtvRedirectScope(const Sn2MirrorRtvRedirectScope&) = delete;
+    Sn2MirrorRtvRedirectScope& operator=(const Sn2MirrorRtvRedirectScope&) = delete;
+    ~Sn2MirrorRtvRedirectScope() { restore(); }
+
+    void restore() {
+        if (!active) return;
+        if (command_list != nullptr && restore_rtv_count > 0) {
+            D3D12_CPU_DESCRIPTOR_HANDLE* dsv_ptr = restore_has_dsv ? &restore_dsv : nullptr;
+            command_list->OMSetRenderTargets(restore_rtv_count, restore_rtvs.data(), FALSE, dsv_ptr);
+        }
+        active = false;
+    }
+};
+
 int sn2_copyrect_table_mode();
 static bool sn2_begin_copyrect_scratch_table(
     ID3D12GraphicsCommandList* command_list,
@@ -598,6 +684,11 @@ bool env_flag_enabled_a(const char* name) {
     return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
 }
 
+bool sn2_hooks_disabled_by_env() {
+    static const bool disabled = env_flag_enabled_a("UEVR_DISABLE_SN2_HOOKS");
+    return disabled;
+}
+
 std::string env_value_a(const char* name) {
     char value[512]{};
     const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
@@ -624,28 +715,54 @@ uint32_t env_u32_a(const char* name, uint32_t fallback) {
     return end != value ? static_cast<uint32_t>(parsed) : fallback;
 }
 
+double env_double_a(const char* name, double fallback) {
+    char value[32]{};
+    const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+    if (len == 0 || len >= sizeof(value)) return fallback;
+    char* end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    return end != value ? parsed : fallback;
+}
+
 uint32_t sn2_d3d12_root_table_log_max() {
-    static const uint32_t max = env_u32_a("UEVR_SN2_D3D12_ROOT_TABLE_LOG_MAX", 16);
+    // Default quiet. The root-table summaries are useful while bringing up an
+    // eye-attribution probe, but they run forever in live sessions if left on.
+    static const uint32_t max = env_u32_a("UEVR_SN2_D3D12_ROOT_TABLE_LOG_MAX", 0);
     return max;
 }
 
 uint32_t sn2_d3d12_compute_root_table_log_max() {
-    static const uint32_t max = env_u32_a("UEVR_SN2_D3D12_COMPUTE_ROOT_TABLE_LOG_MAX", 16);
+    static const uint32_t max = env_u32_a("UEVR_SN2_D3D12_COMPUTE_ROOT_TABLE_LOG_MAX", 0);
     return max;
 }
 
 uint32_t sn2_d3d12_copy_desc_log_max() {
-    static const uint32_t max = env_u32_a("UEVR_SN2_D3D12_COPY_DESC_LOG_MAX", 8);
+    static const uint32_t max = env_u32_a("UEVR_SN2_D3D12_COPY_DESC_LOG_MAX", 0);
     return max;
 }
 
 uint32_t sn2_pool_log_max() {
-    static const uint32_t max = env_u32_a("UEVR_SN2_POOL_LOG_MAX", 16);
+    static const uint32_t max = env_u32_a("UEVR_SN2_POOL_LOG_MAX", 0);
     return max;
 }
 
 uint32_t sn2_fog_descriptor_log_max() {
     static const uint32_t max = env_u32_a("UEVR_SN2_FOG_DESCRIPTOR_LOG_MAX", 0);
+    return max;
+}
+
+bool sn2_stereo_trace_log_enabled() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_STEREO_TRACE_LOG");
+    return enabled;
+}
+
+bool sn2_rt_snapshot_verbose_log_enabled() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_RTSNAP_VERBOSE");
+    return enabled;
+}
+
+uint32_t sn2_rt_snapshot_log_max() {
+    static const uint32_t max = env_u32_a("UEVR_SN2_RTSNAP_LOG_MAX", 64);
     return max;
 }
 
@@ -774,6 +891,13 @@ bool sn2_fog_compute_diag_enabled() {
     return enabled;
 }
 
+bool sn2_fog_volume_snapshot_enabled() {
+    static const bool enabled =
+        !sn2_hooks_disabled_by_env() &&
+        env_flag_enabled_a("UEVR_SN2_FOG_VOLUME_SNAPSHOT");
+    return enabled;
+}
+
 int sn2_fog_compute_replay_mode() {
     static const int mode = env_int_a("UEVR_SN2_FOG_COMPUTE_REPLAY_RIGHT", 0);
     return mode;
@@ -808,10 +932,14 @@ int sn2_fog_srv_redirect_mode() {
 
 bool sn2_fog_descriptor_tracking_enabled() {
     static const bool enabled =
-        env_flag_enabled_a("UEVR_SN2_FOG_DESCRIPTOR_TRACKING") ||
-        sn2_fog_compute_diag_enabled() ||
-        sn2_fog_compute_replay_mode() != 0 ||
-        sn2_fog_srv_redirect_mode() != 0;
+        !sn2_hooks_disabled_by_env() &&
+        (env_flag_enabled_a("UEVR_SN2_FOG_DESCRIPTOR_TRACKING") ||
+         sn2_fog_volume_snapshot_enabled() ||
+         sn2_fog_xeye::enabled() ||
+         env_flag_enabled_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE") ||
+         sn2_fog_compute_diag_enabled() ||
+         sn2_fog_compute_replay_mode() != 0 ||
+         sn2_fog_srv_redirect_mode() != 0);
     return enabled;
 }
 
@@ -1390,22 +1518,49 @@ UINT sn2_tail_srv_repair_count() {
 
 bool sn2_upload_buffer_tracking_enabled() {
     static const bool enabled =
-        sn2_copyrect_diag_enabled() ||
-        sn2_pso3069_diag_enabled() ||
-        env_flag_enabled_a("UEVR_SN2_MAP_UPLOAD_ON_CREATE") ||
-        env_flag_enabled_a("UEVR_SN2_CB0_DIAG") ||
-        // UWE Fog mirror infrastructure (P1+P2) needs the
-        // CreateCommittedResource / CreatePlacedResource vtable hook to fire.
-        env_flag_enabled_a("UEVR_SN2_UWE_FOG_MIRROR") ||
-        // Binding analyzer needs the create-resource hook to populate the
-        // gpu_va → resource map for CBV decode. Check via GetEnvironmentVariableW
-        // since the env value is a path (may exceed env_flag_enabled_a's 32-char
-        // buffer).
-        (GetEnvironmentVariableW(L"UEVR_SN2_BINDING_ANALYZER_JSON", nullptr, 0) > 0) ||
-        // CB content dumper + right-CB synthesizer need the same gpu_va → cpu
-        // mapping to read donor bytes / dump CBV content.
-        (GetEnvironmentVariableW(L"UEVR_SN2_CB_DUMP_DIR", nullptr, 0) > 0) ||
-        env_flag_enabled_a("UEVR_SN2_RIGHT_CB_SYNTH");
+        !sn2_hooks_disabled_by_env() &&
+        (sn2_copyrect_diag_enabled() ||
+         sn2_pso3069_diag_enabled() ||
+         env_flag_enabled_a("UEVR_SN2_MAP_UPLOAD_ON_CREATE") ||
+         env_flag_enabled_a("UEVR_SN2_CB0_DIAG") ||
+         env_flag_enabled_a("UEVR_SN2_FOG_UV_CB_DIAG") ||
+         env_flag_enabled_a("UEVR_SN2_FOG_COMPOSITE_UV_CB_FIX") ||
+         env_flag_enabled_a("UEVR_SN2_VIEWUB_ROOT_CONSTANT_SCAN") ||
+         env_flag_enabled_a("UEVR_SN2_VIEWUB_TABLE_CBV_SCAN") ||
+         // UWE Fog mirror infrastructure (P1+P2) needs the
+         // CreateCommittedResource / CreatePlacedResource vtable hook to fire.
+         env_flag_enabled_a("UEVR_SN2_UWE_FOG_MIRROR") ||
+         // StereoScope ViewUB chain scanner maps bindless CBVs from the global
+         // descriptor heap, then scans their bytes for fog-volume indices.
+         env_flag_enabled_a("UEVR_SN2_VIEWUB_DECODE") ||
+         env_flag_enabled_a("UEVR_SN2_VIEWUB_CHAIN_SCAN") ||
+         env_flag_enabled_a("UEVR_SN2_BINDLESS_FOG_TRACE") ||
+         env_flag_enabled_a("UEVR_SN2_VIEWUB_FIX") ||
+         env_flag_enabled_a("UEVR_SN2_LIGHTSCATTER_BIND_PROBE") ||
+         // Right-eye analytic fog gate fix needs the gpu_va -> cpu upload map to
+         // patch the composite View UB reg204.w.
+         env_flag_enabled_a("UEVR_SN2_FOG_VIEWUB_GATE_FIX") ||
+         env_flag_enabled_a("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE") ||
+         // Binding analyzer needs the create-resource hook to populate the
+         // gpu_va → resource map for CBV decode. Check via GetEnvironmentVariableW
+         // since the env value is a path (may exceed env_flag_enabled_a's 32-char
+         // buffer).
+         (GetEnvironmentVariableW(L"UEVR_SN2_BINDING_ANALYZER_JSON", nullptr, 0) > 0) ||
+         // CB content dumper + right-CB synthesizer need the same gpu_va → cpu
+         // mapping to read donor bytes / dump CBV content.
+         (GetEnvironmentVariableW(L"UEVR_SN2_CB_DUMP_DIR", nullptr, 0) > 0) ||
+         env_flag_enabled_a("UEVR_SN2_RIGHT_CB_SYNTH") ||
+         // 2026-05-26: capture the REAL right-eye View CB VA from right-bucket
+         // draws (validated via the View-UB signature) so the 0x13b00f0c
+         // basepass-geometry dup projects with the engine's own right view
+         // instead of a guessed delta. Needs gpu_va -> cpu to validate candidates.
+         env_flag_enabled_a("UEVR_SN2_DUP_USE_CAPTURED_RIGHT_VIEW") ||
+         env_flag_enabled_a("UEVR_SN2_FIX_RIGHT_EYE_UNDERWATER") ||
+         // 2026-05-26 diagnostic: patch the right-eye View UB viewport origin
+         // at reg148/+0x940 to the current viewport origin. The older
+         // reg150/+0x960 guess was an offset mistake; this stays env-gated for
+         // validation and should not be considered the primary fix by default.
+         env_flag_enabled_a("UEVR_SN2_PATCH_RIGHT_VIEWRECT"));
     return enabled;
 }
 
@@ -1414,9 +1569,7 @@ bool is_subnautica2_process() {
         // Honor UEVR_DISABLE_SN2_HOOKS=1 as an escape hatch so we can test
         // the generic Shader Hunter / override paths without SN2-specific
         // stereo trace and SingleLayerWater patches interfering.
-        char disable[8]{};
-        if (GetEnvironmentVariableA("UEVR_DISABLE_SN2_HOOKS", disable, sizeof(disable)) > 0
-                && disable[0] == '1') {
+        if (sn2_hooks_disabled_by_env()) {
             return false;
         }
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -1432,6 +1585,14 @@ bool is_stereo_trace_enabled() {
 
 bool enable_d3d12_diagnostic_command_list_hooks() {
     static const bool enabled = []() {
+        // The one-switch right-eye underwater fix replays a missing graphics
+        // draw, so it needs the DrawIndexed/viewport/root command-list hooks.
+        if (sn2_water_basepass_dup::right_eye_underwater_fix_enabled()) {
+            return true;
+        }
+        if (sn2_fog_volume_snapshot_enabled()) {
+            return true;
+        }
         const bool forensics_requested = env_flag_enabled_a("UEVR_STEREO_FORENSICS");
         if (forensics_requested &&
             !env_flag_enabled_a("UEVR_STEREO_FORENSICS_BIND_ONLY") &&
@@ -1461,6 +1622,11 @@ bool enable_d3d12_diagnostic_command_list_hooks() {
             static_cast<DWORD>(sizeof(value)));
 
         if (len == 0) {
+            // Gate restored (2026-05-23 pm): default the D3D12 diagnostic command-list
+            // hooks OFF when the env is unset. Defaulting them ON crashed the clean
+            // baseline ~10s in (c0000005 in UEVRBackend.dll after a [SN2-FogLineageProducer]
+            // burst). The Shader Hunter / StereoForensics draw feed still opts in via
+            // UEVR_STEREO_FORENSICS=1 or explicit UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS=1.
             return false;
         }
 
@@ -1491,6 +1657,8 @@ bool stereo_forensics_hook_detail_active() {
 // UEVR_ENABLE_D3D12_DESCRIPTOR_TABLE_HOOK=1 to enable.
 bool enable_d3d12_descriptor_table_hook() {
     static const bool enabled = []() {
+        if (sn2_hooks_disabled_by_env()) return false;
+        if (sn2_fog_volume_snapshot_enabled()) return true;
         if (sn2_pso3069_diag_enabled()) return true;
         if (sn2_fog_srv_redirect_mode() != 0) return true;
         if (sn2_water_chain_redirect_mode() != 0) return true;
@@ -1515,6 +1683,7 @@ bool enable_d3d12_descriptor_table_hook() {
 // view_id. Default OFF — overhead is non-trivial when on.
 bool enable_d3d12_compute_root_table_hook() {
     static const bool enabled = []() {
+        if (sn2_hooks_disabled_by_env()) return false;
         char value[32]{};
         const auto len = GetEnvironmentVariableA(
             "UEVR_SUBNAUTICA2_ENABLE_FOG_COMPUTE_BIND_HOOK",
@@ -1582,6 +1751,11 @@ namespace sn2_upload_buf_map {
     bool install_map_hook(ID3D12Resource* sample_res);
     uint8_t* gpu_va_to_cpu(D3D12_GPU_VIRTUAL_ADDRESS gpu_va, uint64_t min_size);
     uint64_t scan_tracked_buffers_for_bad_cb0_tail();
+    // 2026-05-23 ROOT-CAUSE FIX: scan tracked upload buffers for the secondary-eye fog
+    // view UB whose view-rect block (ViewSize/InvSize/ScreenPositionScaleBias at bytes
+    // 144..256) is ZEROED, and copy the view-rect from the matching valid (primary-eye)
+    // fog view UB. Independent of command-list hooks. Returns #windows patched.
+    uint64_t scan_and_fix_fog_view_ub();
     size_t entry_count();
     // SEH-safe in-place cb0 bug patch. Returns true if the buffer matched the
     // broken view-1 signature and was rewritten to the view-0 layout.
@@ -1646,7 +1820,7 @@ namespace sn2_gpu_readback {
         D3D12_GPU_VIRTUAL_ADDRESS source_va{0};
         uint64_t                  size{0};
         uint64_t                  scheduled_frame{0};
-        const char*               tag{nullptr};
+        char                      tag[64]{};
         uint64_t                  fence_value{0};
         bool                      data_ready{false};
         bool                      dumped{false};
@@ -1942,6 +2116,9 @@ uint64_t take_counter(std::atomic<uint64_t>& value) {
 
 void log_stereo_trace_if_needed() {
     if (!is_subnautica2_process()) {
+        return;
+    }
+    if (!sn2_stereo_trace_log_enabled()) {
         return;
     }
 
@@ -2493,15 +2670,18 @@ bool D3D12Hook::hook() {
         // 2026-05-22: hook CreateDescriptorHeap so we catch every CBV/SRV/UAV
         // heap at creation time. Per-CL SetDescriptorHeaps capture misses heaps
         // bound on cmdlists whose vtable subclass we didn't hook (root cause
-        // of right-eye 0x37558DE4 root 1 NO_REGISTERED_HEAP).
-        add_unique_pointer_hook(
-            device,
-            CREATE_DESCRIPTOR_HEAP_VTABLE_INDEX,
-            reinterpret_cast<void*>(&D3D12Hook::create_descriptor_heap),
-            m_create_descriptor_heap_hooks,
-            m_create_descriptor_heap_hook_lookup,
-            create_descriptor_heap_slots
-        );
+        // of right-eye 0x37558DE4 root 1 NO_REGISTERED_HEAP). Keep this fully
+        // out of true-baseline launches: the wrapper is only for SN2 forensics.
+        if (!sn2_hooks_disabled_by_env()) {
+            add_unique_pointer_hook(
+                device,
+                CREATE_DESCRIPTOR_HEAP_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::create_descriptor_heap),
+                m_create_descriptor_heap_hooks,
+                m_create_descriptor_heap_hook_lookup,
+                create_descriptor_heap_slots
+            );
+        }
 
         Microsoft::WRL::ComPtr<ID3D12Device1> device1{};
         Microsoft::WRL::ComPtr<ID3D12Device2> device2{};
@@ -2584,14 +2764,16 @@ bool D3D12Hook::hook() {
                 root_signature_slots
             );
 
-            add_unique_pointer_hook(
-                iface,
-                CREATE_DESCRIPTOR_HEAP_VTABLE_INDEX,
-                reinterpret_cast<void*>(&D3D12Hook::create_descriptor_heap),
-                m_create_descriptor_heap_hooks,
-                m_create_descriptor_heap_hook_lookup,
-                create_descriptor_heap_slots
-            );
+            if (!sn2_hooks_disabled_by_env()) {
+                add_unique_pointer_hook(
+                    iface,
+                    CREATE_DESCRIPTOR_HEAP_VTABLE_INDEX,
+                    reinterpret_cast<void*>(&D3D12Hook::create_descriptor_heap),
+                    m_create_descriptor_heap_hooks,
+                    m_create_descriptor_heap_hook_lookup,
+                    create_descriptor_heap_slots
+                );
+            }
 
             add_unique_pointer_hook(
                 iface,
@@ -2729,7 +2911,7 @@ bool D3D12Hook::hook() {
             auto read = [](const char* name) {
                 return env_value_a(name);
             };
-            spdlog::info("[D3D12] Env vars: UEVR_DISABLE_SN2_HOOKS={} | UEVR_DISABLE_NATIVE_STEREO_FIX={} | UEVR_SN2_DISABLE_NATIVE_STEREO_FIX={} | UEVR_SN2_DIAG_CLEAN={} | UEVR_SN2_DIAG_STRICT={} | UEVR_SN2_PSO3069_DIAG={} | UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS={} | UEVR_ENABLE_D3D12_DESCRIPTOR_TABLE_HOOK={} | UEVR_SUBNAUTICA2_ENABLE_FOG_COMPUTE_BIND_HOOK={} | UEVR_SN2_EI_DIAG={} | UEVR_SN2_PSO3069_CAPTURE_MARK_FILE={} | UEVR_SN2_FOG_SRV_REDIRECT={} | UEVR_SN2_FOG_SRV_REDIRECT_ROOT={} | UEVR_SN2_FOG_SRV_REDIRECT_SLOTS={} | UEVR_SN2_FOG_SRV_REDIRECT_RELAXED={} | UEVR_SN2_PSO3069_CB_REDIRECT={} | UEVR_SN2_PSO3069_CB_REDIRECT_ROOTS={} | UEVR_SN2_WATER_CHAIN_REDIRECT={} | UEVR_SN2_WATER_CHAIN_REDIRECT_INCLUDE_PSO3069={} | UEVR_SN2_WATER_CHAIN_REDIRECT_MARK_FILE={} | UEVR_SN2_WATER_CHAIN_REDIRECT_MAX_TOTAL={} | UEVR_SN2_WATER_CHAIN_REDIRECT_MAX_PER_FRAME_PER_PSO={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_ROOTS={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MARK_FILE={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MAX_TOTAL={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MAX_PER_FRAME_PER_PSO={} | UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH={} | UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MARK_FILE={} | UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MAX_TOTAL={} | UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MAX_PER_FRAME_PER_PSO={} | UEVR_DXC_PATH={} | UEVR_SHADER_HUNTER_PRETRACK={} | UEVR_SHADER_HUNTER_SUPPRESSION_BLOCKLIST={} | UEVR_SHADER_HUNTER_SKIP_LEFT_ONLY={} | UEVR_SHADER_HUNTER_SKIP_RIGHT_ONLY={} | UEVR_SN2_SKYATMOS_CB_REDIRECT={} | UEVR_SN2_SKYATMOS_CB_REDIRECT_ROOTS={}",
+            spdlog::info("[D3D12] Env vars: UEVR_DISABLE_SN2_HOOKS={} | UEVR_DISABLE_NATIVE_STEREO_FIX={} | UEVR_SN2_DISABLE_NATIVE_STEREO_FIX={} | UEVR_SN2_DIAG_CLEAN={} | UEVR_SN2_DIAG_STRICT={} | UEVR_SN2_PSO3069_DIAG={} | UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS={} | UEVR_ENABLE_D3D12_DESCRIPTOR_TABLE_HOOK={} | UEVR_SUBNAUTICA2_ENABLE_FOG_COMPUTE_BIND_HOOK={} | UEVR_SN2_EI_DIAG={} | UEVR_SN2_PSO3069_CAPTURE_MARK_FILE={} | UEVR_SN2_FOG_SRV_REDIRECT={} | UEVR_SN2_FOG_SRV_REDIRECT_ROOT={} | UEVR_SN2_FOG_SRV_REDIRECT_SLOTS={} | UEVR_SN2_FOG_SRV_REDIRECT_RELAXED={} | UEVR_SN2_FOG_VOLUME_XEYE_COPY={} | UEVR_SN2_FOG_VOLUME_XEYE_COPY_STATE={} | UEVR_SN2_FOG_VOLUME_XEYE_SNAPSHOT={} | UEVR_SN2_FOG_VOLUME_SNAPSHOT={} | UEVR_SN2_PSO3069_CB_REDIRECT={} | UEVR_SN2_PSO3069_CB_REDIRECT_ROOTS={} | UEVR_SN2_WATER_CHAIN_REDIRECT={} | UEVR_SN2_WATER_CHAIN_REDIRECT_INCLUDE_PSO3069={} | UEVR_SN2_WATER_CHAIN_REDIRECT_MARK_FILE={} | UEVR_SN2_WATER_CHAIN_REDIRECT_MAX_TOTAL={} | UEVR_SN2_WATER_CHAIN_REDIRECT_MAX_PER_FRAME_PER_PSO={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_ROOTS={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MARK_FILE={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MAX_TOTAL={} | UEVR_SN2_WATER_CHAIN_CB_REDIRECT_MAX_PER_FRAME_PER_PSO={} | UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH={} | UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MARK_FILE={} | UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MAX_TOTAL={} | UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH_MAX_PER_FRAME_PER_PSO={} | UEVR_DXC_PATH={} | UEVR_SHADER_HUNTER_PRETRACK={} | UEVR_SHADER_HUNTER_SUPPRESSION_BLOCKLIST={} | UEVR_SHADER_HUNTER_SKIP_LEFT_ONLY={} | UEVR_SHADER_HUNTER_SKIP_RIGHT_ONLY={} | UEVR_SN2_SKYATMOS_CB_REDIRECT={} | UEVR_SN2_SKYATMOS_CB_REDIRECT_ROOTS={}",
                 read("UEVR_DISABLE_SN2_HOOKS"),
                 read("UEVR_DISABLE_NATIVE_STEREO_FIX"),
                 read("UEVR_SN2_DISABLE_NATIVE_STEREO_FIX"),
@@ -2745,6 +2927,10 @@ bool D3D12Hook::hook() {
                 read("UEVR_SN2_FOG_SRV_REDIRECT_ROOT"),
                 read("UEVR_SN2_FOG_SRV_REDIRECT_SLOTS"),
                 read("UEVR_SN2_FOG_SRV_REDIRECT_RELAXED"),
+                read("UEVR_SN2_FOG_VOLUME_XEYE_COPY"),
+                read("UEVR_SN2_FOG_VOLUME_XEYE_COPY_STATE"),
+                read("UEVR_SN2_FOG_VOLUME_XEYE_SNAPSHOT"),
+                read("UEVR_SN2_FOG_VOLUME_SNAPSHOT"),
                 read("UEVR_SN2_PSO3069_CB_REDIRECT"),
                 read("UEVR_SN2_PSO3069_CB_REDIRECT_ROOTS"),
                 read("UEVR_SN2_WATER_CHAIN_REDIRECT"),
@@ -2784,6 +2970,11 @@ bool D3D12Hook::hook() {
                 read("UEVR_STEREO_FORENSICS_MAX_TOTAL_BYTES"));
             spdlog::info("[D3D12] is_subnautica2_process()={} command_list_diagnostics_enabled={}",
                 is_subnautica2_process(), command_list_diagnostics_enabled);
+            if (is_subnautica2_process() && sn2_water_basepass_dup::right_eye_underwater_fix_enabled()) {
+                spdlog::info(
+                    "[SN2-RightEyeUnderwaterFix] enabled: replaying left-only PS 0x13b00f0c to the right viewport, "
+                    "using captured right-eye View CB, defaulting to root4-only View swap unless UEVR_SN2_DUP_VIEW_SWAP_ROOTS is set");
+            }
             if (is_subnautica2_process()) {
                 uevr_sn2_try_install_early_volumetric_fog_per_view_hook();
                 uevr_sn2_install_render_hooks();
@@ -3090,6 +3281,33 @@ void D3D12Hook::install_command_list_hooks(ID3D12GraphicsCommandList* command_li
             iface,
             EXECUTE_INDIRECT_VTABLE_INDEX,
             reinterpret_cast<void*>(&D3D12Hook::execute_indirect),
+            m_command_list_diagnostic_hooks,
+            m_command_list_diagnostic_hook_lookup,
+            m_command_list_diagnostic_slots
+        );
+
+        add_unique_pointer_hook(
+            iface,
+            IA_SET_PRIMITIVE_TOPOLOGY_VTABLE_INDEX,
+            reinterpret_cast<void*>(&D3D12Hook::ia_set_primitive_topology),
+            m_command_list_diagnostic_hooks,
+            m_command_list_diagnostic_hook_lookup,
+            m_command_list_diagnostic_slots
+        );
+
+        add_unique_pointer_hook(
+            iface,
+            IA_SET_INDEX_BUFFER_VTABLE_INDEX,
+            reinterpret_cast<void*>(&D3D12Hook::ia_set_index_buffer),
+            m_command_list_diagnostic_hooks,
+            m_command_list_diagnostic_hook_lookup,
+            m_command_list_diagnostic_slots
+        );
+
+        add_unique_pointer_hook(
+            iface,
+            IA_SET_VERTEX_BUFFERS_VTABLE_INDEX,
+            reinterpret_cast<void*>(&D3D12Hook::ia_set_vertex_buffers),
             m_command_list_diagnostic_hooks,
             m_command_list_diagnostic_hook_lookup,
             m_command_list_diagnostic_slots
@@ -3697,6 +3915,30 @@ namespace sn2_sky_atmos_scan {
 
 HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags, DXGI_PRESENT_PARAMETERS* params, bool present1) {
     sn2_sky_atmos_scan::scan_and_patch_uploads();
+
+    // 2026-05-23 ROOT-CAUSE FIX driver: repair the secondary-eye fog view UB's zeroed
+    // view-rect block (ViewSize/InvSize/ScreenPositionScaleBias) by copying it from the
+    // matching primary-eye fog view UB. Runs off-thread (Present never blocked); patches
+    // CPU bytes the GPU reads next frame. Independent of the diagnostic command-list hooks.
+    {
+        static const bool fog_vub_fix_enabled = env_flag_enabled_a("UEVR_SN2_FOG_VIEWUB_PATCH");
+        if (fog_vub_fix_enabled && sn2_upload_buf_map::entry_count() > 0) {
+            static std::atomic<bool> fog_scan_running{false};
+            bool expected = false;
+            if (fog_scan_running.compare_exchange_strong(expected, true)) {
+                std::thread([]() {
+                    const uint64_t patches = sn2_upload_buf_map::scan_and_fix_fog_view_ub();
+                    static std::atomic<uint64_t> fog_log{0};
+                    const auto fn = fog_log.fetch_add(1, std::memory_order_relaxed);
+                    if (fn < 16 || patches > 0 || (fn % 120) == 0) {
+                        SPDLOG_WARN("[SN2-FogViewUBFix] scan#{} patched={} buffers={}",
+                                    fn + 1, patches, sn2_upload_buf_map::entry_count());
+                    }
+                    fog_scan_running.store(false, std::memory_order_release);
+                }).detach();
+            }
+        }
+    }
     auto d3d12 = g_d3d12_hook;
     const auto original_sync_interval = sync_interval;
     const auto original_flags = flags;
@@ -3767,6 +4009,41 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
             d3d12->m_command_queue = *(ID3D12CommandQueue**)(real_swapchain + d3d12->m_command_queue_offset);
         } else {
             d3d12->m_command_queue = *(ID3D12CommandQueue**)((uintptr_t)swap_chain + d3d12->m_command_queue_offset);
+        }
+
+        // 2026-05-23 SN2 right-eye fog fix: hook the present queue's ExecuteCommandLists (vtable
+        // idx 10) ONCE so scan_and_fix_fog_view_ub() can patch the secondary-eye fog view UB at
+        // SUBMIT time (UBs written, GPU not executing). Per-object VtableHook (like m_swapchain_hook).
+        if (d3d12->m_command_queue != nullptr) {
+            static const bool ecl_fix_enabled = []() {
+                char buf[8]{};
+                const auto n = GetEnvironmentVariableA("UEVR_SN2_FOG_ECL_PATCH", buf, sizeof(buf));
+                return n != 0 && n < sizeof(buf) && buf[0] && buf[0] != '0';
+            }();
+            // Global guard: hook each queue's ExecuteCommandLists exactly once. Critically, before
+            // hooking we verify the queue's CURRENT vtable[10] is NOT already our hook — otherwise a
+            // re-hook would capture our own function as the "original" and recurse infinitely (crash).
+            static std::atomic<uintptr_t> g_sn2_ecl_hooked_queue{0};
+            if (ecl_fix_enabled) {
+                const uintptr_t qp = reinterpret_cast<uintptr_t>(d3d12->m_command_queue);
+                void** qvt = *reinterpret_cast<void***>(d3d12->m_command_queue);
+                const bool already_ours = (qvt != nullptr &&
+                    qvt[10] == reinterpret_cast<void*>(&D3D12Hook::execute_command_lists));
+                if (!already_ours && qvt != nullptr &&
+                    g_sn2_ecl_hooked_queue.load(std::memory_order_acquire) != qp) {
+                    // Capture the REAL original from the live vtable BEFORE activating the hook.
+                    g_sn2_ecl_original.store(reinterpret_cast<Sn2EclFn>(qvt[10]), std::memory_order_release);
+                    d3d12->m_command_queue_hook = std::make_unique<VtableHook>(d3d12->m_command_queue);
+                    if (d3d12->m_command_queue_hook->hook_method(10, (uintptr_t)&D3D12Hook::execute_command_lists)) {
+                        g_sn2_ecl_hooked_queue.store(qp, std::memory_order_release);
+                        d3d12->m_command_queue_hooked = true;
+                        SPDLOG_WARN("[SN2-FogECL] hooked ExecuteCommandLists on present queue=0x{:x}", qp);
+                    } else {
+                        SPDLOG_ERROR("[SN2-FogECL] FAILED to hook ExecuteCommandLists");
+                        d3d12->m_command_queue_hook.reset();
+                    }
+                }
+            }
         }
 
         auto& stereo_forensics = render::StereoForensics::get();
@@ -3897,10 +4174,15 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
                         // RTV resource at present time is in COMMON (decayed). Safe to copy.
                         sn2_rt_snapshot::schedule_capture(s_cl.Get(), bp_intent.res,
                             D3D12_RESOURCE_STATE_COMMON, bp_intent.tag);
+                        bp_intent.res->Release();
+                        bp_intent.res = nullptr;
                     }
                     s_cl->Close();
                     ID3D12CommandList* lists[] = { s_cl.Get() };
                     queue->ExecuteCommandLists(1, lists);
+                } else if (have_bp && bp_intent.res != nullptr) {
+                    bp_intent.res->Release();
+                    bp_intent.res = nullptr;
                 }
                 sn2_rt_snapshot::signal_after_execute(queue);
                 sn2_rt_snapshot::drain_to_disk();
@@ -4011,6 +4293,38 @@ extern "C" ID3D12CommandQueue* sn2_eye_screenshot_get_command_queue() {
     return d3d12 != nullptr ? d3d12->get_command_queue() : nullptr;
 }
 
+void WINAPI D3D12Hook::execute_command_lists(ID3D12CommandQueue* queue, UINT num_command_lists, ID3D12CommandList* const* lists) {
+    auto d3d12 = g_d3d12_hook;
+    if (d3d12 != nullptr) {
+        static const bool ecl_fix_enabled = []() {
+            char buf[8]{};
+            const auto n = GetEnvironmentVariableA("UEVR_SN2_FOG_ECL_PATCH", buf, sizeof(buf));
+            return n != 0 && n < sizeof(buf) && buf[0] && buf[0] != '0';
+        }();
+        // Patch the secondary-eye fog view UB right before the GPU executes these command lists.
+        // The engine has already written every UB referenced by `lists` (it wrote them while
+        // recording); the GPU has not run them yet. The scan is internally SEH-guarded per window.
+        if (ecl_fix_enabled && sn2_upload_buf_map::entry_count() > 0) {
+            const uint64_t patched = sn2_upload_buf_map::scan_and_fix_fog_view_ub();
+            static std::atomic<uint64_t> ecln{0};
+            const auto n = ecln.fetch_add(1, std::memory_order_relaxed);
+            if (patched > 0 && (n < 30 || (n % 1200 == 0))) {
+                SPDLOG_WARN("[SN2-FogECL] ecl#{} patched={} buffers={}",
+                    n + 1, patched, sn2_upload_buf_map::entry_count());
+            }
+        }
+    }
+    // Always call the globally-captured original (instance-independent). It is stored before the
+    // hook is activated, so it is non-null by the time this runs.
+    auto original = g_sn2_ecl_original.load(std::memory_order_acquire);
+    if (original != nullptr) {
+        original(queue, num_command_lists, lists);
+        return;
+    }
+    // Should never happen; last-resort direct call.
+    queue->ExecuteCommandLists(num_command_lists, lists);
+}
+
 HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags) {
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
@@ -4033,13 +4347,13 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, UINT sync_interva
     // Loads renderdoc.dll on first call (lazy init), then polls trigger file
     // each present. Touch UEVR_SN2_RD_CAPTURE_TRIGGER_FILE to capture one
     // frame. See feedback_rd_capture_inprocess_only memory for rationale.
-    // Pass queue + HWND so SetActiveWindow can latch the API pair.
+    // Pass device + HWND so SetActiveWindow can latch the API pair.
     if (sn2_rd_capture::env_enabled()) {
         static std::atomic<bool> rd_init_attempted{false};
         if (!rd_init_attempted.exchange(true, std::memory_order_acq_rel)) {
             sn2_rd_capture::init();
         }
-        void* rd_queue = (g_d3d12_hook != nullptr) ? (void*)g_d3d12_hook->get_command_queue() : nullptr;
+        void* rd_device = (g_d3d12_hook != nullptr) ? (void*)g_d3d12_hook->get_device() : nullptr;
         void* rd_hwnd = nullptr;
         if (swap_chain != nullptr) {
             DXGI_SWAP_CHAIN_DESC sc_desc{};
@@ -4048,7 +4362,7 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, UINT sync_interva
             }
         }
         static std::atomic<uint64_t> rd_frame{0};
-        sn2_rd_capture::on_present(rd_frame.fetch_add(1, std::memory_order_relaxed), rd_queue, rd_hwnd);
+        sn2_rd_capture::on_present(rd_frame.fetch_add(1, std::memory_order_relaxed), rd_device, rd_hwnd);
     }
     // 2026-05-22: Sn2HeapDxbcScanner — mid-run DXBC bytecode dumper. Scans
     // the process heap for "DXBC" magic, dumps matching shader containers.
@@ -4086,13 +4400,13 @@ HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain3* swap_chain, UINT sync_interv
     // Loads renderdoc.dll on first call (lazy init), then polls trigger file
     // each present. Touch UEVR_SN2_RD_CAPTURE_TRIGGER_FILE to capture one
     // frame. See feedback_rd_capture_inprocess_only memory for rationale.
-    // Pass queue + HWND so SetActiveWindow can latch the API pair.
+    // Pass device + HWND so SetActiveWindow can latch the API pair.
     if (sn2_rd_capture::env_enabled()) {
         static std::atomic<bool> rd_init_attempted{false};
         if (!rd_init_attempted.exchange(true, std::memory_order_acq_rel)) {
             sn2_rd_capture::init();
         }
-        void* rd_queue = (g_d3d12_hook != nullptr) ? (void*)g_d3d12_hook->get_command_queue() : nullptr;
+        void* rd_device = (g_d3d12_hook != nullptr) ? (void*)g_d3d12_hook->get_device() : nullptr;
         void* rd_hwnd = nullptr;
         if (swap_chain != nullptr) {
             DXGI_SWAP_CHAIN_DESC sc_desc{};
@@ -4101,7 +4415,7 @@ HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain3* swap_chain, UINT sync_interv
             }
         }
         static std::atomic<uint64_t> rd_frame{0};
-        sn2_rd_capture::on_present(rd_frame.fetch_add(1, std::memory_order_relaxed), rd_queue, rd_hwnd);
+        sn2_rd_capture::on_present(rd_frame.fetch_add(1, std::memory_order_relaxed), rd_device, rd_hwnd);
     }
     // 2026-05-22: Sn2HeapDxbcScanner — mid-run DXBC bytecode dumper. Scans
     // the process heap for "DXBC" magic, dumps matching shader containers.
@@ -4309,7 +4623,11 @@ HRESULT WINAPI D3D12Hook::create_graphics_pipeline_state(
         "graphics PSO creation observed through CreateGraphicsPipelineState");
 
     auto& shader_registry = render::ShaderOverrideRegistry::get();
-    if (shader_registry.should_record_d3d12_pipeline_creations() &&
+    const bool sn2_needs_graphics_pso_crc =
+        is_subnautica2_process() &&
+        (sn2_water_basepass_dup::env_enabled() ||
+         sn2_water_basepass_dup::log_7mrt_left_enabled());
+    if ((shader_registry.should_record_d3d12_pipeline_creations() || sn2_needs_graphics_pso_crc) &&
         pso != nullptr &&
         desc != nullptr) {
         shader_registry.register_d3d12_graphics_pipeline_state_creation(
@@ -4340,7 +4658,7 @@ HRESULT WINAPI D3D12Hook::create_graphics_pipeline_state(
     // 2026-05-22: Cache the original desc so Sn2DebugColorOverride can clone
     // it into a magenta-PS replacement on demand. Cost is one map insert +
     // bytecode copies (only when the env-enable flag is set).
-    if (sn2_debug_color::env_enabled() && pso != nullptr && desc != nullptr) {
+    if (is_subnautica2_process() && pso != nullptr && desc != nullptr) {
         sn2_debug_color::note_create_graphics_pso(desc, pso);
     }
 
@@ -4649,7 +4967,11 @@ HRESULT WINAPI D3D12Hook::pipeline_library_load_graphics_pipeline(
 
     if (pso != nullptr && desc != nullptr) {
         auto& shader_registry = render::ShaderOverrideRegistry::get();
-        if (shader_registry.should_record_d3d12_pipeline_creations()) {
+        const bool sn2_needs_graphics_pso_crc =
+            is_subnautica2_process() &&
+            (sn2_water_basepass_dup::env_enabled() ||
+             sn2_water_basepass_dup::log_7mrt_left_enabled());
+        if (shader_registry.should_record_d3d12_pipeline_creations() || sn2_needs_graphics_pso_crc) {
             Microsoft::WRL::ComPtr<ID3D12Device> device{};
             if (SUCCEEDED(pso->GetDevice(IID_PPV_ARGS(&device)))) {
                 shader_registry.register_d3d12_graphics_pipeline_state_creation(device.Get(), pso, desc);
@@ -4872,7 +5194,7 @@ HRESULT WINAPI D3D12Hook::create_pipeline_state(
     // is empty and PSO substitution can't fire.
     if (is_subnautica2_process() && pso != nullptr && desc != nullptr &&
         desc->pPipelineStateSubobjectStream != nullptr && desc->SizeInBytes > 0 &&
-        sn2_debug_color::env_enabled()) {
+        is_subnautica2_process()) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC gdesc{};
         const auto* base = static_cast<const uint8_t*>(desc->pPipelineStateSubobjectStream);
         size_t pos = 0;
@@ -5904,7 +6226,7 @@ namespace sn2_upload_buf_map {
                 self,
                 static_cast<uint32_t>(refs));
         }
-        if (forensics_enabled && refs == 0) {
+        if (refs == 0) {
             std::scoped_lock _{g_mutex};
             // Tombstone in place instead of erasing. Older SN2 helpers assume
             // stable vector positions, and compaction here can corrupt parallel
@@ -5927,7 +6249,7 @@ namespace sn2_upload_buf_map {
     bool install_map_hook(ID3D12Resource* sample_res) {
         if (sample_res == nullptr) return g_hook_installed;
         void** vtbl = *(void***)sample_res;
-        if (render::StereoForensics::get().is_enabled() && !g_release_hook_installed) {
+        if (!g_release_hook_installed) {
             void** release_slot = &vtbl[2];
             g_orig_release = (ReleaseFn)*release_slot;
             if (g_orig_release != nullptr) {
@@ -5964,10 +6286,67 @@ namespace sn2_upload_buf_map {
             }
 
             if (gpu_va >= e.gpu_va_base && gpu_va + min_size <= e.gpu_va_base + e.size) {
-                return e.cpu_ptr + (gpu_va - e.gpu_va_base);
+                auto* const cpu = e.cpu_ptr + (gpu_va - e.gpu_va_base);
+                if (!is_readable_process_range_d3d12(reinterpret_cast<uintptr_t>(cpu), static_cast<size_t>(min_size))) {
+                    continue;
+                }
+                return cpu;
             }
         }
         return nullptr;
+    }
+
+    // Targeted escape hatch for bindless-CBV diagnostics. Some CBV descriptors
+    // point at upload buffers created before our Map hook saw the engine's Map
+    // call, so the entry exists but cpu_ptr is null. Mapping those buffers
+    // broadly during creation has caused startup instability before; this maps
+    // only the specific buffer currently being inspected, after the init window.
+    bool try_map_for_gpu_va(D3D12_GPU_VIRTUAL_ADDRESS gpu_va, uint64_t min_size) {
+        if (gpu_va == 0 || min_size > (std::numeric_limits<uint64_t>::max() - gpu_va)) {
+            return false;
+        }
+
+        ID3D12Resource* resource = nullptr;
+        {
+            std::scoped_lock _{g_mutex};
+            for (const auto& e : g_entries) {
+                if (e.res == nullptr || e.size == 0) {
+                    continue;
+                }
+                if (gpu_va >= e.gpu_va_base && gpu_va + min_size <= e.gpu_va_base + e.size) {
+                    if (e.cpu_ptr != nullptr) {
+                        return true;
+                    }
+                    resource = e.res;
+                    resource->AddRef();
+                    break;
+                }
+            }
+        }
+
+        if (resource == nullptr) {
+            return false;
+        }
+
+        install_map_hook(resource);
+        D3D12_RANGE no_read{0, 0};
+        void* mapped = nullptr;
+        const HRESULT hr = resource->Map(0, &no_read, &mapped);
+        resource->Release();
+
+        static std::atomic<uint64_t> logs{0};
+        const auto n = logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 24 || FAILED(hr) || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-UploadBufMap] targeted-map #{} gpu_va=0x{:x} min=0x{:x} hr=0x{:08x} cpu=0x{:x}",
+                n,
+                static_cast<uint64_t>(gpu_va),
+                min_size,
+                static_cast<uint32_t>(hr),
+                reinterpret_cast<uintptr_t>(mapped));
+        }
+
+        return SUCCEEDED(hr) && mapped != nullptr &&
+            gpu_va_to_cpu(gpu_va, min_size) != nullptr;
     }
 
     // 2026-05-22 — GPU_VA → (resource, offset) for any tracked upload buffer.
@@ -6149,6 +6528,18 @@ namespace sn2_upload_buf_map {
                 heap_flags,
                 initial_state);
 
+            // RenderDoc/PIX/Nsight legibility: name the resource at creation so
+            // the capture shows what it is instead of a numeric ID. Gated by
+            // UEVR_SN2_RDOC_TAGS. Fog volumes get a FOGVOL category hint.
+            if (sn2_rdoc_tags::name_resources_enabled()) {
+                const char* cat = sn2_uwe_fog_mirror::matches_uwe_fog_signature(*desc) ? "FOGVOL" : nullptr;
+                sn2_rdoc_tags::name_resource(
+                    reinterpret_cast<ID3D12Resource*>(*ppv), desc,
+                    /*is_placed*/ false, /*heap_offset*/ 0,
+                    sn2_get_current_fog_view(),
+                    reinterpret_cast<uintptr_t>(_ReturnAddress()), cat);
+            }
+
             // 2026-05-22: Sn2EyePairing twin-detector (committed path).
             // Wired BEFORE other conditional blocks so it fires regardless
             // of UweFogMirror / other env gates.
@@ -6284,6 +6675,18 @@ namespace sn2_upload_buf_map {
                 heap_offset,
                 desc,
                 initial_state);
+
+            // RenderDoc/PIX/Nsight legibility (placed path): name + heap offset.
+            // The heap offset makes placed-heap aliasing legible — two aliased
+            // resources at the same ho=... share memory. Gated by UEVR_SN2_RDOC_TAGS.
+            if (sn2_rdoc_tags::name_resources_enabled()) {
+                const char* cat = sn2_uwe_fog_mirror::matches_uwe_fog_signature(*desc) ? "FOGVOL" : nullptr;
+                sn2_rdoc_tags::name_resource(
+                    reinterpret_cast<ID3D12Resource*>(*ppv), desc,
+                    /*is_placed*/ true, heap_offset,
+                    sn2_get_current_fog_view(),
+                    reinterpret_cast<uintptr_t>(_ReturnAddress()), cat);
+            }
 
             const auto heap_desc = heap->GetDesc();
             if (heap_desc.Properties.Type == D3D12_HEAP_TYPE_UPLOAD &&
@@ -6512,7 +6915,217 @@ namespace sn2_upload_buf_map {
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         return patched;
     }
+
+    // ---- 2026-05-23 ROOT-CAUSE FIX: secondary-eye fog view-rect repair ----
+    // The secondary-eye fog "view" UB (resId 31476-class, 256-byte window) has its
+    // view-rect block (ViewSize @+176/180, InvSize, ScreenPositionScaleBias @+192..) left
+    // ZEROED, while the primary eye's holds the real values. Froxel<->screen mapping /0 ->
+    // garbage right-eye fog. Both eyes' windows are byte-identical except this block, so
+    // we cache the primary's block (keyed by the matrix header @ bytes 0..144) and copy it
+    // into any matching window whose view-rect is zeroed.
+    struct FogWin {
+        float vsx, vsy, sx, sy;
+        uint8_t header[144];
+        uint8_t viewrect[112];
+    };
+    // SEH-safe classify (POD-only locals to avoid C2712): 1=valid, 2=zeroed-candidate, 0=neither.
+    static int fog_vub_classify(const uint8_t* w, FogWin& out) {
+        __try {
+            out.vsx = *(const float*)(w + 176);
+            out.vsy = *(const float*)(w + 180);
+            out.sx  = *(const float*)(w + 192);
+            out.sy  = *(const float*)(w + 196);
+            const float dx = out.sx - out.vsx * 0.5f;
+            const float dy = out.sy + out.vsy * 0.5f;
+            if (out.vsx >= 16.0f && out.vsx <= 16384.0f &&
+                out.vsy >= 16.0f && out.vsy <= 16384.0f &&
+                dx < 1.0f && dx > -1.0f && dy < 1.0f && dy > -1.0f) {
+                memcpy(out.header, w, 144);
+                memcpy(out.viewrect, w + 144, 112);
+                return 1;
+            }
+            if (out.vsx == 0.0f && out.vsy == 0.0f && out.sx == 0.0f && out.sy == 0.0f) {
+                memcpy(out.header, w, 144);
+                return 2;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return 0;
+    }
+    static bool fog_vub_write_viewrect(uint8_t* w, const uint8_t* viewrect112) {
+        __try { memcpy(w + 144, viewrect112, 112); return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return false;
+    }
+    struct FogCacheEntry { uint8_t header[144]; uint8_t viewrect[112]; };
+    static std::vector<FogCacheEntry> g_fog_vub_cache;
+    static std::mutex g_fog_vub_mutex;
+
+    uint64_t scan_and_fix_fog_view_ub() {
+        std::vector<Entry> snap;
+        { std::scoped_lock _{g_mutex}; snap = g_entries; }
+        // Pass 1: cache valid fog view UB view-rect blocks (keyed by matrix header).
+        for (const auto& e : snap) {
+            if (e.cpu_ptr == nullptr || e.size < 256) continue;
+            const uint64_t maxoff = e.size - 256;
+            for (uint64_t off = 0; off <= maxoff; off += 256) {
+                FogWin fw;
+                if (fog_vub_classify(e.cpu_ptr + off, fw) == 1) {
+                    std::scoped_lock _{g_fog_vub_mutex};
+                    bool found = false;
+                    for (auto& c : g_fog_vub_cache) {
+                        if (memcmp(c.header, fw.header, 144) == 0) {
+                            memcpy(c.viewrect, fw.viewrect, 112); found = true; break;
+                        }
+                    }
+                    if (!found && g_fog_vub_cache.size() < 64) {
+                        FogCacheEntry ce;
+                        memcpy(ce.header, fw.header, 144);
+                        memcpy(ce.viewrect, fw.viewrect, 112);
+                        g_fog_vub_cache.push_back(ce);
+                        static std::atomic<uint64_t> cache_log{0};
+                        const auto cl = cache_log.fetch_add(1, std::memory_order_relaxed);
+                        if (cl < 48) {
+                            SPDLOG_WARN("[SN2-FogViewUBFix][cache] #{} ViewSize={}x{} SPSB=({},{}) headerHash=0x{:x}",
+                                cl + 1, (int)fw.vsx, (int)fw.vsy, (int)fw.sx, (int)fw.sy,
+                                (unsigned)(*(const uint32_t*)fw.header ^ *(const uint32_t*)(fw.header + 64)));
+                        }
+                    }
+                }
+            }
+        }
+        // Pass 2: patch zeroed-view-rect windows whose matrix header matches a cached valid one.
+        uint64_t patched = 0;
+        for (const auto& e : snap) {
+            if (e.cpu_ptr == nullptr || e.size < 256) continue;
+            const uint64_t maxoff = e.size - 256;
+            for (uint64_t off = 0; off <= maxoff; off += 256) {
+                FogWin fw;
+                if (fog_vub_classify(e.cpu_ptr + off, fw) == 2) {
+                    std::scoped_lock _{g_fog_vub_mutex};
+                    for (auto& c : g_fog_vub_cache) {
+                        if (memcmp(c.header, fw.header, 144) == 0) {
+                            if (fog_vub_write_viewrect(e.cpu_ptr + off, c.viewrect)) patched++;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        return patched;
+    }
 } // namespace sn2_upload_buf_map
+
+// 2026-05-27 — Default-CBV shadowing. The SN2 SLW/fog consumer reads its View UB
+// (which holds the IntegratedLightScattering bindless index + ViewRectMin) as a
+// bindless CBV in GPU-DEFAULT memory that cannot be CPU-mapped (proven: chain-scan
+// map_success=0 over the whole heap). But UE fills those default CBVs by copying
+// from a CPU-mapped UPLOAD buffer via CopyBufferRegion. This passive tracker
+// observes those copies and keeps a CPU-side shadow of the destination bytes,
+// keyed by destination GPU VA — no GPU readback, no barriers, no state mutation.
+// map fallbacks (chain scan) then read the View UB bytes from this shadow.
+//   record/observe: note_copy(dst_gpu_va, src_cpu_bytes, size)
+//   read:           lookup_gpu_va(gpu_va, size) -> const uint8_t*
+// Gated by UEVR_SN2_DEFAULT_CBV_SHADOW or UEVR_SN2_BINDLESS_FOG_TRACE
+// (zero cost when both are unset).
+namespace sn2_default_cbv_shadow {
+    inline bool enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_DEFAULT_CBV_SHADOW") ||
+            env_flag_enabled_a("UEVR_SN2_BINDLESS_FOG_TRACE");
+        return e;
+    }
+
+    // Only shadow CBV-sized copies; the View UB is ~10 KiB. Skip huge buffer copies.
+    inline uint32_t max_shadow_bytes() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::clamp(env_int_a("UEVR_SN2_DEFAULT_CBV_SHADOW_MAX_BYTES", 65536), 256, 1 << 20));
+        return v;
+    }
+    inline uint32_t max_entries() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(64, env_int_a("UEVR_SN2_DEFAULT_CBV_SHADOW_MAX_ENTRIES", 4096)));
+        return v;
+    }
+
+    struct Entry {
+        uint64_t gpu_va_base = 0;
+        uint32_t size = 0;
+        uint64_t last_frame = 0;
+        std::vector<uint8_t> bytes;
+    };
+    static std::mutex g_mu;
+    static std::unordered_map<uint64_t, Entry> g_shadow;  // dst gpu_va_base -> bytes
+    static std::atomic<uint64_t> g_copies{0};
+
+    // Record a CPU-upload -> GPU-default copy: [dst_va, dst_va+size) now holds src_cpu[0..size).
+    inline void note_copy(uint64_t dst_va, const uint8_t* src_cpu, uint32_t size, uint64_t frame) {
+        if (!enabled() || dst_va == 0 || src_cpu == nullptr || size == 0 || size > max_shadow_bytes()) {
+            return;
+        }
+        if (!is_readable_process_range_d3d12(reinterpret_cast<uintptr_t>(src_cpu), size)) return;
+        std::scoped_lock _{g_mu};
+        if (g_shadow.size() >= max_entries() && g_shadow.find(dst_va) == g_shadow.end()) {
+            // crude eviction: drop the oldest-frame entry
+            uint64_t oldest_frame = UINT64_MAX; uint64_t oldest_key = 0; bool found = false;
+            for (auto& [k, e] : g_shadow) {
+                if (e.last_frame < oldest_frame) { oldest_frame = e.last_frame; oldest_key = k; found = true; }
+            }
+            if (found) g_shadow.erase(oldest_key);
+        }
+        Entry& e = g_shadow[dst_va];
+        e.gpu_va_base = dst_va;
+        e.size = size;
+        e.last_frame = frame;
+        e.bytes.assign(src_cpu, src_cpu + size);
+        const auto n = g_copies.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 32 || (n % 4000) == 0) {
+            SPDLOG_WARN("[SN2-DefaultCbvShadow] note_copy #{} dst_va=0x{:x} size={} entries={}",
+                n, dst_va, size, g_shadow.size());
+        }
+    }
+
+    // Return a pointer to shadow bytes covering [gpu_va, gpu_va+min_size). The data is
+    // copied into a thread_local buffer so the caller can read it without holding the lock;
+    // valid until the next lookup_gpu_va call on this thread.
+    inline const uint8_t* lookup_gpu_va(uint64_t gpu_va, uint32_t min_size) {
+        if (!enabled() || gpu_va == 0 || min_size == 0) return nullptr;
+        std::scoped_lock _{g_mu};
+        for (auto& [k, e] : g_shadow) {
+            if (e.bytes.size() < e.size) continue;
+            if (gpu_va >= e.gpu_va_base && gpu_va + min_size <= e.gpu_va_base + e.size) {
+                static thread_local std::vector<uint8_t> tl;
+                const uint64_t off = gpu_va - e.gpu_va_base;
+                tl.assign(e.bytes.begin() + static_cast<size_t>(off),
+                          e.bytes.begin() + static_cast<size_t>(off) + min_size);
+                return tl.data();
+            }
+        }
+        return nullptr;
+    }
+
+    // Like lookup_gpu_va, but returns as much of the shadowed range as is available
+    // up to requested_size. This matters for View UB copies (~10 KiB): a caller asking
+    // for the default 64 KiB scan window should still get the full copied View UB, not
+    // fall back to the nearest power-of-two window below the copy size.
+    inline const uint8_t* lookup_gpu_va_window(uint64_t gpu_va, uint32_t requested_size, uint32_t& out_size) {
+        out_size = 0;
+        if (!enabled() || gpu_va == 0 || requested_size == 0) return nullptr;
+        std::scoped_lock _{g_mu};
+        for (auto& [k, e] : g_shadow) {
+            if (e.bytes.size() < e.size) continue;
+            if (gpu_va < e.gpu_va_base || gpu_va >= e.gpu_va_base + e.size) continue;
+            const uint64_t off = gpu_va - e.gpu_va_base;
+            const uint64_t avail = static_cast<uint64_t>(e.size) - off;
+            const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(avail, requested_size));
+            if (n < 256) continue;
+            static thread_local std::vector<uint8_t> tl;
+            tl.assign(e.bytes.begin() + static_cast<size_t>(off),
+                      e.bytes.begin() + static_cast<size_t>(off) + n);
+            out_size = n;
+            return tl.data();
+        }
+        return nullptr;
+    }
+} // namespace sn2_default_cbv_shadow
 
 namespace sn2_fixed_cb0 {
     D3D12_GPU_VIRTUAL_ADDRESS get_or_create(ID3D12Device* device) {
@@ -6795,7 +7408,11 @@ namespace sn2_gpu_readback {
             s.source_va        = src->GetGPUVirtualAddress() + src_offset;
             s.size             = size;
             s.scheduled_frame  = scheduled_frame;
-            s.tag              = tag;
+            if (tag != nullptr && tag[0] != '\0') {
+                std::snprintf(s.tag, sizeof(s.tag), "%s", tag);
+            } else {
+                s.tag[0] = '\0';
+            }
             s.fence_value      = 0;  // will be set by signal_after_execute
             s.data_ready       = false;
             s.dumped           = false;
@@ -6837,7 +7454,7 @@ namespace sn2_gpu_readback {
             // If this slot was tagged "MAIN-LEFT-<hex>", route the bytes to
             // sn2_compute_capture so the right-eye substitute path can use
             // them next frame.
-            if (s.tag != nullptr && std::strncmp(s.tag, "MAIN-LEFT-", 10) == 0) {
+            if (s.tag[0] != '\0' && std::strncmp(s.tag, "MAIN-LEFT-", 10) == 0) {
                 const uint32_t cs_crc = (uint32_t)std::strtoul(s.tag + 10, nullptr, 16);
                 if (cs_crc != 0) {
                     sn2_compute_capture::on_left_main_args_ready(cs_crc, cpu, s.size);
@@ -6845,7 +7462,7 @@ namespace sn2_gpu_readback {
             }
 
             SPDLOG_WARN("[SN2-Readback-Done] tag={} src_va=0x{:x} sz={} dispatch=({},{},{}) words=[{:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}]",
-                s.tag != nullptr ? s.tag : "?",
+                s.tag[0] != '\0' ? s.tag : "?",
                 (uint64_t)s.source_va, s.size,
                 u[0], u[1], u[2],
                 u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7]);
@@ -6864,6 +7481,236 @@ namespace sn2_gpu_readback {
         g_initialized = false;
     }
 } // namespace sn2_gpu_readback
+
+namespace sn2_indirect_arg_trace {
+    bool enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_INDIRECT_ARG_READBACK");
+        return e;
+    }
+
+    uint32_t max_total() {
+        static const uint32_t v = env_u32_a("UEVR_SN2_INDIRECT_ARG_READBACK_MAX", 512);
+        return v;
+    }
+
+    uint32_t bytes_to_copy() {
+        static const uint32_t v = std::clamp<uint32_t>(
+            env_u32_a("UEVR_SN2_INDIRECT_ARG_READBACK_BYTES", 64),
+            16,
+            static_cast<uint32_t>(sn2_gpu_readback::SLOT_SIZE));
+        return v;
+    }
+
+    const std::string& arm_file_path() {
+        static const std::string path = []() {
+            char value[1024]{};
+            const auto len = GetEnvironmentVariableA(
+                "UEVR_SN2_INDIRECT_ARG_READBACK_ARM_FILE",
+                value,
+                static_cast<DWORD>(sizeof(value)));
+            if (len == 0 || len >= sizeof(value)) {
+                return std::string{};
+            }
+            return std::string{value, value + len};
+        }();
+        return path;
+    }
+
+    bool armed() {
+        const auto& path = arm_file_path();
+        if (path.empty()) {
+            return true;
+        }
+
+        static std::atomic<int> state{0}; // 0=unseen, -1=waiting logged, 1=armed.
+        if (state.load(std::memory_order_relaxed) == 1) {
+            return true;
+        }
+
+        const DWORD attrs = GetFileAttributesA(path.c_str());
+        const bool exists = attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+        if (exists) {
+            if (state.exchange(1, std::memory_order_relaxed) != 1) {
+                SPDLOG_WARN("[SN2-EI-ArgTrace] armed by sentinel {}", path);
+            }
+            return true;
+        }
+
+        int expected = 0;
+        if (state.compare_exchange_strong(expected, -1, std::memory_order_relaxed)) {
+            SPDLOG_WARN("[SN2-EI-ArgTrace] waiting for arm sentinel {}; readback/direct-arg trace is idle", path);
+        }
+        return false;
+    }
+
+    const char* eye_label(int view_id) {
+        if (view_id == 0) return "L";
+        if (view_id == 1) return "R";
+        return "U";
+    }
+
+    const char* inferred_kind(uint32_t cs_crc, uint32_t mesh_crc, uint32_t ps_crc) {
+        if (mesh_crc != 0) return "DISPATCH_MESH_INFERRED";
+        if (cs_crc != 0) return "DISPATCH_INFERRED";
+        if (ps_crc != 0) return "GRAPHICS_INFERRED";
+        return "UNTRACKED";
+    }
+
+    void schedule(ID3D12GraphicsCommandList* command_list,
+                  ID3D12Resource* argument_buffer,
+                  UINT64 argument_buffer_offset,
+                  ID3D12Resource* count_buffer,
+                  UINT64 count_buffer_offset,
+                  const sn2_command_signature_registry::Entry* sig_info,
+                  const char* sig_kind,
+                  UINT max_command_count,
+                  int view_id,
+                  uint32_t cs_crc,
+                  uint32_t ps_crc,
+                  uint64_t event_seq) {
+        if (!enabled() || command_list == nullptr || argument_buffer == nullptr) {
+            return;
+        }
+        if (!armed()) {
+            return;
+        }
+        if (!sn2_gpu_readback::initialized()) {
+            return;
+        }
+
+        static std::atomic<uint32_t> total_arg_reads{0};
+        static std::atomic<uint32_t> total_count_reads{0};
+        const uint32_t max_reads = max_total();
+        const uint32_t arg_index = total_arg_reads.fetch_add(1, std::memory_order_relaxed);
+        if (arg_index >= max_reads) {
+            if (arg_index == max_reads) {
+                SPDLOG_WARN("[SN2-EI-ArgTrace] cap reached: {} arg-buffer readbacks; set UEVR_SN2_INDIRECT_ARG_READBACK_MAX to raise it", max_reads);
+            }
+            return;
+        }
+
+        const uint32_t stride = sig_info != nullptr ? sig_info->byte_stride : 0;
+        uint32_t copy_bytes = bytes_to_copy();
+        if (stride != 0 && max_command_count != 0) {
+            const uint64_t command_bytes = static_cast<uint64_t>(stride) * std::min<UINT>(max_command_count, 4);
+            copy_bytes = static_cast<uint32_t>(std::min<uint64_t>(copy_bytes, std::max<uint64_t>(16, command_bytes)));
+        }
+
+        const uint32_t shader_crc = cs_crc != 0 ? cs_crc : ps_crc;
+        char arg_tag[64]{};
+        std::snprintf(arg_tag, sizeof(arg_tag), "EIARG-%s-%s-%08x-%llu",
+            eye_label(view_id),
+            sig_kind != nullptr ? sig_kind : "UNK",
+            shader_crc,
+            static_cast<unsigned long long>(event_seq));
+        sn2_gpu_readback::schedule_copy(
+            command_list,
+            argument_buffer,
+            argument_buffer_offset,
+            copy_bytes,
+            arg_tag,
+            event_seq);
+
+        if (count_buffer != nullptr) {
+            const uint32_t count_index = total_count_reads.fetch_add(1, std::memory_order_relaxed);
+            if (count_index < max_reads) {
+                char count_tag[64]{};
+                std::snprintf(count_tag, sizeof(count_tag), "EICNT-%s-%s-%08x-%llu",
+                    eye_label(view_id),
+                    sig_kind != nullptr ? sig_kind : "UNK",
+                    shader_crc,
+                    static_cast<unsigned long long>(event_seq));
+                sn2_gpu_readback::schedule_copy(
+                    command_list,
+                    count_buffer,
+                    count_buffer_offset,
+                    16,
+                    count_tag,
+                    event_seq);
+            }
+        }
+    }
+
+    // DIRECT DispatchMesh / Dispatch path: the thread-group counts are call
+    // arguments (not a GPU arg buffer), so there's nothing to read back — we
+    // just log them per eye, symmetric with the [SN2-EI] indirect trace. This
+    // covers suspects (e.g. DISPATCH_MESH fd8019f5/a4c2c811) that issue via the
+    // direct API and therefore never hit execute_indirect(). "right-absent"
+    // shows as no DM-RIGHT line; a present-but-empty right eye shows x=0.
+    void record_direct(const char* kind, int view_id, int viewport_bucket,
+                       uintptr_t pso, uint32_t cs_crc, uint32_t ps_crc,
+                       UINT x, UINT y, UINT z) {
+        if (!enabled() || !armed()) {
+            return;
+        }
+        static std::atomic<uint32_t> total_direct{0};
+        const uint32_t max_reads = max_total();
+        const uint32_t idx = total_direct.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= max_reads) {
+            if (idx == max_reads) {
+                SPDLOG_WARN("[SN2-DM] cap reached: {} direct dispatches; raise UEVR_SN2_INDIRECT_ARG_READBACK_MAX", max_reads);
+            }
+            return;
+        }
+        char tag[48]{};
+        std::snprintf(tag, sizeof(tag), "DM-%s-%s",
+            eye_label(view_id), kind != nullptr ? kind : "?");
+        SPDLOG_WARN("[SN2-DM] tag={} n={} view_id={} bucket={} pso=0x{:x} cs_crc=0x{:08x} ps_crc=0x{:08x} x={} y={} z={} threadgroups={}",
+            tag, idx + 1, view_id, viewport_bucket, pso, cs_crc, ps_crc, x, y, z,
+            static_cast<uint64_t>(x) * y * z);
+    }
+} // namespace sn2_indirect_arg_trace
+
+namespace sn2_dispatch_mesh_trace {
+    bool enabled() {
+        static const bool e =
+            env_flag_enabled_a("UEVR_SN2_DIRECT_DISPATCH_MESH_TRACE") ||
+            env_flag_enabled_a("UEVR_SN2_INDIRECT_ARG_READBACK");
+        return e;
+    }
+
+    uint32_t max_total() {
+        static const uint32_t v = env_u32_a("UEVR_SN2_DIRECT_DISPATCH_MESH_TRACE_MAX", 4096);
+        return v;
+    }
+
+    void note(int view_id,
+              int eye_bucket,
+              uintptr_t pso,
+              uint32_t amplification_crc,
+              uint32_t mesh_crc,
+              uint32_t pixel_crc,
+              UINT group_x,
+              UINT group_y,
+              UINT group_z) {
+        if (!enabled() || !sn2_indirect_arg_trace::armed()) {
+            return;
+        }
+
+        static std::atomic<uint32_t> total{0};
+        const uint32_t max_logs = max_total();
+        const uint32_t idx = total.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= max_logs) {
+            if (idx == max_logs) {
+                SPDLOG_WARN("[SN2-DispatchMesh-Args] cap reached: {}; set UEVR_SN2_DIRECT_DISPATCH_MESH_TRACE_MAX to raise it", max_logs);
+            }
+            return;
+        }
+
+        SPDLOG_WARN("[SN2-DispatchMesh-Args] eye={} view_id={} bucket={} pso=0x{:x} as_crc=0x{:08x} ms_crc=0x{:08x} ps_crc=0x{:08x} groups=({},{},{}) seq={}",
+            sn2_indirect_arg_trace::eye_label(view_id),
+            view_id,
+            eye_bucket,
+            static_cast<uint64_t>(pso),
+            amplification_crc,
+            mesh_crc,
+            pixel_crc,
+            group_x,
+            group_y,
+            group_z,
+            idx + 1);
+    }
+} // namespace sn2_dispatch_mesh_trace
 
 // 2026-05-19 SN2 INDIRECT ARG INJECT — UPLOAD-heap buffer we control to
 // substitute right-eye indirect-dispatch arg buffers with LEFT-eye-captured
@@ -6933,6 +7780,306 @@ namespace sn2_indirect_arg_inject {
     }
 } // namespace sn2_indirect_arg_inject
 
+// === SN2 right-eye fog FIX: per-volume "litness" scoreboard (2026-05-25) =====
+// The IntegratedLightScattering fog volume is read BINDLESSLY (root-slot redirects
+// are bypassed). The bindless heap holds ~13 distinct ILS volumes; content readback
+// shows LIT TEAL ones (G/B-dominant) coexist with red/dark ones, and the right eye
+// reads a wrong/dark one. This scoreboard records each volume's per-channel teal
+// score (fed from sn2_rt_snapshot::log_slice_stats below) so sn2_viewub_decode can
+// each frame copy a LIT volume's content into the DARK/red ones (by bindless index).
+// Targeting only DARK volumes preserves the left eye's lit one. Additive, default
+// OFF (env UEVR_SN2_VIEWUB_FIX). Defined here, before sn2_rt_snapshot, so that the
+// stats logger can call note().
+namespace sn2_litness {
+    static std::mutex g_mutex;
+    static std::unordered_map<uint32_t, float> g_score;  // bindless_index -> teal score
+    static std::unordered_map<uintptr_t, float> g_resource_score;  // ID3D12Resource* -> teal score
+
+    struct Descriptor {
+        uint32_t index{};
+        SIZE_T cpu{};
+        uintptr_t resource{};
+        uint8_t kind{}; // 1=SRV, 2=UAV
+        uint64_t width{};
+        uint32_t height{};
+        uint16_t depth{};
+        int format{};
+        uint64_t last_seen_ms{};
+    };
+
+    static std::unordered_map<uint32_t, Descriptor> g_descriptors;
+
+    // Teal score for picking the LIT underwater fog volume as the substitution SOURCE.
+    // 2026-05-27: the old (g+b)-2r rewarded raw green magnitude, so it picked GREEN-BLOWN
+    // GARBAGE volumes (e.g. mean=(88,3016,0.0007), score 2839) over the REAL underwater teal
+    // (e.g. mean=(0.16,0.80,1.17), score 1.65). Real underwater teal has BLUE present and
+    // balanced green/blue at modest magnitude. Use min(g,b)-2r (requires BOTH g and b present,
+    // so green-blown b~0 garbage scores ~ -2r) and reject blown/overflow volumes outright.
+    inline float teal_score(float r, float g, float b) {
+        if (!(r < 50.0f) || !(g < 50.0f) || !(b < 50.0f)) return -1.0e6f;  // garbage/overflow/NaN
+        const float m = (g < b) ? g : b;  // min(g,b): true teal needs both channels, not green-only
+        return m - 2.0f * r;
+    }
+
+    inline void note(uint32_t index, float r, float g, float b, ID3D12Resource* resource = nullptr) {
+        const float score = teal_score(r, g, b);
+        std::scoped_lock _{g_mutex};
+        g_score[index] = score;
+        if (resource != nullptr) {
+            g_resource_score[reinterpret_cast<uintptr_t>(resource)] = score;
+        }
+        static std::atomic<uint64_t> logs{0};
+        const auto n = logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 32 || (n % 256) == 0) {
+            SPDLOG_WARN("[SN2-LitScore] idx={} res=0x{:x} mean=({:.4f},{:.4f},{:.4f}) score={:.4f}",
+                index, reinterpret_cast<uintptr_t>(resource), r, g, b, score);
+        }
+    }
+
+    inline void note_descriptor(uint32_t index,
+                                D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                                ID3D12Resource* resource,
+                                const D3D12_RESOURCE_DESC& desc,
+                                uint8_t kind) {
+        if (cpu.ptr == 0 || resource == nullptr || kind == 0) {
+            return;
+        }
+        Descriptor d{};
+        d.index = index;
+        d.cpu = cpu.ptr;
+        d.resource = reinterpret_cast<uintptr_t>(resource);
+        d.kind = kind;
+        d.width = desc.Width;
+        d.height = desc.Height;
+        d.depth = desc.DepthOrArraySize;
+        d.format = static_cast<int>(desc.Format);
+        d.last_seen_ms = GetTickCount64();
+        std::scoped_lock _{g_mutex};
+        g_descriptors[index] = d;
+    }
+
+    // Pick a clearly-lit source volume (max score, must exceed 0.10) and the dark/red
+    // targets (score < 0.05, excluding the source, capped at 12). Returns true iff a
+    // source and at least one target were found.
+    inline bool plan(uint32_t& out_src, std::vector<uint32_t>& out_targets) {
+        std::scoped_lock _{g_mutex};
+        bool have_src = false;
+        uint32_t src = 0;
+        float best = -1e30f;
+        for (const auto& [idx, score] : g_score) {
+            if (score > best) { best = score; src = idx; have_src = true; }
+        }
+        if (!have_src || best <= 0.10f) return false;
+        out_src = src;
+        out_targets.clear();
+        for (const auto& [idx, score] : g_score) {
+            if (idx == src) continue;
+            if (score < 0.05f) {
+                out_targets.push_back(idx);
+                if (out_targets.size() >= 12) break;
+            }
+        }
+        return !out_targets.empty();
+    }
+
+    inline bool fix_enabled() {
+        static const bool e = []() {
+            if (sn2_hooks_disabled_by_env()) return false;
+            const char* v = std::getenv("UEVR_SN2_VIEWUB_FIX");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        return e;
+    }
+
+    inline bool descriptor_substitute_enabled() {
+        static const bool e = []() {
+            if (sn2_hooks_disabled_by_env()) return false;
+            const char* v = std::getenv("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        return e;
+    }
+
+    inline uint32_t descriptor_substitute_max_frames() {
+        static const uint32_t frames = env_u32_a("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE_MAX_FRAMES", 180);
+        return frames;
+    }
+
+    inline bool descriptor_substitute_window_active(uint64_t frame) {
+        const uint32_t max_frames = descriptor_substitute_max_frames();
+        if (max_frames == 0) {
+            return true;
+        }
+        static std::atomic<uint64_t> first_frame{UINT64_MAX};
+        uint64_t first = first_frame.load(std::memory_order_relaxed);
+        if (first == UINT64_MAX &&
+            first_frame.compare_exchange_strong(first, frame, std::memory_order_relaxed)) {
+            first = frame;
+        }
+        if (first == UINT64_MAX) {
+            first = frame;
+        }
+        const bool active = frame >= first && (frame - first) < max_frames;
+        if (!active) {
+            static std::atomic<bool> logged{false};
+            bool expected = false;
+            if (logged.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+                SPDLOG_WARN("[SN2-ViewUB-DescSub] stopped after {} frames (set UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE_MAX_FRAMES=0 for unlimited)",
+                    max_frames);
+            }
+        }
+        return active;
+    }
+
+    inline bool score_for_descriptor_locked(const Descriptor& d, float& out_score) {
+        auto si = g_score.find(d.index);
+        if (si != g_score.end()) {
+            out_score = si->second;
+            return true;
+        }
+        auto sr = g_resource_score.find(d.resource);
+        if (sr != g_resource_score.end()) {
+            out_score = sr->second;
+            return true;
+        }
+        return false;
+    }
+
+    inline bool lookup_descriptor(uint32_t index, Descriptor& out) {
+        std::scoped_lock _{g_mutex};
+        auto it = g_descriptors.find(index);
+        if (it == g_descriptors.end()) {
+            return false;
+        }
+        out = it->second;
+        return true;
+    }
+
+    inline bool lookup_score(uint32_t index, uintptr_t resource, float& out_score) {
+        std::scoped_lock _{g_mutex};
+        auto si = g_score.find(index);
+        if (si != g_score.end()) {
+            out_score = si->second;
+            return true;
+        }
+        auto sr = g_resource_score.find(resource);
+        if (sr != g_resource_score.end()) {
+            out_score = sr->second;
+            return true;
+        }
+        return false;
+    }
+
+    inline uint32_t descriptor_target_cap() {
+        static const uint32_t cap = std::max(1, env_int_a("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE_MAX_TARGETS", 24));
+        return cap;
+    }
+
+    inline bool patch_unknown_descriptors() {
+        static const bool e = []() {
+            const char* v = std::getenv("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE_PATCH_UNKNOWN");
+            if (v == nullptr || v[0] == '\0') {
+                return false;
+            }
+            return v[0] != '0';
+        }();
+        return e;
+    }
+
+    inline bool plan_descriptor_substitution(uint32_t& out_src, std::vector<uint32_t>& out_targets) {
+        out_src = 0;
+        out_targets.clear();
+        std::scoped_lock _{g_mutex};
+
+        bool have_src = false;
+        Descriptor src{};
+        float best = -1e30f;
+        uint32_t scored_descriptors = 0;
+        uint32_t scored_srvs = 0;
+        for (const auto& [idx, d] : g_descriptors) {
+            if (d.cpu == 0 || d.resource == 0) {
+                continue;
+            }
+            float score = 0.0f;
+            if (!score_for_descriptor_locked(d, score)) {
+                continue;
+            }
+            ++scored_descriptors;
+            if (d.kind == 1) {
+                ++scored_srvs;
+            }
+            if (score > best) {
+                best = score;
+                src = d;
+                have_src = true;
+            }
+        }
+        if (!have_src || best <= 0.10f) {
+            static std::atomic<uint64_t> logs{0};
+            const auto n = logs.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 16 || (n % 600) == 0) {
+                SPDLOG_WARN("[SN2-LitPlan] no lit source: descriptors={} scored={} scored_srvs={} best={:.4f}",
+                    g_descriptors.size(), scored_descriptors, scored_srvs, best);
+            }
+            return false;
+        }
+
+        const bool patch_unknown = patch_unknown_descriptors();
+        const uint32_t max_targets = descriptor_target_cap();
+        out_src = src.index;
+        for (const auto& [idx, d] : g_descriptors) {
+            if (idx == src.index || d.kind != 1 || d.cpu == 0 || d.resource == 0 ||
+                d.resource == src.resource || d.width != src.width || d.height != src.height ||
+                d.depth != src.depth || d.format != src.format) {
+                continue;
+            }
+            float score = 0.0f;
+            const bool have_score = score_for_descriptor_locked(d, score);
+            if ((!have_score && patch_unknown) || (have_score && score < 0.05f)) {
+                out_targets.push_back(idx);
+                if (out_targets.size() >= max_targets) {
+                    break;
+                }
+            }
+        }
+        static std::atomic<uint64_t> logs{0};
+        const auto n = logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-LitPlan] src_idx={} src_kind={} best={:.4f} descriptors={} scored={} scored_srvs={} targets={} patch_unknown={}",
+                src.index, static_cast<unsigned>(src.kind), best, g_descriptors.size(),
+                scored_descriptors, scored_srvs, out_targets.size(), patch_unknown ? 1 : 0);
+        }
+        return !out_targets.empty();
+    }
+
+    inline bool descriptor_ps_allowed(uint32_t ps_crc) {
+        const char* v = std::getenv("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE_PS_CRCS");
+        if (v == nullptr || v[0] == '\0') {
+            return ps_crc == 0xDE7C3822u || ps_crc == 0xB9BE2499u || ps_crc == 0x4E86DC09u;
+        }
+        const char* p = v;
+        while (*p != '\0') {
+            while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t') {
+                ++p;
+            }
+            if (*p == '\0') {
+                break;
+            }
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(p, &end, 0);
+            if (end != p && static_cast<uint32_t>(parsed) == ps_crc) {
+                return true;
+            }
+            if (end == p) {
+                ++p;
+            } else {
+                p = end;
+            }
+        }
+        return false;
+    }
+} // namespace sn2_litness
+
 // 2026-05-20 SN2 RT SNAPSHOT — capture 2D render-target pixels to disk for
 // per-eye divergence analysis. Each captured texture is copied (via
 // CopyTextureRegion to a buffer-laid-out readback resource) into a slot of
@@ -6953,6 +8100,7 @@ namespace sn2_rt_snapshot {
         uint64_t   fence_value{};
         char       tag[64]{};
         uint64_t   frame{};
+        ID3D12Resource* hold_resource{};
         bool       saved{};
     };
 
@@ -6971,9 +8119,19 @@ namespace sn2_rt_snapshot {
         const char* env = std::getenv("UEVR_SN2_RT_SNAPSHOT");
         const char* water_diff = std::getenv("UEVR_SN2_WATER_CHAIN_RT_DIFF");
         const char* input_dump = std::getenv("UEVR_SN2_WATER_CHAIN_INPUT_DUMP");
+        const char* fog_volume = std::getenv("UEVR_SN2_FOG_VOLUME_SNAPSHOT");
+        const char* xeye_volume = std::getenv("UEVR_SN2_FOG_VOLUME_XEYE_SNAPSHOT");
+        const char* bindless_sub = std::getenv("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE");
+        const char* lightscatter_history = std::getenv("UEVR_SN2_LIGHTSCATTER_HISTORY_SNAPSHOT");
+        const char* lightscatter_output = std::getenv("UEVR_SN2_LIGHTSCATTER_OUTPUT_SNAPSHOT");
         return (env != nullptr && env[0] != '\0' && env[0] != '0') ||
             (water_diff != nullptr && water_diff[0] != '\0' && water_diff[0] != '0') ||
-            (input_dump != nullptr && input_dump[0] != '\0' && input_dump[0] != '0');
+            (input_dump != nullptr && input_dump[0] != '\0' && input_dump[0] != '0') ||
+            (fog_volume != nullptr && fog_volume[0] != '\0' && fog_volume[0] != '0') ||
+            (xeye_volume != nullptr && xeye_volume[0] != '\0' && xeye_volume[0] != '0') ||
+            (bindless_sub != nullptr && bindless_sub[0] != '\0' && bindless_sub[0] != '0') ||
+            (lightscatter_output != nullptr && lightscatter_output[0] != '\0' && lightscatter_output[0] != '0') ||
+            (lightscatter_history != nullptr && lightscatter_history[0] != '\0' && lightscatter_history[0] != '0');
     }();
     bool enabled() { return g_enabled; }
 
@@ -7072,9 +8230,11 @@ namespace sn2_rt_snapshot {
         dst_loc.PlacedFootprint.Footprint.Format = desc.Format;
         dst_loc.PlacedFootprint.Footprint.Width = static_cast<UINT>(desc.Width);
         dst_loc.PlacedFootprint.Footprint.Height = desc.Height;
-        // For 3D textures this captures z-slice 0 only. That is enough to
-        // identify left/right resource content mismatches without dumping a
-        // whole froxel volume from a hot draw hook.
+        // For 3D textures this captures ONE z-slice. We pick a MID slice
+        // (depth/2) by default — slice 0 is the near froxel slice which is
+        // naturally near-black (that is why the prior probe was inconclusive).
+        // Override with UEVR_SN2_FOG_SNAP_Z. One slice is enough to compare
+        // left vs right volume CONTENT (producer-bad vs consumer-mis-sample).
         dst_loc.PlacedFootprint.Footprint.Depth = 1;
         dst_loc.PlacedFootprint.Footprint.RowPitch = row_pitch;
 
@@ -7097,12 +8257,19 @@ namespace sn2_rt_snapshot {
         D3D12_BOX src_box{};
         D3D12_BOX* src_box_ptr = nullptr;
         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+            UINT zsel = static_cast<UINT>(desc.DepthOrArraySize) / 2;  // MID slice
+            if (const char* zev = std::getenv("UEVR_SN2_FOG_SNAP_Z")) {
+                if (zev[0] != '\0') {
+                    const int zz = std::atoi(zev);
+                    if (zz >= 0 && zz < static_cast<int>(desc.DepthOrArraySize)) zsel = static_cast<UINT>(zz);
+                }
+            }
             src_box.left = 0;
             src_box.top = 0;
-            src_box.front = 0;
+            src_box.front = zsel;
             src_box.right = static_cast<UINT>(desc.Width);
             src_box.bottom = desc.Height;
-            src_box.back = 1;
+            src_box.back = zsel + 1;
             src_box_ptr = &src_box;
         }
         cl->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, src_box_ptr);
@@ -7114,6 +8281,11 @@ namespace sn2_rt_snapshot {
         {
             std::scoped_lock _{g_mutex};
             Slot& s = g_slots[slot_index];
+            if (s.hold_resource != nullptr) {
+                s.hold_resource->Release();
+                s.hold_resource = nullptr;
+            }
+            src_tex->AddRef();
             s.width = static_cast<uint32_t>(desc.Width);
             s.height = desc.Height;
             s.row_pitch = row_pitch;
@@ -7121,6 +8293,7 @@ namespace sn2_rt_snapshot {
             s.byte_size = byte_size;
             s.fence_value = 0;  // set by signal_after_execute
             s.frame = g_frame_counter.load(std::memory_order_relaxed);
+            s.hold_resource = src_tex;
             s.saved = false;
             std::strncpy(s.tag, tag != nullptr ? tag : "?", sizeof(s.tag) - 1);
             s.tag[sizeof(s.tag) - 1] = '\0';
@@ -7224,8 +8397,104 @@ namespace sn2_rt_snapshot {
             std::fwrite(rgb_row.data(), 1, rgb_row.size(), f);
         }
         std::fclose(f);
-        SPDLOG_WARN("[SN2-RTSnap] saved {} ({}x{} fmt={}) → {}",
-            s.tag, s.width, s.height, (int)s.format, path);
+        static std::atomic<uint64_t> saved_logs{0};
+        const auto log_n = saved_logs.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t max_logs = sn2_rt_snapshot_log_max();
+        if (sn2_rt_snapshot_verbose_log_enabled() ||
+            (max_logs > 0 && log_n < static_cast<uint64_t>(max_logs))) {
+            SPDLOG_WARN("[SN2-RTSnap] saved {} ({}x{} fmt={}) -> {}",
+                s.tag, s.width, s.height, (int)s.format, path);
+        }
+    }
+
+    // Per-channel numeric stats for the captured slice. This is the CONCLUSIVE
+    // signal for the producer-content question: compare the mean/max of the
+    // L vs R fog-volume mid-slice. R≈L => producer content is fine (the bug is
+    // the consumer's per-eye volume sampling); R≈0 or wildly different => the
+    // producer wrote bad/empty content for the right eye.
+    static void log_slice_stats(const Slot& s, const uint8_t* cpu) {
+        auto f11 = [](uint32_t e5m6) -> float {
+            if (e5m6 == 0) return 0.0f;
+            const uint32_t e = (e5m6 >> 6) & 0x1F, m = e5m6 & 0x3F;
+            return e ? std::ldexp(1.0f + m / 64.0f, (int)e - 15) : (m / 64.0f / 16384.0f);
+        };
+        auto f10 = [](uint32_t e5m5) -> float {
+            if (e5m5 == 0) return 0.0f;
+            const uint32_t e = (e5m5 >> 5) & 0x1F, m = e5m5 & 0x1F;
+            return e ? std::ldexp(1.0f + m / 32.0f, (int)e - 15) : (m / 32.0f / 16384.0f);
+        };
+        auto half = [](uint16_t h) -> float {
+            const uint32_t sign = (h >> 15) & 1;
+            const uint32_t exp_bits = (h >> 10) & 0x1F;
+            const uint32_t mant_bits = h & 0x3FF;
+            float v = 0.0f;
+            if (exp_bits == 0) {
+                v = mant_bits ? std::ldexp(static_cast<float>(mant_bits) / 1024.0f, -14) : 0.0f;
+            } else if (exp_bits == 31) {
+                v = mant_bits == 0 ? 65504.0f : 0.0f;
+            } else {
+                v = std::ldexp(1.0f + mant_bits / 1024.0f, static_cast<int>(exp_bits) - 15);
+            }
+            return sign ? -v : v;
+        };
+        if (s.format != DXGI_FORMAT_R11G11B10_FLOAT &&
+            s.format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            return;
+        }
+        double sumR = 0, sumG = 0, sumB = 0, maxR = 0, maxG = 0, maxB = 0;
+        uint64_t n = 0, nonzero = 0;
+        for (uint32_t y = 0; y < s.height; ++y) {
+            const uint8_t* row = cpu + (static_cast<size_t>(y) * s.row_pitch);
+            for (uint32_t x = 0; x < s.width; ++x) {
+                float rf = 0.0f;
+                float gf = 0.0f;
+                float bf = 0.0f;
+                if (s.format == DXGI_FORMAT_R11G11B10_FLOAT) {
+                    const uint32_t p = *reinterpret_cast<const uint32_t*>(row + x * 4);
+                    rf = f11(p & 0x7FF);
+                    gf = f11((p >> 11) & 0x7FF);
+                    bf = f10((p >> 22) & 0x3FF);
+                } else {
+                    const auto* px = reinterpret_cast<const uint16_t*>(row + x * 8);
+                    rf = half(px[0]);
+                    gf = half(px[1]);
+                    bf = half(px[2]);
+                }
+                sumR += rf; sumG += gf; sumB += bf;
+                if (rf > maxR) maxR = rf; if (gf > maxG) maxG = gf; if (bf > maxB) maxB = bf;
+                if (rf > 0.0001f || gf > 0.0001f || bf > 0.0001f) ++nonzero;
+                ++n;
+            }
+        }
+        if (n == 0) return;
+        const double meanR = sumR / n, meanG = sumG / n, meanB = sumB / n;
+        static std::atomic<uint64_t> stat_logs{0};
+        const auto log_n = stat_logs.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t max_logs = sn2_rt_snapshot_log_max();
+        if (sn2_rt_snapshot_verbose_log_enabled() ||
+            (max_logs > 0 && log_n < static_cast<uint64_t>(max_logs))) {
+            SPDLOG_WARN("[SN2-FogSnapStats] tag={} {}x{} N={} nonzero%={:.1f} mean=({:.4f},{:.4f},{:.4f}) max=({:.3f},{:.3f},{:.3f})",
+                s.tag, s.width, s.height, n, 100.0 * (double)nonzero / (double)n,
+                meanR, meanG, meanB, maxR, maxG, maxB);
+        }
+        // === SN2 right-eye fog FIX: feed the litness scoreboard. The heap-scan queues
+        // these as "HEAPVOL-U_n<bindless_index>"; parse the trailing integer and record
+        // the volume's teal score so sn2_viewub_decode::apply_litness_copy can pick a
+        // LIT source + DARK targets. Read-only here (no mutation).
+        {
+            const char* prefix = "HEAPVOL-U_n";
+            const size_t plen = 11;  // strlen("HEAPVOL-U_n")
+            if (std::strncmp(s.tag, prefix, plen) == 0 && s.tag[plen] != '\0') {
+                char* endp = nullptr;
+                const unsigned long idx = std::strtoul(s.tag + plen, &endp, 10);
+                if (endp != s.tag + plen) {
+                    sn2_litness::note(static_cast<uint32_t>(idx),
+                        static_cast<float>(meanR), static_cast<float>(meanG),
+                        static_cast<float>(meanB),
+                        s.hold_resource);
+                }
+            }
+        }
     }
 
     void drain_to_disk() {
@@ -7251,10 +8520,16 @@ namespace sn2_rt_snapshot {
             }
             g_mapped = static_cast<uint8_t*>(mapped);
             const uint8_t* cpu = g_mapped + off;
-            // Log first 16 bytes to verify
-            SPDLOG_WARN("[SN2-RTSnap] drain slot {} first16: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                i, cpu[0],cpu[1],cpu[2],cpu[3],cpu[4],cpu[5],cpu[6],cpu[7],cpu[8],cpu[9],cpu[10],cpu[11],cpu[12],cpu[13],cpu[14],cpu[15]);
+            if (sn2_rt_snapshot_verbose_log_enabled()) {
+                SPDLOG_WARN("[SN2-RTSnap] drain slot {} first16: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                    i, cpu[0],cpu[1],cpu[2],cpu[3],cpu[4],cpu[5],cpu[6],cpu[7],cpu[8],cpu[9],cpu[10],cpu[11],cpu[12],cpu[13],cpu[14],cpu[15]);
+            }
             save_ppm(s, cpu);
+            log_slice_stats(s, cpu);
+            if (s.hold_resource != nullptr) {
+                s.hold_resource->Release();
+                s.hold_resource = nullptr;
+            }
             s.saved = true;
         }
     }
@@ -7271,7 +8546,8 @@ namespace sn2_rt_snapshot {
             char eye_char, uint64_t seq) {
         if (res == nullptr || tag_prefix == nullptr) return;
         std::scoped_lock _{g_intent_mutex};
-        if (g_intents.size() >= 16) return;  // cap (raised for multi-pass)
+        if (g_intents.size() >= 64) return;  // cap (raised for multi-pass + LightScattering IO snapshots)
+        res->AddRef();
         Intent it{};
         it.res = res;
         std::snprintf(it.tag, sizeof(it.tag), "%s-%c_n%llu",
@@ -7307,6 +8583,115 @@ namespace sn2_rt_snapshot {
         return it != g_rtv_map.end() ? it->second : nullptr;
     }
 } // namespace sn2_rt_snapshot
+
+namespace sn2_fog_volume_snapshot {
+    static std::mutex g_mutex;
+    static std::unordered_set<uint64_t> g_queued;
+    static std::array<uint32_t, 3> g_counts{};
+
+    int max_per_bucket() {
+        static const int max = std::max(0, env_int_a("UEVR_SN2_FOG_VOLUME_SNAPSHOT_MAX_PER_EYE", 4));
+        return max;
+    }
+
+    bool include_unknown() {
+        static const bool enabled = env_flag_enabled_a("UEVR_SN2_FOG_VOLUME_SNAPSHOT_UNKNOWN");
+        return enabled;
+    }
+
+    bool broad_mode() {
+        static const bool enabled = env_flag_enabled_a("UEVR_SN2_FOG_VOLUME_SNAPSHOT_BROAD");
+        return enabled;
+    }
+
+    bool is_integrated_light_scattering_volume(const D3D12_RESOURCE_DESC& d) {
+        if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) return false;
+        if (d.Format != DXGI_FORMAT_R11G11B10_FLOAT) return false;
+        // SN2's IntegratedLightScattering volume has been seen as 54x30x48 in
+        // live traces and 141x74x64 in RenderDoc captures. Keep enough slack
+        // for resolution/quality variance, but reject the many 16^3/24^3/32^3
+        // LUTs that otherwise consume the snapshot budget.
+        if (d.Width < 40 || d.Width > 192) return false;
+        if (d.Height < 20 || d.Height > 128) return false;
+        if (d.DepthOrArraySize < 32 || d.DepthOrArraySize > 80) return false;
+        return true;
+    }
+
+    bool should_capture_desc(const D3D12_RESOURCE_DESC& rd) {
+        return broad_mode()
+            ? sn2_view1_fog_srv_pool::is_fog_3d(rd)
+            : is_integrated_light_scattering_volume(rd);
+    }
+
+    void maybe_queue_desc(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& rd, const char* source, int view_id) {
+        if (!sn2_fog_volume_snapshot_enabled() || resource == nullptr) {
+            return;
+        }
+        if (view_id != 0 && view_id != 1 && !include_unknown()) {
+            return;
+        }
+        if (!should_capture_desc(rd)) {
+            return;
+        }
+
+        const size_t bucket = (view_id == 0) ? 0 : (view_id == 1) ? 1 : 2;
+        uint64_t source_hash = 14695981039346656037ull;
+        if (source != nullptr) {
+            for (const char* p = source; *p != '\0'; ++p) {
+                source_hash ^= static_cast<unsigned char>(*p);
+                source_hash *= 1099511628211ull;
+            }
+        }
+        const uint64_t key =
+            (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(resource)) & 0x0000FFFFFFFFFFFFull) |
+            (static_cast<uint64_t>(bucket) << 48) |
+            ((source_hash & 0xFFull) << 56);
+        uint32_t seq = 0;
+        {
+            std::scoped_lock _{g_mutex};
+            if (g_queued.count(key) != 0) {
+                return;
+            }
+            if (max_per_bucket() > 0 && g_counts[bucket] >= static_cast<uint32_t>(max_per_bucket())) {
+                return;
+            }
+            g_queued.insert(key);
+            seq = ++g_counts[bucket];
+        }
+
+        const char eye =
+            (view_id == 0) ? 'L' :
+            (view_id == 1) ? 'R' :
+            'U';
+        const char* tag =
+            (source != nullptr && std::strstr(source, "UAV") != nullptr) ? "FOGUAV" : "FOGSRV";
+        sn2_rt_snapshot::queue_intent_named(resource, tag, eye, seq);
+
+        static std::atomic<uint64_t> log_count{0};
+        const auto n = log_count.fetch_add(1, std::memory_order_relaxed);
+        if (n < 32) {
+            SPDLOG_WARN(
+                "[SN2-FogVolumeSnapshot] queued {} source={} eye={} seq={} res={:p} fmt={} dim={}x{}x{}",
+                tag,
+                source != nullptr ? source : "?",
+                eye,
+                seq,
+                (void*)resource,
+                (int)rd.Format,
+                (int)rd.Width,
+                (int)rd.Height,
+                (int)rd.DepthOrArraySize);
+        }
+    }
+
+    void maybe_queue(ID3D12Resource* resource, const char* source, int view_id) {
+        if (!sn2_fog_volume_snapshot_enabled() || resource == nullptr) {
+            return;
+        }
+        const D3D12_RESOURCE_DESC rd = resource->GetDesc();
+        maybe_queue_desc(resource, rd, source, view_id);
+    }
+} // namespace sn2_fog_volume_snapshot
 
 // 2026-05-19 SN2 COMPUTE CAPTURE — record LEFT-eye Nanite/VSM compute call
 // state to enable future RIGHT-eye replay. Per-frame ring; cleared each frame
@@ -7501,17 +8886,113 @@ namespace sn2_descriptor_registry {
     static std::atomic<uint64_t> g_generation{0};
 
     bool enabled() {
+        if (sn2_hooks_disabled_by_env()) {
+            return false;
+        }
         return sn2_pso3069_diag_enabled() ||
             sn2_copyrect_diag_enabled() ||
             sn2_fog_compute_diag_enabled() ||
             sn2_fog_srv_redirect_mode() != 0 ||
             sn2_tail_srv_repair_mode() != 0 ||
             env_flag_enabled_a("UEVR_STEREO_EXPERIMENTS") ||
+            // Fog-volume snapshots need descriptor-create/copy lineage so a
+            // bound bindless slot can be resolved back to the Texture3D.
+            sn2_fog_volume_snapshot_enabled() ||
+            // Producer-side content-copy needs the same descriptor/resource
+            // records even when no readback snapshot diagnostic is enabled.
+            sn2_fog_xeye::enabled() ||
+            // Bindless fog descriptor substitution resolves heap slots back to
+            // SRV resources and then rewrites dark bindless SRVs to a lit source.
+            sn2_litness::descriptor_substitute_enabled() ||
+            // Dye-fill resolves one caller-named bindless slot to its resource.
+            env_flag_enabled_a("UEVR_SN2_DYE_FILL") ||
+            // Bindless ViewUB decode / chain scan needs CBV descriptor records
+            // plus SRV descriptor records for ILS-volume heap slots.
+            env_flag_enabled_a("UEVR_SN2_VIEWUB_DECODE") ||
+            env_flag_enabled_a("UEVR_SN2_VIEWUB_CHAIN_SCAN") ||
+            env_flag_enabled_a("UEVR_SN2_VIEWUB_ROOT_CONSTANT_SCAN") ||
+            env_flag_enabled_a("UEVR_SN2_VIEWUB_TABLE_CBV_SCAN") ||
+            env_flag_enabled_a("UEVR_SN2_VIEWUB_FIX") ||
+            env_flag_enabled_a("UEVR_SN2_BINDLESS_FOG_TRACE") ||
+            env_flag_enabled_a("UEVR_SN2_LIGHTSCATTER_BIND_PROBE") ||
+            // Fog producer/consumer lineage needs the same descriptor
+            // resolution but without forcing expensive texture readbacks.
+            env_flag_enabled_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE") ||
             // Sn2EyePairing needs CPU descriptor -> resource resolution even
             // when none of the older diagnostics are active.
             sn2_eye_pairing::env_enabled() ||
             // UWE fog mirror P3 needs the cpu-handle → resource lookup.
-            env_flag_enabled_a("UEVR_SN2_UWE_FOG_MIRROR");
+            env_flag_enabled_a("UEVR_SN2_UWE_FOG_MIRROR") ||
+            // 2026-05-24 precise fog table patch resolves compute table CBV slots ->
+            // cbv_desc.BufferLocation, so it needs CBV-create recording.
+            env_flag_enabled_a("UEVR_SN2_FOG_TABLE_PATCH") ||
+            // 2026-05-24 live fog-consumer per-eye counter resolves PS SRV table slots -> resource.
+            env_flag_enabled_a("UEVR_SN2_FOG_CONSUMER_COUNT") ||
+            // 2026-05-25 fog UV diagnostic: target water/fog draws have no
+            // root CBVs, so scan their currently-bound descriptor tables for
+            // CBV descriptors.
+            env_flag_enabled_a("UEVR_SN2_FOG_UV_TABLE_CB_SCAN") ||
+            // LightScatteringCS binding probe resolves descriptor-table CBVs/SRVs
+            // to their resources and upload-buffer bytes.
+            env_flag_enabled_a("UEVR_SN2_LIGHTSCATTER_BIND_PROBE") ||
+            // 2026-05-24 THE FIX: right-eye composite copy-shift resolves the bound
+            // fog SRV descriptor slots -> ID3D12Resource*. Active from start (must
+            // catch the fog SRV's descriptor chain, created early) but FILTERED to
+            // R11G11B10F only (see record_srv/record_uav) so the recording overhead
+            // stays light enough not to destabilize UEVR's init race.
+            env_flag_enabled_a("UEVR_SN2_FOG_RIGHT_COMPOSITE_SHIFT") ||
+            // 2026-05-25 resolve-stage copy-shift: needs UAV descriptor
+            // lineage so the UWEFogResolveCS output can be found directly.
+            env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT") ||
+            // 2026-05-25 shadow redirect: needs the right-eye composite's
+            // fixed SRV table slots resolved to the two R11 fog textures.
+            env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_REDIRECT") ||
+            env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_DISCOVER") ||
+            // Targeted 0x13b00f0c replay audit: resolves descriptor-table SRVs
+            // for the duplicated draw only, so we can see the Texture3D inputs
+            // without enabling broad forensics/event logging.
+            env_flag_enabled_a("UEVR_SN2_DUP_DETAIL_LOG") ||
+            // 2026-05-25 consumer-side cross-eye fog copy: resolves the composite's
+            // bound R11 fog SRV table slots -> ID3D12Resource* to copy L->R.
+            env_flag_enabled_a("UEVR_SN2_FOG_COMPOSITE_XEYE") ||
+            env_flag_enabled_a("UEVR_SN2_FOG_COMPOSITE_SELF_SHIFT");
+    }
+
+    // LITE registry mode: when ONLY the composite-shift fix needs the registry,
+    // record SRVs into g_by_cpu (bounded by reused cpu.ptr → correct resolution)
+    // but SKIP the unbounded g_by_descriptor_hash map + per-descriptor hash compute
+    // + UAV recording. The hash map grows a new entry per descriptor and rehashes
+    // under g_mutex during UE5's init descriptor-storm — the overhead that
+    // destabilizes UEVR's init race. Other registry consumers keep the full path.
+    bool fog_only_mode() {
+        static const bool v = []() {
+            if (sn2_hooks_disabled_by_env()) return false;
+            return (env_flag_enabled_a("UEVR_SN2_FOG_RIGHT_COMPOSITE_SHIFT") ||
+                    env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT") ||
+                    env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_REDIRECT") ||
+                    env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_DISCOVER") ||
+                    env_flag_enabled_a("UEVR_SN2_DUP_DETAIL_LOG") ||
+                    env_flag_enabled_a("UEVR_SN2_FOG_UV_TABLE_CB_SCAN") ||
+                    env_flag_enabled_a("UEVR_SN2_DYE_FILL") ||
+                    env_flag_enabled_a("UEVR_SN2_VIEWUB_DECODE") ||
+                    env_flag_enabled_a("UEVR_SN2_VIEWUB_CHAIN_SCAN") ||
+                    env_flag_enabled_a("UEVR_SN2_VIEWUB_ROOT_CONSTANT_SCAN") ||
+                    env_flag_enabled_a("UEVR_SN2_VIEWUB_TABLE_CBV_SCAN") ||
+                    env_flag_enabled_a("UEVR_SN2_VIEWUB_FIX") ||
+                    sn2_litness::descriptor_substitute_enabled()) &&
+                !sn2_pso3069_diag_enabled() && !sn2_copyrect_diag_enabled() &&
+                !sn2_fog_compute_diag_enabled() && sn2_fog_srv_redirect_mode() == 0 &&
+                sn2_tail_srv_repair_mode() == 0 &&
+                !env_flag_enabled_a("UEVR_STEREO_EXPERIMENTS") &&
+                !sn2_fog_volume_snapshot_enabled() &&
+                !sn2_fog_xeye::enabled() &&
+                !env_flag_enabled_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE") &&
+                !sn2_eye_pairing::env_enabled() &&
+                !env_flag_enabled_a("UEVR_SN2_UWE_FOG_MIRROR") &&
+                !env_flag_enabled_a("UEVR_SN2_FOG_TABLE_PATCH") &&
+                !env_flag_enabled_a("UEVR_SN2_FOG_CONSUMER_COUNT");
+        }();
+        return v;
     }
 
     // Public lookup so the UWE fog mirror dispatch redirect (P3) can resolve
@@ -7644,12 +9125,21 @@ namespace sn2_descriptor_registry {
         if (entry.cpu_handle.ptr == 0) return;
         entry.last_seen_tick = GetTickCount64();
         entry.generation = g_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+        const bool lite = fog_only_mode();
         if (entry.descriptor_hash == 0) {
             entry.descriptor_hash = descriptor_memory_hash(entry.cpu_handle);
         }
         std::scoped_lock _{g_mutex};
+        if (lite && g_by_cpu.bucket_count() < 8) {
+            // Reserve both maps up front so neither rehashes under the lock during
+            // UE5's init descriptor-storm (the rehash spikes destabilize UEVR init).
+            g_by_cpu.reserve(131072);
+            g_by_descriptor_hash.reserve(262144);
+        }
         g_by_cpu[entry.cpu_handle.ptr] = entry;
         if (entry.descriptor_hash != 0) {
+            // Keep the hash map — the composite's bindless fog slot resolves by
+            // descriptor-bytes hash (not cpu.ptr) to a record_srv entry.
             g_by_descriptor_hash[entry.descriptor_hash] = entry;
         }
     }
@@ -7717,12 +9207,78 @@ namespace sn2_descriptor_registry {
 
     void record_srv(ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE cpu) {
         if (!enabled() || resource == nullptr || cpu.ptr == 0) return;
+        if (fog_only_mode() &&
+            (sn2_litness::descriptor_substitute_enabled() ||
+             env_flag_enabled_a("UEVR_SN2_DYE_FILL")) &&
+            !env_flag_enabled_a("UEVR_SN2_FOG_RIGHT_COMPOSITE_SHIFT")) {
+            const auto rd = resource->GetDesc();
+            if (!sn2_fog_volume_snapshot::should_capture_desc(rd)) {
+                return;
+            }
+        }
+        // Resolve post-shift only needs UAV descriptors. If it is the only
+        // descriptor-registry consumer, avoid recording every SRV during UE5's
+        // descriptor storm.
+        if (fog_only_mode() &&
+            (env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_REDIRECT") ||
+             env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_DISCOVER")) &&
+            !env_flag_enabled_a("UEVR_SN2_FOG_RIGHT_COMPOSITE_SHIFT") &&
+            !sn2_litness::descriptor_substitute_enabled() &&
+            !env_flag_enabled_a("UEVR_SN2_DYE_FILL") &&
+            !env_flag_enabled_a("UEVR_SN2_VIEWUB_DECODE") &&
+            !env_flag_enabled_a("UEVR_SN2_VIEWUB_CHAIN_SCAN") &&
+            !env_flag_enabled_a("UEVR_SN2_VIEWUB_ROOT_CONSTANT_SCAN") &&
+            !env_flag_enabled_a("UEVR_SN2_VIEWUB_TABLE_CBV_SCAN") &&
+            !env_flag_enabled_a("UEVR_SN2_VIEWUB_FIX") &&
+             !env_flag_enabled_a("UEVR_SN2_FOG_UV_TABLE_CB_SCAN")) {
+            const auto rd = resource->GetDesc();
+            const bool track_aux_srv =
+                env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_TRACK_AUX_SRV");
+            const bool full_sbs_2d =
+                rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                rd.Width >= 1024 && rd.Width <= 1536 &&
+                rd.Height >= 256 && rd.Height <= 900;
+            if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                rd.Width < 1024 || rd.Width > 1536 ||
+                rd.Height < 256 || rd.Height > 900 ||
+                (!track_aux_srv && rd.Format != DXGI_FORMAT_R11G11B10_FLOAT) ||
+                (track_aux_srv && !full_sbs_2d)) {
+                return;
+            }
+        }
+        if (fog_only_mode() &&
+            env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT") &&
+            !env_flag_enabled_a("UEVR_SN2_FOG_RIGHT_COMPOSITE_SHIFT") &&
+            !env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_REDIRECT") &&
+            !sn2_litness::descriptor_substitute_enabled() &&
+            !env_flag_enabled_a("UEVR_SN2_DYE_FILL") &&
+            !env_flag_enabled_a("UEVR_SN2_VIEWUB_DECODE") &&
+            !env_flag_enabled_a("UEVR_SN2_VIEWUB_CHAIN_SCAN") &&
+            !env_flag_enabled_a("UEVR_SN2_VIEWUB_ROOT_CONSTANT_SCAN") &&
+            !env_flag_enabled_a("UEVR_SN2_VIEWUB_TABLE_CBV_SCAN") &&
+            !env_flag_enabled_a("UEVR_SN2_VIEWUB_FIX") &&
+            !env_flag_enabled_a("UEVR_SN2_FOG_UV_TABLE_CB_SCAN")) {
+            return;
+        }
+        // NOTE: record ALL SRVs (no content filter) so the composite's real fog SRV
+        // resolves correctly. The init-race overhead is cut elsewhere (lite_mode in
+        // publish skips the unbounded g_by_descriptor_hash + reserves g_by_cpu).
         Entry e{};
         e.cpu_handle = cpu;
         e.resource = resource;
         e.kind = Kind::SRV;
         e.resource_desc = resource->GetDesc();
         e.has_resource_desc = true;
+        // Diagnostic-only lifetime guard. The draw-time fog-volume snapshot
+        // resolves bindless descriptor copies back to ID3D12Resource*. UE5 can
+        // recycle descriptor slots and transient resources aggressively, so pin
+        // fog-shaped Texture3D SRV resources while this explicit capture mode is
+        // active. We intentionally keep the ref for the short diagnostic session
+        // instead of risking a stale pointer in the draw hook.
+        if ((sn2_fog_volume_snapshot_enabled() || sn2_litness::descriptor_substitute_enabled()) &&
+            sn2_fog_volume_snapshot::should_capture_desc(e.resource_desc)) {
+            resource->AddRef();
+        }
         if (desc != nullptr) {
             e.srv_desc = *desc;
             e.has_srv_desc = true;
@@ -7734,6 +9290,23 @@ namespace sn2_descriptor_registry {
 
     void record_uav(ID3D12Resource* resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE cpu) {
         if (!enabled() || resource == nullptr || cpu.ptr == 0) return;
+        // Fog-only light mode normally resolves SRV slots only. The resolve
+        // post-shift experiment is the exception: keep only full-SBS
+        // R11G11B10F Texture2D UAVs so the UWEFogResolveCS output can be
+        // found without tracking every UAV in the process.
+        if (fog_only_mode()) {
+            if (!env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT") &&
+                !env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_REDIRECT")) {
+                return;
+            }
+            const auto rd = resource->GetDesc();
+            if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                rd.Format != DXGI_FORMAT_R11G11B10_FLOAT ||
+                rd.Width < 1024 || rd.Width > 1536 ||
+                rd.Height < 256 || rd.Height > 900) {
+                return;
+            }
+        }
         Entry e{};
         e.cpu_handle = cpu;
         e.resource = resource;
@@ -7784,8 +9357,15 @@ namespace sn2_descriptor_registry {
 
     void record_copy(D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src) {
         if (!enabled() || dst.ptr == 0 || src.ptr == 0) return;
+        // Copy tracking IS needed for CURRENT-frame resolution: UE5 recycles transient
+        // fog resources, so the byte-hash alone can resolve a STALE instance — the
+        // cpu.ptr entry published here points at the current copy's source resource.
+        // Init-race overhead is bounded by the publish() reserve (no rehash spikes)
+        // and the lite fast-skip below (no hash fallback / hash compute for the many
+        // non-tracked copy sources).
         Entry src_entry{};
         if (!lookup(src, src_entry)) {
+            if (fog_only_mode()) return;   // src not tracked → skip the hash fallback
             const auto src_hash = descriptor_memory_hash(src);
             if (!lookup_by_descriptor_hash(src_hash, src_entry)) return;
         }
@@ -7971,6 +9551,9 @@ void WINAPI D3D12Hook::create_shader_resource_view(
             // Pass the current fog-view thread-local (set by sub_142FD6170 hook).
             const int view_id_at_creation = sn2_get_current_fog_view();
             sn2_fog_srv_map::record(resource, descriptor, view_id_at_creation);
+            if (sn2_fog_xeye::is_ils_volume(rd)) {
+                sn2_fog_xeye::note_resource("CreateSRV", view_id_at_creation, resource, &rd);
+            }
 
             // 2026-05-17 Step D-safe: if this Texture3D matches the fog volume
             // signature (R11G11B10F, fog-sized 3D), AddRef and create our own
@@ -7980,6 +9563,7 @@ void WINAPI D3D12Hook::create_shader_resource_view(
             if (sn2_fog_srv_pool_enabled() && sn2_view1_fog_srv_pool::is_fog_3d(rd)) {
                 sn2_view1_fog_srv_pool::add(device, resource);
             }
+            sn2_fog_volume_snapshot::maybe_queue(resource, "SRV", view_id_at_creation);
 
             // Look up creation index of this SRV for log clarity.
             sn2_fog_srv_map::Entry e_lookup{};
@@ -8042,6 +9626,10 @@ void WINAPI D3D12Hook::create_unordered_access_view(
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
             const int view_id = sn2_get_current_fog_view();
             sn2_fog_uav_map::record(resource, descriptor, view_id);
+            if (sn2_fog_xeye::is_ils_volume(rd)) {
+                sn2_fog_xeye::note_resource("CreateUAV", view_id, resource, &rd);
+            }
+            sn2_fog_volume_snapshot::maybe_queue(resource, "UAV", view_id);
 
             // Lookup for log readability.
             sn2_fog_uav_map::Entry e_lookup{};
@@ -8217,14 +9805,13 @@ void WINAPI D3D12Hook::copy_descriptors(
 
             sn2_bindless_slot_map::record(dst, src);
             sn2_draw_log_v2::slot_lifetime::on_write(static_cast<uint64_t>(dst.ptr));
-            // Propagate batched copies to the descriptor registry so the
-            // UWE fog mirror's lookup_resource_by_cpu_ptr can resolve game
-            // resources bound to bindless slots. UE5 uses this batched
-            // variant for per-frame bindless heap updates — without this
-            // propagation, the registry only knows about staging-heap slots.
-            if (sn2_descriptor_registry::enabled()) {
-                sn2_descriptor_registry::record_copy(dst, src);
-            }
+            // NOTE: the descriptor-registry record_copy is intentionally NOT called
+            // here (pre-copy). Pre-copy, `dst` still holds the OLD descriptor bytes, so
+            // record_copy would hash the stale bytes and map that stale hash → the new
+            // source resource, polluting g_by_descriptor_hash and risking wrong
+            // resolution for any slot still carrying those old bytes. The registry is
+            // updated ONLY post-copy (after original(), where `dst` holds the new
+            // bytes) in the block below.
 
             ++dst_within;
             ++src_within;
@@ -8409,6 +9996,10 @@ inline void update_cmdlist_root_signature(
         s.last_graphics_root_uav.fill({});
         s.last_graphics_root_cbv_hash.fill({});
         s.last_graphics_root_constants_hash.fill({});
+        s.last_graphics_root_constants_count.fill({});
+        for (auto& constants : s.last_graphics_root_constants) {
+            constants.fill({});
+        }
         s.last_graphics_root_desc_table_resource_hash.fill({});
         s.last_graphics_descriptor_reads.clear();
     } else {
@@ -8419,6 +10010,10 @@ inline void update_cmdlist_root_signature(
         s.last_compute_root_uav.fill({});
         s.last_compute_root_cbv_hash.fill({});
         s.last_compute_root_constants_hash.fill({});
+        s.last_compute_root_constants_count.fill({});
+        for (auto& constants : s.last_compute_root_constants) {
+            constants.fill({});
+        }
         s.last_compute_root_desc_table_resource_hash.fill({});
         s.last_compute_descriptor_reads.clear();
     }
@@ -8440,6 +10035,71 @@ inline void update_cmdlist_viewport(ID3D12GraphicsCommandList* cl, UINT num_view
     s.has_viewport = true;
     s.last_viewport_bucket = classify_viewports(num_viewports, viewports);
     remember_cmdlist_eye_bucket(s, s.last_viewport_bucket);
+}
+
+inline void update_cmdlist_primitive_topology(
+    ID3D12GraphicsCommandList* cl,
+    D3D_PRIMITIVE_TOPOLOGY primitive_topology
+) {
+    if (cl == nullptr) return;
+    std::scoped_lock _{g_cmdlist_state_mutex};
+    auto& s = g_cmdlist_state_map[cl];
+    s.primitive_topology = primitive_topology;
+    s.has_primitive_topology = true;
+}
+
+inline void update_cmdlist_index_buffer(
+    ID3D12GraphicsCommandList* cl,
+    const D3D12_INDEX_BUFFER_VIEW* view
+) {
+    if (cl == nullptr) return;
+    std::scoped_lock _{g_cmdlist_state_mutex};
+    auto& s = g_cmdlist_state_map[cl];
+    if (view != nullptr) {
+        s.index_buffer_view = *view;
+        s.has_index_buffer = true;
+    } else {
+        s.index_buffer_view = {};
+        s.has_index_buffer = false;
+    }
+}
+
+inline void update_cmdlist_vertex_buffers(
+    ID3D12GraphicsCommandList* cl,
+    UINT start_slot,
+    UINT num_views,
+    const D3D12_VERTEX_BUFFER_VIEW* views
+) {
+    if (cl == nullptr || views == nullptr || num_views == 0) return;
+    std::scoped_lock _{g_cmdlist_state_mutex};
+    auto& s = g_cmdlist_state_map[cl];
+    for (UINT i = 0; i < num_views; ++i) {
+        const UINT slot = start_slot + i;
+        if (slot >= CommandListCorrelationState::MAX_TRACKED_VERTEX_BUFFERS) break;
+        s.vertex_buffer_views[slot] = views[i];
+        s.has_vertex_buffer[slot] = true;
+        s.max_vertex_buffer_slot = std::max(s.max_vertex_buffer_slot, slot + 1);
+    }
+}
+
+inline void update_cmdlist_descriptor_heaps(
+    ID3D12GraphicsCommandList* cl,
+    UINT num_descriptor_heaps,
+    ID3D12DescriptorHeap* const* descriptor_heaps
+) {
+    if (cl == nullptr) return;
+    std::scoped_lock _{g_cmdlist_state_mutex};
+    auto& s = g_cmdlist_state_map[cl];
+    s.descriptor_heaps.fill(nullptr);
+    s.descriptor_heap_count = 0;
+    if (descriptor_heaps == nullptr) return;
+    const UINT count = std::min<UINT>(num_descriptor_heaps, D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES);
+    for (UINT i = 0; i < count; ++i) {
+        s.descriptor_heaps[i] = descriptor_heaps[i];
+        if (descriptor_heaps[i] != nullptr) {
+            s.descriptor_heap_count = i + 1;
+        }
+    }
 }
 
 inline void update_cmdlist_scissor(ID3D12GraphicsCommandList* cl, UINT num_rects, const D3D12_RECT* rects) {
@@ -8602,6 +10262,42 @@ inline void update_cmdlist_root_constants_hash(
     }
 }
 
+inline void update_cmdlist_root_constants_values(
+    ID3D12GraphicsCommandList* cl,
+    bool graphics,
+    UINT root_param,
+    const void* src_data,
+    UINT count,
+    UINT dest_offset
+) {
+    if (cl == nullptr || !root_param_in_range(root_param) || src_data == nullptr || count == 0) {
+        return;
+    }
+    if (dest_offset >= CommandListCorrelationState::MAX_ROOT_CONSTANT_DWORDS) {
+        return;
+    }
+
+    const UINT writable = static_cast<UINT>(
+        CommandListCorrelationState::MAX_ROOT_CONSTANT_DWORDS - dest_offset);
+    const UINT copy_count = std::min(count, writable);
+    if (copy_count == 0) {
+        return;
+    }
+
+    std::scoped_lock _{g_cmdlist_state_mutex};
+    auto& s = g_cmdlist_state_map[cl];
+    auto& values = graphics ? s.last_graphics_root_constants : s.last_compute_root_constants;
+    auto& counts = graphics ? s.last_graphics_root_constants_count : s.last_compute_root_constants_count;
+    std::memcpy(
+        values[root_param].data() + dest_offset,
+        src_data,
+        static_cast<size_t>(copy_count) * sizeof(uint32_t));
+    const UINT end = dest_offset + copy_count;
+    counts[root_param] = static_cast<uint8_t>(std::min<UINT>(
+        CommandListCorrelationState::MAX_ROOT_CONSTANT_DWORDS,
+        std::max<UINT>(counts[root_param], end)));
+}
+
 inline void update_cmdlist_root_cbv_hash(
     ID3D12GraphicsCommandList* cl,
     bool graphics,
@@ -8744,6 +10440,12 @@ inline int cmdlist_eye_bucket(const CommandListCorrelationState& s) {
         return s.last_known_eye_bucket;
     }
     return static_cast<int>(StereoTraceBucket::Unknown);
+}
+
+static int sn2_view_id_from_eye_bucket(int eye_bucket) {
+    if (eye_bucket == 1) return 0;
+    if (eye_bucket == 2) return 1;
+    return -1;
 }
 
 namespace gpu_timestamp_timing {
@@ -8950,6 +10652,7 @@ inline void record_root_bind_event(
     const bool forensics_capturing = forensics.is_capturing_this_frame();
     const bool diagnostics_recording =
         render::D3D12Diagnostics::get().is_enabled() &&
+        !render::D3D12Diagnostics::get().is_lightweight() &&
         (!forensics_enabled || forensics_capturing || stereo_forensics_keep_hook_detail_on_skipped_frames());
     if (!diagnostics_recording && !forensics_capturing) {
         return;
@@ -9251,6 +10954,138 @@ inline int cmdlist_view_id(const CommandListCorrelationState& s) {
     return s.viewport_top_left_x > 1.0f ? 1 : 0;
 }
 
+// True if any SN2 feature that reads per-cmdlist root-bind state (redirects,
+// traces, forensics, snapshots) is enabled at launch. When ANY is on, the
+// root-bind hooks MUST keep doing their per-call bookkeeping. Computed once.
+// True once UEVR is past its fragile D3D12 init race. The composite-shift fix's
+// descriptor-registry/root-bind bookkeeping overhead, if active DURING the init
+// race, prevents UEVR's framework from initializing and the game cleanly exits.
+// Lazy-activating the bookkeeping only AFTER the init race lets init succeed
+// (baseline-like → stable), then enables the fix on the persistent vista. Time
+// from the first call (≈ game D3D12 start). DEFAULT = 5s (lowered from 110s
+// 2026-05-26 for fast iteration); override with UEVR_SN2_FOG_INIT_DELAY_S.
+// NOTE: runs/discover logs from earlier 2026-05-25 used the old 110s default —
+// that is why they kept logging reason=init_race and never reached the loop.
+inline bool sn2_past_init_race() {
+    static const double delay_s = []() {
+        const char* v = std::getenv("UEVR_SN2_FOG_INIT_DELAY_S");
+        if (v == nullptr || v[0] == '\0') return 5.0;
+        char* e = nullptr; const double d = std::strtod(v, &e);
+        return (e != v && d >= 0.0) ? d : 5.0;
+    }();
+    static std::atomic<uint64_t> first{0};
+    const uint64_t now = GetTickCount64();
+    uint64_t expected = 0;
+    first.compare_exchange_strong(expected, now, std::memory_order_relaxed);
+    return (now - first.load(std::memory_order_relaxed)) >= static_cast<uint64_t>(delay_s * 1000.0);
+}
+
+inline bool sn2_rootbind_bookkeeping_required() {
+    // "Other" features need bookkeeping immediately (not affected by the fix).
+    static const bool other_required = []() {
+        auto on = [](const char* n) {
+            const char* v = std::getenv(n);
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        };
+        return on("UEVR_SN2_FOG_SRV_REDIRECT") || on("UEVR_SN2_CONSUMER_SRV_REDIRECT") ||
+               on("UEVR_ENABLE_D3D12_DESCRIPTOR_TABLE_HOOK") ||
+               on("UEVR_SN2_WATER_CHAIN_REDIRECT") || on("UEVR_SN2_WATER_CHAIN_CB_REDIRECT") ||
+               on("UEVR_SN2_WATER_CHAIN_VIEWCB_PATCH") || on("UEVR_SN2_PSO3069_CB_REDIRECT") ||
+               on("UEVR_SN2_PSO3069_DIAG") ||
+               on("UEVR_SN2_SKYATMOS_RIGHT_TABLE_SWAP") || on("UEVR_SN2_SKYATMOS_CB_REDIRECT") ||
+               on("UEVR_SN2_SKYATMOS_SKIP_RIGHT") || on("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE") ||
+               on("UEVR_SN2_PROD_FOG_SNAPSHOT") || on("UEVR_SN2_FOG_VOLUME_SNAPSHOT") ||
+               on("UEVR_STEREO_FORENSICS") || on("UEVR_SN2_RESOURCE_BINDING_LEDGER") ||
+               on("UEVR_SN2_COPYRECT_TABLE_FROM_LEFT") || on("UEVR_SN2_DUPLICATE_SLW_BASEPASS_RIGHT") ||
+               on("UEVR_SN2_UWE_FOG_MIRROR") || on("UEVR_SN2_FOGCONSUMER_SRV_DIAG") ||
+               on("UEVR_SN2_FOG_RIGHT_VOL_REDIRECT") || on("UEVR_SN2_UWE_FOG_COMPUTE_PROBE") ||
+               on("UEVR_SN2_DUPLICATE_UWE_FOG_COMPUTE_RIGHT") || on("UEVR_SN2_FOG_RV_CB_REDIRECT") ||
+               // SN2 per-view LIGHT INJECTION (root-cause attempt): re-issues a
+               // LEFT-eye light-scatter dispatch for the right eye with a
+               // right-eye View CB swap, so view 1's froxel volume gets lit.
+               // Needs per-cmdlist compute root CBVs recorded to find/swap the
+               // View CB. The PROBE alone also needs root state to log it.
+               on("UEVR_SN2_FORCE_PERVIEW_LIGHTINJECT") ||
+               on("UEVR_SN2_PERVIEW_LIGHTINJECT_PROBE") ||
+               on("UEVR_SN2_FOG_RV_COMPOSITE_CB") || on("UEVR_SN2_FOG_VOLUME_XEYE_COPY") ||
+               // StereoScope event ledger needs per-cmdlist root descriptor
+               // tables recorded so emit_draw/emit_dispatch can resolve bindings.
+               on("UEVR_SN2_EVENT_LEDGER") ||
+               // StereoScope live-mutation runtime: needs eye bucket + ps/cs CRC
+               // available at the draw/dispatch sites so skip rules can match.
+               on("UEVR_SN2_LIVE_MUTATE") ||
+               // StereoScope bindless View-UB decoder: needs root CBVs recorded so
+               // it can map the View UB bytes -> bindless index -> fog volume.
+               on("UEVR_SN2_VIEWUB_DECODE") ||
+               // One-level-deeper ViewUB chain scanner: walks bindless CBV
+               // descriptors and maps their bytes to locate the real View UB.
+               on("UEVR_SN2_VIEWUB_CHAIN_SCAN") ||
+               // Root-constant decoder: root constants often carry the first
+               // bindless indirection to the View UB.
+               on("UEVR_SN2_VIEWUB_ROOT_CONSTANT_SCAN") ||
+               // Descriptor-table CBV decoder: some UE bindless layouts bind
+               // the View UB through a descriptor-table CBV rather than a root CBV.
+               on("UEVR_SN2_VIEWUB_TABLE_CBV_SCAN") ||
+               // SN2 right-eye fog FIX (litness LIT->DARK volume copy): needs the
+               // bindless heap + descriptor registry bookkeeping live to resolve and
+               // copy ILS volumes by bindless index.
+               on("UEVR_SN2_VIEWUB_FIX") ||
+               // Focused B9BE2499 bindless fog trace: records the exact CB/root
+               // source location of any value that resolves to an ILS Texture3D.
+               on("UEVR_SN2_BINDLESS_FOG_TRACE") ||
+               // 2026-05-25 fog UV diagnostic: requires the current graphics root
+               // descriptor-table state at the target water/fog draws.
+               on("UEVR_SN2_FOG_UV_TABLE_CB_SCAN") || on("UEVR_SN2_FOG_UV_CB_DIAG") ||
+               on("UEVR_SN2_FOG_COMPOSITE_UV_CB_FIX") ||
+               on("UEVR_SN2_FOG_RESOLVE_RIGHT_XMAX_FIX") ||
+               // 2026-05-26 right-eye View UB viewport-origin work: needs per-cmdlist
+               // graphics root CBVs recorded to find/patch the right View UB.
+               on("UEVR_SN2_PATCH_RIGHT_VIEWRECT") ||
+               on("UEVR_SN2_DUP_USE_CAPTURED_RIGHT_VIEW") ||
+               on("UEVR_SN2_FIX_RIGHT_EYE_UNDERWATER") ||
+               on("UEVR_SN2_RIGHT_VIEW_CAPTURE_DIAG");
+    }();
+    if (other_required) return true;
+    // These fixes lazy-activate ONLY after the init race (see above).
+    static const bool fix_env = []() {
+        auto on = [](const char* n) {
+            const char* v = std::getenv(n);
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        };
+        return on("UEVR_SN2_FOG_RIGHT_COMPOSITE_SHIFT") ||
+            on("UEVR_SN2_FOG_RESOLVE_POST_SHIFT") ||
+            on("UEVR_SN2_FOG_RESOLVE_SHADOW_REDIRECT") ||
+            on("UEVR_SN2_FOG_COMPOSITE_XEYE") ||
+            on("UEVR_SN2_FOG_COMPOSITE_SELF_SHIFT") ||
+            on("UEVR_SN2_FOG_VIEWUB_GATE_FIX") ||
+            on("UEVR_SN2_FOG_RESOLVE_SHADOW_DISCOVER") ||
+            on("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE");
+    }();
+    return fix_env && sn2_past_init_race();
+}
+
+// Whether the high-frequency root-bind hooks (SetGraphics/ComputeRoot*) can
+// fast-passthrough — skipping read_cmdlist_state (global-mutex lock + full state
+// COPY) and all per-call diagnostic bookkeeping. Safe whenever no consumer needs
+// it: i.e. no redirect/trace feature is active (checked once) AND diagnostics are
+// either off (overlay closed) or in lightweight/hunter mode. The heavy DX12
+// Diagnostics / Eye Diff tab puts diagnostics in full (non-lightweight) enabled
+// mode, which correctly disables the passthrough so it still gets bind data.
+inline bool sn2_skip_rootbind_bookkeeping() {
+    // Descriptor substitution needs root-bind state eventually, but enabling the
+    // root-table work during SN2's D3D12 init race prevents UEVR's framework from
+    // stabilizing. Hard-skip all root-bind bookkeeping until the same delayed
+    // activation point used by the composite-shift fix.
+    if (sn2_litness::descriptor_substitute_enabled() && !sn2_past_init_race()) {
+        return true;
+    }
+    if (sn2_rootbind_bookkeeping_required()) {
+        return false;
+    }
+    auto& d = render::D3D12Diagnostics::get();
+    return d.is_lightweight() || !d.is_enabled();
+}
+
 struct BindlessHeapState {
     ID3D12DescriptorHeap* heap{nullptr};
     SIZE_T  cpu_base{0};
@@ -9327,6 +11162,786 @@ inline BindlessHeapRegistry& bindless_heap_registry() {
     return r;
 }
 
+static void sn2_try_snapshot_bound_fog_t5(
+    const CommandListCorrelationState& state,
+    const char* draw_kind,
+    uint32_t ps_crc
+) {
+    if (!sn2_fog_volume_snapshot_enabled()) {
+        return;
+    }
+
+    // This probe is for the SLW water base-pass fog consumer. Avoid scanning
+    // every draw in the frame; when the dimension filter misses, that scan is
+    // expensive enough to make live captures unreliable. Set
+    // UEVR_SN2_FOG_VOLUME_SNAPSHOT_TARGET_PS=0 to opt back into scan-all.
+    static const uint32_t target_ps =
+        env_u32_a("UEVR_SN2_FOG_VOLUME_SNAPSHOT_TARGET_PS", 0xDE7C3822u);
+    if (target_ps != 0 && ps_crc != target_ps) {
+        return;
+    }
+
+    const int eye_bucket = cmdlist_eye_bucket(state);
+    const int view_id = sn2_view_id_from_eye_bucket(eye_bucket);
+    if (view_id < 0 && !env_flag_enabled_a("UEVR_SN2_FOG_VOLUME_SNAPSHOT_UNKNOWN")) {
+        return;
+    }
+
+    for (size_t root = 0; root < state.last_graphics_root_desc_tables.size(); ++root) {
+        const uint64_t table_gpu = state.last_graphics_root_desc_tables[root];
+        if (table_gpu == 0) {
+            continue;
+        }
+
+        SIZE_T cpu_base = 0;
+        UINT stride = 0;
+        if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) {
+            continue;
+        }
+
+        const int scan_slots = std::max(1, env_int_a("UEVR_SN2_FOG_VOLUME_SNAPSHOT_SCAN_SLOTS", 128));
+        for (int slot = 0; slot < scan_slots; ++slot) {
+            const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * static_cast<SIZE_T>(stride);
+            sn2_descriptor_registry::Entry entry{};
+            if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(slot_cpu, entry) ||
+                entry.kind != sn2_descriptor_registry::Kind::SRV ||
+                entry.resource == nullptr ||
+                !entry.has_resource_desc) {
+                continue;
+            }
+
+            const D3D12_RESOURCE_DESC rd = entry.resource_desc;
+            if (!sn2_fog_volume_snapshot::should_capture_desc(rd)) {
+                continue;
+            }
+
+            sn2_fog_volume_snapshot::maybe_queue_desc(entry.resource, rd, "T5", view_id);
+
+            static std::atomic<uint64_t> log_count{0};
+            const auto n = log_count.fetch_add(1, std::memory_order_relaxed);
+            if (n < 64 || (n % 256) == 0) {
+                SPDLOG_WARN(
+                    "[SN2-FogT5Capture] n={} draw={} eye={} view_id={} ps=0x{:08x} root={} slot={} res={:p} dim={}x{}x{} fmt={}",
+                    n + 1,
+                    draw_kind != nullptr ? draw_kind : "?",
+                    eye_bucket,
+                    view_id,
+                    ps_crc,
+                    root,
+                    slot,
+                    (void*)entry.resource,
+                    (int)rd.Width,
+                    (int)rd.Height,
+                    (int)rd.DepthOrArraySize,
+                    (int)rd.Format);
+            }
+            return;
+        }
+    }
+}
+
+namespace sn2_fog_lineage_trace {
+    struct Producer {
+        uint64_t seq{};
+        uint32_t cs_crc{};
+        UINT x{};
+        UINT y{};
+        UINT z{};
+        uint32_t root{};
+        uint32_t slot{};
+        uintptr_t resource{};
+        D3D12_RESOURCE_DESC desc{};
+        D3D12_GPU_VIRTUAL_ADDRESS cbv3{};
+        D3D12_GPU_VIRTUAL_ADDRESS cbv4{};
+    };
+
+    static std::mutex g_mutex;
+    static std::deque<Producer> g_recent_producers;
+    static std::atomic<uint64_t> g_producer_observations{0};
+    static std::atomic<uint64_t> g_producer_logs{0};
+    static std::atomic<uint64_t> g_consumer_logs{0};
+    static std::atomic<uint64_t> g_consumer_draws_seen{0};
+    static std::atomic<uint64_t> g_consumer_draws_scanned{0};
+    static std::atomic<uint64_t> g_consumer_target_filtered{0};
+    static std::atomic<uint64_t> g_consumer_draw_limit_skips{0};
+    static std::atomic<uint64_t> g_consumer_tables_bound{0};
+    static std::atomic<uint64_t> g_consumer_tables_resolved{0};
+    static std::atomic<uint64_t> g_consumer_table_resolve_failed{0};
+    static std::atomic<uint64_t> g_consumer_slots_scanned{0};
+    static std::atomic<uint64_t> g_consumer_descriptor_entries{0};
+    static std::atomic<uint64_t> g_consumer_srv_entries{0};
+    static std::atomic<uint64_t> g_consumer_tex3d_srvs{0};
+    static std::atomic<uint64_t> g_consumer_integrated_srvs{0};
+    static std::atomic<uint64_t> g_consumer_hit_rows{0};
+    static std::atomic<uint64_t> g_last_summary_scanned{0};
+    static std::mutex g_ps_counts_mutex;
+    static std::unordered_map<uint32_t, uint64_t> g_ps_counts;
+
+    bool enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE");
+        return e;
+    }
+
+    int start_after_ms() {
+        static const int v = std::max(0, env_int_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE_START_AFTER_MS", 0));
+        return v;
+    }
+
+    bool armed() {
+        static const ULONGLONG start = GetTickCount64();
+        const int delay = start_after_ms();
+        return delay <= 0 || (GetTickCount64() - start) >= static_cast<ULONGLONG>(delay);
+    }
+
+    int max_rows() {
+        static const int v = std::max(0, env_int_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE_MAX_ROWS", 160));
+        return v;
+    }
+
+    int scan_slots() {
+        static const int v = std::max(1, env_int_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE_SCAN_SLOTS", 96));
+        return v;
+    }
+
+    int producer_scan_slots() {
+        static const int v = std::max(1, env_int_a("UEVR_SN2_FOG_PRODUCER_TEX3D_TRACE_SCAN_SLOTS", scan_slots()));
+        return v;
+    }
+
+    int max_producer_observations() {
+        static const int v = std::max(0, env_int_a("UEVR_SN2_FOG_LINEAGE_PRODUCER_MAX_OBSERVATIONS", 4096));
+        return v;
+    }
+
+    int draw_scan_limit() {
+        static const int v = std::max(0, env_int_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE_DRAW_SCAN_LIMIT", 12000));
+        return v;
+    }
+
+    int summary_interval() {
+        static const int v = std::max(0, env_int_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE_SUMMARY_INTERVAL", 2048));
+        return v;
+    }
+
+    int ps_summary_rows() {
+        static const int v = std::max(1, env_int_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE_PS_SUMMARY_ROWS", 12));
+        return v;
+    }
+
+    uint32_t target_ps_crc() {
+        // 0 means "any PS that binds a matching Texture3D". Keep this broad by
+        // default; the trace is separately capped by draw_scan_limit/max_rows.
+        static const uint32_t v = env_u32_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE_TARGET_PS", 0u);
+        return v;
+    }
+
+    bool is_candidate_tex3d(const D3D12_RESOURCE_DESC& d) {
+        if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+            return false;
+        }
+        if (d.Width < 4 || d.Width > 768) {
+            return false;
+        }
+        if (d.Height < 4 || d.Height > 768) {
+            return false;
+        }
+        if (d.DepthOrArraySize < 2 || d.DepthOrArraySize > 256) {
+            return false;
+        }
+
+        switch (d.Format) {
+        case DXGI_FORMAT_R11G11B10_FLOAT:
+        case DXGI_FORMAT_R32G32_FLOAT:
+        case DXGI_FORMAT_R10G10B10A2_UNORM:
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_UNORM:
+        case DXGI_FORMAT_R16_FLOAT:
+        case DXGI_FORMAT_R32_FLOAT:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    const char* classify_desc(const D3D12_RESOURCE_DESC& d) {
+        if (d.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
+            d.Width <= 16 && d.Height <= 16 && d.DepthOrArraySize >= 16) {
+            return "scatter3d";
+        }
+        if (d.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
+            d.Width >= 40 && d.Width <= 192 &&
+            d.Height >= 20 && d.Height <= 128 &&
+            d.DepthOrArraySize >= 32 && d.DepthOrArraySize <= 96) {
+            return "integrated_light_scattering";
+        }
+        if (d.Width >= 256 || d.Height >= 256) {
+            return "large_3d_lut_or_volume";
+        }
+        return "tex3d";
+    }
+
+    bool is_integrated_light_scattering_desc(const D3D12_RESOURCE_DESC& d) {
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+            d.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
+            d.Width >= 40 && d.Width <= 192 &&
+            d.Height >= 20 && d.Height <= 128 &&
+            d.DepthOrArraySize >= 32 && d.DepthOrArraySize <= 96;
+    }
+
+    int producer_log_rows() {
+        static const int v = std::max(0, env_int_a("UEVR_SN2_FOG_LINEAGE_PRODUCER_LOG_ROWS", 192));
+        return v;
+    }
+
+    bool same_desc(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b) {
+        return a.Dimension == b.Dimension &&
+            a.Format == b.Format &&
+            a.Width == b.Width &&
+            a.Height == b.Height &&
+            a.DepthOrArraySize == b.DepthOrArraySize &&
+            a.MipLevels == b.MipLevels;
+    }
+
+    void note_ps_crc(uint32_t ps_crc) {
+        std::scoped_lock _{g_ps_counts_mutex};
+        ++g_ps_counts[ps_crc];
+    }
+
+    std::string top_ps_summary() {
+        std::vector<std::pair<uint32_t, uint64_t>> rows;
+        {
+            std::scoped_lock _{g_ps_counts_mutex};
+            rows.reserve(g_ps_counts.size());
+            for (const auto& [ps, count] : g_ps_counts) {
+                rows.emplace_back(ps, count);
+            }
+        }
+        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+            if (a.second != b.second) {
+                return a.second > b.second;
+            }
+            return a.first < b.first;
+        });
+
+        std::string out;
+        const int max_rows = ps_summary_rows();
+        for (int i = 0; i < max_rows && i < static_cast<int>(rows.size()); ++i) {
+            if (!out.empty()) {
+                out += " ";
+            }
+            out += fmt::format("0x{:08x}:{}", rows[i].first, rows[i].second);
+        }
+        return out;
+    }
+
+    size_t recent_producer_count() {
+        std::scoped_lock _{g_mutex};
+        return g_recent_producers.size();
+    }
+
+    size_t active_graphics_root_table_count(const CommandListCorrelationState& state) {
+        size_t count = 0;
+        for (const auto table : state.last_graphics_root_desc_tables) {
+            if (table != 0) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    void maybe_log_consumer_summary(
+        const char* reason,
+        const CommandListCorrelationState& state,
+        uint32_t ps_crc,
+        uint64_t scanned,
+        bool force = false
+    ) {
+        const int interval = summary_interval();
+        if (!force && scanned > 4 && (interval <= 0 || (scanned % static_cast<uint64_t>(interval)) != 0)) {
+            return;
+        }
+
+        const uint64_t previous = g_last_summary_scanned.exchange(scanned, std::memory_order_relaxed);
+        if (!force && previous == scanned) {
+            return;
+        }
+
+        SPDLOG_WARN(
+            "[SN2-FogLineageSummary] reason={} seen={} scanned={} target_filtered={} draw_limit_skips={} producer_obs={} producer_logs={} recent_producers={} consumer_rows={} hit_rows={} tables_bound={} tables_resolved={} table_resolve_failed={} slots_scanned={} descriptor_entries={} srv_entries={} tex3d_srvs={} integrated_srvs={} current_ps=0x{:08x} root_sig=0x{:x} active_root_tables={} heap_count={} descriptor_registry={} top_ps=\"{}\"",
+            reason != nullptr ? reason : "?",
+            g_consumer_draws_seen.load(std::memory_order_relaxed),
+            g_consumer_draws_scanned.load(std::memory_order_relaxed),
+            g_consumer_target_filtered.load(std::memory_order_relaxed),
+            g_consumer_draw_limit_skips.load(std::memory_order_relaxed),
+            g_producer_observations.load(std::memory_order_relaxed),
+            g_producer_logs.load(std::memory_order_relaxed),
+            recent_producer_count(),
+            g_consumer_logs.load(std::memory_order_relaxed),
+            g_consumer_hit_rows.load(std::memory_order_relaxed),
+            g_consumer_tables_bound.load(std::memory_order_relaxed),
+            g_consumer_tables_resolved.load(std::memory_order_relaxed),
+            g_consumer_table_resolve_failed.load(std::memory_order_relaxed),
+            g_consumer_slots_scanned.load(std::memory_order_relaxed),
+            g_consumer_descriptor_entries.load(std::memory_order_relaxed),
+            g_consumer_srv_entries.load(std::memory_order_relaxed),
+            g_consumer_tex3d_srvs.load(std::memory_order_relaxed),
+            g_consumer_integrated_srvs.load(std::memory_order_relaxed),
+            ps_crc,
+            state.last_graphics_root_signature,
+            active_graphics_root_table_count(state),
+            bindless_heap_registry().count(),
+            sn2_descriptor_registry::registry_size(),
+            top_ps_summary());
+    }
+
+    bool resolve_descriptor(
+        uint64_t table_gpu,
+        UINT slot,
+        sn2_descriptor_registry::Entry& out
+    ) {
+        if (table_gpu == 0) {
+            return false;
+        }
+        SIZE_T cpu_base = 0;
+        UINT stride = 0;
+        if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) {
+            return false;
+        }
+        const SIZE_T cpu = cpu_base + static_cast<SIZE_T>(slot) * static_cast<SIZE_T>(stride);
+        return sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(cpu, out);
+    }
+
+    void note_compute_tex3d(
+        uint64_t seq,
+        uint32_t cs_crc,
+        UINT x,
+        UINT y,
+        UINT z,
+        uint32_t root,
+        uint32_t slot,
+        ID3D12Resource* resource,
+        const D3D12_RESOURCE_DESC& desc,
+        D3D12_GPU_VIRTUAL_ADDRESS cbv3,
+        D3D12_GPU_VIRTUAL_ADDRESS cbv4
+    ) {
+        if (!enabled() || resource == nullptr || !is_candidate_tex3d(desc)) {
+            return;
+        }
+
+        const int obs_cap = max_producer_observations();
+        const auto obs = g_producer_observations.fetch_add(1, std::memory_order_relaxed);
+        if (obs_cap > 0 && obs >= static_cast<uint64_t>(obs_cap)) {
+            return;
+        }
+
+        Producer p{};
+        p.seq = seq;
+        p.cs_crc = cs_crc;
+        p.x = x;
+        p.y = y;
+        p.z = z;
+        p.root = root;
+        p.slot = slot;
+        p.resource = reinterpret_cast<uintptr_t>(resource);
+        p.desc = desc;
+        p.cbv3 = cbv3;
+        p.cbv4 = cbv4;
+
+        {
+            std::scoped_lock _{g_mutex};
+            g_recent_producers.push_back(p);
+            while (g_recent_producers.size() > 256) {
+                g_recent_producers.pop_front();
+            }
+        }
+
+        const auto n = g_producer_logs.fetch_add(1, std::memory_order_relaxed);
+        if (n < static_cast<uint64_t>(producer_log_rows())) {
+            SPDLOG_WARN(
+                "[SN2-FogLineageProducer] n={} seq={} cs=0x{:08x} root={} slot={} res=0x{:x} class={} dim={}x{}x{} fmt={} dispatch={}x{}x{} cbv3=0x{:x} cbv4=0x{:x}",
+                n + 1,
+                seq,
+                cs_crc,
+                root,
+                slot,
+                p.resource,
+                classify_desc(desc),
+                static_cast<unsigned>(desc.Width),
+                desc.Height,
+                desc.DepthOrArraySize,
+                static_cast<unsigned>(desc.Format),
+                x,
+                y,
+                z,
+                cbv3,
+                cbv4);
+        }
+    }
+
+    void find_match(uintptr_t resource, const D3D12_RESOURCE_DESC& desc, Producer& exact, Producer& desc_match) {
+        std::scoped_lock _{g_mutex};
+        for (auto it = g_recent_producers.rbegin(); it != g_recent_producers.rend(); ++it) {
+            if (exact.resource == 0 && it->resource == resource) {
+                exact = *it;
+            }
+            if (desc_match.resource == 0 && same_desc(it->desc, desc)) {
+                desc_match = *it;
+            }
+            if (exact.resource != 0 && desc_match.resource != 0) {
+                break;
+            }
+        }
+    }
+
+    void trace_compute_srv_consumers(
+        const CommandListCorrelationState& state,
+        uint32_t cs_crc,
+        UINT x,
+        UINT y,
+        UINT z
+    ) {
+        if (g_consumer_logs.load(std::memory_order_relaxed) >= static_cast<uint64_t>(max_rows())) {
+            return;
+        }
+
+        const int max_slots = producer_scan_slots();
+        int per_dispatch_hits = 0;
+        static const bool log_unmatched =
+            env_flag_enabled_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE_LOG_UNMATCHED");
+
+        for (size_t root = 0; root < state.last_compute_root_desc_tables.size(); ++root) {
+            const uint64_t table = state.last_compute_root_desc_tables[root];
+            if (table == 0) {
+                continue;
+            }
+
+            for (int slot = 0; slot < max_slots; ++slot) {
+                sn2_descriptor_registry::Entry entry{};
+                if (!resolve_descriptor(table, static_cast<UINT>(slot), entry) ||
+                    entry.kind != sn2_descriptor_registry::Kind::SRV ||
+                    entry.resource == nullptr ||
+                    !entry.has_resource_desc ||
+                    !is_candidate_tex3d(entry.resource_desc)) {
+                    continue;
+                }
+
+                Producer exact{};
+                Producer desc_match{};
+                const uintptr_t resource = reinterpret_cast<uintptr_t>(entry.resource);
+                find_match(resource, entry.resource_desc, exact, desc_match);
+
+                const char* match = "none";
+                const Producer* producer = nullptr;
+                if (exact.resource != 0) {
+                    match = "exact";
+                    producer = &exact;
+                } else if (desc_match.resource != 0) {
+                    match = "same_desc";
+                    producer = &desc_match;
+                }
+
+                const bool is_integrated_light_scattering = is_integrated_light_scattering_desc(entry.resource_desc);
+                if (producer == nullptr && !log_unmatched && !is_integrated_light_scattering) {
+                    continue;
+                }
+
+                int tracked_view = -1;
+                sn2_fog_srv_map::Entry srv_entry{};
+                if (sn2_fog_srv_map::lookup_by_resource(entry.resource, srv_entry)) {
+                    tracked_view = srv_entry.view_id;
+                } else {
+                    sn2_fog_uav_map::Entry uav_entry{};
+                    if (sn2_fog_uav_map::lookup_by_resource(entry.resource, uav_entry)) {
+                        tracked_view = uav_entry.view_id;
+                    }
+                }
+
+                const auto row = g_consumer_logs.fetch_add(1, std::memory_order_relaxed);
+                if (row < static_cast<uint64_t>(max_rows())) {
+                    SPDLOG_WARN(
+                        "[SN2-FogLineageComputeConsumer] row={} cs=0x{:08x} eye={} view={} root={} slot={} res=0x{:x} class={} dim={}x{}x{} fmt={} tracked_view={} desc_gen={} match={} prod_seq={} prod_cs=0x{:08x} prod_res=0x{:x} prod_root={} prod_slot={} prod_dispatch={}x{}x{} cbv3=0x{:x} cbv4=0x{:x} dispatch={}x{}x{}",
+                        row + 1,
+                        cs_crc,
+                        cmdlist_eye_bucket(state),
+                        sn2_view_id_from_eye_bucket(cmdlist_eye_bucket(state)),
+                        static_cast<unsigned>(root),
+                        slot,
+                        resource,
+                        classify_desc(entry.resource_desc),
+                        static_cast<unsigned>(entry.resource_desc.Width),
+                        entry.resource_desc.Height,
+                        entry.resource_desc.DepthOrArraySize,
+                        static_cast<unsigned>(entry.resource_desc.Format),
+                        tracked_view,
+                        entry.generation,
+                        match,
+                        producer != nullptr ? producer->seq : 0,
+                        producer != nullptr ? producer->cs_crc : 0,
+                        producer != nullptr ? producer->resource : 0,
+                        producer != nullptr ? producer->root : 0,
+                        producer != nullptr ? producer->slot : 0,
+                        producer != nullptr ? producer->x : 0,
+                        producer != nullptr ? producer->y : 0,
+                        producer != nullptr ? producer->z : 0,
+                        state.last_compute_root_cbv[3],
+                        state.last_compute_root_cbv[4],
+                        x,
+                        y,
+                        z);
+                }
+
+                ++per_dispatch_hits;
+                if (per_dispatch_hits >= 8) {
+                    g_consumer_hit_rows.fetch_add(static_cast<uint64_t>(per_dispatch_hits), std::memory_order_relaxed);
+                    return;
+                }
+            }
+        }
+
+        if (per_dispatch_hits > 0) {
+            g_consumer_hit_rows.fetch_add(static_cast<uint64_t>(per_dispatch_hits), std::memory_order_relaxed);
+        }
+    }
+
+    void trace_compute_dispatch(
+        const CommandListCorrelationState& state,
+        uint32_t cs_crc,
+        UINT x,
+        UINT y,
+        UINT z
+    ) {
+        if (!enabled() || !armed() || cs_crc == 0) {
+            return;
+        }
+
+        static std::atomic<uint64_t> seq_source{0};
+        const uint64_t seq = seq_source.fetch_add(1, std::memory_order_relaxed) + 1;
+        const int max_slots = producer_scan_slots();
+        int per_dispatch_hits = 0;
+        bool stop_producer_scan = false;
+
+        for (size_t root = 0; root < state.last_compute_root_desc_tables.size() && !stop_producer_scan; ++root) {
+            const uint64_t table = state.last_compute_root_desc_tables[root];
+            if (table == 0) {
+                continue;
+            }
+            for (int slot = 0; slot < max_slots; ++slot) {
+                sn2_descriptor_registry::Entry entry{};
+                if (!resolve_descriptor(table, static_cast<UINT>(slot), entry) ||
+                    entry.kind != sn2_descriptor_registry::Kind::UAV ||
+                    entry.resource == nullptr ||
+                    !entry.has_resource_desc ||
+                    !is_candidate_tex3d(entry.resource_desc)) {
+                    continue;
+                }
+
+                note_compute_tex3d(
+                    seq,
+                    cs_crc,
+                    x,
+                    y,
+                    z,
+                    static_cast<uint32_t>(root),
+                    static_cast<uint32_t>(slot),
+                    entry.resource,
+                    entry.resource_desc,
+                    state.last_compute_root_cbv[3],
+                    state.last_compute_root_cbv[4]);
+
+                ++per_dispatch_hits;
+                if (per_dispatch_hits >= 8) {
+                    stop_producer_scan = true;
+                    break;
+                }
+            }
+        }
+
+        trace_compute_srv_consumers(state, cs_crc, x, y, z);
+    }
+
+    void trace_consumer_draw(
+        const CommandListCorrelationState& state,
+        const char* draw_kind,
+        uint32_t ps_crc,
+        UINT a0,
+        UINT a1,
+        UINT a2,
+        INT a3,
+        UINT a4
+    ) {
+        if (!enabled() || !armed()) {
+            return;
+        }
+        if (g_consumer_logs.load(std::memory_order_relaxed) >= static_cast<uint64_t>(max_rows())) {
+            return;
+        }
+
+        g_consumer_draws_seen.fetch_add(1, std::memory_order_relaxed);
+
+        const uint32_t target = target_ps_crc();
+        if (target != 0 && (ps_crc == 0 || ps_crc != target)) {
+            g_consumer_target_filtered.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        const auto scanned = g_consumer_draws_scanned.fetch_add(1, std::memory_order_relaxed) + 1;
+        const int limit = draw_scan_limit();
+        if (limit > 0 && scanned > static_cast<uint64_t>(limit)) {
+            g_consumer_draw_limit_skips.fetch_add(1, std::memory_order_relaxed);
+            if (scanned == static_cast<uint64_t>(limit) + 1) {
+                maybe_log_consumer_summary("draw_limit", state, ps_crc, scanned, true);
+            }
+            return;
+        }
+        note_ps_crc(ps_crc);
+
+        const int eye_bucket = cmdlist_eye_bucket(state);
+        const int view_id = sn2_view_id_from_eye_bucket(eye_bucket);
+        const int max_slots = scan_slots();
+        int per_draw_hits = 0;
+        uint64_t local_tables_bound = 0;
+        uint64_t local_tables_resolved = 0;
+        uint64_t local_table_resolve_failed = 0;
+        uint64_t local_slots_scanned = 0;
+        uint64_t local_descriptor_entries = 0;
+        uint64_t local_srv_entries = 0;
+        uint64_t local_tex3d_srvs = 0;
+        uint64_t local_integrated_srvs = 0;
+
+        const auto commit_counters = [&]() {
+            if (local_tables_bound) g_consumer_tables_bound.fetch_add(local_tables_bound, std::memory_order_relaxed);
+            if (local_tables_resolved) g_consumer_tables_resolved.fetch_add(local_tables_resolved, std::memory_order_relaxed);
+            if (local_table_resolve_failed) g_consumer_table_resolve_failed.fetch_add(local_table_resolve_failed, std::memory_order_relaxed);
+            if (local_slots_scanned) g_consumer_slots_scanned.fetch_add(local_slots_scanned, std::memory_order_relaxed);
+            if (local_descriptor_entries) g_consumer_descriptor_entries.fetch_add(local_descriptor_entries, std::memory_order_relaxed);
+            if (local_srv_entries) g_consumer_srv_entries.fetch_add(local_srv_entries, std::memory_order_relaxed);
+            if (local_tex3d_srvs) g_consumer_tex3d_srvs.fetch_add(local_tex3d_srvs, std::memory_order_relaxed);
+            if (local_integrated_srvs) g_consumer_integrated_srvs.fetch_add(local_integrated_srvs, std::memory_order_relaxed);
+        };
+
+        for (size_t root = 0; root < state.last_graphics_root_desc_tables.size(); ++root) {
+            const uint64_t table_gpu = state.last_graphics_root_desc_tables[root];
+            if (table_gpu == 0) {
+                continue;
+            }
+            ++local_tables_bound;
+
+            SIZE_T cpu_base = 0;
+            UINT stride = 0;
+            if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) {
+                ++local_table_resolve_failed;
+                continue;
+            }
+            ++local_tables_resolved;
+            local_slots_scanned += static_cast<uint64_t>(max_slots);
+
+            for (int slot = 0; slot < max_slots; ++slot) {
+                const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * static_cast<SIZE_T>(stride);
+                sn2_descriptor_registry::Entry entry{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(slot_cpu, entry)) {
+                    continue;
+                }
+                ++local_descriptor_entries;
+                if (entry.kind != sn2_descriptor_registry::Kind::SRV) {
+                    continue;
+                }
+                ++local_srv_entries;
+                if (entry.resource == nullptr ||
+                    !entry.has_resource_desc ||
+                    !is_candidate_tex3d(entry.resource_desc)) {
+                    continue;
+                }
+                ++local_tex3d_srvs;
+                if (is_integrated_light_scattering_desc(entry.resource_desc)) {
+                    ++local_integrated_srvs;
+                }
+
+                Producer exact{};
+                Producer desc_match{};
+                const uintptr_t resource = reinterpret_cast<uintptr_t>(entry.resource);
+                find_match(resource, entry.resource_desc, exact, desc_match);
+                int tracked_view = -1;
+                sn2_fog_srv_map::Entry srv_entry{};
+                if (sn2_fog_srv_map::lookup_by_resource(entry.resource, srv_entry)) {
+                    tracked_view = srv_entry.view_id;
+                } else {
+                    sn2_fog_uav_map::Entry uav_entry{};
+                    if (sn2_fog_uav_map::lookup_by_resource(entry.resource, uav_entry)) {
+                        tracked_view = uav_entry.view_id;
+                    }
+                }
+
+                const char* match = "none";
+                const Producer* producer = nullptr;
+                if (exact.resource != 0) {
+                    match = "exact";
+                    producer = &exact;
+                } else if (desc_match.resource != 0) {
+                    match = "same_desc";
+                    producer = &desc_match;
+                }
+
+                static const bool log_unmatched =
+                    env_flag_enabled_a("UEVR_SN2_FOG_CONSUMER_TEX3D_TRACE_LOG_UNMATCHED");
+                const bool is_integrated_light_scattering = is_integrated_light_scattering_desc(entry.resource_desc);
+                if (producer == nullptr && !log_unmatched && !is_integrated_light_scattering) {
+                    continue;
+                }
+
+                const auto row = g_consumer_logs.fetch_add(1, std::memory_order_relaxed);
+                if (row < static_cast<uint64_t>(max_rows())) {
+                    SPDLOG_WARN(
+                        "[SN2-FogLineageConsumer] row={} draw={} ps=0x{:08x} eye={} view={} root={} slot={} res=0x{:x} class={} dim={}x{}x{} fmt={} tracked_view={} desc_gen={} match={} prod_seq={} prod_cs=0x{:08x} prod_res=0x{:x} prod_root={} prod_slot={} prod_dispatch={}x{}x{} cbv4=0x{:x} cbv5=0x{:x} args=({}, {}, {}, {}, {})",
+                        row + 1,
+                        draw_kind != nullptr ? draw_kind : "?",
+                        ps_crc,
+                        eye_bucket,
+                        view_id,
+                        static_cast<unsigned>(root),
+                        slot,
+                        resource,
+                        classify_desc(entry.resource_desc),
+                        static_cast<unsigned>(entry.resource_desc.Width),
+                        entry.resource_desc.Height,
+                        entry.resource_desc.DepthOrArraySize,
+                        static_cast<unsigned>(entry.resource_desc.Format),
+                        tracked_view,
+                        entry.generation,
+                        match,
+                        producer != nullptr ? producer->seq : 0,
+                        producer != nullptr ? producer->cs_crc : 0,
+                        producer != nullptr ? producer->resource : 0,
+                        producer != nullptr ? producer->root : 0,
+                        producer != nullptr ? producer->slot : 0,
+                        producer != nullptr ? producer->x : 0,
+                        producer != nullptr ? producer->y : 0,
+                        producer != nullptr ? producer->z : 0,
+                        state.last_graphics_root_cbv[4],
+                        state.last_graphics_root_cbv[5],
+                        a0,
+                        a1,
+                        a2,
+                        a3,
+                        a4);
+                }
+
+                ++per_draw_hits;
+                if (per_draw_hits >= 8) {
+                    g_consumer_hit_rows.fetch_add(static_cast<uint64_t>(per_draw_hits), std::memory_order_relaxed);
+                    commit_counters();
+                    maybe_log_consumer_summary("hit_limit", state, ps_crc, scanned, true);
+                    return;
+                }
+            }
+        }
+        if (per_draw_hits > 0) {
+            g_consumer_hit_rows.fetch_add(static_cast<uint64_t>(per_draw_hits), std::memory_order_relaxed);
+        }
+        commit_counters();
+        maybe_log_consumer_summary("periodic", state, ps_crc, scanned, false);
+    }
+} // namespace sn2_fog_lineage_trace
+
 struct SamplerHeapState {
     ID3D12DescriptorHeap* heap{nullptr};
     SIZE_T  cpu_base{0};
@@ -9362,7 +11977,10 @@ namespace sn2_fog_compute {
     static std::atomic<uint64_t> g_replay_seq{0};
 
     bool enabled() {
-        return sn2_fog_compute_diag_enabled() || sn2_fog_compute_replay_mode() != 0;
+        return sn2_fog_compute_diag_enabled() ||
+            sn2_fog_compute_replay_mode() != 0 ||
+            sn2_fog_lineage_trace::enabled() ||
+            sn2_fog_xeye::enabled();
     }
 
     const char* name(uint32_t crc) {
@@ -9391,6 +12009,66 @@ namespace sn2_fog_compute {
         default:
             return false;
         }
+    }
+
+    struct ResolvedComputeSlot {
+        ID3D12Resource* resource{};
+        D3D12_RESOURCE_DESC desc{};
+        sn2_descriptor_registry::Kind kind{};
+        bool valid{};
+    };
+
+    ResolvedComputeSlot resolve_compute_slot(uint64_t table_gpu, UINT slot) {
+        ResolvedComputeSlot out{};
+        if (table_gpu == 0) {
+            return out;
+        }
+
+        SIZE_T cpu_base = 0;
+        UINT stride = 0;
+        if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) {
+            return out;
+        }
+
+        const SIZE_T cpu = cpu_base + static_cast<SIZE_T>(slot) * stride;
+        sn2_descriptor_registry::Entry entry{};
+        if (sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(cpu, entry) &&
+            entry.resource != nullptr &&
+            entry.has_resource_desc) {
+            out.resource = entry.resource;
+            out.desc = entry.resource_desc;
+            out.kind = entry.kind;
+            out.valid = true;
+        }
+        return out;
+    }
+
+    std::string compute_slot_summary(const char* prefix, uint64_t table_gpu, std::initializer_list<UINT> slots) {
+        std::string out;
+        for (const UINT slot : slots) {
+            const auto info = resolve_compute_slot(table_gpu, slot);
+            if (!info.valid) {
+                continue;
+            }
+            char tmp[192]{};
+            std::snprintf(
+                tmp,
+                sizeof(tmp),
+                " %s%u=res0x%llx dim%d fmt%d %ux%ux%u",
+                prefix != nullptr ? prefix : "s",
+                slot,
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(info.resource)),
+                static_cast<int>(info.desc.Dimension),
+                static_cast<int>(info.desc.Format),
+                static_cast<unsigned>(info.desc.Width),
+                info.desc.Height,
+                info.desc.DepthOrArraySize);
+            out += tmp;
+            if (out.size() > 1200) {
+                break;
+            }
+        }
+        return out;
     }
 
     bool should_capture_left_tail(uint32_t crc) {
@@ -9451,12 +12129,133 @@ namespace sn2_fog_compute {
         UINT y,
         UINT z
     ) {
-        if (!enabled() || command_list == nullptr || state.current_pso == nullptr || !is_fog_chain_crc(cs_crc)) {
+        if (!enabled() || command_list == nullptr || state.current_pso == nullptr) {
+            return;
+        }
+        const bool xeye_on = sn2_fog_xeye::enabled();
+        if (!xeye_on && !is_fog_chain_crc(cs_crc)) {
             return;
         }
 
         const int view_id = cmdlist_view_id(state);
         const auto seq = g_seen_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        static const bool prod_fog_snapshot = env_flag_enabled_a("UEVR_SN2_PROD_FOG_SNAPSHOT");
+        const bool trace_on = sn2_fog_lineage_trace::enabled() && sn2_fog_lineage_trace::armed();
+        if (trace_on || prod_fog_snapshot || xeye_on) {
+            int dispatch_fog_eye = -2;
+            bool dispatch_fog_eye_consumed = false;
+            auto fog_eye_for_dispatch = [&]() {
+                if (!dispatch_fog_eye_consumed) {
+                    dispatch_fog_eye = sn2_consume_queued_fog_view();
+                    if (dispatch_fog_eye != 0 && dispatch_fog_eye != 1) {
+                        dispatch_fog_eye = sn2_get_current_fog_view();
+                    }
+                    dispatch_fog_eye_consumed = true;
+                    static std::atomic<uint64_t> eye_log{0};
+                    const auto n = eye_log.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= 64 || (n % 1200) == 0) {
+                        SPDLOG_WARN(
+                            "[SN2-FogXEye] dispatch-eye cs=0x{:08x} eye={} queued_left={} dispatch={}x{}x{} n={}",
+                            cs_crc,
+                            dispatch_fog_eye,
+                            sn2_queued_fog_view_count(),
+                            x,
+                            y,
+                            z,
+                            n);
+                    }
+                }
+                return dispatch_fog_eye;
+            };
+            const auto note_root = [&](uint32_t root, std::initializer_list<UINT> slots) {
+                if (root >= state.last_compute_root_desc_tables.size()) {
+                    return;
+                }
+                const uint64_t table = state.last_compute_root_desc_tables[root];
+                if (table == 0) {
+                    return;
+                }
+                for (const UINT slot : slots) {
+                    const auto info = resolve_compute_slot(table, slot);
+                    if (!info.valid || info.resource == nullptr) {
+                        continue;
+                    }
+                    if (trace_on) {
+                        sn2_fog_lineage_trace::note_compute_tex3d(
+                            seq,
+                            cs_crc,
+                            x,
+                            y,
+                            z,
+                            root,
+                            slot,
+                            info.resource,
+                            info.desc,
+                            state.last_compute_root_cbv[3],
+                            state.last_compute_root_cbv[4]);
+                    }
+                    // Eye-attributed PRODUCER snapshot. The consumer reads the
+                    // fog volume via the bindless View UB (not a root-table SRV),
+                    // so the producer's UAV write is the only place we can grab
+                    // view0's vs view1's volume content with an eye label. This
+                    // answers the linchpin question: is view1's froxel volume
+                    // already black/garbage at the producer, or does it go bad
+                    // downstream? Capped per eye; correlate the n<seq> in the
+                    // filename with the [SN2-ProdFogSnap]/producer-trace seq.
+                    // Eye comes from the volumetric-fog per-view hook
+                    // (g_sn2_current_fog_view), NOT the viewport: fog compute
+                    // runs in the RDG compute phase before any per-view draw
+                    // sets a viewport, so cmdlist_view_id() is -1 here. Requires
+                    // UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_PER_VIEW_HOOK=1.
+                    const bool xeye_ils_uav =
+                        xeye_on &&
+                        info.kind == sn2_descriptor_registry::Kind::UAV &&
+                        sn2_fog_xeye::is_ils_volume(info.desc);
+                    if (xeye_ils_uav) {
+                        const int fog_eye = fog_eye_for_dispatch();
+                        if (fog_eye != 0 && fog_eye != 1) {
+                            continue;
+                        }
+                        char source[64]{};
+                        std::snprintf(
+                            source,
+                            sizeof(source),
+                            "ComputeRoot cs=0x%08x r%u.s%u",
+                            cs_crc,
+                            root,
+                            slot);
+                        sn2_fog_xeye::note_resource(source, fog_eye, info.resource, &info.desc);
+                        sn2_fog_xeye::note_compute_resource(cs_crc, root, slot, fog_eye, info.resource, info.desc);
+                    }
+                    if (prod_fog_snapshot &&
+                        sn2_fog_lineage_trace::is_integrated_light_scattering_desc(info.desc)) {
+                        const int fog_eye = fog_eye_for_dispatch();
+                        if (fog_eye != 0 && fog_eye != 1) {
+                            continue;
+                        }
+                        static std::atomic<int> l_cnt{0};
+                        static std::atomic<int> r_cnt{0};
+                        static const int cap = std::max(1, env_int_a("UEVR_SN2_PROD_FOG_SNAPSHOT_MAX_PER_EYE", 8));
+                        const int n = (fog_eye == 0 ? l_cnt : r_cnt).fetch_add(1, std::memory_order_relaxed);
+                        if (n < cap) {
+                            sn2_rt_snapshot::queue_intent_named(
+                                info.resource, "PRODFOG",
+                                fog_eye == 0 ? 'L' : 'R', seq);
+                            SPDLOG_WARN(
+                                "[SN2-ProdFogSnap] queued eye={} seq={} cs=0x{:08x} res=0x{:x} dim={}x{}x{} dispatch={}x{}x{} vp_view={}",
+                                fog_eye == 0 ? 'L' : 'R', seq, cs_crc,
+                                reinterpret_cast<uintptr_t>(info.resource),
+                                static_cast<unsigned>(info.desc.Width), info.desc.Height,
+                                info.desc.DepthOrArraySize, x, y, z, view_id);
+                        }
+                    }
+                }
+            };
+            note_root(0, {0, 1, 2, 3, 4, 5, 6, 7});
+            note_root(1, {0, 1, 2, 3});
+            note_root(2, {0, 1, 2, 3, 4, 5, 6, 7});
+            note_root(3, {0, 1, 2, 3});
+        }
         if (view_id == 0 && should_capture_left_tail(cs_crc)) {
             CapturedPass pass{};
             pass.pso = reinterpret_cast<ID3D12PipelineState*>(state.current_pso);
@@ -9473,8 +12272,20 @@ namespace sn2_fog_compute {
             static std::atomic<uint64_t> log_count{0};
             const auto n = log_count.fetch_add(1, std::memory_order_relaxed);
             if (n < 160 || (n % 900) == 0) {
+                const std::string root0_slots = compute_slot_summary(
+                    "r0s",
+                    state.last_compute_root_desc_tables[0],
+                    {0, 1, 2, 3, 4, 5, 6, 7});
+                const std::string root1_slots = compute_slot_summary(
+                    "r1s",
+                    state.last_compute_root_desc_tables[1],
+                    {0, 1, 2, 3});
+                const std::string root2_slots = compute_slot_summary(
+                    "r2s",
+                    state.last_compute_root_desc_tables[2],
+                    {0, 1, 2, 3});
                 SPDLOG_WARN(
-                    "[SN2-FogCompute] seq={} view={} crc=0x{:08x} {} pso={:p} root_sig=0x{:x} dispatch={}x{}x{} rt0=0x{:x} rt1=0x{:x} rt2=0x{:x} rt3=0x{:x} cbv1=0x{:x} cbv2=0x{:x} cbv3=0x{:x} cbv4=0x{:x}",
+                    "[SN2-FogCompute] seq={} view={} crc=0x{:08x} {} pso={:p} root_sig=0x{:x} dispatch={}x{}x{} rt0=0x{:x} rt1=0x{:x} rt2=0x{:x} rt3=0x{:x} cbv1=0x{:x} cbv2=0x{:x} cbv3=0x{:x} cbv4=0x{:x} slots:{}{}{}",
                     seq,
                     view_id,
                     cs_crc,
@@ -9491,7 +12302,10 @@ namespace sn2_fog_compute {
                     state.last_compute_root_cbv[1],
                     state.last_compute_root_cbv[2],
                     state.last_compute_root_cbv[3],
-                    state.last_compute_root_cbv[4]);
+                    state.last_compute_root_cbv[4],
+                    root0_slots.empty() ? " r0(none)" : root0_slots.c_str(),
+                    root1_slots.empty() ? " r1(none)" : root1_slots.c_str(),
+                    root2_slots.empty() ? " r2(none)" : root2_slots.c_str());
             }
         }
     }
@@ -9709,6 +12523,2332 @@ inline void clear_cmdlist_state(ID3D12GraphicsCommandList* cl) {
 }
 } // namespace
 
+// === StereoScope event ledger emit (2026-05-25) ============================
+// Defined OUTSIDE the unnamed namespace, in the GLOBAL sn2_event_ledger (so the
+// call sites' qualified `sn2_event_ledger::emit_draw` are unambiguous). The
+// file-scope helpers it uses — bindless_heap_registry(), sn2_descriptor_registry,
+// cmdlist_eye_bucket(), sn2_rt_snapshot's frame counter, CommandListCorrelationState
+// — all live in the unnamed namespace above, which is reachable here by ordinary
+// unqualified lookup. Additive + read-only: scans the already-recorded root
+// descriptor tables and writes one JSON line. Never mutates D3D12 state.
+namespace sn2_event_ledger {
+    // Scan up to 2 root tables x first 32 slots of `tables`, resolve each slot
+    // via the descriptor registry, and append SRV bindings -> `inputs`,
+    // UAV bindings -> `outputs` (compact JSON binding objects, comma-joined).
+    inline void scan_root_tables(const CommandListCorrelationState::RootSlotArray& tables,
+                                 std::string& inputs, std::string& outputs) {
+        int scanned_tables = 0;
+        const size_t ntab = tables.size();
+        for (size_t root = 0; root < ntab && scanned_tables < 2; ++root) {
+            const uint64_t table_gpu = tables[root];
+            if (table_gpu == 0) continue;
+            SIZE_T cpu_base = 0; UINT stride = 0;
+            if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) {
+                continue;
+            }
+            ++scanned_tables;
+            for (int slot = 0; slot < 32; ++slot) {
+                const SIZE_T scpu = cpu_base + static_cast<SIZE_T>(slot) * static_cast<SIZE_T>(stride);
+                sn2_descriptor_registry::Entry e{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(scpu, e)) continue;
+                if (e.resource == nullptr || !e.has_resource_desc) continue;
+                if (e.kind == sn2_descriptor_registry::Kind::SRV) {
+                    if (!inputs.empty()) inputs += ",";
+                    append_binding(inputs, slot, 't', slot, e.resource, e.resource_desc);
+                } else if (e.kind == sn2_descriptor_registry::Kind::UAV) {
+                    if (!outputs.empty()) outputs += ",";
+                    append_binding(outputs, slot, 'u', slot, e.resource, e.resource_desc);
+                }
+            }
+        }
+    }
+
+    inline uint64_t current_frame() {
+        return sn2_rt_snapshot::g_frame_counter.load(std::memory_order_relaxed);
+    }
+
+    inline void append_f32(std::string& out, float v) {
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "%.3f", static_cast<double>(v));
+        out += buf;
+    }
+
+    template <typename ArrayT>
+    inline void append_root_array_hex(std::string& out, const ArrayT& values, size_t max_count) {
+        out += "[";
+        const size_t n = std::min(values.size(), max_count);
+        for (size_t i = 0; i < n; ++i) {
+            if (i != 0) out += ",";
+            out += "\"";
+            append_hex64(out, static_cast<uint64_t>(values[i]));
+            out += "\"";
+        }
+        out += "]";
+    }
+
+    inline std::string draw_extra_json(const CommandListCorrelationState& s,
+                                       uint32_t vs_crc,
+                                       uint32_t gs_crc,
+                                       uint32_t ps_crc,
+                                       uint32_t index_count,
+                                       uint32_t instance_count,
+                                       uint32_t start_index,
+                                       int32_t base_vertex,
+                                       uint32_t start_instance,
+                                       uintptr_t callsite) {
+        std::string extra;
+        extra.reserve(1400);
+        extra += "\"src\":";
+        append_json_string(extra, sn2_rdoc_tags::format_rva(callsite));
+        extra += ",\"vs_crc\":\"";
+        if (vs_crc != 0) append_hex32(extra, vs_crc);
+        extra += "\",\"gs_crc\":\"";
+        if (gs_crc != 0) append_hex32(extra, gs_crc);
+        extra += "\",\"pso\":\"";
+        append_hex64(extra, reinterpret_cast<uintptr_t>(s.current_pso));
+        extra += "\",\"root_sig\":\"";
+        append_hex64(extra, s.last_graphics_root_signature);
+        extra += "\",\"draw_args\":{\"index_count\":";
+        append_u64(extra, index_count);
+        extra += ",\"instance_count\":";
+        append_u64(extra, instance_count);
+        extra += ",\"start_index\":";
+        append_u64(extra, start_index);
+        extra += ",\"base_vertex\":";
+        append_i64(extra, base_vertex);
+        extra += ",\"start_instance\":";
+        append_u64(extra, start_instance);
+        extra += "},\"viewport\":{\"has\":";
+        extra += s.has_viewport ? "true" : "false";
+        extra += ",\"bucket\":";
+        append_i64(extra, static_cast<int>(s.last_viewport_bucket));
+        extra += ",\"count\":";
+        append_u64(extra, s.viewport_count);
+        extra += ",\"x\":";
+        append_f32(extra, s.viewport0.TopLeftX);
+        extra += ",\"y\":";
+        append_f32(extra, s.viewport0.TopLeftY);
+        extra += ",\"w\":";
+        append_f32(extra, s.viewport0.Width);
+        extra += ",\"h\":";
+        append_f32(extra, s.viewport0.Height);
+        extra += "},\"scissor\":{\"left\":";
+        append_i64(extra, s.scissor0.left);
+        extra += ",\"top\":";
+        append_i64(extra, s.scissor0.top);
+        extra += ",\"right\":";
+        append_i64(extra, s.scissor0.right);
+        extra += ",\"bottom\":";
+        append_i64(extra, s.scissor0.bottom);
+        extra += "},\"rtv_count\":";
+        append_u64(extra, s.last_rtv_count);
+        extra += ",\"rtv_handles\":";
+        append_root_array_hex(extra, s.last_rtv_handles, s.last_rtv_handles.size());
+        extra += ",\"graphics_cbv_roots\":";
+        append_root_array_hex(extra, s.last_graphics_root_cbv, 16);
+        extra += ",\"graphics_table_roots\":";
+        append_root_array_hex(extra, s.last_graphics_root_desc_tables, 16);
+        extra += ",\"ps_crc_u32\":";
+        append_u64(extra, ps_crc);
+        return extra;
+    }
+
+    void emit_draw(ID3D12GraphicsCommandList* /*cl*/, const CommandListCorrelationState& s, uint32_t ps_crc,
+                   uint32_t index_count, uint32_t instance_count, uint32_t start_index,
+                   int32_t base_vertex, uint32_t start_instance, uintptr_t callsite) {
+        if (!enabled() || !Sink::get().reserve()) return;
+        const uint64_t seq = seq_counter().fetch_add(1, std::memory_order_relaxed) + 1;
+        const int eye = bucket_to_eye(static_cast<int>(s.last_viewport_bucket));
+        std::string inputs, outputs;
+        scan_root_tables(s.last_graphics_root_desc_tables, inputs, outputs);
+        const auto pso_key = reinterpret_cast<uintptr_t>(s.current_pso);
+        auto& registry = render::ShaderOverrideRegistry::get();
+        const uint32_t vs_crc = pso_key != 0 ? registry.d3d12_pso_vertex_crc32(pso_key) : 0;
+        const uint32_t gs_crc = pso_key != 0 ? registry.d3d12_pso_geometry_crc32(pso_key) : 0;
+        const std::string extra = draw_extra_json(
+            s, vs_crc, gs_crc, ps_crc,
+            index_count, instance_count, start_index, base_vertex, start_instance,
+            callsite);
+        emit_line(seq, current_frame(), "draw", eye, /*cs_crc*/ 0, ps_crc,
+                  0, 0, 0, inputs, outputs, extra);
+    }
+
+    void emit_dispatch(const CommandListCorrelationState& s, uint32_t cs_crc,
+                       uint32_t x, uint32_t y, uint32_t z) {
+        if (!enabled() || !Sink::get().reserve()) return;
+        const uint64_t seq = seq_counter().fetch_add(1, std::memory_order_relaxed) + 1;
+        // dispatch_eye_bucket at the call site == cmdlist_eye_bucket(s); recompute
+        // here so the signature stays a clean (state, crc, dims) tuple.
+        const int eye = bucket_to_eye(cmdlist_eye_bucket(s));
+        std::string inputs, outputs;
+        scan_root_tables(s.last_compute_root_desc_tables, inputs, outputs);
+        emit_line(seq, current_frame(), "dispatch", eye, cs_crc, /*ps_crc*/ 0,
+                  static_cast<int>(x), static_cast<int>(y), static_cast<int>(z),
+                  inputs, outputs);
+    }
+} // namespace sn2_event_ledger
+
+// === Sn2DyeFill — dye GPU tap (2026-05-25) =================================
+// Defined OUTSIDE the unnamed namespace so the call site's qualified name is
+// unambiguous, while still reaching the file-scope helpers tls_bindless_heap /
+// sn2_descriptor_registry / g_d3d12_hook / sn2_rt_snapshot::g_frame_counter.
+// Resolves a SINGLE caller-named bindless index directly (no million-entry
+// heap scan) and floods that 3D R11G11B10_FLOAT volume with a dye color once
+// per frame via ClearUnorderedAccessViewFloat. Default OFF.
+namespace sn2_dye_fill {
+
+namespace {
+// Same ILS-volume shape test the fog probes use.
+inline bool dye_is_ils_volume(const D3D12_RESOURCE_DESC& d) {
+    return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+        && d.Format == DXGI_FORMAT_R11G11B10_FLOAT
+        && d.Width >= 40 && d.Width <= 192
+        && d.Height >= 20 && d.Height <= 128
+        && d.DepthOrArraySize >= 32 && d.DepthOrArraySize <= 80;
+}
+
+// Persistent shader-visible CBV_SRV_UAV scratch heap (created once). One
+// descriptor serves BOTH the GPU and CPU handle ClearUAVFloat needs.
+struct DyeScratch {
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
+    bool tried = false;
+};
+DyeScratch& dye_scratch() { static DyeScratch s; return s; }
+
+ID3D12DescriptorHeap* ensure_scratch_heap(ID3D12Device* dev) {
+    auto& s = dye_scratch();
+    if (s.heap != nullptr) return s.heap.Get();
+    if (s.tried) return nullptr;       // already failed once — don't retry-spam
+    s.tried = true;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 1;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.heap)))) {
+        SPDLOG_WARN("[SN2-DyeFill] CreateDescriptorHeap (shader-visible) failed");
+        s.heap.Reset();
+        return nullptr;
+    }
+    return s.heap.Get();
+}
+
+struct DyeTarget {
+    int64_t index{-1};
+    size_t ordinal{0};
+    bool cycling{false};
+};
+
+std::mutex& dye_candidate_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::vector<int64_t>& dye_auto_candidates() {
+    static std::vector<int64_t> v;
+    return v;
+}
+
+std::unordered_map<int64_t, uint32_t>& dye_candidate_misses() {
+    static std::unordered_map<int64_t, uint32_t> m;
+    return m;
+}
+
+void dye_write_jsonl(nlohmann::json&& row);
+
+bool dye_auto_scan_enabled() {
+    static const bool e = env_flag_enabled_a("UEVR_SN2_DYE_AUTO_SCAN");
+    return e;
+}
+
+uint32_t dye_auto_scan_cap() {
+    static const uint32_t cap = static_cast<uint32_t>(
+        std::max(256, env_int_a("UEVR_SN2_DYE_AUTO_SCAN_CAP", 16384)));
+    return cap;
+}
+
+uint32_t dye_auto_scan_max_chunks() {
+    static const uint32_t chunks = static_cast<uint32_t>(
+        std::max(1, env_int_a("UEVR_SN2_DYE_AUTO_SCAN_MAX_CHUNKS", 8)));
+    return chunks;
+}
+
+uint32_t dye_auto_scan_max_scans() {
+    // Auto-scan is a discovery pass, not a permanent per-second sampler. Default
+    // to one full heap sweep; set 0 for unlimited while actively debugging.
+    static const uint32_t scans = static_cast<uint32_t>(
+        std::max(0, env_int_a("UEVR_SN2_DYE_AUTO_SCAN_MAX_SCANS",
+                              static_cast<int>(dye_auto_scan_max_chunks()))));
+    return scans;
+}
+
+uint32_t dye_auto_scan_max_candidates() {
+    // Descriptor indices are transient and can grow without bound if we keep
+    // accumulating across heap reuse. Cap by default so cycling remains usable.
+    static const uint32_t max_candidates = static_cast<uint32_t>(
+        std::max(0, env_int_a("UEVR_SN2_DYE_AUTO_SCAN_MAX_CANDIDATES", 1024)));
+    return max_candidates;
+}
+
+uint32_t dye_auto_scan_log_max() {
+    static const uint32_t max_logs = static_cast<uint32_t>(
+        std::max(0, env_int_a("UEVR_SN2_DYE_AUTO_SCAN_LOG_MAX", 16)));
+    return max_logs;
+}
+
+uint32_t dye_prune_after_misses() {
+    static const uint32_t misses = static_cast<uint32_t>(
+        std::max(0, env_int_a("UEVR_SN2_DYE_PRUNE_AFTER_MISSES", 24)));
+    return misses;
+}
+
+bool dye_prefer_newest_auto_candidate() {
+    static const bool e = []() {
+        const char* v = std::getenv("UEVR_SN2_DYE_PREFER_NEWEST");
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
+    }();
+    return e;
+}
+
+void dye_note_candidate_success(int64_t idx) {
+    std::scoped_lock _{dye_candidate_mutex()};
+    dye_candidate_misses().erase(idx);
+}
+
+void dye_note_candidate_miss(int64_t idx, const char* reason) {
+    const uint32_t prune_after = dye_prune_after_misses();
+    if (idx < 0 || prune_after == 0 || !dye_auto_scan_enabled()) {
+        return;
+    }
+
+    bool pruned = false;
+    uint32_t misses = 0;
+    {
+        std::scoped_lock _{dye_candidate_mutex()};
+        auto& counts = dye_candidate_misses();
+        misses = ++counts[idx];
+        if (misses >= prune_after) {
+            auto& candidates = dye_auto_candidates();
+            const auto before = candidates.size();
+            candidates.erase(std::remove(candidates.begin(), candidates.end(), idx), candidates.end());
+            counts.erase(idx);
+            pruned = candidates.size() != before;
+        }
+    }
+
+    if (pruned) {
+        SPDLOG_INFO("[SN2-DyeFill] pruned stale candidate idx={} after {} misses ({})",
+                    idx, misses, reason != nullptr ? reason : "?");
+        dye_write_jsonl({
+            {"event", "candidate_pruned"},
+            {"index", idx},
+            {"misses", misses},
+            {"reason", reason != nullptr ? reason : "?"}
+        });
+    }
+}
+
+size_t dye_candidate_count() {
+    std::scoped_lock _{dye_candidate_mutex()};
+    return dye_auto_candidates().size();
+}
+
+const std::string& dye_candidate_jsonl_path() {
+    static const std::string path = []() {
+        const char* v = std::getenv("UEVR_SN2_DYE_CANDIDATE_FILE");
+        return (v != nullptr && v[0] != '\0') ? std::string(v) : std::string();
+    }();
+    return path;
+}
+
+std::mutex& dye_candidate_file_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_set<std::string>& dye_written_candidate_keys() {
+    static std::unordered_set<std::string> s;
+    return s;
+}
+
+void dye_write_jsonl(nlohmann::json&& row) {
+    const auto& path = dye_candidate_jsonl_path();
+    if (path.empty()) {
+        return;
+    }
+    std::scoped_lock _{dye_candidate_file_mutex()};
+    try {
+        const std::filesystem::path p{path};
+        if (p.has_parent_path()) {
+            std::filesystem::create_directories(p.parent_path());
+        }
+        std::ofstream f(path, std::ios::app);
+        if (f.good()) {
+            row["time_ms"] = static_cast<uint64_t>(GetTickCount64());
+            f << row.dump() << '\n';
+        }
+    } catch (...) {
+        static std::atomic<uint64_t> failures{0};
+        const auto n = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 4) {
+            SPDLOG_WARN("[SN2-DyeFill] failed writing candidate file {}", path);
+        }
+    }
+}
+
+void dye_note_candidate_jsonl(const char* source,
+                              uint32_t index,
+                              const sn2_descriptor_registry::Entry& e,
+                              bool added) {
+    if (e.resource == nullptr || !e.has_resource_desc) {
+        return;
+    }
+    // Candidate discovery can revisit the same slot every scan. Emit each
+    // source/index/resource tuple once so the host runner has a small,
+    // deterministic list without scraping the large UEVR log.
+    const std::string key =
+        std::string(source != nullptr ? source : "?") + ":" +
+        std::to_string(index) + ":" +
+        std::to_string(reinterpret_cast<uintptr_t>(e.resource));
+    {
+        std::scoped_lock _{dye_candidate_file_mutex()};
+        auto& written = dye_written_candidate_keys();
+        if (!written.insert(key).second) {
+            return;
+        }
+    }
+    const D3D12_RESOURCE_DESC& d = e.resource_desc;
+    dye_write_jsonl({
+        {"event", "candidate"},
+        {"source", source != nullptr ? source : "?"},
+        {"index", index},
+        {"resource", reinterpret_cast<uintptr_t>(e.resource)},
+        {"kind", e.kind == sn2_descriptor_registry::Kind::UAV ? "UAV" :
+                 e.kind == sn2_descriptor_registry::Kind::SRV ? "SRV" : "other"},
+        {"width", static_cast<uint64_t>(d.Width)},
+        {"height", static_cast<uint32_t>(d.Height)},
+        {"depth", static_cast<uint32_t>(d.DepthOrArraySize)},
+        {"format", static_cast<int>(d.Format)},
+        {"added", added ? 1 : 0}
+    });
+}
+
+void dye_note_cycle_jsonl(int64_t index, size_t ordinal, uint64_t sample) {
+    dye_write_jsonl({
+        {"event", "cycle"},
+        {"index", index},
+        {"ordinal", ordinal},
+        {"sample", sample}
+    });
+}
+
+void dye_note_result_jsonl(int64_t index,
+                           const char* outcome,
+                           uint64_t sample,
+                           const D3D12_RESOURCE_DESC& d) {
+    dye_write_jsonl({
+        {"event", "dye_result"},
+        {"index", index},
+        {"outcome", outcome != nullptr ? outcome : "?"},
+        {"sample", sample},
+        {"width", static_cast<uint64_t>(d.Width)},
+        {"height", static_cast<uint32_t>(d.Height)},
+        {"depth", static_cast<uint32_t>(d.DepthOrArraySize)},
+        {"format", static_cast<int>(d.Format)}
+    });
+}
+
+void dye_auto_scan_heap() {
+    if (!dye_auto_scan_enabled()) {
+        return;
+    }
+    const BindlessHeapState heap = tls_bindless_heap;
+    if (heap.cpu_base == 0 || heap.stride == 0 || heap.num_descriptors == 0) {
+        return;
+    }
+
+    static std::atomic<uint64_t> last_scan_ms{0};
+    const uint64_t now = GetTickCount64();
+    uint64_t last = last_scan_ms.load(std::memory_order_relaxed);
+    if (now - last < 1000) {
+        return;
+    }
+    if (!last_scan_ms.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        return;
+    }
+
+    static std::atomic<uint32_t> scans_done{0};
+    const uint32_t max_scans = dye_auto_scan_max_scans();
+    uint32_t previous_scans = scans_done.load(std::memory_order_relaxed);
+    if (max_scans != 0 && previous_scans >= max_scans) {
+        return;
+    }
+    if (!scans_done.compare_exchange_strong(previous_scans, previous_scans + 1,
+                                            std::memory_order_relaxed)) {
+        return;
+    }
+
+    static std::atomic<uint32_t> scan_chunk{0};
+    const uint32_t chunk = scan_chunk.fetch_add(1, std::memory_order_relaxed) % dye_auto_scan_max_chunks();
+    const uint32_t cap = std::min<uint32_t>(dye_auto_scan_cap(), heap.num_descriptors);
+    const uint64_t start64 = static_cast<uint64_t>(chunk) * static_cast<uint64_t>(cap);
+    if (start64 >= heap.num_descriptors) {
+        return;
+    }
+    const uint32_t start = static_cast<uint32_t>(start64);
+    const uint32_t end = static_cast<uint32_t>(
+        std::min<uint64_t>(static_cast<uint64_t>(heap.num_descriptors), start64 + cap));
+
+    int found = 0;
+    int added = 0;
+    int dropped = 0;
+    {
+        std::scoped_lock _{dye_candidate_mutex()};
+        auto& candidates = dye_auto_candidates();
+        const uint32_t max_candidates = dye_auto_scan_max_candidates();
+        for (uint32_t i = start; i < end; ++i) {
+            const SIZE_T cpu = heap.cpu_base + static_cast<SIZE_T>(i) * static_cast<SIZE_T>(heap.stride);
+            sn2_descriptor_registry::Entry e{};
+            if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(cpu, e)) continue;
+            if (e.resource == nullptr || !e.has_resource_desc) continue;
+            if (!dye_is_ils_volume(e.resource_desc)) continue;
+            ++found;
+            const int64_t idx = static_cast<int64_t>(i);
+            bool added_this = false;
+            if (std::find(candidates.begin(), candidates.end(), idx) == candidates.end()) {
+                if (max_candidates != 0 && candidates.size() >= max_candidates) {
+                    ++dropped;
+                    dye_note_candidate_jsonl("dye_auto_scan_dropped", i, e, false);
+                    continue;
+                }
+                candidates.push_back(idx);
+                ++added;
+                added_this = true;
+            }
+            dye_note_candidate_jsonl("dye_auto_scan", i, e, added_this);
+        }
+    }
+
+    static std::atomic<uint64_t> logs{0};
+    const auto n = logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint32_t max_logs = dye_auto_scan_log_max();
+    if (max_logs != 0 && n <= max_logs) {
+        std::scoped_lock _{dye_candidate_mutex()};
+        SPDLOG_INFO("[SN2-DyeFill] auto-scan scan={}/{} chunk={} range=[{}, {}) found={} added={} dropped={} candidates={}",
+            previous_scans + 1, max_scans, chunk, start, end, found, added, dropped,
+            dye_auto_candidates().size());
+    }
+}
+
+const std::vector<int64_t>& dye_index_sequence() {
+    static const std::vector<int64_t> seq = []() {
+        std::vector<int64_t> out;
+        const char* v = std::getenv("UEVR_SN2_DYE_IDX_SEQUENCE");
+        if (v == nullptr || v[0] == '\0') {
+            return out;
+        }
+        const char* p = v;
+        while (*p != '\0') {
+            while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t') {
+                ++p;
+            }
+            if (*p == '\0') {
+                break;
+            }
+            char* end = nullptr;
+            const long long parsed = std::strtoll(p, &end, 0);
+            if (end != p && parsed >= 0) {
+                out.push_back(static_cast<int64_t>(parsed));
+            }
+            p = (end != p) ? end : (p + 1);
+        }
+        return out;
+    }();
+    return seq;
+}
+
+uint64_t dye_frames_per_index() {
+    static const uint64_t frames = static_cast<uint64_t>(
+        std::max(1, env_int_a("UEVR_SN2_DYE_FRAMES_PER_INDEX", 120)));
+    return frames;
+}
+
+DyeTarget current_dye_target(uint64_t sample) {
+    const auto& seq = dye_index_sequence();
+    if (!seq.empty() || dye_auto_scan_enabled()) {
+        std::vector<int64_t> auto_seq;
+        if (seq.empty()) {
+            std::scoped_lock _{dye_candidate_mutex()};
+            auto_seq = dye_auto_candidates();
+        }
+        const auto& active_seq = !seq.empty() ? seq : auto_seq;
+        if (active_seq.empty()) {
+            return DyeTarget{-1, 0, false};
+        }
+        static std::atomic<uint64_t> first_sample{UINT64_MAX};
+        uint64_t first = first_sample.load(std::memory_order_relaxed);
+        if (first == UINT64_MAX &&
+            first_sample.compare_exchange_strong(first, sample, std::memory_order_relaxed)) {
+            first = sample;
+        }
+        if (first == UINT64_MAX) {
+            first = sample;
+        }
+        const uint64_t relative = (sample >= first) ? (sample - first) : 0;
+        size_t ordinal = static_cast<size_t>(
+            (relative / dye_frames_per_index()) % static_cast<uint64_t>(active_seq.size()));
+        if (seq.empty() && dye_prefer_newest_auto_candidate()) {
+            ordinal = active_seq.size() - 1 - ordinal;
+        }
+        return DyeTarget{active_seq[ordinal], ordinal, true};
+    }
+    return DyeTarget{target_index(), 0, false};
+}
+
+D3D12_RESOURCE_STATES dye_shader_read_state() {
+    static const auto state = static_cast<D3D12_RESOURCE_STATES>(
+        std::max(0, env_int_a("UEVR_SN2_DYE_SHADER_READ_STATE",
+                              static_cast<int>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))));
+    return state;
+}
+
+uint64_t dye_min_interval_ms() {
+    static const uint64_t ms = static_cast<uint64_t>(
+        std::max(1, env_int_a("UEVR_SN2_DYE_MIN_INTERVAL_MS", 50)));
+    return ms;
+}
+
+uint32_t dye_cycle_log_max() {
+    static const uint32_t max_logs = static_cast<uint32_t>(
+        std::max(0, env_int_a("UEVR_SN2_DYE_CYCLE_LOG_MAX", 16)));
+    return max_logs;
+}
+} // namespace
+
+void fill(ID3D12GraphicsCommandList* cl) {
+    if (!enabled() || cl == nullptr) return;
+
+    // Time/call gate instead of sn2_rt_snapshot::g_frame_counter: dye-only runs
+    // do not initialize the RT snapshot fence path, so that counter can stay at
+    // zero and accidentally suppress every later attempt.
+    const uint64_t now = GetTickCount64();
+    static std::atomic<uint64_t> last_ms{0};
+    uint64_t prev_ms = last_ms.load(std::memory_order_relaxed);
+    if (now - prev_ms < dye_min_interval_ms()) {
+        return;
+    }
+    if (!last_ms.compare_exchange_strong(prev_ms, now, std::memory_order_relaxed)) {
+        return;
+    }
+    static std::atomic<uint64_t> sample_counter{0};
+    const uint64_t sample = sample_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    dye_auto_scan_heap();
+    const DyeTarget target = current_dye_target(sample);
+    const int64_t idx = target.index;
+    if (idx < 0) return;
+
+    if (target.cycling) {
+        static std::atomic<int64_t> last_logged_idx{-1};
+        const int64_t prev = last_logged_idx.exchange(idx, std::memory_order_relaxed);
+        static std::atomic<uint32_t> cycle_logs{0};
+        uint32_t log_n = cycle_logs.load(std::memory_order_relaxed);
+        if (prev != idx && log_n < dye_cycle_log_max() &&
+            cycle_logs.compare_exchange_strong(log_n, log_n + 1, std::memory_order_relaxed)) {
+            SPDLOG_INFO("[SN2-DyeFill] cycle target ordinal={} idx={} frames_per_index={}",
+                        target.ordinal, idx, dye_frames_per_index());
+        }
+        if (prev != idx) {
+            dye_note_cycle_jsonl(idx, target.ordinal, sample);
+        }
+    }
+
+    // Need a live bindless heap to translate the index -> CPU descriptor -> resource.
+    if (tls_bindless_heap.cpu_base == 0 || tls_bindless_heap.stride == 0) return;
+    if (tls_bindless_heap.num_descriptors != 0 &&
+        static_cast<UINT>(idx) >= tls_bindless_heap.num_descriptors) {
+        static std::atomic<uint64_t> oob{0};
+        if (oob.fetch_add(1, std::memory_order_relaxed) % 240 == 0)
+            SPDLOG_WARN("[SN2-DyeFill] idx {} >= heap capacity {} — skipping",
+                        idx, tls_bindless_heap.num_descriptors);
+        dye_note_candidate_miss(idx, "oob");
+        return;
+    }
+
+    // Resolve the single target index directly (NO heap scan).
+    const SIZE_T cpu = tls_bindless_heap.cpu_base + static_cast<SIZE_T>(idx) * tls_bindless_heap.stride;
+    ID3D12Resource* res = sn2_descriptor_registry::lookup_resource_by_cpu_ptr_or_hash(cpu);
+    if (res == nullptr) {
+        static std::atomic<uint64_t> miss{0};
+        if (miss.fetch_add(1, std::memory_order_relaxed) % 30 == 0)
+            SPDLOG_WARN("[SN2-DyeFill] idx {} did not resolve to a resource", idx);
+        dye_note_candidate_miss(idx, "no_resource");
+        return;
+    }
+
+    const D3D12_RESOURCE_DESC d = res->GetDesc();
+    if (!dye_is_ils_volume(d)) {
+        static std::atomic<uint64_t> shape{0};
+        if (shape.fetch_add(1, std::memory_order_relaxed) % 30 == 0)
+            SPDLOG_WARN("[SN2-DyeFill] idx {} resource is not a 3D R11G11B10F volume "
+                        "(dim={} fmt={} {}x{}x{}) — skipping",
+                        idx, (int)d.Dimension, (int)d.Format,
+                        (uint64_t)d.Width, (uint32_t)d.Height, (uint32_t)d.DepthOrArraySize);
+        dye_note_candidate_miss(idx, "wrong_shape");
+        return;
+    }
+    if ((d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+        static std::atomic<uint64_t> flags{0};
+        if (flags.fetch_add(1, std::memory_order_relaxed) % 30 == 0)
+            SPDLOG_WARN("[SN2-DyeFill] idx {} resource has no ALLOW_UNORDERED_ACCESS flag — skipping",
+                        idx);
+        dye_note_candidate_miss(idx, "no_uav_flag");
+        return;
+    }
+
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (dev == nullptr) return;
+    ID3D12DescriptorHeap* heap = ensure_scratch_heap(dev);
+    if (heap == nullptr) return;
+
+    // One descriptor (slot 0) — shader-visible heap gives us a matching
+    // CPU + GPU handle for ClearUnorderedAccessViewFloat.
+    const D3D12_CPU_DESCRIPTOR_HANDLE cpu_h = heap->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpu_h = heap->GetGPUDescriptorHandleForHeapStart();
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = d.Format;                       // R11G11B10_FLOAT typed UAV
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+    uav.Texture3D.MipSlice = 0;
+    uav.Texture3D.FirstWSlice = 0;
+    uav.Texture3D.WSize = static_cast<UINT>(-1); // all slices
+    dev->CreateUnorderedAccessView(res, nullptr, &uav, cpu_h);
+
+    auto barrier = [&](D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = res;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = before;
+        b.Transition.StateAfter = after;
+        cl->ResourceBarrier(1, &b);
+    };
+
+    const std::array<float, 4>& c = color();
+    const D3D12_RESOURCE_STATES read_state = dye_shader_read_state();
+    barrier(read_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cl->ClearUnorderedAccessViewFloat(gpu_h, cpu_h, res, c.data(), 0, nullptr);
+    barrier(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read_state);
+    dye_note_candidate_success(idx);
+    dye_note_result_jsonl(idx, "dyed", sample, d);
+
+    static std::atomic<uint64_t> hit{0};
+    const auto h = hit.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (h <= 8 || (h % 120) == 0) {
+        SPDLOG_WARN("[SN2-DyeFill] dyed idx {} ({}x{}x{}) color=({:.2f},{:.2f},{:.2f}) state=0x{:x} #{} ",
+                    idx, (uint64_t)d.Width, (uint32_t)d.Height, (uint32_t)d.DepthOrArraySize,
+                    c[0], c[1], c[2], static_cast<unsigned>(read_state), h);
+    }
+}
+
+} // namespace sn2_dye_fill
+
+// === StereoScope bindless View-UB decoder (2026-05-25) =====================
+// Defined OUTSIDE the unnamed namespace (like sn2_event_ledger) so the call sites'
+// qualified names are unambiguous, while still reaching the file-scope helpers
+// tls_bindless_heap / sn2_upload_buf_map / sn2_descriptor_registry / cmdlist state.
+// Read-only diagnostic: scans the consumer's root CBVs (the View UB is one) for uints
+// that, used as a bindless heap index, resolve to an ILS fog volume, and logs the hit.
+namespace sn2_viewub_decode {
+    inline bool is_ils_volume(const D3D12_RESOURCE_DESC& d) {
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            && d.Format == DXGI_FORMAT_R11G11B10_FLOAT
+            && d.Width >= 40 && d.Width <= 192
+            && d.Height >= 20 && d.Height <= 128
+            && d.DepthOrArraySize >= 32 && d.DepthOrArraySize <= 80;
+    }
+
+    struct ScanStats { int cbvs = 0, mapped = 0, candidates = 0, resolved = 0, threeD = 0, ils = 0; uint32_t heap_n = 0; };
+
+    inline bool chain_scan_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_VIEWUB_CHAIN_SCAN");
+        return e;
+    }
+
+    inline bool root_constant_scan_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_VIEWUB_ROOT_CONSTANT_SCAN");
+        return e;
+    }
+
+    inline bool table_cbv_scan_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_VIEWUB_TABLE_CBV_SCAN");
+        return e;
+    }
+
+    inline bool chain_scan_any_ps() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_VIEWUB_CHAIN_SCAN_ANY_PS");
+        return e;
+    }
+
+    inline uint32_t chain_probe_log_max() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_VIEWUB_CHAIN_PROBE_LOG_MAX", 96)));
+        return v;
+    }
+
+    inline bool chain_known_consumer_ps(uint32_t crc) {
+        return crc == 0xDE7C3822u || crc == 0xB9BE2499u || crc == 0x4E86DC09u;
+    }
+
+    inline void note_draw_probe(int eye, uint32_t crc, bool known_consumer) {
+        if (!chain_scan_enabled()) return;
+        static std::atomic<uint64_t> logs{0};
+        const auto n = logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        const uint32_t max_logs = chain_probe_log_max();
+        static const bool periodic = env_flag_enabled_a("UEVR_SN2_VIEWUB_CHAIN_PROBE_PERIODIC");
+        if (n <= max_logs || (periodic && (n % 1000) == 0)) {
+            SPDLOG_WARN("[SN2-ViewUB-ChainProbe] draw#{} eye={} ps=0x{:08x} known_consumer={} any_ps={}",
+                n,
+                eye,
+                crc,
+                known_consumer ? 1 : 0,
+                chain_scan_any_ps() ? 1 : 0);
+        }
+    }
+
+    inline uint32_t chain_scan_cap() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(256, env_int_a("UEVR_SN2_VIEWUB_CHAIN_SCAN_CAP", 8192)));
+        return v;
+    }
+
+    inline uint32_t chain_scan_max_chunks() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(1, env_int_a("UEVR_SN2_VIEWUB_CHAIN_SCAN_MAX_CHUNKS", 16)));
+        return v;
+    }
+
+    inline uint32_t chain_scan_window_bytes() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::clamp(env_int_a("UEVR_SN2_VIEWUB_CHAIN_SCAN_WINDOW", 65536), 256, 1 << 20));
+        return v;
+    }
+
+    inline uint32_t chain_scan_max_cbvs_per_chunk() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(1, env_int_a("UEVR_SN2_VIEWUB_CHAIN_SCAN_MAX_CBVS_PER_CHUNK", 96)));
+        return v;
+    }
+
+    inline uint32_t chain_scan_log_max() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_VIEWUB_CHAIN_SCAN_LOG_MAX", 96)));
+        return v;
+    }
+
+    inline uint32_t chain_scan_interval_ms() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_VIEWUB_CHAIN_SCAN_INTERVAL_MS", 250)));
+        return v;
+    }
+
+    inline bool chain_scan_map_missing_cbvs() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_VIEWUB_CHAIN_MAP_MISSING");
+        return e;
+    }
+
+    inline uint32_t root_constant_scan_log_max() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_VIEWUB_ROOT_CONSTANT_LOG_MAX", 128)));
+        return v;
+    }
+
+    inline uint32_t table_cbv_scan_slots() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::clamp(env_int_a("UEVR_SN2_VIEWUB_TABLE_CBV_SCAN_SLOTS", 256), 1, 4096));
+        return v;
+    }
+
+    inline uint32_t table_cbv_scan_log_max() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_VIEWUB_TABLE_CBV_LOG_MAX", 128)));
+        return v;
+    }
+
+    inline std::string chain_scan_jsonl_path() {
+        char buf[MAX_PATH * 2]{};
+        const DWORD n = GetEnvironmentVariableA("UEVR_SN2_VIEWUB_CHAIN_FILE", buf, static_cast<DWORD>(sizeof(buf)));
+        if (n == 0 || n >= sizeof(buf)) return {};
+        return std::string(buf, buf + n);
+    }
+
+    inline void write_chain_hit_jsonl(
+        int eye,
+        uint32_t crc,
+        const char* kind,
+        uint32_t cbv_idx,
+        uint64_t cbv_va,
+        uint32_t byte_off,
+        uint32_t fog_idx,
+        ID3D12Resource* resource,
+        const D3D12_RESOURCE_DESC& d)
+    {
+        const std::string path = chain_scan_jsonl_path();
+        if (path.empty()) return;
+        try {
+            std::ofstream f(path, std::ios::binary | std::ios::app);
+            if (!f) return;
+            f << "{\"event\":\"viewub_chain_hit\""
+              << ",\"eye\":" << eye
+              << ",\"kind\":\"" << (kind ? kind : "?") << "\""
+              << ",\"crc\":\"0x" << std::hex << std::setw(8) << std::setfill('0') << crc << std::dec << "\""
+              << ",\"cbv_bindless_idx\":" << cbv_idx
+              << ",\"cbv_gpu_va\":\"0x" << std::hex << cbv_va << std::dec << "\""
+              << ",\"byte_off\":" << byte_off
+              << ",\"fog_bindless_idx\":" << fog_idx
+              << ",\"resource\":\"0x" << std::hex << reinterpret_cast<uintptr_t>(resource) << std::dec << "\""
+              << ",\"width\":" << static_cast<uint64_t>(d.Width)
+              << ",\"height\":" << static_cast<uint32_t>(d.Height)
+              << ",\"depth\":" << static_cast<uint32_t>(d.DepthOrArraySize)
+              << "}\n";
+        } catch (...) {
+        }
+    }
+
+    inline void scan_bindless_cbv_chain(int eye, uint32_t crc, const char* kind) {
+        if (!chain_scan_enabled()) return;
+        if (!sn2_past_init_race()) return;
+
+        const BindlessHeapState heap = tls_bindless_heap;
+        if (heap.cpu_base == 0 || heap.stride == 0 || heap.num_descriptors == 0) return;
+
+        static std::atomic<uint64_t> last_scan_ms{0};
+        const uint64_t now = GetTickCount64();
+        const uint32_t interval = chain_scan_interval_ms();
+        uint64_t last = last_scan_ms.load(std::memory_order_relaxed);
+        if (interval != 0 && now - last < interval) return;
+        if (!last_scan_ms.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+
+        static std::atomic<uint32_t> chunks{0};
+        const uint32_t chunk = chunks.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t max_chunks = chain_scan_max_chunks();
+        if (chunk >= max_chunks) return;
+
+        const uint64_t start64 = static_cast<uint64_t>(chunk) * static_cast<uint64_t>(chain_scan_cap());
+        if (start64 >= heap.num_descriptors) return;
+        const uint32_t start = static_cast<uint32_t>(start64);
+        const uint32_t end = static_cast<uint32_t>(std::min<uint64_t>(
+            static_cast<uint64_t>(heap.num_descriptors),
+            start64 + static_cast<uint64_t>(chain_scan_cap())));
+
+        uint32_t cbv_seen = 0;
+        uint32_t mapped = 0;
+        uint32_t map_attempts = 0;
+        uint32_t map_success = 0;
+        uint32_t candidate_words = 0;
+        uint32_t resolved_words = 0;
+        uint32_t ils_hits = 0;
+        const uint32_t max_cbvs = chain_scan_max_cbvs_per_chunk();
+        const uint32_t window_cap = chain_scan_window_bytes();
+        const bool map_missing = chain_scan_map_missing_cbvs();
+
+        for (uint32_t cbv_idx = start; cbv_idx < end && cbv_seen < max_cbvs; ++cbv_idx) {
+            const SIZE_T cbv_cpu = heap.cpu_base + static_cast<SIZE_T>(cbv_idx) * static_cast<SIZE_T>(heap.stride);
+            sn2_descriptor_registry::Entry cbv{};
+            if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(cbv_cpu, cbv)) continue;
+            if (cbv.kind != sn2_descriptor_registry::Kind::CBV || !cbv.has_cbv_desc) continue;
+            ++cbv_seen;
+
+            uint32_t window = std::min<uint32_t>(
+                window_cap,
+                cbv.cbv_desc.SizeInBytes != 0 ? cbv.cbv_desc.SizeInBytes : window_cap);
+            if (window < 256) continue;
+            uint8_t* cpu = nullptr;
+            for (uint32_t w = window; w >= 256; w >>= 1) {
+                cpu = sn2_upload_buf_map::gpu_va_to_cpu(cbv.cbv_desc.BufferLocation, w);
+                if (cpu != nullptr) { window = w; break; }
+            }
+            if (cpu == nullptr && map_missing) {
+                ++map_attempts;
+                if (sn2_upload_buf_map::try_map_for_gpu_va(cbv.cbv_desc.BufferLocation, window)) {
+                    ++map_success;
+                    for (uint32_t w = window; w >= 256; w >>= 1) {
+                        cpu = sn2_upload_buf_map::gpu_va_to_cpu(cbv.cbv_desc.BufferLocation, w);
+                        if (cpu != nullptr) { window = w; break; }
+                    }
+                }
+            }
+            // 2026-05-27: default-CBV shadow fallback. GPU-default CBVs can't be CPU-mapped
+            // (map_success=0 over the whole heap); read their bytes from the passive
+            // CopyBufferRegion shadow instead.
+            if (cpu == nullptr) {
+                const uint8_t* sh = sn2_default_cbv_shadow::lookup_gpu_va(cbv.cbv_desc.BufferLocation, window);
+                if (sh != nullptr) cpu = const_cast<uint8_t*>(sh);
+            }
+            if (cpu == nullptr) continue;
+            ++mapped;
+
+            const uint32_t words = window / 4;
+            for (uint32_t wi = 0; wi < words; ++wi) {
+                uint32_t fog_idx = 0;
+                std::memcpy(&fog_idx, cpu + static_cast<size_t>(wi) * 4, sizeof(fog_idx));
+                if (fog_idx == 0 || fog_idx >= heap.num_descriptors) continue;
+                ++candidate_words;
+
+                const SIZE_T fog_cpu = heap.cpu_base + static_cast<SIZE_T>(fog_idx) * static_cast<SIZE_T>(heap.stride);
+                sn2_descriptor_registry::Entry fog{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(fog_cpu, fog)) continue;
+                if (fog.resource == nullptr || !fog.has_resource_desc) continue;
+                ++resolved_words;
+                if (!is_ils_volume(fog.resource_desc)) continue;
+
+                ++ils_hits;
+                // 2026-05-27 DETERMINISTIC EYE TAG: the CBV holding this fog index is the View UB;
+                // its ViewRectMin (FViewUniformShaderParameters +0x940) is (0,0) for the LEFT eye
+                // and (640,0) for the RIGHT eye. Reading it from the SAME mapped CBV bytes lets us
+                // pin each fog bindless index to an eye with no readback heuristic.
+                {
+                    float vrm_x = -1.0f, vrm_y = -1.0f;
+                    if (window >= 0x950) {
+                        std::memcpy(&vrm_x, cpu + 0x940, sizeof(float));
+                        std::memcpy(&vrm_y, cpu + 0x944, sizeof(float));
+                    }
+                    static std::atomic<uint64_t> vn{0};
+                    const auto v = vn.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (v <= 96 || (v % 300) == 0) {
+                        SPDLOG_WARN("[SN2-ViewUB-ChainEye] ViewRectMin=({:.0f},{:.0f}) fog_idx={} res=0x{:x} {}x{}x{} fmt={} cbv_idx={} cbv_va=0x{:x} byte_off={}",
+                            vrm_x, vrm_y, fog_idx, reinterpret_cast<uintptr_t>(fog.resource),
+                            static_cast<unsigned>(fog.resource_desc.Width), fog.resource_desc.Height,
+                            fog.resource_desc.DepthOrArraySize, static_cast<unsigned>(fog.resource_desc.Format),
+                            cbv_idx, static_cast<uint64_t>(cbv.cbv_desc.BufferLocation), wi * 4);
+                    }
+                }
+                sn2_litness::note_descriptor(
+                    fog_idx,
+                    D3D12_CPU_DESCRIPTOR_HANDLE{fog_cpu},
+                    fog.resource,
+                    fog.resource_desc,
+                    fog.kind == sn2_descriptor_registry::Kind::SRV ? 1 :
+                    fog.kind == sn2_descriptor_registry::Kind::UAV ? 2 : 0);
+
+                static std::atomic<uint64_t> logs{0};
+                const auto ln = logs.fetch_add(1, std::memory_order_relaxed) + 1;
+                const uint32_t byte_off = wi * 4;
+                if (ln <= chain_scan_log_max() || (ln % 600) == 0) {
+                    SPDLOG_WARN("[SN2-ViewUB-Chain] eye={} {} crc=0x{:08x} cbv_idx={} cbv_va=0x{:x} byte_off={} fog_idx={} kind={} -> res=0x{:x} {}x{}x{}",
+                        eye,
+                        kind ? kind : "?",
+                        crc,
+                        cbv_idx,
+                        static_cast<uint64_t>(cbv.cbv_desc.BufferLocation),
+                        byte_off,
+                        fog_idx,
+                        sn2_descriptor_registry::kind_name(fog.kind),
+                        reinterpret_cast<uintptr_t>(fog.resource),
+                        static_cast<unsigned>(fog.resource_desc.Width),
+                        fog.resource_desc.Height,
+                        fog.resource_desc.DepthOrArraySize);
+                }
+                write_chain_hit_jsonl(
+                    eye,
+                    crc,
+                    kind,
+                    cbv_idx,
+                    static_cast<uint64_t>(cbv.cbv_desc.BufferLocation),
+                    byte_off,
+                    fog_idx,
+                    fog.resource,
+                    fog.resource_desc);
+            }
+        }
+
+        static std::atomic<uint64_t> summaries{0};
+        const auto sn = summaries.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (sn <= 32 || (sn % 120) == 0) {
+            SPDLOG_WARN("[SN2-ViewUB-Chain] scan chunk={}/{} range=[{}, {}) cbv_seen={} mapped={} map_attempts={} map_success={} cand={} resolved={} ils_hits={}",
+                chunk + 1,
+                max_chunks,
+                start,
+                end,
+                cbv_seen,
+                mapped,
+                map_attempts,
+                map_success,
+                candidate_words,
+                resolved_words,
+                ils_hits);
+        }
+    }
+
+    inline void scan_root_constants(const CommandListCorrelationState& s, int eye, uint32_t crc, const char* kind) {
+        if (!root_constant_scan_enabled()) return;
+        if (!sn2_past_init_race()) return;
+
+        const BindlessHeapState heap = tls_bindless_heap;
+        if (heap.cpu_base == 0 || heap.stride == 0 || heap.num_descriptors == 0) return;
+
+        uint32_t root_words = 0;
+        uint32_t descriptor_resolved = 0;
+        uint32_t direct_ils = 0;
+        uint32_t cbv_seen = 0;
+        uint32_t cbv_mapped = 0;
+        uint32_t cbv_map_attempts = 0;
+        uint32_t cbv_map_success = 0;
+        uint32_t cbv_no_upload_entry = 0;
+        uint32_t candidate_words = 0;
+        uint32_t fog_resolved = 0;
+        uint32_t ils_hits = 0;
+        const uint32_t window_cap = chain_scan_window_bytes();
+        const bool map_missing = chain_scan_map_missing_cbvs();
+
+        for (uint32_t root = 0; root < s.last_graphics_root_constants_count.size(); ++root) {
+            const uint32_t count = s.last_graphics_root_constants_count[root];
+            if (count == 0) continue;
+            for (uint32_t word = 0; word < count && word < CommandListCorrelationState::MAX_ROOT_CONSTANT_DWORDS; ++word) {
+                ++root_words;
+                const uint32_t bindless_idx = s.last_graphics_root_constants[root][word];
+                if (bindless_idx == 0 || bindless_idx >= heap.num_descriptors) continue;
+
+                const SIZE_T desc_cpu = heap.cpu_base + static_cast<SIZE_T>(bindless_idx) * static_cast<SIZE_T>(heap.stride);
+                sn2_descriptor_registry::Entry desc{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(desc_cpu, desc)) continue;
+                ++descriptor_resolved;
+
+                if (desc.resource != nullptr && desc.has_resource_desc && is_ils_volume(desc.resource_desc)) {
+                    ++direct_ils;
+                    sn2_litness::note_descriptor(
+                        bindless_idx,
+                        D3D12_CPU_DESCRIPTOR_HANDLE{desc_cpu},
+                        desc.resource,
+                        desc.resource_desc,
+                        desc.kind == sn2_descriptor_registry::Kind::SRV ? 1 :
+                        desc.kind == sn2_descriptor_registry::Kind::UAV ? 2 : 0);
+
+                    static std::atomic<uint64_t> direct_logs{0};
+                    const auto n = direct_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= root_constant_scan_log_max() || (n % 600) == 0) {
+                        SPDLOG_WARN("[SN2-ViewUB-RootConst] DIRECT-ILS eye={} {} crc=0x{:08x} root={} word={} idx={} kind={} res=0x{:x} {}x{}x{}",
+                            eye,
+                            kind ? kind : "?",
+                            crc,
+                            root,
+                            word,
+                            bindless_idx,
+                            sn2_descriptor_registry::kind_name(desc.kind),
+                            reinterpret_cast<uintptr_t>(desc.resource),
+                            static_cast<unsigned>(desc.resource_desc.Width),
+                            desc.resource_desc.Height,
+                            desc.resource_desc.DepthOrArraySize);
+                    }
+                    continue;
+                }
+
+                if (desc.kind != sn2_descriptor_registry::Kind::CBV || !desc.has_cbv_desc) {
+                    continue;
+                }
+                ++cbv_seen;
+
+                uint32_t window = std::min<uint32_t>(
+                    window_cap,
+                    desc.cbv_desc.SizeInBytes != 0 ? desc.cbv_desc.SizeInBytes : window_cap);
+                if (window < 256) continue;
+
+                uint8_t* cpu = nullptr;
+                for (uint32_t w = window; w >= 256; w >>= 1) {
+                    cpu = sn2_upload_buf_map::gpu_va_to_cpu(desc.cbv_desc.BufferLocation, w);
+                    if (cpu != nullptr) { window = w; break; }
+                }
+                if (cpu == nullptr && map_missing) {
+                    ++cbv_map_attempts;
+                    if (sn2_upload_buf_map::try_map_for_gpu_va(desc.cbv_desc.BufferLocation, window)) {
+                        ++cbv_map_success;
+                        for (uint32_t w = window; w >= 256; w >>= 1) {
+                            cpu = sn2_upload_buf_map::gpu_va_to_cpu(desc.cbv_desc.BufferLocation, w);
+                            if (cpu != nullptr) { window = w; break; }
+                        }
+                    }
+                }
+                if (cpu == nullptr) {
+                    ID3D12Resource* va_res = nullptr;
+                    uint64_t va_off = 0;
+                    if (!sn2_upload_buf_map::resolve_va(desc.cbv_desc.BufferLocation, va_res, va_off)) {
+                        ++cbv_no_upload_entry;
+                    }
+                    static std::atomic<uint64_t> miss_logs{0};
+                    const auto n = miss_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= root_constant_scan_log_max() || (n % 600) == 0) {
+                        SPDLOG_WARN("[SN2-ViewUB-RootConst] CBV-UNMAPPED eye={} {} crc=0x{:08x} root={} word={} cbv_idx={} va=0x{:x} size=0x{:x} upload_entry={} upload_res=0x{:x} off=0x{:x}",
+                            eye,
+                            kind ? kind : "?",
+                            crc,
+                            root,
+                            word,
+                            bindless_idx,
+                            static_cast<uint64_t>(desc.cbv_desc.BufferLocation),
+                            desc.cbv_desc.SizeInBytes,
+                            va_res != nullptr ? 1 : 0,
+                            reinterpret_cast<uintptr_t>(va_res),
+                            va_off);
+                    }
+                    continue;
+                }
+                ++cbv_mapped;
+
+                const uint32_t words = window / 4;
+                for (uint32_t wi = 0; wi < words; ++wi) {
+                    uint32_t fog_idx = 0;
+                    std::memcpy(&fog_idx, cpu + static_cast<size_t>(wi) * 4, sizeof(fog_idx));
+                    if (fog_idx == 0 || fog_idx >= heap.num_descriptors) continue;
+                    ++candidate_words;
+
+                    const SIZE_T fog_cpu = heap.cpu_base + static_cast<SIZE_T>(fog_idx) * static_cast<SIZE_T>(heap.stride);
+                    sn2_descriptor_registry::Entry fog{};
+                    if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(fog_cpu, fog)) continue;
+                    if (fog.resource == nullptr || !fog.has_resource_desc) continue;
+                    ++fog_resolved;
+                    if (!is_ils_volume(fog.resource_desc)) continue;
+
+                    ++ils_hits;
+                    sn2_litness::note_descriptor(
+                        fog_idx,
+                        D3D12_CPU_DESCRIPTOR_HANDLE{fog_cpu},
+                        fog.resource,
+                        fog.resource_desc,
+                        fog.kind == sn2_descriptor_registry::Kind::SRV ? 1 :
+                        fog.kind == sn2_descriptor_registry::Kind::UAV ? 2 : 0);
+
+                    static std::atomic<uint64_t> hit_logs{0};
+                    const auto n = hit_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+                    const uint32_t byte_off = wi * 4;
+                    if (n <= root_constant_scan_log_max() || (n % 600) == 0) {
+                        SPDLOG_WARN("[SN2-ViewUB-RootConst] CHAIN-HIT eye={} {} crc=0x{:08x} root={} word={} cbv_idx={} cbv_va=0x{:x} byte_off={} fog_idx={} kind={} res=0x{:x} {}x{}x{}",
+                            eye,
+                            kind ? kind : "?",
+                            crc,
+                            root,
+                            word,
+                            bindless_idx,
+                            static_cast<uint64_t>(desc.cbv_desc.BufferLocation),
+                            byte_off,
+                            fog_idx,
+                            sn2_descriptor_registry::kind_name(fog.kind),
+                            reinterpret_cast<uintptr_t>(fog.resource),
+                            static_cast<unsigned>(fog.resource_desc.Width),
+                            fog.resource_desc.Height,
+                            fog.resource_desc.DepthOrArraySize);
+                    }
+                    write_chain_hit_jsonl(
+                        eye,
+                        crc,
+                        kind,
+                        bindless_idx,
+                        static_cast<uint64_t>(desc.cbv_desc.BufferLocation),
+                        byte_off,
+                        fog_idx,
+                        fog.resource,
+                        fog.resource_desc);
+                }
+            }
+        }
+
+        static std::atomic<uint64_t> summaries{0};
+        const auto n = summaries.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-ViewUB-RootConst] summary#{} eye={} {} crc=0x{:08x} root_words={} desc_resolved={} direct_ils={} cbv_seen={} cbv_mapped={} map_attempts={} map_success={} no_upload_entry={} cand={} fog_resolved={} ils_hits={}",
+                n,
+                eye,
+                kind ? kind : "?",
+                crc,
+                root_words,
+                descriptor_resolved,
+                direct_ils,
+                cbv_seen,
+                cbv_mapped,
+                cbv_map_attempts,
+                cbv_map_success,
+                cbv_no_upload_entry,
+                candidate_words,
+                fog_resolved,
+                ils_hits);
+        }
+    }
+
+    inline void scan_table_cbvs(const CommandListCorrelationState& s, int eye, uint32_t crc, const char* kind) {
+        if (!table_cbv_scan_enabled()) return;
+        if (!sn2_past_init_race()) return;
+
+        const BindlessHeapState heap = tls_bindless_heap;
+        if (heap.cpu_base == 0 || heap.stride == 0 || heap.num_descriptors == 0) return;
+
+        uint32_t tables_seen = 0;
+        uint32_t slots_scanned = 0;
+        uint32_t descriptors_resolved = 0;
+        uint32_t direct_ils = 0;
+        uint32_t cbv_seen = 0;
+        uint32_t cbv_mapped = 0;
+        uint32_t cbv_map_attempts = 0;
+        uint32_t cbv_map_success = 0;
+        uint32_t cbv_no_upload_entry = 0;
+        uint32_t candidate_words = 0;
+        uint32_t fog_resolved = 0;
+        uint32_t ils_hits = 0;
+        const uint32_t max_slots = table_cbv_scan_slots();
+        const uint32_t window_cap = chain_scan_window_bytes();
+        const bool map_missing = chain_scan_map_missing_cbvs();
+
+        for (uint32_t root = 0; root < s.last_graphics_root_desc_tables.size(); ++root) {
+            const uint64_t table_gpu = s.last_graphics_root_desc_tables[root];
+            if (table_gpu == 0) continue;
+            SIZE_T cpu_base = 0;
+            UINT stride = 0;
+            if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) {
+                continue;
+            }
+            ++tables_seen;
+            for (uint32_t slot = 0; slot < max_slots; ++slot) {
+                ++slots_scanned;
+                const SIZE_T desc_cpu = cpu_base + static_cast<SIZE_T>(slot) * static_cast<SIZE_T>(stride);
+                sn2_descriptor_registry::Entry desc{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(desc_cpu, desc)) continue;
+                ++descriptors_resolved;
+
+                if (desc.resource != nullptr && desc.has_resource_desc && is_ils_volume(desc.resource_desc)) {
+                    ++direct_ils;
+                    const uint32_t heap_idx = (desc_cpu >= heap.cpu_base && heap.stride != 0 &&
+                        ((desc_cpu - heap.cpu_base) / heap.stride) <= std::numeric_limits<uint32_t>::max())
+                        ? static_cast<uint32_t>((desc_cpu - heap.cpu_base) / heap.stride)
+                        : 0;
+                    sn2_litness::note_descriptor(
+                        heap_idx,
+                        D3D12_CPU_DESCRIPTOR_HANDLE{desc_cpu},
+                        desc.resource,
+                        desc.resource_desc,
+                        desc.kind == sn2_descriptor_registry::Kind::SRV ? 1 :
+                        desc.kind == sn2_descriptor_registry::Kind::UAV ? 2 : 0);
+
+                    static std::atomic<uint64_t> direct_logs{0};
+                    const auto n = direct_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= table_cbv_scan_log_max() || (n % 600) == 0) {
+                        SPDLOG_WARN("[SN2-ViewUB-TableCBV] DIRECT-ILS eye={} {} crc=0x{:08x} root={} slot={} kind={} res=0x{:x} {}x{}x{}",
+                            eye,
+                            kind ? kind : "?",
+                            crc,
+                            root,
+                            slot,
+                            sn2_descriptor_registry::kind_name(desc.kind),
+                            reinterpret_cast<uintptr_t>(desc.resource),
+                            static_cast<unsigned>(desc.resource_desc.Width),
+                            desc.resource_desc.Height,
+                            desc.resource_desc.DepthOrArraySize);
+                    }
+                    continue;
+                }
+
+                if (desc.kind != sn2_descriptor_registry::Kind::CBV || !desc.has_cbv_desc) {
+                    continue;
+                }
+                ++cbv_seen;
+
+                uint32_t window = std::min<uint32_t>(
+                    window_cap,
+                    desc.cbv_desc.SizeInBytes != 0 ? desc.cbv_desc.SizeInBytes : window_cap);
+                if (window < 256) continue;
+
+                uint8_t* cpu = nullptr;
+                for (uint32_t w = window; w >= 256; w >>= 1) {
+                    cpu = sn2_upload_buf_map::gpu_va_to_cpu(desc.cbv_desc.BufferLocation, w);
+                    if (cpu != nullptr) { window = w; break; }
+                }
+                if (cpu == nullptr && map_missing) {
+                    ++cbv_map_attempts;
+                    if (sn2_upload_buf_map::try_map_for_gpu_va(desc.cbv_desc.BufferLocation, window)) {
+                        ++cbv_map_success;
+                        for (uint32_t w = window; w >= 256; w >>= 1) {
+                            cpu = sn2_upload_buf_map::gpu_va_to_cpu(desc.cbv_desc.BufferLocation, w);
+                            if (cpu != nullptr) { window = w; break; }
+                        }
+                    }
+                }
+                if (cpu == nullptr) {
+                    ID3D12Resource* va_res = nullptr;
+                    uint64_t va_off = 0;
+                    if (!sn2_upload_buf_map::resolve_va(desc.cbv_desc.BufferLocation, va_res, va_off)) {
+                        ++cbv_no_upload_entry;
+                    }
+                    static std::atomic<uint64_t> miss_logs{0};
+                    const auto n = miss_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= table_cbv_scan_log_max() || (n % 600) == 0) {
+                        SPDLOG_WARN("[SN2-ViewUB-TableCBV] CBV-UNMAPPED eye={} {} crc=0x{:08x} root={} slot={} va=0x{:x} size=0x{:x} upload_entry={} upload_res=0x{:x} off=0x{:x}",
+                            eye,
+                            kind ? kind : "?",
+                            crc,
+                            root,
+                            slot,
+                            static_cast<uint64_t>(desc.cbv_desc.BufferLocation),
+                            desc.cbv_desc.SizeInBytes,
+                            va_res != nullptr ? 1 : 0,
+                            reinterpret_cast<uintptr_t>(va_res),
+                            va_off);
+                    }
+                    continue;
+                }
+                ++cbv_mapped;
+
+                const uint32_t words = window / 4;
+                for (uint32_t wi = 0; wi < words; ++wi) {
+                    uint32_t fog_idx = 0;
+                    std::memcpy(&fog_idx, cpu + static_cast<size_t>(wi) * 4, sizeof(fog_idx));
+                    if (fog_idx == 0 || fog_idx >= heap.num_descriptors) continue;
+                    ++candidate_words;
+
+                    const SIZE_T fog_cpu = heap.cpu_base + static_cast<SIZE_T>(fog_idx) * static_cast<SIZE_T>(heap.stride);
+                    sn2_descriptor_registry::Entry fog{};
+                    if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(fog_cpu, fog)) continue;
+                    if (fog.resource == nullptr || !fog.has_resource_desc) continue;
+                    ++fog_resolved;
+                    if (!is_ils_volume(fog.resource_desc)) continue;
+
+                    ++ils_hits;
+                    sn2_litness::note_descriptor(
+                        fog_idx,
+                        D3D12_CPU_DESCRIPTOR_HANDLE{fog_cpu},
+                        fog.resource,
+                        fog.resource_desc,
+                        fog.kind == sn2_descriptor_registry::Kind::SRV ? 1 :
+                        fog.kind == sn2_descriptor_registry::Kind::UAV ? 2 : 0);
+
+                    static std::atomic<uint64_t> hit_logs{0};
+                    const auto n = hit_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+                    const uint32_t byte_off = wi * 4;
+                    if (n <= table_cbv_scan_log_max() || (n % 600) == 0) {
+                        SPDLOG_WARN("[SN2-ViewUB-TableCBV] CHAIN-HIT eye={} {} crc=0x{:08x} root={} slot={} cbv_va=0x{:x} byte_off={} fog_idx={} kind={} res=0x{:x} {}x{}x{}",
+                            eye,
+                            kind ? kind : "?",
+                            crc,
+                            root,
+                            slot,
+                            static_cast<uint64_t>(desc.cbv_desc.BufferLocation),
+                            byte_off,
+                            fog_idx,
+                            sn2_descriptor_registry::kind_name(fog.kind),
+                            reinterpret_cast<uintptr_t>(fog.resource),
+                            static_cast<unsigned>(fog.resource_desc.Width),
+                            fog.resource_desc.Height,
+                            fog.resource_desc.DepthOrArraySize);
+                    }
+                    write_chain_hit_jsonl(
+                        eye,
+                        crc,
+                        kind,
+                        slot,
+                        static_cast<uint64_t>(desc.cbv_desc.BufferLocation),
+                        byte_off,
+                        fog_idx,
+                        fog.resource,
+                        fog.resource_desc);
+                }
+            }
+        }
+
+        static std::atomic<uint64_t> summaries{0};
+        const auto n = summaries.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-ViewUB-TableCBV] summary#{} eye={} {} crc=0x{:08x} tables={} slots={} desc_resolved={} direct_ils={} cbv_seen={} cbv_mapped={} map_attempts={} map_success={} no_upload_entry={} cand={} fog_resolved={} ils_hits={}",
+                n,
+                eye,
+                kind ? kind : "?",
+                crc,
+                tables_seen,
+                slots_scanned,
+                descriptors_resolved,
+                direct_ils,
+                cbv_seen,
+                cbv_mapped,
+                cbv_map_attempts,
+                cbv_map_success,
+                cbv_no_upload_entry,
+                candidate_words,
+                fog_resolved,
+                ils_hits);
+        }
+    }
+
+    // Scan one root CBV's bytes for bindless indices that resolve to an ILS volume.
+    inline void scan_cbv(uint64_t cbv_va, int cbv_param, int eye, uint32_t crc, const char* kind, ScanStats& st) {
+        st.cbvs++;
+        if (cbv_va == 0) return;
+        const BindlessHeapState heap = tls_bindless_heap;
+        st.heap_n = heap.num_descriptors;
+        if (heap.cpu_base == 0 || heap.stride == 0 || heap.num_descriptors == 0) return;
+        uint32_t window = scan_window_bytes();
+        uint8_t* cpu = nullptr;
+        for (uint32_t w = window; w >= 256; w >>= 1) {   // shrink until the mapped buffer covers it
+            cpu = sn2_upload_buf_map::gpu_va_to_cpu(cbv_va, w);
+            if (cpu != nullptr) { window = w; break; }
+        }
+        if (cpu == nullptr) return;
+        st.mapped++;
+        const uint32_t count = window / 4;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t v;
+            std::memcpy(&v, cpu + static_cast<size_t>(i) * 4, 4);
+            if (v == 0 || v >= heap.num_descriptors) continue;
+            st.candidates++;
+            const SIZE_T h = heap.cpu_base + static_cast<SIZE_T>(v) * static_cast<SIZE_T>(heap.stride);
+            sn2_descriptor_registry::Entry e{};
+            if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(h, e)) continue;
+            if (e.resource == nullptr || !e.has_resource_desc) continue;
+            st.resolved++;
+            const D3D12_RESOURCE_DESC& d = e.resource_desc;
+            if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) st.threeD++;
+            if (!is_ils_volume(d)) continue;
+            st.ils++;
+            static std::atomic<uint64_t> hit{0};
+            const auto hn = hit.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (hn <= 96 || (hn % 600) == 0) {
+                SPDLOG_WARN("[SN2-ViewUB] eye={} {} crc=0x{:08x} cbv_param={} byte_off={} bindless_idx={} -> res=0x{:x} {}x{}x{}",
+                    eye, kind, crc, cbv_param, i * 4, v,
+                    reinterpret_cast<uintptr_t>(e.resource),
+                    static_cast<unsigned>(d.Width), d.Height, d.DepthOrArraySize);
+            }
+        }
+    }
+
+    // The View UB is itself bindless (root CBVs don't map), so chasing the index chain is
+    // multi-level. Instead scan the global bindless heap ONCE for ILS-volume descriptors:
+    // that finds the fog volume resource(s) directly and answers "one shared volume or two
+    // distinct per-eye?" — the question that decides consumer-binding vs producer-content.
+    inline void scan_heap_for_ils() {
+        static std::atomic<int> state{0};   // non-fix path: 0=idle 1=running/done
+        const bool desc_substitute = sn2_litness::descriptor_substitute_enabled();
+        uint32_t scan_index = 0;
+        if (!desc_substitute) {
+            int expected = 0;
+            if (!state.compare_exchange_strong(expected, 1)) return;   // once only
+        } else {
+            // Descriptor substitution runs from the draw hook. Never walk the full
+            // bindless heap here; a million-descriptor scan stalls the render thread.
+            // Instead scan bounded chunks over several frames so we can reach the SRV
+            // aliases that often live past the early UAV-only indices.
+            static std::atomic<uint64_t> last_scan_ms{0};
+            static std::atomic<uint32_t> scan_count{0};
+            const uint32_t max_scans = static_cast<uint32_t>(
+                std::max(1, env_int_a("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE_MAX_HEAP_SCANS", 4)));
+            if (scan_count.load(std::memory_order_relaxed) >= max_scans) return;
+            const uint64_t now = GetTickCount64();
+            uint64_t last = last_scan_ms.load(std::memory_order_relaxed);
+            if (now - last < 1000) return;
+            if (!last_scan_ms.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+            scan_index = scan_count.fetch_add(1, std::memory_order_relaxed);
+            if (scan_index >= max_scans) return;
+        }
+        const BindlessHeapState heap = tls_bindless_heap;
+        if (heap.cpu_base == 0 || heap.stride == 0 || heap.num_descriptors == 0) return;
+        uint32_t cap = heap.num_descriptors;
+        bool explicit_cap = false;
+        if (const char* cv = std::getenv("UEVR_SN2_VIEWUB_HEAP_CAP")) {
+            if (cv[0]) { long n = std::strtol(cv, nullptr, 0); if (n > 0) cap = static_cast<uint32_t>(n); }
+            explicit_cap = cv[0] != '\0';
+        }
+        if (desc_substitute) {
+            const uint32_t substitute_cap = static_cast<uint32_t>(
+                std::max(256, env_int_a("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE_HEAP_CAP", 16384)));
+            if (cap > substitute_cap) cap = substitute_cap;
+        } else if (!explicit_cap) {
+            const uint32_t decode_cap = static_cast<uint32_t>(
+                std::max(256, env_int_a("UEVR_SN2_VIEWUB_HEAP_CAP_DEFAULT", 65536)));
+            if (cap > decode_cap) cap = decode_cap;
+        }
+        if (cap > heap.num_descriptors) cap = heap.num_descriptors;
+        uint32_t scan_start = 0;
+        uint32_t scan_end = cap;
+        if (desc_substitute) {
+            const uint64_t start64 = static_cast<uint64_t>(scan_index) * static_cast<uint64_t>(cap);
+            if (start64 >= heap.num_descriptors) return;
+            scan_start = static_cast<uint32_t>(start64);
+            scan_end = static_cast<uint32_t>(std::min<uint64_t>(
+                static_cast<uint64_t>(heap.num_descriptors),
+                start64 + static_cast<uint64_t>(cap)));
+        }
+        ID3D12Resource* seen[16]; int distinct = 0; int found = 0;
+        int srv_found = 0;
+        int uav_found = 0;
+        const int stop_after_distinct = desc_substitute
+            ? std::max(1, std::min(16, env_int_a("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE_STOP_AFTER_DISTINCT", 14)))
+            : 16;
+        bool early_stop = false;
+        for (uint32_t i = scan_start; i < scan_end; ++i) {
+            const SIZE_T h = heap.cpu_base + static_cast<SIZE_T>(i) * static_cast<SIZE_T>(heap.stride);
+            sn2_descriptor_registry::Entry e{};
+            if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(h, e)) continue;
+            if (e.resource == nullptr || !e.has_resource_desc) continue;
+            if (!is_ils_volume(e.resource_desc)) continue;
+            ++found;
+            const uint8_t desc_kind =
+                e.kind == sn2_descriptor_registry::Kind::SRV ? 1 :
+                e.kind == sn2_descriptor_registry::Kind::UAV ? 2 : 0;
+            if (desc_kind == 1) ++srv_found;
+            else if (desc_kind == 2) ++uav_found;
+            sn2_litness::note_descriptor(i, D3D12_CPU_DESCRIPTOR_HANDLE{h}, e.resource, e.resource_desc, desc_kind);
+            bool isnew = true;
+            for (int k = 0; k < distinct; ++k) if (seen[k] == e.resource) { isnew = false; break; }
+            if (isnew && distinct < 16) {
+                seen[distinct++] = e.resource;
+                const D3D12_RESOURCE_DESC& d = e.resource_desc;
+                SPDLOG_WARN("[SN2-ViewUB-Heap] ILS vol #{} bindless_idx={} res=0x{:x} {}x{}x{} kind={}",
+                    distinct, i, reinterpret_cast<uintptr_t>(e.resource),
+                    static_cast<unsigned>(d.Width), d.Height, d.DepthOrArraySize,
+                    e.kind == sn2_descriptor_registry::Kind::UAV ? "UAV" : "SRV");
+                // Queue a mid-Z content readback of each distinct volume so [SN2-FogSnapStats]
+                // tells us which volumes are LIT (teal: G/B-dominant) vs DARK — i.e. which is
+                // the left eye's good fog vs the right eye's washed one. (Needs the snapshot
+                // system. Descriptor-substitute mode enables the snapshot backend
+                // directly, so this no longer needs the broader fog-volume snapshot
+                // diagnostic switch.
+                sn2_rt_snapshot::queue_intent_named(e.resource, "HEAPVOL", 'U', i);
+                if (desc_substitute && srv_found > 0 && distinct >= stop_after_distinct) {
+                    early_stop = true;
+                    break;
+                }
+            }
+        }
+        SPDLOG_WARN("[SN2-ViewUB-Heap] scan done: range=[{}, {}) cap={} found_slots={} srv={} uav={} distinct_ILS_volumes={} early_stop={}",
+            scan_start, scan_end, cap, found, srv_found, uav_found, distinct, early_stop ? 1 : 0);
+    }
+
+    // === THE FIX (2026-05-25): per-frame litness copy ===
+    // The right eye reads a wrong/dark ILS fog volume via the bindless heap. Each frame,
+    // copy a LIT (teal) volume's content into the DARK/red volumes — resolved live by their
+    // bindless index — so whichever volume the right eye samples is now teal. Targeting only
+    // dark volumes preserves the left eye's lit one. Additive, env-gated (UEVR_SN2_VIEWUB_FIX),
+    // runs at most once per frame. Litness scores are fed by sn2_rt_snapshot::log_slice_stats
+    // (needs UEVR_SN2_FOG_VOLUME_SNAPSHOT=1 so the readbacks populate sn2_litness).
+    void apply_litness_copy(ID3D12GraphicsCommandList* cl) {
+        if (!sn2_litness::fix_enabled() || cl == nullptr) return;
+        // Run at most once per frame (the DE7C3822 case fires for many draws/frame).
+        static std::atomic<uint64_t> last_frame{~0ull};
+        const uint64_t frame = sn2_rt_snapshot::g_frame_counter.load(std::memory_order_relaxed);
+        uint64_t prev = last_frame.load(std::memory_order_relaxed);
+        if (prev == frame) return;
+        if (!last_frame.compare_exchange_strong(prev, frame)) return;
+        // One-shot/idempotent: populate litness (queues the HEAPVOL readbacks).
+        scan_heap_for_ils();
+
+        const BindlessHeapState heap = tls_bindless_heap;
+        if (heap.cpu_base == 0 || heap.stride == 0 || heap.num_descriptors == 0) return;
+
+        uint32_t src_idx = 0;
+        std::vector<uint32_t> targets;
+        if (!sn2_litness::plan(src_idx, targets)) return;
+
+        ID3D12Resource* src = sn2_descriptor_registry::lookup_resource_by_cpu_ptr_or_hash(
+            heap.cpu_base + static_cast<SIZE_T>(src_idx) * static_cast<SIZE_T>(heap.stride));
+        if (src == nullptr) return;
+
+        auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+            D3D12_RESOURCE_BARRIER br{};
+            br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            br.Transition.pResource = r;
+            br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            br.Transition.StateBefore = a;
+            br.Transition.StateAfter = b;
+            cl->ResourceBarrier(1, &br);
+        };
+        const D3D12_RESOURCE_STATES S = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+        // Resolve the source's desc once so we can require target descs match it.
+        sn2_descriptor_registry::Entry src_e{};
+        if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(
+                heap.cpu_base + static_cast<SIZE_T>(src_idx) * static_cast<SIZE_T>(heap.stride), src_e)
+            || !src_e.has_resource_desc || !is_ils_volume(src_e.resource_desc)) {
+            return;
+        }
+
+        int copied = 0;
+        for (uint32_t idx : targets) {
+            sn2_descriptor_registry::Entry e{};
+            if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(
+                    heap.cpu_base + static_cast<SIZE_T>(idx) * static_cast<SIZE_T>(heap.stride), e)) {
+                continue;
+            }
+            ID3D12Resource* dst = e.resource;
+            if (dst == nullptr || dst == src || !e.has_resource_desc) continue;
+            if (!is_ils_volume(e.resource_desc)) continue;
+            // Require an identical volume shape/format so CopyResource is geometrically valid.
+            const D3D12_RESOURCE_DESC& d = e.resource_desc;
+            const D3D12_RESOURCE_DESC& sd = src_e.resource_desc;
+            if (d.Dimension != sd.Dimension || d.Format != sd.Format ||
+                d.Width != sd.Width || d.Height != sd.Height ||
+                d.DepthOrArraySize != sd.DepthOrArraySize || d.MipLevels != sd.MipLevels) {
+                continue;
+            }
+            barrier(dst, S, D3D12_RESOURCE_STATE_COPY_DEST);
+            barrier(src, S, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            cl->CopyResource(dst, src);
+            barrier(dst, D3D12_RESOURCE_STATE_COPY_DEST, S);
+            barrier(src, D3D12_RESOURCE_STATE_COPY_SOURCE, S);
+            ++copied;
+        }
+
+        static std::atomic<uint64_t> log_n{0};
+        const auto ln = log_n.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ln <= 32 || (ln % 600) == 0) {
+            SPDLOG_WARN("[SN2-ViewUB-Fix] frame={} src_idx={} copied={} (of targets={})",
+                frame, src_idx, copied, targets.size());
+        }
+    }
+
+    // Safer follow-up experiment to the content copy above: leave resources alone and
+    // rewrite only bindless SRV descriptors whose measured contents are dark/red so
+    // they point at the best measured lit-teal SRV descriptor. This tests the current
+    // leading hypothesis directly: the right-eye consumer is bindless-indexing a
+    // wrong volume even though a correct teal volume already exists in the heap.
+    void apply_litness_descriptor_substitute(ID3D12GraphicsCommandList* cl, int view_id, uint32_t ps_crc) {
+        if (!sn2_litness::descriptor_substitute_enabled() || cl == nullptr) return;
+        if (!sn2_past_init_race()) return;
+        if (!sn2_litness::descriptor_ps_allowed(ps_crc)) return;
+        static const bool any_eye = env_flag_enabled_a("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE_ANY_EYE");
+        if (!any_eye && view_id != 1) return;
+
+        // Refresh the descriptor/index map while the consumer is known active.
+        scan_heap_for_ils();
+
+        const uint64_t frame = sn2_rt_snapshot::g_frame_counter.load(std::memory_order_relaxed);
+        if (!sn2_litness::descriptor_substitute_window_active(frame)) {
+            return;
+        }
+        static std::atomic<uint64_t> last_applied_frame{~0ull};
+        if (last_applied_frame.load(std::memory_order_relaxed) == frame) return;
+
+        uint32_t src_idx = 0;
+        std::vector<uint32_t> target_indices;
+        if (!sn2_litness::plan_descriptor_substitution(src_idx, target_indices)) {
+            static std::atomic<uint64_t> miss{0};
+            const auto m = miss.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (m <= 16 || (m % 600) == 0) {
+                SPDLOG_WARN("[SN2-ViewUB-DescSub] no plan yet frame={} ps=0x{:08x} eye={} miss={} (waiting for HEAPVOL stats)",
+                    frame, ps_crc, view_id, m);
+            }
+            return;
+        }
+
+        sn2_litness::Descriptor src{};
+        if (!sn2_litness::lookup_descriptor(src_idx, src) || src.cpu == 0) {
+            return;
+        }
+
+        ID3D12Device* dev = g_d3d12_hook != nullptr ? g_d3d12_hook->get_device() : nullptr;
+        if (dev == nullptr) {
+            return;
+        }
+
+        const auto max_per_frame = static_cast<size_t>(
+            std::max(1, env_int_a("UEVR_SN2_VIEWUB_DESCRIPTOR_SUBSTITUTE_MAX_COPIES", 24)));
+        size_t copied = 0;
+        for (uint32_t dst_idx : target_indices) {
+            if (copied >= max_per_frame) break;
+            sn2_litness::Descriptor dst{};
+            if (!sn2_litness::lookup_descriptor(dst_idx, dst) || dst.cpu == 0 || dst.cpu == src.cpu) {
+                continue;
+            }
+            if (dst.kind != 1 || dst.resource == src.resource ||
+                dst.width != src.width || dst.height != src.height ||
+                dst.depth != src.depth || dst.format != src.format) {
+                continue;
+            }
+
+            D3D12_CPU_DESCRIPTOR_HANDLE dst_cpu{dst.cpu};
+            D3D12_CPU_DESCRIPTOR_HANDLE src_cpu{src.cpu};
+            if (src.kind == 1) {
+                dev->CopyDescriptorsSimple(1, dst_cpu, src_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                sn2_descriptor_registry::record_copy(dst_cpu, src_cpu);
+                render::D3D12Diagnostics::get().record_descriptor_copy("SN2ViewUBDescSub", dst_cpu, src_cpu);
+            } else {
+                // The lit donor often first appears as a UAV descriptor. A pixel
+                // shader needs an SRV descriptor, so rebuild the target SRV view
+                // shape over the lit donor resource instead of copying a UAV.
+                sn2_descriptor_registry::Entry dst_entry{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(dst.cpu, dst_entry) ||
+                    !dst_entry.has_srv_desc) {
+                    continue;
+                }
+                auto* src_resource = reinterpret_cast<ID3D12Resource*>(src.resource);
+                dev->CreateShaderResourceView(src_resource, &dst_entry.srv_desc, dst_cpu);
+                sn2_descriptor_registry::record_srv(src_resource, &dst_entry.srv_desc, dst_cpu);
+            }
+            ++copied;
+        }
+
+        if (copied != 0) {
+            last_applied_frame.store(frame, std::memory_order_relaxed);
+        }
+        static std::atomic<uint64_t> logs{0};
+        const auto n = logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 32 || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-ViewUB-DescSub] frame={} ps=0x{:08x} eye={} src_idx={} src_kind={} copied={} targets={} src_cpu=0x{:x}",
+                frame,
+                ps_crc,
+                view_id,
+                src_idx,
+                static_cast<unsigned>(src.kind),
+                copied,
+                target_indices.size(),
+                static_cast<uint64_t>(src.cpu));
+        }
+    }
+
+    void scan_graphics(const CommandListCorrelationState& s, int eye, uint32_t crc) {
+        // Run the one-shot heap scan when either the decoder OR the fix is enabled
+        // (the fix needs litness populated). The rest of this function is decode-only.
+        if (!enabled() && !chain_scan_enabled() && !root_constant_scan_enabled() &&
+            !table_cbv_scan_enabled() &&
+            !sn2_litness::fix_enabled() && !sn2_litness::descriptor_substitute_enabled()) return;
+        if (sn2_litness::descriptor_substitute_enabled() && !sn2_past_init_race()) return;
+        if (enabled() || sn2_litness::fix_enabled() || sn2_litness::descriptor_substitute_enabled()) {
+            scan_heap_for_ils();
+        }
+        if (chain_scan_enabled()) {
+            scan_bindless_cbv_chain(eye, crc, "draw");
+        }
+        if (root_constant_scan_enabled()) {
+            scan_root_constants(s, eye, crc, "draw");
+        }
+        if (table_cbv_scan_enabled()) {
+            scan_table_cbvs(s, eye, crc, "draw");
+        }
+        if (!enabled()) return;
+        static std::atomic<uint64_t> calls{0};
+        const auto c = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (c > 32) return;   // throttle: first ~32 draws
+        ScanStats st;
+        const size_t n = s.last_graphics_root_cbv.size();
+        for (size_t p = 0; p < n; ++p) scan_cbv(s.last_graphics_root_cbv[p], static_cast<int>(p), eye, crc, "draw", st);
+        if (c <= 16)
+            SPDLOG_WARN("[SN2-ViewUB-Diag] draw#{} crc=0x{:08x} eye={} cbvs={} mapped={} heap_n={} cand={} resolved={} 3D={} ILS={}",
+                c, crc, eye, st.cbvs, st.mapped, st.heap_n, st.candidates, st.resolved, st.threeD, st.ils);
+    }
+
+    void scan_compute(const CommandListCorrelationState& s, int eye, uint32_t crc) {
+        if (!enabled()) return;
+        static std::atomic<uint64_t> calls{0};
+        const auto c = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (c > 64) return;
+        ScanStats st;
+        const size_t n = s.last_compute_root_cbv.size();
+        for (size_t p = 0; p < n; ++p) scan_cbv(s.last_compute_root_cbv[p], static_cast<int>(p), eye, crc, "disp", st);
+        if (c <= 24)
+            SPDLOG_WARN("[SN2-ViewUB-Diag] disp#{} crc=0x{:08x} eye={} cbvs={} mapped={} heap_n={} cand={} resolved={} 3D={} ILS={}",
+                c, crc, eye, st.cbvs, st.mapped, st.heap_n, st.candidates, st.resolved, st.threeD, st.ils);
+    }
+} // namespace sn2_viewub_decode
+
+// === SN2 focused bindless fog trace (2026-05-27) ===========================
+// The SLW fog consumer does not bind its IntegratedLightScattering Texture3D as
+// a root-table t5 SRV. It reads a uint bindless index from a CB/root-constant
+// chain, then indexes ResourceDescriptorHeap. This tracer emits a compact JSONL
+// row for every draw-local value that resolves to an ILS Texture3D, including
+// the source location of that index. It is read-only and narrow by default:
+// target PS = 0xB9BE2499.
+namespace sn2_bindless_fog_trace {
+    inline bool enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_BINDLESS_FOG_TRACE");
+        return e;
+    }
+
+    inline bool target_ps(uint32_t crc) {
+        static const std::unordered_set<uint32_t> targets = []() {
+            std::unordered_set<uint32_t> out;
+            char buf[512]{};
+            const DWORD n = GetEnvironmentVariableA("UEVR_SN2_BINDLESS_FOG_TRACE_PS_CRCS", buf, sizeof(buf));
+            if (n > 0 && n < sizeof(buf)) {
+                char* ctx = nullptr;
+                for (char* tok = strtok_s(buf, ",; \t", &ctx); tok != nullptr; tok = strtok_s(nullptr, ",; \t", &ctx)) {
+                    const uint32_t v = static_cast<uint32_t>(std::strtoul(tok, nullptr, 0));
+                    if (v != 0) out.insert(v);
+                }
+            }
+            if (out.empty()) {
+                out.insert(0xB9BE2499u);
+            }
+            return out;
+        }();
+        return targets.find(crc) != targets.end();
+    }
+
+    inline uint32_t scan_window_bytes() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::clamp(env_int_a("UEVR_SN2_BINDLESS_FOG_TRACE_WINDOW", 65536), 256, 1 << 20));
+        return v;
+    }
+
+    inline uint32_t table_scan_slots() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::clamp(env_int_a("UEVR_SN2_BINDLESS_FOG_TRACE_TABLE_SLOTS", 256), 1, 8192));
+        return v;
+    }
+
+    inline uint32_t max_hits_per_draw() {
+        static const uint32_t v = static_cast<uint32_t>(
+            std::max(1, env_int_a("UEVR_SN2_BINDLESS_FOG_TRACE_MAX_HITS_PER_DRAW", 64)));
+        return v;
+    }
+
+    inline uint64_t max_rows() {
+        static const uint64_t v = static_cast<uint64_t>(
+            std::max(1, env_int_a("UEVR_SN2_BINDLESS_FOG_TRACE_MAX_ROWS", 20000)));
+        return v;
+    }
+
+    inline bool scan_table_cbvs_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_BINDLESS_FOG_TRACE_TABLE_CBV");
+        return e;
+    }
+
+    inline bool map_missing_cbvs() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_BINDLESS_FOG_TRACE_MAP_MISSING");
+        return e;
+    }
+
+    inline std::string default_path() {
+        return "C:\\Users\\ellio\\AppData\\Roaming\\UnrealVRMod\\Subnautica2-Win64-Shipping\\sn2_bindless_fog_trace.jsonl";
+    }
+
+    inline std::string path() {
+        static const std::string p = []() {
+            char buf[MAX_PATH * 2]{};
+            const DWORD n = GetEnvironmentVariableA("UEVR_SN2_BINDLESS_FOG_TRACE_PATH", buf, sizeof(buf));
+            if (n > 0 && n < sizeof(buf)) {
+                return std::string(buf, buf + n);
+            }
+            return default_path();
+        }();
+        return p;
+    }
+
+    inline std::string hex_u64(uint64_t v) {
+        char buf[32]{};
+        std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(v));
+        return std::string(buf);
+    }
+
+    struct Counters {
+        uint32_t hits = 0;
+        uint32_t words = 0;
+        uint32_t resolved = 0;
+        uint32_t ils = 0;
+        uint32_t root_cbvs = 0;
+        uint32_t root_constant_words = 0;
+        uint32_t tables = 0;
+        uint32_t table_slots = 0;
+        uint32_t cbv_mapped = 0;
+        uint32_t cbv_shadow_mapped = 0;
+        uint32_t cbv_unmapped = 0;
+        uint32_t first_fog_idx = 0;
+        uintptr_t first_resource = 0;
+        uint64_t first_width = 0;
+        uint32_t first_height = 0;
+        uint32_t first_depth = 0;
+        int first_format = 0;
+        float first_litness_score = 0.0f;
+        bool have_first = false;
+        bool first_has_litness_score = false;
+    };
+
+    std::mutex& file_mutex() {
+        static std::mutex m;
+        return m;
+    }
+
+    std::atomic<uint64_t>& row_counter() {
+        static std::atomic<uint64_t> c{0};
+        return c;
+    }
+
+    bool resolve_ils_index(uint32_t idx, sn2_descriptor_registry::Entry& out, SIZE_T& out_cpu) {
+        const BindlessHeapState heap = tls_bindless_heap;
+        if (heap.cpu_base == 0 || heap.stride == 0 || heap.num_descriptors == 0) return false;
+        if (idx == 0 || idx >= heap.num_descriptors) return false;
+        const SIZE_T cpu = heap.cpu_base + static_cast<SIZE_T>(idx) * static_cast<SIZE_T>(heap.stride);
+        sn2_descriptor_registry::Entry e{};
+        if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(cpu, e)) return false;
+        if (e.resource == nullptr || !e.has_resource_desc) return false;
+        if (!sn2_viewub_decode::is_ils_volume(e.resource_desc)) return false;
+        out = e;
+        out_cpu = cpu;
+        return true;
+    }
+
+    void note_first_hit(Counters& c, uint32_t fog_idx, const sn2_descriptor_registry::Entry& fog) {
+        if (c.have_first || fog.resource == nullptr || !fog.has_resource_desc) return;
+        c.have_first = true;
+        c.first_fog_idx = fog_idx;
+        c.first_resource = reinterpret_cast<uintptr_t>(fog.resource);
+        c.first_width = static_cast<uint64_t>(fog.resource_desc.Width);
+        c.first_height = static_cast<uint32_t>(fog.resource_desc.Height);
+        c.first_depth = static_cast<uint32_t>(fog.resource_desc.DepthOrArraySize);
+        c.first_format = static_cast<int>(fog.resource_desc.Format);
+        c.first_has_litness_score = sn2_litness::lookup_score(
+            fog_idx, reinterpret_cast<uintptr_t>(fog.resource), c.first_litness_score);
+    }
+
+    bool map_cbv(D3D12_GPU_VIRTUAL_ADDRESS va,
+                 uint32_t requested_window,
+                 uint8_t*& out_cpu,
+                 uint32_t& out_window,
+                 bool& out_from_shadow) {
+        out_cpu = nullptr;
+        out_window = requested_window;
+        out_from_shadow = false;
+        for (uint32_t w = requested_window; w >= 256; w >>= 1) {
+            out_cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, w);
+            if (out_cpu != nullptr) {
+                out_window = w;
+                return true;
+            }
+        }
+        uint32_t shadow_window = 0;
+        const uint8_t* shadow_cpu = sn2_default_cbv_shadow::lookup_gpu_va_window(va, requested_window, shadow_window);
+        if (shadow_cpu != nullptr && shadow_window >= 256) {
+            out_cpu = const_cast<uint8_t*>(shadow_cpu);
+            out_window = shadow_window;
+            out_from_shadow = true;
+            return true;
+        }
+        if (!map_missing_cbvs()) return false;
+        if (!sn2_upload_buf_map::try_map_for_gpu_va(va, requested_window)) return false;
+        for (uint32_t w = requested_window; w >= 256; w >>= 1) {
+            out_cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, w);
+            if (out_cpu != nullptr) {
+                out_window = w;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool write_json_line(nlohmann::json&& j) {
+        const uint64_t row = row_counter().fetch_add(1, std::memory_order_relaxed) + 1;
+        if (row > max_rows()) return false;
+        j["row"] = row;
+        j["time_ms"] = static_cast<uint64_t>(GetTickCount64());
+        j["frame"] = sn2_rt_snapshot::g_frame_counter.load(std::memory_order_relaxed);
+        try {
+            const std::filesystem::path p{path()};
+            if (p.has_parent_path()) {
+                std::filesystem::create_directories(p.parent_path());
+            }
+            std::scoped_lock _{file_mutex()};
+            std::ofstream f(path(), std::ios::app | std::ios::binary);
+            if (f.good()) {
+                f << j.dump() << '\n';
+                return true;
+            }
+        } catch (...) {
+        }
+        return false;
+    }
+
+    void write_hit(int eye,
+                   uint32_t ps_crc,
+                   const char* draw_kind,
+                   const char* source,
+                   int root,
+                   int slot,
+                   int word,
+                   uint32_t byte_off,
+                   uint32_t cbv_idx,
+                   uint64_t cbv_va,
+                   uint32_t fog_idx,
+                   SIZE_T fog_cpu,
+                   const sn2_descriptor_registry::Entry& fog) {
+        float score = 0.0f;
+        const bool have_score = sn2_litness::lookup_score(
+            fog_idx, reinterpret_cast<uintptr_t>(fog.resource), score);
+
+        nlohmann::json j;
+        j["event"] = "bindless_fog_hit";
+        j["eye"] = eye;
+        j["draw"] = draw_kind != nullptr ? draw_kind : "?";
+        j["ps_crc"] = hex_u64(ps_crc);
+        j["source"] = source != nullptr ? source : "?";
+        j["root"] = root;
+        j["slot"] = slot;
+        j["word"] = word;
+        j["byte_off"] = byte_off;
+        j["cbv_bindless_idx"] = cbv_idx;
+        j["cbv_gpu_va"] = hex_u64(cbv_va);
+        j["fog_bindless_idx"] = fog_idx;
+        j["fog_cpu"] = hex_u64(static_cast<uint64_t>(fog_cpu));
+        j["resource"] = hex_u64(reinterpret_cast<uintptr_t>(fog.resource));
+        j["descriptor_kind"] = sn2_descriptor_registry::kind_name(fog.kind);
+        j["width"] = static_cast<uint64_t>(fog.resource_desc.Width);
+        j["height"] = static_cast<uint32_t>(fog.resource_desc.Height);
+        j["depth"] = static_cast<uint32_t>(fog.resource_desc.DepthOrArraySize);
+        j["format"] = static_cast<int>(fog.resource_desc.Format);
+        if (have_score) {
+            j["litness_score"] = score;
+        }
+
+        write_json_line(std::move(j));
+
+        static std::atomic<uint64_t> logs{0};
+        const auto n = logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 48 || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-BindlessFogTrace] row={} eye={} ps=0x{:08x} src={} root={} slot={} word={} byte_off={} cbv_idx={} fog_idx={} kind={} res=0x{:x} {}x{}x{} score={}",
+                row_counter().load(std::memory_order_relaxed),
+                eye,
+                ps_crc,
+                source != nullptr ? source : "?",
+                root,
+                slot,
+                word,
+                byte_off,
+                cbv_idx,
+                fog_idx,
+                sn2_descriptor_registry::kind_name(fog.kind),
+                reinterpret_cast<uintptr_t>(fog.resource),
+                static_cast<unsigned>(fog.resource_desc.Width),
+                fog.resource_desc.Height,
+                fog.resource_desc.DepthOrArraySize,
+                have_score ? score : -9999.0f);
+        }
+    }
+
+    void write_draw_summary(ID3D12GraphicsCommandList* cl,
+                            const CommandListCorrelationState& s,
+                            int eye,
+                            uint32_t ps_crc,
+                            const char* draw_kind,
+                            const Counters& c) {
+        nlohmann::json j;
+        j["event"] = "bindless_fog_draw_summary";
+        j["eye"] = eye;
+        j["draw"] = draw_kind != nullptr ? draw_kind : "?";
+        j["ps_crc"] = hex_u64(ps_crc);
+        j["pso"] = hex_u64(reinterpret_cast<uintptr_t>(s.current_pso));
+        j["root_signature"] = hex_u64(s.last_graphics_root_signature);
+        j["heap_num_descriptors"] = tls_bindless_heap.num_descriptors;
+        j["hits"] = c.hits;
+        j["candidate_words"] = c.words;
+        j["resolved_words"] = c.resolved;
+        j["ils_hits"] = c.ils;
+        j["root_cbvs"] = c.root_cbvs;
+        j["root_constant_words"] = c.root_constant_words;
+        j["tables"] = c.tables;
+        j["table_slots"] = c.table_slots;
+        j["cbv_mapped"] = c.cbv_mapped;
+        j["cbv_shadow_mapped"] = c.cbv_shadow_mapped;
+        j["cbv_unmapped"] = c.cbv_unmapped;
+        j["viewport"] = {
+            {"x", s.viewport0.TopLeftX},
+            {"y", s.viewport0.TopLeftY},
+            {"w", s.viewport0.Width},
+            {"h", s.viewport0.Height}
+        };
+        if (c.have_first) {
+            j["first_fog_bindless_idx"] = c.first_fog_idx;
+            j["first_resource"] = hex_u64(c.first_resource);
+            j["first_dims"] = {
+                {"width", c.first_width},
+                {"height", c.first_height},
+                {"depth", c.first_depth}
+            };
+            j["first_format"] = c.first_format;
+            if (c.first_has_litness_score) {
+                j["first_litness_score"] = c.first_litness_score;
+            }
+        }
+        write_json_line(std::move(j));
+
+        if (sn2_rdoc_tags::markers_enabled() && cl != nullptr) {
+            char detail[224]{};
+            std::snprintf(
+                detail,
+                sizeof(detail),
+                "SN2BF ps=0x%08x hits=%u cand=%u resolved=%u root_cbv=%u shadow=%u tbl=%u first_idx=%u first_res=0x%llx",
+                ps_crc,
+                c.hits,
+                c.words,
+                c.resolved,
+                c.root_cbvs,
+                c.cbv_shadow_mapped,
+                c.tables,
+                c.have_first ? c.first_fog_idx : 0,
+                static_cast<unsigned long long>(c.first_resource));
+            sn2_rdoc_tags::mark(cl, eye == 0 ? 1 : eye == 1 ? 2 : 0, detail);
+        }
+    }
+
+    void scan_cbv_bytes(int eye,
+                        uint32_t ps_crc,
+                        const char* draw_kind,
+                        const char* source,
+                        int root,
+                        int slot,
+                        uint32_t cbv_idx,
+                        D3D12_GPU_VIRTUAL_ADDRESS cbv_va,
+                        uint32_t cbv_size,
+                        Counters& c) {
+        if (c.hits >= max_hits_per_draw()) return;
+        uint32_t requested = scan_window_bytes();
+        if (cbv_size != 0) {
+            requested = std::min<uint32_t>(requested, cbv_size);
+        }
+        if (requested < 256) return;
+
+        uint8_t* cpu = nullptr;
+        uint32_t window = requested;
+        bool from_shadow = false;
+        if (!map_cbv(cbv_va, requested, cpu, window, from_shadow) || cpu == nullptr) {
+            ++c.cbv_unmapped;
+            return;
+        }
+        ++c.cbv_mapped;
+        if (from_shadow) {
+            ++c.cbv_shadow_mapped;
+        }
+
+        const uint32_t words = window / 4;
+        for (uint32_t wi = 0; wi < words && c.hits < max_hits_per_draw(); ++wi) {
+            uint32_t fog_idx = 0;
+            std::memcpy(&fog_idx, cpu + static_cast<size_t>(wi) * 4, sizeof(fog_idx));
+            if (fog_idx == 0 || fog_idx >= tls_bindless_heap.num_descriptors) continue;
+            ++c.words;
+            sn2_descriptor_registry::Entry fog{};
+            SIZE_T fog_cpu = 0;
+            if (!resolve_ils_index(fog_idx, fog, fog_cpu)) continue;
+            ++c.resolved;
+            ++c.ils;
+            ++c.hits;
+            note_first_hit(c, fog_idx, fog);
+
+            sn2_litness::note_descriptor(
+                fog_idx,
+                D3D12_CPU_DESCRIPTOR_HANDLE{fog_cpu},
+                fog.resource,
+                fog.resource_desc,
+                fog.kind == sn2_descriptor_registry::Kind::SRV ? 1 :
+                fog.kind == sn2_descriptor_registry::Kind::UAV ? 2 : 0);
+
+            write_hit(eye, ps_crc, draw_kind, source, root, slot, static_cast<int>(wi),
+                      wi * 4, cbv_idx, static_cast<uint64_t>(cbv_va), fog_idx, fog_cpu, fog);
+        }
+    }
+
+    void scan_graphics(ID3D12GraphicsCommandList* cl,
+                       const CommandListCorrelationState& s,
+                       int eye,
+                       uint32_t ps_crc,
+                       const char* draw_kind) {
+        if (!enabled() || !target_ps(ps_crc) || !sn2_past_init_race()) return;
+        const BindlessHeapState heap = tls_bindless_heap;
+        if (heap.cpu_base == 0 || heap.stride == 0 || heap.num_descriptors == 0) return;
+
+        Counters c{};
+
+        for (uint32_t root = 0; root < s.last_graphics_root_cbv.size() && c.hits < max_hits_per_draw(); ++root) {
+            const auto va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(s.last_graphics_root_cbv[root]);
+            if (va == 0) continue;
+            ++c.root_cbvs;
+            scan_cbv_bytes(eye, ps_crc, draw_kind, "root_cbv", static_cast<int>(root), -1,
+                           0, va, 0, c);
+        }
+
+        for (uint32_t root = 0; root < s.last_graphics_root_constants_count.size() && c.hits < max_hits_per_draw(); ++root) {
+            const uint32_t count = s.last_graphics_root_constants_count[root];
+            c.root_constant_words += count;
+            for (uint32_t word = 0; word < count && word < CommandListCorrelationState::MAX_ROOT_CONSTANT_DWORDS && c.hits < max_hits_per_draw(); ++word) {
+                const uint32_t idx = s.last_graphics_root_constants[root][word];
+                if (idx == 0 || idx >= heap.num_descriptors) continue;
+                const SIZE_T cpu = heap.cpu_base + static_cast<SIZE_T>(idx) * static_cast<SIZE_T>(heap.stride);
+                sn2_descriptor_registry::Entry e{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(cpu, e)) continue;
+
+                if (e.resource != nullptr && e.has_resource_desc && sn2_viewub_decode::is_ils_volume(e.resource_desc)) {
+                    ++c.hits;
+                    ++c.ils;
+                    note_first_hit(c, idx, e);
+                    sn2_litness::note_descriptor(
+                        idx,
+                        D3D12_CPU_DESCRIPTOR_HANDLE{cpu},
+                        e.resource,
+                        e.resource_desc,
+                        e.kind == sn2_descriptor_registry::Kind::SRV ? 1 :
+                        e.kind == sn2_descriptor_registry::Kind::UAV ? 2 : 0);
+                    write_hit(eye, ps_crc, draw_kind, "root_constant_direct",
+                              static_cast<int>(root), -1, static_cast<int>(word), word * 4,
+                              0, 0, idx, cpu, e);
+                    continue;
+                }
+
+                if (e.kind == sn2_descriptor_registry::Kind::CBV && e.has_cbv_desc) {
+                    scan_cbv_bytes(eye, ps_crc, draw_kind, "root_constant_cbv",
+                                   static_cast<int>(root), -1, static_cast<int>(idx),
+                                   e.cbv_desc.BufferLocation, e.cbv_desc.SizeInBytes, c);
+                }
+            }
+        }
+
+        if (scan_table_cbvs_enabled()) {
+            const uint32_t max_slots = table_scan_slots();
+            for (uint32_t root = 0; root < s.last_graphics_root_desc_tables.size() && c.hits < max_hits_per_draw(); ++root) {
+                const uint64_t table_gpu = s.last_graphics_root_desc_tables[root];
+                if (table_gpu == 0) continue;
+                SIZE_T cpu_base = 0;
+                UINT stride = 0;
+                if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) continue;
+                ++c.tables;
+                for (uint32_t slot = 0; slot < max_slots && c.hits < max_hits_per_draw(); ++slot) {
+                    ++c.table_slots;
+                    const SIZE_T desc_cpu = cpu_base + static_cast<SIZE_T>(slot) * static_cast<SIZE_T>(stride);
+                    sn2_descriptor_registry::Entry e{};
+                    if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(desc_cpu, e)) continue;
+                    if (e.resource != nullptr && e.has_resource_desc && sn2_viewub_decode::is_ils_volume(e.resource_desc)) {
+                        const uint32_t heap_idx = (desc_cpu >= heap.cpu_base && heap.stride != 0)
+                            ? static_cast<uint32_t>((desc_cpu - heap.cpu_base) / heap.stride)
+                            : 0;
+                        ++c.hits;
+                        ++c.ils;
+                        note_first_hit(c, heap_idx, e);
+                        sn2_litness::note_descriptor(
+                            heap_idx,
+                            D3D12_CPU_DESCRIPTOR_HANDLE{desc_cpu},
+                            e.resource,
+                            e.resource_desc,
+                            e.kind == sn2_descriptor_registry::Kind::SRV ? 1 :
+                            e.kind == sn2_descriptor_registry::Kind::UAV ? 2 : 0);
+                        write_hit(eye, ps_crc, draw_kind, "table_direct",
+                                  static_cast<int>(root), static_cast<int>(slot), -1, 0,
+                                  0, 0, heap_idx, desc_cpu, e);
+                        continue;
+                    }
+                    if (e.kind == sn2_descriptor_registry::Kind::CBV && e.has_cbv_desc) {
+                        scan_cbv_bytes(eye, ps_crc, draw_kind, "table_cbv",
+                                       static_cast<int>(root), static_cast<int>(slot), 0,
+                                       e.cbv_desc.BufferLocation, e.cbv_desc.SizeInBytes, c);
+                    }
+                }
+            }
+        }
+
+        write_draw_summary(cl, s, eye, ps_crc, draw_kind, c);
+
+        static std::atomic<uint64_t> summaries{0};
+        const auto n = summaries.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 32 || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-BindlessFogTrace] summary#{} eye={} ps=0x{:08x} draw={} hits={} words={} resolved={} ils={} heap_n={} path={}",
+                n,
+                eye,
+                ps_crc,
+                draw_kind != nullptr ? draw_kind : "?",
+                c.hits,
+                c.words,
+                c.resolved,
+                c.ils,
+                heap.num_descriptors,
+                path());
+        }
+    }
+} // namespace sn2_bindless_fog_trace
+
 // 2026-05-22: Hook ID3D12Device::CreateDescriptorHeap. Registers every
 // CBV/SRV/UAV heap as soon as it is created — solves the
 // NO_REGISTERED_HEAP misses we got from the per-CL SetDescriptorHeaps
@@ -9730,6 +14870,9 @@ HRESULT WINAPI D3D12Hook::create_descriptor_heap(
     }
 
     const HRESULT hr = original(device, desc, riid, heap);
+    if (sn2_hooks_disabled_by_env()) {
+        return hr;
+    }
     if (SUCCEEDED(hr) && heap != nullptr && *heap != nullptr && desc != nullptr && device != nullptr) {
         Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_iface_forensics{};
         auto* unknown = reinterpret_cast<IUnknown*>(*heap);
@@ -9757,8 +14900,10 @@ HRESULT WINAPI D3D12Hook::create_descriptor_heap(
 
             static std::atomic<uint64_t> n{0};
             const auto idx = n.fetch_add(1, std::memory_order_relaxed);
-            if (idx < 32) {
-                SPDLOG_WARN(
+            static const uint64_t max_logs = static_cast<uint64_t>(
+                std::max(0, env_int_a("UEVR_D3D12_CREATE_DESCRIPTOR_HEAP_LOG_MAX", 0)));
+            if (idx < max_logs) {
+                SPDLOG_INFO(
                     "[D3D12-CreateDescriptorHeap] heap={:p} cpu_base=0x{:x} gpu_base=0x{:x} stride={} num_desc={} flags=0x{:x} registry_total={}",
                     (void*)heap_iface.Get(),
                     static_cast<uint64_t>(s.cpu_base), s.gpu_base, s.stride,
@@ -9780,6 +14925,29 @@ static void sn2_log_pso3069_draw_snapshot(
     UINT c,
     INT d,
     UINT e);
+
+// Per-eye SRV capture for the visible fog-apply consumer (PS 0x4E86DC09 =
+// ExponentialPixelMain). Logs every bound graphics root-table slot's resource +
+// dims per eye so we can diff L vs R and find the empty/garbage 2D fog input.
+static void sn2_log_fogconsumer_srv_snapshot(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state);
+
+static void sn2_log_fog_composite_uv_cb_snapshot(
+    const CommandListCorrelationState& state,
+    const char* draw_kind);
+
+static bool sn2_begin_fog_composite_uv_cb_patch(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2Pso3069CbvScope& scope);
+
+static bool sn2_begin_fog_sbs_compute_rect_patch(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    uint32_t cs_crc,
+    UINT& restore_root,
+    uint64_t& restore_va);
 
 HRESULT WINAPI D3D12Hook::close_command_list(ID3D12GraphicsCommandList* command_list) {
     auto d3d12 = g_d3d12_hook;
@@ -10163,6 +15331,35 @@ using Sn2DrawInstancedFn = void (WINAPI*)(
     UINT,
     UINT);
 
+static std::atomic<Sn2DrawIndexedInstancedFn> g_sn2_deferred_draw_indexed_original{nullptr};
+
+static Sn2DrawIndexedInstancedFn sn2_draw_indexed_original_for(ID3D12GraphicsCommandList* command_list) {
+    if (command_list == nullptr) return nullptr;
+    return g_sn2_deferred_draw_indexed_original.load(std::memory_order_relaxed);
+}
+
+namespace sn2_underwater_deferred {
+    bool enabled();
+    void capture(
+        ID3D12GraphicsCommandList* command_list,
+        const CommandListCorrelationState& left_state,
+        const D3D12_VIEWPORT& right_viewport,
+        const D3D12_RECT& right_scissor,
+        bool use_scissor,
+        const std::array<UINT, 8>& swap_roots,
+        const std::array<uint64_t, 8>& swap_right_vas,
+        size_t swap_count,
+        UINT index_count_per_instance,
+        UINT instance_count,
+        UINT start_index_location,
+        INT base_vertex_location,
+        UINT start_instance_location);
+    void try_replay(
+        ID3D12GraphicsCommandList* command_list,
+        const CommandListCorrelationState& current,
+        Sn2DrawIndexedInstancedFn original);
+}
+
 static void sn2_try_duplicate_fog_voxelize_right(
     ID3D12GraphicsCommandList* command_list,
     const CommandListCorrelationState& state,
@@ -10456,6 +15653,2282 @@ static bool sn2_try_begin_consumer_cb_swap(
     return true;
 }
 
+// === THE TRUE FIX (2026-05-24): depth-free fog reprojection compute pass ===
+// Reads the left-eye-framed fog's left half and writes the right half at
+// (rx + disparity), edge-CLAMPING the source coord so the far-right region
+// smoothly extends the rightmost fog instead of ghosting (the residual the
+// copy-shift left). Binds the fog texture as a single RWTexture2D: reads [0,half)
+// and writes [half,width) — disjoint regions, no UAV race. Self-contained PSO +
+// shader-visible UAV ring; restores the engine's heaps + graphics PSO after.
+struct Sn2FogReprojectState {
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> root_sig{};
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso{};
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> uav_heap{};   // shader-visible ring
+    UINT uav_stride = 0;
+    static constexpr UINT kRing = 64;
+    std::atomic<UINT> ring{0};
+    bool tried = false;
+    bool ok = false;
+};
+static Sn2FogReprojectState g_fog_reproject;
+
+static bool sn2_fog_reproject_ensure(ID3D12Device* dev) {
+    auto& s = g_fog_reproject;
+    if (s.ok) return true;
+    if (s.tried) return false;          // compiled-once; don't retry every frame on failure
+    s.tried = true;
+    if (dev == nullptr) return false;
+
+    // Root signature: [0] = 4x 32-bit constants @ b0 ; [1] = table( UAV u0 ).
+    D3D12_DESCRIPTOR_RANGE uav_range{};
+    uav_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uav_range.NumDescriptors = 1;
+    uav_range.BaseShaderRegister = 0;
+    uav_range.RegisterSpace = 0;
+    uav_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.ShaderRegister = 0;
+    params[0].Constants.RegisterSpace = 0;
+    params[0].Constants.Num32BitValues = 4;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges = &uav_range;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rs_desc{};
+    rs_desc.NumParameters = 2;
+    rs_desc.pParameters = params;
+    rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    Microsoft::WRL::ComPtr<ID3DBlob> rs_blob{}, rs_err{};
+    if (FAILED(D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &rs_err))) {
+        SPDLOG_WARN("[SN2-Reproject] root-sig serialize failed");
+        return false;
+    }
+    if (FAILED(dev->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&s.root_sig)))) {
+        SPDLOG_WARN("[SN2-Reproject] CreateRootSignature failed");
+        return false;
+    }
+
+    // Embedded HLSL — compiled at runtime via the DXC helper (cs_6_0).
+    static const char* kHlsl =
+        "cbuffer P : register(b0) { uint half_w; uint height; int shift; uint pad; }\n"
+        "RWTexture2D<float4> Fog : register(u0);\n"
+        "[numthreads(8,8,1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID) {\n"
+        "  if (id.x >= half_w || id.y >= height) return;\n"
+        "  int sx = (int)id.x + shift;\n"
+        "  sx = clamp(sx, 0, (int)half_w - 1);\n"
+        "  Fog[int2((int)half_w + (int)id.x, (int)id.y)] = Fog[int2(sx, (int)id.y)];\n"
+        "}\n";
+    wchar_t tmp[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tmp);
+    const std::filesystem::path hlsl_path = std::filesystem::path(tmp) / L"sn2_fog_reproject.hlsl";
+    try {
+        std::ofstream f(hlsl_path, std::ios::binary | std::ios::trunc);
+        f.write(kHlsl, static_cast<std::streamsize>(std::strlen(kHlsl)));
+    } catch (...) {
+        SPDLOG_WARN("[SN2-Reproject] failed to write HLSL temp file");
+        return false;
+    }
+    render::ShaderCompileRequest req{};
+    req.source_path = hlsl_path;
+    req.entry_point = "main";
+    req.profile = "cs_6_0";
+    req.preferred_backend = render::ShaderCompilerBackend::Dxc;
+    req.warnings_as_errors = false;
+    req.strict_mode = false;
+    req.debug_info = false;
+    const auto res = render::compile_shader_file(req);
+    if (!res.succeeded || res.bytecode.empty()) {
+        SPDLOG_WARN("[SN2-Reproject] shader compile FAILED: {}", res.error);
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = s.root_sig.Get();
+    pso_desc.CS = D3D12_SHADER_BYTECODE{res.bytecode.data(), res.bytecode.size()};
+    if (FAILED(dev->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&s.pso)))) {
+        SPDLOG_WARN("[SN2-Reproject] CreateComputePipelineState failed");
+        return false;
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = Sn2FogReprojectState::kRing;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.uav_heap)))) {
+        SPDLOG_WARN("[SN2-Reproject] CreateDescriptorHeap failed");
+        return false;
+    }
+    s.uav_stride = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    s.ok = true;
+    SPDLOG_WARN("[SN2-Reproject] PSO + UAV ring ready (cs bytecode {} bytes)", res.bytecode.size());
+    return true;
+}
+
+// Reproject one full-width fog texture's left half into its right half (compute).
+// Returns true if the reprojection ran (caller then skips the copy-shift for it).
+static bool sn2_fog_reproject_one(
+    ID3D12Device* dev,
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    ID3D12Resource* T,
+    const D3D12_RESOURCE_DESC& d)
+{
+    // Init-race gate: skip the compute pass (→ caller falls back to the safe
+    // copy-shift) until UEVR's D3D12 framework has had time to finish its setup
+    // retries. Our heap/PSO swap crashes the game if it runs during that window.
+    {
+        static std::atomic<uint64_t> first_tick{0};
+        const uint64_t now = GetTickCount64();
+        uint64_t expected = 0;
+        first_tick.compare_exchange_strong(expected, now, std::memory_order_relaxed);
+        const uint64_t start = first_tick.load(std::memory_order_relaxed);
+        const uint64_t delay_ms = static_cast<uint64_t>(
+            sn2_fog_right_vol_redirect::reproject_delay_s() * 1000.0);
+        if (now - start < delay_ms) return false;
+    }
+    if (!sn2_fog_reproject_ensure(dev)) return false;
+    auto& s = g_fog_reproject;
+    const UINT width = static_cast<UINT>(d.Width);
+    const UINT half = width / 2;
+    const UINT height = d.Height;
+    if (half == 0 || height == 0) return false;
+
+    // Capture the engine's currently-bound heaps BEFORE we swap to ours — our own
+    // SetDescriptorHeaps below re-enters UEVR's hook and overwrites tls_*; reading
+    // them after would "restore" our own heap and leave the composite draw with no
+    // engine descriptors (crash). If no engine CBV/SRV/UAV heap is bound yet (UEVR
+    // init race), skip reprojection entirely (caller falls back to copy-shift).
+    ID3D12DescriptorHeap* const engine_cbvsrvuav = tls_bindless_heap.heap;
+    ID3D12DescriptorHeap* const engine_sampler = tls_sampler_heap.heap;
+    if (engine_cbvsrvuav == nullptr) return false;
+    const int shift = static_cast<int>(static_cast<double>(width) *
+        sn2_fog_right_vol_redirect::reproject_disp_frac() + 0.5);
+
+    // Allocate a ring slot and create a UAV on T there.
+    const UINT slot = s.ring.fetch_add(1, std::memory_order_relaxed) % Sn2FogReprojectState::kRing;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = s.uav_heap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += static_cast<SIZE_T>(slot) * s.uav_stride;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = s.uav_heap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += static_cast<UINT64>(slot) * s.uav_stride;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = d.Format;     // R11G11B10_FLOAT typed UAV load/store (game uses it)
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uav.Texture2D.MipSlice = 0;
+    uav.Texture2D.PlaneSlice = 0;
+    dev->CreateUnorderedAccessView(T, nullptr, &uav, cpu);
+
+    auto barrier = [&](D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = T;
+        b.Transition.Subresource = 0;
+        b.Transition.StateBefore = before;
+        b.Transition.StateAfter = after;
+        command_list->ResourceBarrier(1, &b);
+    };
+
+    barrier(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    ID3D12DescriptorHeap* my_heaps[1]{s.uav_heap.Get()};
+    command_list->SetDescriptorHeaps(1, my_heaps);
+    ++g_per_eye_pso_rebind_depth;
+    command_list->SetPipelineState(s.pso.Get());
+    --g_per_eye_pso_rebind_depth;
+    command_list->SetComputeRootSignature(s.root_sig.Get());
+    const UINT consts[4]{half, height, static_cast<UINT>(shift), 0u};
+    command_list->SetComputeRoot32BitConstants(0, 4, consts, 0);
+    command_list->SetComputeRootDescriptorTable(1, gpu);
+    command_list->Dispatch((half + 7) / 8, (height + 7) / 8, 1);
+
+    barrier(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    // Restore the engine's descriptor heaps (captured BEFORE the swap) + graphics
+    // PSO (graphics root sig and root args are untouched by the compute calls above).
+    ID3D12DescriptorHeap* restore[2]{};
+    UINT restore_n = 0;
+    if (engine_cbvsrvuav != nullptr) restore[restore_n++] = engine_cbvsrvuav;
+    if (engine_sampler != nullptr)   restore[restore_n++] = engine_sampler;
+    if (restore_n > 0) command_list->SetDescriptorHeaps(restore_n, restore);
+    if (state.current_pso != nullptr) {
+        ++g_per_eye_pso_rebind_depth;
+        command_list->SetPipelineState(static_cast<ID3D12PipelineState*>(state.current_pso));
+        --g_per_eye_pso_rebind_depth;
+    }
+    static std::atomic<uint64_t> n{0};
+    const auto seq = n.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (seq <= 32 || (seq % 600) == 0)
+        SPDLOG_WARN("[SN2-Reproject] reprojected fog (w={} half={} shift={}) seq={}", width, half, shift, seq);
+    return true;
+}
+
+// === THE FIX (2026-05-24): right-eye fog composite copy-shift ===
+// Geometry-proven (no-UEVR capture sn2_nouevr_20260521_220823_frame1127.rdc):
+// the right-eye composite (ExponentialPixelMain, PS 0x4E86DC09) samples its
+// full-SBS-width fog textures (scattering + transmittance, R11G11B10F, full
+// backbuffer dims) at SBS screen-UV [0.5,1.0], but UWEFogResolveCS wrote the
+// right eye's fog EYE-LOCAL into the LEFT half [0,0.5]. So the composite reads
+// the black right half -> right eye black. The left eye works because its
+// content lives in [0,0.5] and it samples [0,0.5].
+//
+// FIX: just before the right composite draw, copy each fog texture's left-half
+// content into its right half (via a scratch — same-resource copy needs a single
+// state). Offset = width/2 is geometrically EXACT: texel X in the right half maps
+// back to eye-local texel (X - width/2) = the resolve output for right-screen
+// pixel X. The engine's own (correct) composite then finds the right eye's fog.
+// No new shader, no SRV redirect; only the right eye's own fog texture is touched
+// (left composite already ran and reads a different texture). SRV-only filter
+// excludes the scene-color UAV (which is also full-width R11G11B10F).
+static void sn2_apply_right_composite_fog_shift(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state)
+{
+    if (!sn2_fog_right_vol_redirect::composite_shift_enabled()) return;
+    // Stay completely inert during UEVR's D3D12 init race (the bookkeeping the fix
+    // needs is also gated off then); only act once UEVR is stable + presenting.
+    if (!sn2_past_init_race()) return;
+    if (command_list == nullptr || state.current_pso == nullptr) return;
+    const bool sn2_ce       = sn2_fog_right_vol_redirect::cross_eye_enabled();
+    const bool sn2_is_left  = (state.last_viewport_bucket == StereoTraceBucket::Left);
+    const bool sn2_is_right = (state.last_viewport_bucket == StereoTraceBucket::Right);
+    // The right composite always participates. The LEFT composite only matters in
+    // cross-eye mode, where we capture the left eye's (correct) fog to inject into
+    // the right eye. Anything else: bail.
+    if (!sn2_is_right && !(sn2_is_left && sn2_ce)) return;
+
+    auto& reg = render::ShaderOverrideRegistry::get();
+    const uint32_t ps_crc = reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso));
+    if (ps_crc != sn2_fog_right_vol_redirect::composite_ps_crc()) return;
+
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (dev == nullptr || bindless_heap_registry().count() == 0) return;
+
+    // Collect the full-width R11G11B10F fog SRV(s) bound to this draw. Default cap
+    // = 1 (the scattering): the validated teal result shifted only the first fog
+    // texture; also shifting the 2nd (transmittance/other) corrupts the right eye
+    // (washes it out). Tunable via UEVR_SN2_FOG_MAX_TEX (1 or 2).
+    const int max_tex = []() {
+        const char* v = std::getenv("UEVR_SN2_FOG_MAX_TEX");
+        if (v == nullptr || v[0] == '\0') return 1;
+        const int n = std::atoi(v);
+        return (n >= 1 && n <= 2) ? n : 1;
+    }();
+    constexpr UINT kSearch = 256;
+    ID3D12Resource* fog[2] = {nullptr, nullptr};
+    int nfog = 0;
+    int found_total = 0;   // unique full-width R11G11B10F SRVs seen (diagnostic)
+    const size_t num_tables = state.last_graphics_root_desc_tables.size();
+    for (size_t ti = 0; ti < num_tables && found_total < 8; ++ti) {
+        const uint64_t table_gpu = state.last_graphics_root_desc_tables[ti];
+        if (table_gpu == 0) continue;
+        SIZE_T cpu_base = 0; UINT stride = 0;
+        if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) continue;
+        for (UINT i = 0; i < kSearch && found_total < 8; ++i) {
+            const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(i) * static_cast<SIZE_T>(stride);
+            sn2_descriptor_registry::Entry entry{};
+            if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(slot_cpu, entry) ||
+                entry.kind != sn2_descriptor_registry::Kind::SRV ||
+                entry.resource == nullptr || !entry.has_resource_desc) {
+                continue;
+            }
+            const D3D12_RESOURCE_DESC& d = entry.resource_desc;
+            if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) continue;
+            if (d.Format != DXGI_FORMAT_R11G11B10_FLOAT) continue;
+            // FULL-SBS fog ONLY. Exclude small intermediate passes (w=320/128,
+            // bloom/downsample) AND large non-fog RTs (w=2048 = a UEVR/engine
+            // render target whose reprojection crashed). The SBS fog is the
+            // eye-pair width (~1180-1300 native/dynamic) at ~half height.
+            if (d.Width < 1024 || d.Width > 1536) continue;
+            if (d.Height < 256 || d.Height > 900) continue;
+            if (entry.resource == fog[0] || entry.resource == fog[1]) continue;
+            // DIAGNOSTIC: log every full-width R11G11B10F SRV candidate (root/slot/
+            // resource/dims) so we can see if the selection is ambiguous (multiple
+            // candidates → wrong one picked) at reduced render resolution.
+            {
+                static std::atomic<uint64_t> cand{0};
+                const auto cn = cand.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (cn <= 40 || (cn % 1200) == 0)
+                    SPDLOG_WARN("[SN2-CompShift-Cand] root={} slot={} res=0x{:x} {}x{} cand#{} -> {}",
+                        ti, i, reinterpret_cast<uintptr_t>(entry.resource),
+                        static_cast<unsigned>(d.Width), static_cast<unsigned>(d.Height),
+                        found_total, (nfog < max_tex) ? "SHIFTED" : "skipped");
+            }
+            ++found_total;
+            if (nfog < max_tex) fog[nfog++] = entry.resource;
+        }
+    }
+    if (nfog == 0) {
+        static std::atomic<uint64_t> miss{0};
+        const auto n = miss.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n % 600) == 0)
+            SPDLOG_WARN("[SN2-CompShift] right composite 0x{:08x} draw#{} — no R11G11B10F fog SRV in {} tables", ps_crc, n, num_tables);
+        return;
+    }
+
+    // Lazy scratch per fog index. GROW-ONLY and allocated at the filter-max size, so a
+    // resolution flip (dynamic-res or a swapchain ResizeBuffers loop) does NOT trigger
+    // a mid-frame CreateCommittedResource realloc + deferred release — that allocation
+    // hitch perturbs frame timing and, if dynamic res is on, feeds an oscillation. The
+    // copies only ever reference the sub-region [0,half)x[0,height), so an oversized
+    // scratch is fine (same R11G11B10F format required by CopyTextureRegion).
+    struct Scratch { Microsoft::WRL::ComPtr<ID3D12Resource> tex; UINT w = 0, h = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; };
+    static Scratch s_scratch[2];
+    auto ensure_scratch = [&](int idx, const D3D12_RESOURCE_DESC& src) -> ID3D12Resource* {
+        Scratch& sc = s_scratch[idx];
+        const UINT need_w = static_cast<UINT>(src.Width);
+        if (sc.tex && sc.w >= need_w && sc.h >= src.Height && sc.fmt == src.Format)
+            return sc.tex.Get();                       // reuse if already big enough
+        sc.tex.Reset();
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = src;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        rd.Width  = (src.Width  > 1536ull) ? src.Width  : 1536ull;   // grow to filter-max
+        rd.Height = (src.Height > 900u)    ? src.Height : 900u;      // (never shrink)
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sc.tex)))) {
+            sc.tex.Reset(); return nullptr;
+        }
+        sc.w = static_cast<UINT>(rd.Width); sc.h = static_cast<UINT>(rd.Height); sc.fmt = src.Format;
+        return sc.tex.Get();
+    };
+    auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = r;
+        b.Transition.Subresource = 0;
+        b.Transition.StateBefore = before;
+        b.Transition.StateAfter = after;
+        command_list->ResourceBarrier(1, &b);
+    };
+
+    // ===== CROSS-EYE path (default) ============================================
+    // The right eye's OWN fog content is garbage at mid-depth (producer-intrinsic),
+    // so repositioning it within its own texture yields a white-top/dark-middle
+    // water column. Instead: CAPTURE the left eye's correct fog (left composite
+    // draw) into a persistent COMMON-state scratch, then INJECT it into the right
+    // eye's fog right half (right composite draw). Right eye then shows the left
+    // eye's teal fog at a parallax offset (= the known "teal + logo ghost" result).
+    // The capture scratch stays COMMON between uses so it is safe across command
+    // lists (each use does COMMON->X->COMMON); the queue executes the left draw's
+    // list before the right draw's, so the captured content is ready.
+    struct CapTex { Microsoft::WRL::ComPtr<ID3D12Resource> tex; UINT w = 0, h = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; bool valid = false; };
+    static CapTex s_left_cap[2];
+    auto ensure_cap = [&](int idx, const D3D12_RESOURCE_DESC& src) -> ID3D12Resource* {
+        CapTex& c = s_left_cap[idx];
+        const UINT need_w = static_cast<UINT>(src.Width);
+        if (c.tex && c.w >= need_w && c.h >= src.Height && c.fmt == src.Format) return c.tex.Get();
+        c.tex.Reset(); c.valid = false;
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = src; rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        rd.Width  = (src.Width  > 1536ull) ? src.Width  : 1536ull;
+        rd.Height = (src.Height > 900u)    ? src.Height : 900u;
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&c.tex)))) { c.tex.Reset(); return nullptr; }
+        c.w = static_cast<UINT>(rd.Width); c.h = static_cast<UINT>(rd.Height); c.fmt = src.Format;
+        return c.tex.Get();
+    };
+
+    if (sn2_ce && sn2_is_left) {
+        // CAPTURE: left fog[k] [0,half) -> s_left_cap[k] [0,half)
+        for (int k = 0; k < nfog; ++k) {
+            ID3D12Resource* T = fog[k]; const auto d = T->GetDesc();
+            const UINT half = static_cast<UINT>(d.Width) / 2; if (half == 0) continue;
+            ID3D12Resource* cap = ensure_cap(k, d); if (cap == nullptr) continue;
+            D3D12_BOX box{}; box.left = 0; box.top = 0; box.front = 0; box.right = half; box.bottom = d.Height; box.back = 1;
+            D3D12_TEXTURE_COPY_LOCATION dl{}; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0; dl.pResource = cap;
+            D3D12_TEXTURE_COPY_LOCATION sl{}; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0; sl.pResource = T;
+            barrier(T,   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier(cap, D3D12_RESOURCE_STATE_COMMON,                D3D12_RESOURCE_STATE_COPY_DEST);
+            command_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, &box);
+            barrier(T,   D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            barrier(cap, D3D12_RESOURCE_STATE_COPY_DEST,   D3D12_RESOURCE_STATE_COMMON);
+            s_left_cap[k].valid = true;
+        }
+        static std::atomic<uint64_t> capn{0};
+        const auto n = capn.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n % 600) == 0)
+            SPDLOG_WARN("[SN2-CompShift] captured {} left fog tex (half={}) ps=0x{:08x} seq={}",
+                nfog, (nfog > 0 && fog[0] ? static_cast<UINT>(fog[0]->GetDesc().Width) / 2 : 0), ps_crc, n);
+        return;
+    }
+
+    if (sn2_ce && sn2_is_right) {
+        // APPLY: captured left fog[k] [0,half) -> right fog[k] [half,width)
+        int applied_ce = 0;
+        for (int k = 0; k < nfog; ++k) {
+            if (!s_left_cap[k].valid || !s_left_cap[k].tex) continue;
+            ID3D12Resource* T = fog[k]; const auto d = T->GetDesc();
+            const UINT half = static_cast<UINT>(d.Width) / 2; if (half == 0) continue;
+            ID3D12Resource* cap = s_left_cap[k].tex.Get();
+            UINT copy_w = half; if (half + copy_w > static_cast<UINT>(d.Width)) copy_w = static_cast<UINT>(d.Width) - half;
+            D3D12_BOX box{}; box.left = 0; box.top = 0; box.front = 0; box.right = copy_w; box.bottom = d.Height; box.back = 1;
+            D3D12_TEXTURE_COPY_LOCATION dl{}; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0; dl.pResource = T;
+            D3D12_TEXTURE_COPY_LOCATION sl{}; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0; sl.pResource = cap;
+            barrier(T,   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            barrier(cap, D3D12_RESOURCE_STATE_COMMON,                D3D12_RESOURCE_STATE_COPY_SOURCE);
+            command_list->CopyTextureRegion(&dl, half, 0, 0, &sl, &box);
+            barrier(T,   D3D12_RESOURCE_STATE_COPY_DEST,   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            barrier(cap, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            ++applied_ce;
+        }
+        static std::atomic<uint64_t> appce{0};
+        const auto n = appce.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 32 || (n % 600) == 0)
+            SPDLOG_WARN("[SN2-CompShift] CROSS-EYE applied {} fog tex (half={}) ps=0x{:08x} seq={}",
+                applied_ce, (nfog > 0 && fog[0] ? static_cast<UINT>(fog[0]->GetDesc().Width) / 2 : 0), ps_crc, n);
+        return;
+    }
+    // ===== WITHIN-EYE path (UEVR_SN2_FOG_WITHIN_EYE=1) =========================
+
+    int applied_n = 0;
+    const bool use_reproject = sn2_fog_right_vol_redirect::reproject_enabled();
+    for (int k = 0; k < nfog; ++k) {
+        ID3D12Resource* T = fog[k];
+        const auto d = T->GetDesc();
+        const UINT half = static_cast<UINT>(d.Width) / 2;
+        if (half == 0) continue;
+        // Optional compute reprojection (smooth, but its mid-draw heap/PSO swap
+        // crashes UEVR's D3D12 init race — opt-in only). The default safe path is
+        // the CopyTextureRegion clamp-extend below (step 4).
+        if (sn2_fog_right_vol_redirect::reproject_compute_enabled() &&
+            sn2_fog_reproject_one(dev, command_list, state, T, d)) {
+            ++applied_n;
+            continue;
+        }
+        ID3D12Resource* scr = ensure_scratch(k, d);
+        if (scr == nullptr) continue;
+
+        D3D12_BOX box{}; box.left = 0; box.top = 0; box.front = 0;
+        box.right = half; box.bottom = d.Height; box.back = 1;
+        D3D12_TEXTURE_COPY_LOCATION dl{}; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION sl{}; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
+
+        // step 1: T(PSR)->COPY_SOURCE, scratch(COMMON)->COPY_DEST; copy T[0,half) -> scratch[0,half)
+        barrier(T, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(scr, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        dl.pResource = scr; sl.pResource = T;
+        command_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, &box);
+        // step 2: T->COPY_DEST, scratch->COPY_SOURCE (barriers always needed for 2b/2c).
+        barrier(T, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        barrier(scr, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        dl.pResource = T; sl.pResource = scr;
+        // Full-cover copy scratch[0,half) -> T[half,width). REQUIRED in non-reproject
+        // mode (fills the right edge when DST_FRAC<0.5 / =0.5). REDUNDANT in reproject
+        // mode — steps 2b+2c overwrite the entire [half,width) region — so skip it
+        // there (saves a full half-width x height copy per fog texture per frame).
+        if (!use_reproject) {
+            command_list->CopyTextureRegion(&dl, half, 0, 0, &sl, &box);
+        }
+        // step 2b: aligned overwrite — pull the content LEFT to match the right eye's
+        // parallax-shifted scene (the right fog is left-eye-framed). The full-cover copy
+        // above prevents a black gap at the right edge; this overwrites the center with
+        // the aligned content. In reproject mode the offset = half - disparity (so the
+        // dominant content aligns with the right scene); otherwise use the DST_FRAC knob.
+        UINT dst_left;
+        if (use_reproject) {
+            const int disp = static_cast<int>(static_cast<double>(d.Width) *
+                sn2_fog_right_vol_redirect::reproject_disp_frac() + 0.5);
+            dst_left = (static_cast<int>(half) > disp) ? (half - static_cast<UINT>(disp)) : 0u;
+        } else {
+            const double frac = sn2_fog_right_vol_redirect::composite_shift_dst_frac();
+            dst_left = static_cast<UINT>(static_cast<double>(d.Width) * frac + 0.5);
+        }
+        UINT aligned_end = half;   // where the aligned content ends (for step 4)
+        if (dst_left != half) {
+            UINT copy_w = half;
+            if (dst_left + copy_w > static_cast<UINT>(d.Width)) copy_w = static_cast<UINT>(d.Width) - dst_left;
+            D3D12_BOX abox{}; abox.left = 0; abox.top = 0; abox.front = 0;
+            abox.right = copy_w; abox.bottom = d.Height; abox.back = 1;
+            dl.pResource = T; sl.pResource = scr;
+            command_list->CopyTextureRegion(&dl, dst_left, 0, 0, &sl, &abox);
+            aligned_end = dst_left + copy_w;
+        }
+        // step 2c (reproject mode): CLAMP-EXTEND the right-edge gap. The left-eye-framed
+        // fog is narrower than the right eye, so after aligning it the far-right region
+        // [aligned_end, width) would otherwise show the misaligned full-cover content (a
+        // faint logo "sliver"). Tile the content's rightmost (dark cave-wall) margin
+        // across the gap so it smoothly extends the fog instead — pure CopyTextureRegion,
+        // no compute/heap/PSO swap, so it can't crash UEVR's init race.
+        if (use_reproject && aligned_end < static_cast<UINT>(d.Width)) {
+            const UINT strip = 16;   // rightmost source columns to replicate
+            dl.pResource = T; sl.pResource = scr;
+            for (UINT x = aligned_end; x < static_cast<UINT>(d.Width); ) {
+                UINT w = (x + strip <= static_cast<UINT>(d.Width)) ? strip : (static_cast<UINT>(d.Width) - x);
+                if (w == 0 || w > half) break;
+                D3D12_BOX sb{}; sb.left = half - w; sb.top = 0; sb.front = 0;
+                sb.right = half; sb.bottom = d.Height; sb.back = 1;
+                command_list->CopyTextureRegion(&dl, x, 0, 0, &sl, &sb);
+                x += w;
+            }
+        }
+        // step 3: restore for the draw
+        barrier(T, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        barrier(scr, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        ++applied_n;
+    }
+    static std::atomic<uint64_t> applied{0};
+    const auto n = applied.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 32 || (n % 600) == 0)
+        SPDLOG_WARN("[SN2-CompShift] shifted {} fog tex (half={}) ps=0x{:08x} seq={}",
+            applied_n, (nfog > 0 && fog[0] ? static_cast<UINT>(fog[0]->GetDesc().Width) / 2 : 0), ps_crc, n);
+}
+
+// 2026-05-25: UWEFogResolveCS writes the resolved 2D fog into the left half of
+// its full-SBS output texture, while downstream composite samples the right half
+// for the secondary eye. This experiment runs immediately after each resolve
+// dispatch and copies the freshly-written left half into the right half of the
+// resolve output UAV. It is intentionally resolve-stage only; the older
+// composite-stage copy was too late and could move already-composited scene
+// content such as the logo.
+static bool sn2_fog_resolve_post_shift_enabled()
+{
+    // The shadow redirect fix has two halves:
+    //  1. after UWEFogResolveCS, build/update shifted shadow copies of the two R11 outputs;
+    //  2. at ExponentialPixelMain, redirect those two SRVs to the shadows.
+    // Keep UEVR_SN2_FOG_RESOLVE_POST_SHIFT as the low-level diagnostic toggle,
+    // but make the production redirect arm the producer-side update automatically.
+    static const bool e =
+        env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT") ||
+        env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_REDIRECT");
+    return e;
+}
+
+static bool sn2_fog_resolve_shadow_redirect_enabled()
+{
+    static const bool e = env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_REDIRECT");
+    return e;
+}
+
+namespace sn2_fog_resolve_shift_trace {
+    struct Info {
+        uint64_t seq{};
+        uint64_t frame{};
+        UINT root{};
+        UINT slot{};
+        UINT width{};
+        UINT height{};
+        UINT dst_x{};
+        UINT copy_w{};
+    };
+
+    static std::mutex g_mu;
+    static std::unordered_map<ID3D12Resource*, Info> g_recent;
+    static std::atomic<uint64_t> g_seq{0};
+
+    uint64_t current_seq()
+    {
+        return g_seq.load(std::memory_order_relaxed);
+    }
+
+    uint64_t note(ID3D12Resource* res,
+                  UINT root,
+                  UINT slot,
+                  UINT width,
+                  UINT height,
+                  UINT dst_x,
+                  UINT copy_w)
+    {
+        if (res == nullptr) return 0;
+        const uint64_t seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        Info info{};
+        info.seq = seq;
+        info.frame = g_sn2_d3d12_present_frame_index.load(std::memory_order_relaxed);
+        info.root = root;
+        info.slot = slot;
+        info.width = width;
+        info.height = height;
+        info.dst_x = dst_x;
+        info.copy_w = copy_w;
+        std::scoped_lock _{g_mu};
+        g_recent[res] = info;
+        if (g_recent.size() > 256) {
+            const uint64_t keep_after = (seq > 128) ? (seq - 128) : 0;
+            for (auto it = g_recent.begin(); it != g_recent.end(); ) {
+                if (it->second.seq < keep_after) {
+                    it = g_recent.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        return seq;
+    }
+
+    bool lookup(ID3D12Resource* res, Info& out)
+    {
+        if (res == nullptr) return false;
+        std::scoped_lock _{g_mu};
+        const auto it = g_recent.find(res);
+        if (it == g_recent.end()) return false;
+        out = it->second;
+        return true;
+    }
+}
+
+static std::string sn2_root_binding_label(
+    uintptr_t root_signature,
+    uintptr_t pipeline_state,
+    uint32_t root_parameter,
+    uint32_t descriptor_index)
+{
+    auto& diagnostics = render::D3D12Diagnostics::get();
+    auto info = diagnostics.root_signature(root_signature);
+    if (!info.has_value() && pipeline_state != 0) {
+        info = diagnostics.root_signature_for_pipeline(pipeline_state);
+    }
+    if (!info.has_value()) {
+        return "unmapped";
+    }
+
+    for (const auto& parameter : info->parameters) {
+        if (parameter.index != root_parameter) {
+            continue;
+        }
+
+        if (parameter.parameter_type == "descriptor_table") {
+            uint32_t append_offset = 0;
+            for (const auto& range : parameter.ranges) {
+                const bool appends = range.offset_from_table_start == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+                const uint32_t effective_offset = appends ? append_offset : range.offset_from_table_start;
+                const uint64_t range_end = range.num_descriptors == UINT_MAX
+                    ? UINT64_MAX
+                    : static_cast<uint64_t>(effective_offset) + range.num_descriptors;
+                if (descriptor_index >= effective_offset &&
+                    static_cast<uint64_t>(descriptor_index) < range_end) {
+                    const uint32_t relative = descriptor_index - effective_offset;
+                    const uint32_t shader_register = range.base_shader_register + relative;
+                    const char* prefix = "?";
+                    if (range.type == "srv") {
+                        prefix = "t";
+                    } else if (range.type == "uav") {
+                        prefix = "u";
+                    } else if (range.type == "cbv") {
+                        prefix = "b";
+                    } else if (range.type == "sampler") {
+                        prefix = "s";
+                    }
+
+                    return fmt::format("{}{} space{} rel{} range{}",
+                        prefix,
+                        shader_register,
+                        range.register_space,
+                        relative,
+                        effective_offset);
+                }
+
+                if (range.num_descriptors == UINT_MAX) {
+                    append_offset = UINT_MAX;
+                } else if (append_offset != UINT_MAX) {
+                    append_offset = effective_offset + range.num_descriptors;
+                }
+            }
+            return "table_out_of_range";
+        }
+
+        const char* prefix = "?";
+        if (parameter.parameter_type == "srv") {
+            prefix = "t";
+        } else if (parameter.parameter_type == "uav") {
+            prefix = "u";
+        } else if (parameter.parameter_type == "cbv") {
+            prefix = "b";
+        }
+        return fmt::format("{}{} space{} root_descriptor",
+            prefix,
+            parameter.shader_register,
+            parameter.register_space);
+    }
+
+    return "root_not_found";
+}
+
+namespace sn2_fog_resolve_shadow {
+    struct Shadow {
+        Microsoft::WRL::ComPtr<ID3D12Resource> tex{};
+        D3D12_RESOURCE_DESC desc{};
+        D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu{};
+        D3D12_CPU_DESCRIPTOR_HANDLE uav_cpu{};
+        D3D12_GPU_DESCRIPTOR_HANDLE uav_gpu{};
+        D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};
+        uint64_t update_seq{};
+    };
+
+    struct Heap {
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap{};
+        UINT stride{};
+        UINT capacity{};
+        UINT next{};
+        bool tried{};
+    };
+
+    static std::mutex g_mu;
+    static Heap g_heap;
+    static std::unordered_map<ID3D12Resource*, Shadow> g_shadows;
+
+    bool ensure_heap_locked(ID3D12Device* dev)
+    {
+        if (g_heap.heap) return true;
+        if (g_heap.tried || dev == nullptr) return false;
+        g_heap.tried = true;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 256;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        const HRESULT hr = dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_heap.heap));
+        if (FAILED(hr) || !g_heap.heap) {
+            SPDLOG_WARN("[SN2-FogResolveShadow] SRV heap create failed hr=0x{:08x}", static_cast<unsigned>(hr));
+            g_heap.heap.Reset();
+            return false;
+        }
+        g_heap.stride = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        g_heap.capacity = hd.NumDescriptors;
+        SPDLOG_WARN("[SN2-FogResolveShadow] SRV heap ready capacity={} stride={}", g_heap.capacity, g_heap.stride);
+        return true;
+    }
+
+    Shadow* ensure_shadow_locked(ID3D12Device* dev, ID3D12Resource* original, const D3D12_RESOURCE_DESC& src_desc)
+    {
+        if (dev == nullptr || original == nullptr) return nullptr;
+        auto it = g_shadows.find(original);
+        if (it != g_shadows.end()) return &it->second;
+        if (!ensure_heap_locked(dev) || (g_heap.next + 1) >= g_heap.capacity) return nullptr;
+
+        const bool unsafe_shadow_debug_clear =
+            env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_UNSAFE_DEBUG_CLEAR");
+
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = src_desc;
+        rd.Flags = unsafe_shadow_debug_clear
+            ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+            : D3D12_RESOURCE_FLAG_NONE;
+
+        Shadow sh{};
+        const HRESULT hr = dev->CreateCommittedResource(
+            &hp,
+            D3D12_HEAP_FLAG_NONE,
+            &rd,
+            D3D12_RESOURCE_STATE_COMMON,
+            nullptr,
+            IID_PPV_ARGS(&sh.tex));
+        if (FAILED(hr) || !sh.tex) {
+            SPDLOG_WARN("[SN2-FogResolveShadow] texture create failed hr=0x{:08x} {}x{} fmt={}",
+                static_cast<unsigned>(hr),
+                static_cast<unsigned>(src_desc.Width),
+                src_desc.Height,
+                static_cast<unsigned>(src_desc.Format));
+            return nullptr;
+        }
+
+        sh.desc = rd;
+        sh.state = D3D12_RESOURCE_STATE_COMMON;
+        sh.srv_cpu = g_heap.heap->GetCPUDescriptorHandleForHeapStart();
+        sh.srv_cpu.ptr += static_cast<SIZE_T>(g_heap.next++) * g_heap.stride;
+        if (unsafe_shadow_debug_clear) {
+            sh.uav_cpu = g_heap.heap->GetCPUDescriptorHandleForHeapStart();
+            sh.uav_cpu.ptr += static_cast<SIZE_T>(g_heap.next) * g_heap.stride;
+            sh.uav_gpu = g_heap.heap->GetGPUDescriptorHandleForHeapStart();
+            sh.uav_gpu.ptr += static_cast<UINT64>(g_heap.next++) * g_heap.stride;
+        }
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = src_desc.Format;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MostDetailedMip = 0;
+        srv.Texture2D.MipLevels = 1;
+        srv.Texture2D.PlaneSlice = 0;
+        srv.Texture2D.ResourceMinLODClamp = 0.0f;
+        dev->CreateShaderResourceView(sh.tex.Get(), &srv, sh.srv_cpu);
+
+        if (unsafe_shadow_debug_clear) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+            uav.Format = src_desc.Format;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            uav.Texture2D.MipSlice = 0;
+            uav.Texture2D.PlaneSlice = 0;
+            dev->CreateUnorderedAccessView(sh.tex.Get(), nullptr, &uav, sh.uav_cpu);
+        }
+
+        auto [ins, _] = g_shadows.emplace(original, std::move(sh));
+        static std::atomic<uint64_t> create_logs{0};
+        const auto n = create_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-FogResolveShadow] created #{} orig=0x{:x} shadow=0x{:x} {}x{} fmt={} srv_cpu=0x{:x}",
+                n,
+                reinterpret_cast<uintptr_t>(original),
+                reinterpret_cast<uintptr_t>(ins->second.tex.Get()),
+                static_cast<unsigned>(src_desc.Width),
+                src_desc.Height,
+                static_cast<unsigned>(src_desc.Format),
+                static_cast<uintptr_t>(ins->second.srv_cpu.ptr));
+        }
+        return &ins->second;
+    }
+
+    void transition(ID3D12GraphicsCommandList* cl, ID3D12Resource* r,
+                    D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+    {
+        if (before == after) return;
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = r;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = before;
+        b.Transition.StateAfter = after;
+        cl->ResourceBarrier(1, &b);
+    }
+
+    bool update_from_resolve_output(ID3D12Device* dev,
+                                    ID3D12GraphicsCommandList* cl,
+                                    ID3D12Resource* original,
+                                    const D3D12_RESOURCE_DESC& src_desc,
+                                    UINT dst_x_hint = 0,
+                                    UINT copy_width_hint = 0)
+    {
+        if (dev == nullptr || cl == nullptr || original == nullptr) return false;
+        if (src_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+            src_desc.Format != DXGI_FORMAT_R11G11B10_FLOAT ||
+            (static_cast<UINT>(src_desc.Width) & 1u) != 0) {
+            return false;
+        }
+
+        std::scoped_lock _{g_mu};
+        Shadow* sh = ensure_shadow_locked(dev, original, src_desc);
+        if (sh == nullptr || !sh->tex) return false;
+        const UINT width = static_cast<UINT>(src_desc.Width);
+        const UINT half = width / 2;
+        const UINT dst_x = (dst_x_hint > 0 && dst_x_hint < width) ? dst_x_hint : half;
+        const UINT copy_width = std::min(
+            (copy_width_hint > 0) ? copy_width_hint : half,
+            (dst_x < width) ? (width - dst_x) : 0u);
+        if (copy_width == 0) return false;
+
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        dst.pResource = sh->tex.Get();
+        src.pResource = original;
+
+        transition(cl, original, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(cl, sh->tex.Get(), sh->state, D3D12_RESOURCE_STATE_COPY_DEST);
+        sh->state = D3D12_RESOURCE_STATE_COPY_DEST;
+
+        D3D12_BOX left_half{};
+        left_half.left = 0;
+        left_half.top = 0;
+        left_half.front = 0;
+        left_half.right = copy_width;
+        left_half.bottom = src_desc.Height;
+        left_half.back = 1;
+        // UWEFogResolveCS writes the secondary-eye fog at raw eye-local X
+        // [0, half). The right composite samples SBS-right X [half, width).
+        // Populate both halves of the shadow from the valid left half: the
+        // right half is the fix, and the left half keeps edge/auxiliary samples
+        // initialized without doing a whole-resource copy on the compute list.
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, &left_half);
+        cl->CopyTextureRegion(&dst, dst_x, 0, 0, &src, &left_half);
+
+        transition(cl, original, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        if (env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_UNSAFE_DEBUG_CLEAR") &&
+            sh->uav_cpu.ptr != 0 && sh->uav_gpu.ptr != 0) {
+            transition(cl, sh->tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            sh->state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            const FLOAT magenta[4] = {8.0f, 0.0f, 8.0f, 1.0f};
+            D3D12_RECT right_half{};
+            right_half.left = static_cast<LONG>(half);
+            right_half.top = 0;
+            right_half.right = static_cast<LONG>(width);
+            right_half.bottom = static_cast<LONG>(src_desc.Height);
+            cl->ClearUnorderedAccessViewFloat(
+                sh->uav_gpu,
+                sh->uav_cpu,
+                sh->tex.Get(),
+                magenta,
+                1,
+                &right_half);
+            D3D12_RESOURCE_BARRIER uav_barrier{};
+            uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uav_barrier.UAV.pResource = sh->tex.Get();
+            cl->ResourceBarrier(1, &uav_barrier);
+        }
+
+        // UWEFogResolveCS can run on a compute command list. Do not transition
+        // to PIXEL_SHADER_RESOURCE here; that state is only legal on the later
+        // graphics composite command list. Leave the shadow in COMMON and
+        // promote it at redirect time.
+        transition(cl, sh->tex.Get(), sh->state, D3D12_RESOURCE_STATE_COMMON);
+        sh->state = D3D12_RESOURCE_STATE_COMMON;
+        ++sh->update_seq;
+        return true;
+    }
+
+    bool lookup_srv(ID3D12Resource* original, D3D12_CPU_DESCRIPTOR_HANDLE& out)
+    {
+        if (original == nullptr) return false;
+        std::scoped_lock _{g_mu};
+        const auto it = g_shadows.find(original);
+        if (it == g_shadows.end() || it->second.srv_cpu.ptr == 0 || it->second.update_seq == 0) return false;
+        out = it->second.srv_cpu;
+        return true;
+    }
+
+    bool lookup_srv_for_pixel(ID3D12GraphicsCommandList* cl,
+                              ID3D12Resource* original,
+                              D3D12_CPU_DESCRIPTOR_HANDLE& out)
+    {
+        if (cl == nullptr || original == nullptr) return false;
+        std::scoped_lock _{g_mu};
+        const auto it = g_shadows.find(original);
+        if (it == g_shadows.end() ||
+            !it->second.tex ||
+            it->second.srv_cpu.ptr == 0 ||
+            it->second.update_seq == 0) {
+            return false;
+        }
+        constexpr auto kPixelRead =
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        if (it->second.state != kPixelRead) {
+            transition(cl, it->second.tex.Get(), it->second.state, kPixelRead);
+            it->second.state = kPixelRead;
+        }
+        out = it->second.srv_cpu;
+        return true;
+    }
+
+    bool update_from_pixel_source(ID3D12Device* dev,
+                                  ID3D12GraphicsCommandList* cl,
+                                  ID3D12Resource* original,
+                                  const D3D12_RESOURCE_DESC& src_desc,
+                                  D3D12_CPU_DESCRIPTOR_HANDLE& out,
+                                  UINT dst_x_hint = 0,
+                                  UINT copy_width_hint = 0)
+    {
+        out = {};
+        if (dev == nullptr || cl == nullptr || original == nullptr) return false;
+        if (src_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+            src_desc.Format != DXGI_FORMAT_R11G11B10_FLOAT ||
+            (static_cast<UINT>(src_desc.Width) & 1u) != 0 ||
+            src_desc.Width < 1024 || src_desc.Width > 1536 ||
+            src_desc.Height < 256 || src_desc.Height > 900) {
+            return false;
+        }
+
+        std::scoped_lock _{g_mu};
+        Shadow* sh = ensure_shadow_locked(dev, original, src_desc);
+        if (sh == nullptr || !sh->tex) return false;
+
+        const UINT width = static_cast<UINT>(src_desc.Width);
+        const UINT half = width / 2;
+        const UINT dst_x = (dst_x_hint > 0 && dst_x_hint < width) ? dst_x_hint : half;
+        const UINT copy_width = std::min(
+            (copy_width_hint > 0) ? copy_width_hint : half,
+            (dst_x < width) ? (width - dst_x) : 0u);
+        if (copy_width == 0) return false;
+
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        dst.pResource = sh->tex.Get();
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        src.pResource = original;
+        D3D12_BOX left_half{};
+        left_half.left = 0;
+        left_half.top = 0;
+        left_half.front = 0;
+        left_half.right = copy_width;
+        left_half.bottom = src_desc.Height;
+        left_half.back = 1;
+
+        constexpr auto kPixelRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        transition(cl, original, kPixelRead, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(cl, sh->tex.Get(), sh->state, D3D12_RESOURCE_STATE_COPY_DEST);
+        sh->state = D3D12_RESOURCE_STATE_COPY_DEST;
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, &left_half);
+        cl->CopyTextureRegion(&dst, dst_x, 0, 0, &src, &left_half);
+        transition(cl, original, D3D12_RESOURCE_STATE_COPY_SOURCE, kPixelRead);
+        transition(cl, sh->tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kPixelRead);
+        sh->state = kPixelRead;
+        ++sh->update_seq;
+        static std::atomic<uint64_t> update_logs{0};
+        const auto n = update_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-FogResolveShadow] pixel shadow update#{} orig=0x{:x} dst_x={} copy_w={} tex={}x{}",
+                n,
+                reinterpret_cast<uintptr_t>(original),
+                dst_x,
+                copy_width,
+                static_cast<unsigned>(src_desc.Width),
+                src_desc.Height);
+        }
+        out = sh->srv_cpu;
+        return out.ptr != 0;
+    }
+
+    size_t count()
+    {
+        std::scoped_lock _{g_mu};
+        return g_shadows.size();
+    }
+}
+
+static void sn2_apply_fog_resolve_post_shift(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    uint32_t cs_crc)
+{
+    if (!sn2_fog_resolve_post_shift_enabled()) return;
+    if (!sn2_past_init_race()) return;
+    if (command_list == nullptr) return;
+    if (cs_crc != sn2_fog_right_vol_redirect::resolve_crc()) return;
+
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (dev == nullptr || bindless_heap_registry().count() == 0) return;
+
+    // If a prior frame's copy removed the device, surface the reason once instead
+    // of letting the next call crash opaquely inside nvwgf2umx.dll.
+    {
+        const HRESULT removed = dev->GetDeviceRemovedReason();
+        if (removed != S_OK) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                SPDLOG_ERROR("[SN2-FogResolvePostShift] DEVICE REMOVED reason=0x{:08x} "
+                             "(DXGI_ERROR_DEVICE_HUNG=0x887A0006 _REMOVED=0x887A0005 "
+                             "_RESET=0x887A0007 INVALID_CALL=0x887A0001)",
+                             static_cast<unsigned>(removed));
+            }
+            return;
+        }
+    }
+
+    constexpr UINT kSearch = 96;
+    const int max_targets = std::clamp(env_int_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_MAX_TARGETS", 2), 1, 4);
+    const int log_max = std::max(0, env_int_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_LOG_MAX", 64));
+
+    ID3D12Resource* targets[4]{};
+    D3D12_RESOURCE_DESC target_descs[4]{};
+    UINT target_roots[4]{};
+    UINT target_slots[4]{};
+    D3D12_CPU_DESCRIPTOR_HANDLE target_cpu_uavs[4]{};
+    D3D12_GPU_DESCRIPTOR_HANDLE target_gpu_uavs[4]{};
+    int target_count = 0;
+    int candidate_count = 0;
+    const size_t num_tables = state.last_compute_root_desc_tables.size();
+    const int only_root = env_int_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_ROOT", -1);
+    const int only_slot = env_int_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_SLOT", -1);
+    const int slot_window_first = env_int_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_FIRST_SLOT", -1);
+    const int slot_window_count = std::clamp(env_int_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_SLOT_COUNT", 0), 0, 32);
+    const bool explicit_slot_filter =
+        only_root >= 0 || only_slot >= 0 || (slot_window_first >= 0 && slot_window_count > 0);
+    const bool strict_default_slots =
+        !explicit_slot_filter && !env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_SCAN_ALL");
+    const int candidate_log_max = std::max(0, env_int_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_CAND_LOG_MAX", log_max));
+    const int max_candidates = std::max(16, env_int_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_CANDIDATE_LIMIT", 128));
+    const bool debug_clear = env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_DEBUG_CLEAR");
+    const bool shadow_redirect = sn2_fog_resolve_shadow_redirect_enabled();
+    const bool xeye_cache_mode =
+        env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_XEYE_CACHE") &&
+        !env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SELF_SHIFT");
+    const bool self_shift_mode = !xeye_cache_mode;
+    const int dst_x_override = env_int_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_DST_X", -1);
+    const int copy_w_override = env_int_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_COPY_W", -1);
+    const bool snapshot_after = env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_SNAPSHOT");
+    const int snapshot_max = std::max(0, env_int_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_SNAPSHOT_MAX", 4));
+    static std::atomic<uint64_t> candidate_log_seq{0};
+
+    for (size_t ti = 0; ti < num_tables && candidate_count < max_candidates; ++ti) {
+        if (only_root >= 0 && static_cast<int>(ti) != only_root) continue;
+        if (strict_default_slots && ti != 0) continue;
+        const uint64_t table_gpu = state.last_compute_root_desc_tables[ti];
+        if (table_gpu == 0) continue;
+
+        SIZE_T cpu_base = 0;
+        UINT stride = 0;
+        if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) continue;
+
+        for (UINT slot = 0; slot < kSearch && candidate_count < max_candidates; ++slot) {
+            if (only_slot >= 0 && static_cast<int>(slot) != only_slot) continue;
+            if (strict_default_slots && slot != 9u && slot != 10u) continue;
+            if (slot_window_first >= 0 && slot_window_count > 0) {
+                const int slot_i = static_cast<int>(slot);
+                if (slot_i < slot_window_first || slot_i >= slot_window_first + slot_window_count) continue;
+            }
+            const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * static_cast<SIZE_T>(stride);
+            sn2_descriptor_registry::Entry entry{};
+            if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(slot_cpu, entry) ||
+                entry.kind != sn2_descriptor_registry::Kind::UAV ||
+                entry.resource == nullptr ||
+                !entry.has_resource_desc) {
+                continue;
+            }
+
+            const auto& d = entry.resource_desc;
+            if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) continue;
+            if (d.Format != DXGI_FORMAT_R11G11B10_FLOAT) continue;
+            // UWEFogResolveCS (cs 0x0930dd4e) is reused for several resolve passes
+            // at different resolutions. Only the full-width SBS fog resolve has its
+            // u0/u1 outputs at root0:slot9/10 in UNORDERED_ACCESS; at other
+            // resolutions (e.g. a 1024-wide variant) those slots point at resources
+            // in a different state, and shifting them removed the device. Gate on
+            // the SBS width so we only touch the one resolve we mean to.
+            const int min_w = std::clamp(env_int_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_MIN_WIDTH", 1152), 2, 8192);
+            if (d.Width < static_cast<UINT>(min_w) || d.Width > 1536) continue;
+            if (d.Height < 256 || d.Height > 900) continue;
+            if ((static_cast<UINT>(d.Width) & 1u) != 0) continue;
+
+            bool duplicate = false;
+            for (int i = 0; i < target_count; ++i) {
+                if (targets[i] == entry.resource) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+
+            const int cand = ++candidate_count;
+            const auto log_seq = candidate_log_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (log_seq <= static_cast<uint64_t>(candidate_log_max) || (log_seq % 600) == 0) {
+                SPDLOG_WARN("[SN2-FogResolvePostShift-Cand] root={} slot={} res=0x{:x} {}x{} fmt={} flags=0x{:x} cand={} selected={}",
+                    ti,
+                    slot,
+                    reinterpret_cast<uintptr_t>(entry.resource),
+                    static_cast<unsigned>(d.Width),
+                    static_cast<unsigned>(d.Height),
+                    static_cast<unsigned>(d.Format),
+                    static_cast<unsigned>(d.Flags),
+                    cand,
+                    (target_count < max_targets) ? 1 : 0);
+            }
+
+            if (target_count < max_targets) {
+                targets[target_count] = entry.resource;
+                target_descs[target_count] = d;
+                target_roots[target_count] = static_cast<UINT>(ti);
+                target_slots[target_count] = slot;
+                target_cpu_uavs[target_count] = D3D12_CPU_DESCRIPTOR_HANDLE{slot_cpu};
+                target_gpu_uavs[target_count] = D3D12_GPU_DESCRIPTOR_HANDLE{table_gpu + static_cast<uint64_t>(slot) * static_cast<uint64_t>(stride)};
+                ++target_count;
+            }
+        }
+    }
+
+    if (target_count == 0) {
+        static std::atomic<uint64_t> miss{0};
+        const auto n = miss.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= static_cast<uint64_t>(log_max) || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-FogResolvePostShift] MISS cs=0x{:08x} tables={} heaps={} registry={}",
+                cs_crc,
+                num_tables,
+                bindless_heap_registry().count(),
+                sn2_descriptor_registry::registry_size());
+        }
+        return;
+    }
+
+    struct Scratch {
+        Microsoft::WRL::ComPtr<ID3D12Resource> tex;
+        UINT w = 0;
+        UINT h = 0;
+        DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+    };
+    static std::mutex s_scratch_mu;
+    static std::atomic<uint64_t> s_ring{0};
+    static Scratch s_scratch[16];
+
+    const UINT ring_slot = static_cast<UINT>(s_ring.fetch_add(1, std::memory_order_relaxed) % 16);
+    std::scoped_lock scratch_lock{s_scratch_mu};
+    Scratch& scratch = s_scratch[ring_slot];
+
+    auto ensure_scratch = [&](const D3D12_RESOURCE_DESC& src) -> ID3D12Resource* {
+        const UINT need_w = static_cast<UINT>(src.Width);
+        if (scratch.tex && scratch.w >= need_w && scratch.h >= src.Height && scratch.fmt == src.Format) {
+            return scratch.tex.Get();
+        }
+        scratch.tex.Reset();
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = src;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        rd.Width = (src.Width > 1536ull) ? src.Width : 1536ull;
+        rd.Height = (src.Height > 900u) ? src.Height : 900u;
+        const HRESULT hr = dev->CreateCommittedResource(
+            &hp,
+            D3D12_HEAP_FLAG_NONE,
+            &rd,
+            D3D12_RESOURCE_STATE_COMMON,
+            nullptr,
+            IID_PPV_ARGS(&scratch.tex));
+        if (FAILED(hr)) {
+            scratch.tex.Reset();
+            scratch.w = scratch.h = 0;
+            scratch.fmt = DXGI_FORMAT_UNKNOWN;
+            static std::atomic<uint64_t> fail{0};
+            const auto n = fail.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= static_cast<uint64_t>(log_max) || (n % 600) == 0) {
+                SPDLOG_WARN("[SN2-FogResolvePostShift] scratch create failed hr=0x{:08x} {}x{} fmt={} n={}",
+                    static_cast<unsigned>(hr),
+                    static_cast<unsigned>(src.Width),
+                    src.Height,
+                    static_cast<unsigned>(src.Format),
+                    n);
+            }
+            return nullptr;
+        }
+        scratch.w = static_cast<UINT>(rd.Width);
+        scratch.h = rd.Height;
+        scratch.fmt = rd.Format;
+        return scratch.tex.Get();
+    };
+
+    auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = r;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = before;
+        b.Transition.StateAfter = after;
+        command_list->ResourceBarrier(1, &b);
+    };
+
+    int applied = 0;
+    UINT last_half = 0;
+    UINT last_dst_x = 0;
+    UINT last_copy_w = 0;
+    UINT first_root = 0;
+    UINT first_slot = 0;
+    uintptr_t first_res = 0;
+    static std::atomic<uint64_t> snap_seq{0};
+    for (int i = 0; i < target_count; ++i) {
+        ID3D12Resource* target = targets[i];
+        const auto& d = target_descs[i];
+        const UINT width = static_cast<UINT>(d.Width);
+        const UINT half = width / 2;
+        if (target == nullptr || half == 0 || d.Height == 0) continue;
+        UINT applied_dst_x = half;
+        if (dst_x_override > 0 && static_cast<UINT>(dst_x_override) < width) {
+            applied_dst_x = static_cast<UINT>(dst_x_override);
+        } else if (state.viewport0.TopLeftX > 0.0f &&
+                   state.viewport0.TopLeftX < static_cast<float>(width)) {
+            applied_dst_x = static_cast<UINT>(std::max(0.0f, std::round(state.viewport0.TopLeftX)));
+        }
+        UINT applied_copy_w = (applied_dst_x < width) ? std::min(half, width - applied_dst_x) : 0u;
+        if (copy_w_override > 0) {
+            applied_copy_w = std::min(applied_copy_w, static_cast<UINT>(copy_w_override));
+        }
+        if (applied_copy_w == 0) continue;
+
+        if (shadow_redirect && !debug_clear) {
+            const UINT view_dst_x = (state.viewport0.TopLeftX > 0.0f &&
+                                     state.viewport0.TopLeftX < static_cast<float>(width))
+                ? static_cast<UINT>(std::max(0.0f, std::round(state.viewport0.TopLeftX)))
+                : 0u;
+            const UINT view_copy_w = (state.viewport0.Width > 0.0f)
+                ? static_cast<UINT>(std::max(0.0f, std::round(state.viewport0.Width)))
+                : 0u;
+            if (!sn2_fog_resolve_shadow::update_from_resolve_output(
+                    dev,
+                    command_list,
+                    target,
+                    d,
+                    view_dst_x,
+                    view_copy_w)) {
+                continue;
+            }
+            last_dst_x = (view_dst_x > 0) ? view_dst_x : half;
+            last_copy_w = std::min((view_copy_w > 0) ? view_copy_w : half,
+                (last_dst_x < width) ? (width - last_dst_x) : 0u);
+            applied_dst_x = last_dst_x;
+            applied_copy_w = last_copy_w;
+        } else if (debug_clear) {
+            // Default clears the SBS-right half. CLEAR_FULL=1 clears the whole
+            // resource (both halves) — used to test whether the LEFT eye's teal
+            // is sourced from THIS resolve output's left half.
+            const bool clear_full = env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_POST_SHIFT_CLEAR_FULL");
+            const FLOAT magenta[4] = { 8.0f, 0.0f, 8.0f, 1.0f };
+            D3D12_RECT right_half{};
+            right_half.left = clear_full ? 0 : static_cast<LONG>(applied_dst_x);
+            right_half.top = 0;
+            right_half.right = static_cast<LONG>(width);
+            right_half.bottom = static_cast<LONG>(d.Height);
+            command_list->ClearUnorderedAccessViewFloat(
+                target_gpu_uavs[i],
+                target_cpu_uavs[i],
+                target,
+                magenta,
+                1,
+                &right_half);
+            D3D12_RESOURCE_BARRIER uav{};
+            uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uav.UAV.pResource = target;
+            command_list->ResourceBarrier(1, &uav);
+        } else {
+            // Copy mode. DEFAULT = SELF-SHIFT. RenderDoc showed the right
+            // UWEFogResolveCS output contains valid fog in its left half and an
+            // empty SBS-right half; ExponentialPixelMain samples the SBS-right
+            // half. So the safe first fix is a same-resource left->right copy via
+            // scratch. The older cross-eye cache is still available for diagnostics
+            // via UEVR_SN2_FOG_RESOLVE_XEYE_CACHE=1.
+            if (i >= 4) continue;
+            const UINT cw = std::min(applied_copy_w, half);
+            const UINT dx = applied_dst_x;
+            D3D12_TEXTURE_COPY_LOCATION cdst{};
+            cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            cdst.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION csrc{};
+            csrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            csrc.SubresourceIndex = 0;
+            D3D12_BOX lbox{};
+            lbox.left = 0; lbox.top = 0; lbox.front = 0;
+            lbox.right = cw; lbox.bottom = d.Height; lbox.back = 1;
+
+            if (self_shift_mode) {
+                ID3D12Resource* scratch_tex = ensure_scratch(d);
+                if (scratch_tex == nullptr) continue;
+                // The resolve just wrote `target` as a UAV. Flush those writes
+                // before the copy reads them. The state transition below also
+                // syncs, but an explicit UAV barrier is cheap insurance against
+                // a producer dispatch whose writes haven't retired.
+                {
+                    D3D12_RESOURCE_BARRIER uav{};
+                    uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    uav.UAV.pResource = target;
+                    command_list->ResourceBarrier(1, &uav);
+                }
+                barrier(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                barrier(scratch_tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                cdst.pResource = scratch_tex; csrc.pResource = target;
+                command_list->CopyTextureRegion(&cdst, 0, 0, 0, &csrc, &lbox);
+                barrier(target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                barrier(scratch_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                cdst.pResource = target; csrc.pResource = scratch_tex;
+                command_list->CopyTextureRegion(&cdst, dx, 0, 0, &csrc, &lbox);
+                barrier(target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                barrier(scratch_tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            } else {
+                struct XeyeCache {
+                    Microsoft::WRL::ComPtr<ID3D12Resource> tex;
+                    UINT w{}, h{}; DXGI_FORMAT fmt{DXGI_FORMAT_UNKNOWN};
+                    bool primed{false};
+                    D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};
+                };
+                static XeyeCache g_xeye[4];
+                XeyeCache& cache = g_xeye[i];
+                if (!cache.tex || cache.w < width || cache.h < d.Height || cache.fmt != d.Format) {
+                    cache.tex.Reset();
+                    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    D3D12_RESOURCE_DESC rd = d; rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+                    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&cache.tex))) || !cache.tex) {
+                        cache.tex.Reset(); continue;
+                    }
+                    cache.w = width; cache.h = d.Height; cache.fmt = d.Format;
+                    cache.primed = false; cache.state = D3D12_RESOURCE_STATE_COMMON;
+                }
+                {
+                    D3D12_RESOURCE_BARRIER uav{};
+                    uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    uav.UAV.pResource = target;
+                    command_list->ResourceBarrier(1, &uav);
+                }
+                if (cache.primed) {
+                    // 1. fill THIS output's SBS-right half [dx, dx+cw) from the cache
+                    //    (= the previous resolve's left half = the left eye's fog).
+                    barrier(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                    if (cache.state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+                        barrier(cache.tex.Get(), cache.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        cache.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    }
+                    cdst.pResource = target; csrc.pResource = cache.tex.Get();
+                    command_list->CopyTextureRegion(&cdst, dx, 0, 0, &csrc, &lbox);
+                    // 2. update the cache from THIS output's left half [0,cw).
+                    barrier(target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    barrier(cache.tex.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                    cache.state = D3D12_RESOURCE_STATE_COPY_DEST;
+                    cdst.pResource = cache.tex.Get(); csrc.pResource = target;
+                    command_list->CopyTextureRegion(&cdst, 0, 0, 0, &csrc, &lbox);
+                    barrier(target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                } else {
+                    // first time: prime cache from this (left) eye only.
+                    barrier(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    barrier(cache.tex.Get(), cache.state, D3D12_RESOURCE_STATE_COPY_DEST);
+                    cache.state = D3D12_RESOURCE_STATE_COPY_DEST;
+                    cdst.pResource = cache.tex.Get(); csrc.pResource = target;
+                    command_list->CopyTextureRegion(&cdst, 0, 0, 0, &csrc, &lbox);
+                    barrier(target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    cache.primed = true;
+                }
+            }
+        }
+        sn2_fog_resolve_shift_trace::note(
+            target,
+            target_roots[i],
+            target_slots[i],
+            width,
+            d.Height,
+            applied_dst_x,
+            applied_copy_w);
+        if (snapshot_after && sn2_rt_snapshot::initialized()) {
+            const auto sn = snap_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (sn <= static_cast<uint64_t>(snapshot_max)) {
+                char tag[64]{};
+                std::snprintf(tag, sizeof(tag), "FGRSHIFT_r%u_s%u_%llu",
+                    target_roots[i],
+                    target_slots[i],
+                    static_cast<unsigned long long>(sn));
+                sn2_rt_snapshot::schedule_capture(command_list, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, tag);
+            }
+        }
+        ++applied;
+        last_half = half;
+        if (last_dst_x == 0) {
+            last_dst_x = half;
+            last_copy_w = half;
+        }
+        if (first_res == 0) {
+            first_root = target_roots[i];
+            first_slot = target_slots[i];
+            first_res = reinterpret_cast<uintptr_t>(target);
+        }
+    }
+
+    static std::atomic<uint64_t> seq{0};
+    const auto n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= static_cast<uint64_t>(log_max) || (n % 600) == 0) {
+        SPDLOG_WARN("[SN2-FogResolvePostShift] mode={} applied={} targets={} candidates={} half={} dst_x={} copy_w={} cs=0x{:08x} first=root{}:slot{} res=0x{:x} seq={}",
+            debug_clear ? "debug_clear" : (shadow_redirect ? "shadow" : (self_shift_mode ? "self_copy" : "xeye_cache")),
+            applied,
+            target_count,
+            candidate_count,
+            last_half,
+            last_dst_x,
+            last_copy_w,
+            cs_crc,
+            first_root,
+            first_slot,
+            first_res,
+            n);
+    }
+}
+
+// THE FIX (2026-05-25): right-eye analytic fog gate. RenderDoc decode of the
+// composite (ExponentialPixelMain, 0x4E86DC09) proved the analytic underwater-fog
+// path is gated by View UB reg204.w (byte 3276): LEFT=0.752 (gate ON -> teal),
+// RIGHT=0.000 (gate OFF -> the analytic fog is skipped -> black water). The fog
+// COLORS come from the (shared) FogStruct, so simply restoring the secondary eye's
+// reg204.w to the primary's value turns the analytic fog back on. The View UB is a
+// large (~10076B) per-frame upload-heap CB; we resolve its CPU pointer via the
+// upload-buffer map and patch reg204.w in place for the right composite, using the
+// value cached from the left composite the same frame. Gated UEVR_SN2_FOG_VIEWUB_GATE_FIX=1.
+static void sn2_try_fog_viewub_gate_fix(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state)
+{
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_FOG_VIEWUB_GATE_FIX");
+    if (!enabled) return;
+    if (!sn2_past_init_race()) return;
+    if (command_list == nullptr || state.current_pso == nullptr) return;
+    auto& reg = render::ShaderOverrideRegistry::get();
+    const uint32_t ps_crc = reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso));
+    if (ps_crc != env_u32_a("UEVR_SN2_FOG_RESOLVE_SHADOW_COMPOSITE_PS", 0x4E86DC09u)) return;
+    const int view_id = cmdlist_view_id(state);
+    const bool is_right = (view_id == 1) || (state.last_viewport_bucket == StereoTraceBucket::Right);
+    const bool is_left = (!is_right) && ((view_id == 0) || (state.last_viewport_bucket == StereoTraceBucket::Left));
+    if (!is_left && !is_right) return;
+
+    // reg204.w (analytic fog gate) is at byte 204*16 + 12 = 3276.
+    // reg149 = ViewSizeAndInvSize at byte 149*16 = 2384: (W, H, 1/W, 1/H).
+    constexpr uint64_t kReg204W = 3276;
+    constexpr uint64_t kReg149 = 2384;
+
+    auto looks_like_view_ub = [](const uint8_t* b) -> bool {
+        float vw, ivw, vh, ivh;
+        std::memcpy(&vw, b + kReg149, 4);
+        std::memcpy(&vh, b + kReg149 + 4, 4);
+        std::memcpy(&ivw, b + kReg149 + 8, 4);
+        std::memcpy(&ivh, b + kReg149 + 12, 4);
+        if (!(vw > 64.0f && vw < 8192.0f && vh > 64.0f && vh < 8192.0f)) return false;
+        if (ivw <= 0.0f || ivh <= 0.0f) return false;
+        return std::fabs(ivw - 1.0f / vw) < 1e-4f && std::fabs(ivh - 1.0f / vh) < 1e-4f;
+    };
+
+    // Identify the View UB by the reg149 ViewSize/InvSize self-consistency signature
+    // (size alone is ambiguous). Try root CBVs first, then descriptor-table CBVs
+    // (UE binds the composite's View UB via a CBV descriptor table, not a root CBV).
+    uint8_t* viewub = nullptr;
+    for (size_t p = 0; p < state.last_graphics_root_cbv.size() && viewub == nullptr; ++p) {
+        const uint64_t va = static_cast<uint64_t>(state.last_graphics_root_cbv[p]);
+        if (va == 0) continue;
+        uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, 5168);
+        if (cpu != nullptr && looks_like_view_ub(cpu)) viewub = cpu;
+    }
+    if (viewub == nullptr) {
+        const UINT kSearch = 256;
+        for (size_t ti = 0; ti < state.last_graphics_root_desc_tables.size() && viewub == nullptr; ++ti) {
+            const uint64_t table_gpu = state.last_graphics_root_desc_tables[ti];
+            if (table_gpu == 0) continue;
+            BindlessHeapState hs{}; SIZE_T cpu_base = 0;
+            if (!bindless_heap_registry().resolve_state(table_gpu, hs, cpu_base) || hs.heap == nullptr || hs.stride == 0) continue;
+            for (UINT slot = 0; slot < kSearch && viewub == nullptr; ++slot) {
+                const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * hs.stride;
+                sn2_descriptor_registry::Entry e{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(slot_cpu, e)) continue;
+                if (e.kind != sn2_descriptor_registry::Kind::CBV || !e.has_cbv_desc) continue;
+                const uint64_t va = static_cast<uint64_t>(e.cbv_desc.BufferLocation);
+                if (va == 0) continue;
+                uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, kReg204W + 16);
+                if (cpu != nullptr && looks_like_view_ub(cpu)) viewub = cpu;
+            }
+        }
+    }
+    if (viewub == nullptr) {
+        static std::atomic<uint64_t> miss{0};
+        const auto n = miss.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n % 1200) == 0)
+            SPDLOG_WARN("[SN2-FogGateFix] {} no View UB root CBV found (ncbv check)", is_left?"L":"R");
+        return;
+    }
+
+    // The composite reads these View-UB regs. Copy the SHARED analytic-fog regs
+    // L->R; PRESERVE the per-eye regs (148/149 ViewRect, 78/259 depth transform).
+    static const int kFogRegs[] = {72, 73, 80, 156, 182, 183, 184, 185, 200, 204, 321};
+    constexpr int kReg149Dims = 2384;
+    float vw = 0.0f; std::memcpy(&vw, viewub + kReg149Dims, 4);
+    float density = 0.0f; std::memcpy(&density, viewub + kReg204W, sizeof(float));
+
+    static std::mutex g_mu;
+    static uint8_t g_left[5168];
+    static bool g_have_left = false;
+
+    if (is_left) {
+        std::scoped_lock lk{g_mu};
+        std::memcpy(g_left, viewub, sizeof(g_left));
+        g_have_left = true;
+        static std::atomic<uint64_t> ls{0};
+        const auto n = ls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 6 || (n % 2400) == 0)
+            SPDLOG_WARN("[SN2-FogGateFix] left cached vw={:.0f} reg204.w={:.5f}", vw, density);
+        return;
+    }
+    // right eye.
+    std::scoped_lock lk{g_mu};
+    if (!g_have_left) return;
+    // DIAGNOSTIC: which of the read regs differ L vs R? (find the real divergent gate)
+    static std::atomic<uint64_t> diag{0};
+    const auto dn = diag.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (dn <= 6) {
+        static const int allRegs[] = {72,73,78,80,148,149,156,182,183,184,185,200,204,259,321};
+        std::string diff;
+        for (int r : allRegs) {
+            for (int c = 0; c < 4; ++c) {
+                uint32_t lu, ru;
+                std::memcpy(&lu, g_left + r*16 + c*4, 4);
+                std::memcpy(&ru, viewub + r*16 + c*4, 4);
+                if (lu != ru) {
+                    char b[64]; std::snprintf(b, sizeof(b), " r%d.%d(L=0x%08x R=0x%08x)", r, c, lu, ru);
+                    diff += b;
+                }
+            }
+        }
+        SPDLOG_WARN("[SN2-FogGateFix] DIFF vw={:.0f} reg204.w={:.5f}:{}", vw, density, diff.empty()?" <none>":diff.c_str());
+    }
+    if (!env_flag_enabled_a("UEVR_SN2_FOG_VIEWUB_GATE_FIX_DIAGONLY")) {
+        for (int r : kFogRegs) {
+            std::memcpy(viewub + r * 16, g_left + r * 16, 16);
+        }
+    }
+}
+
+// Consumer-side cross-eye fog copy (UEVR_SN2_FOG_COMPOSITE_XEYE=1).
+// The right composite (ExponentialPixelMain, 0x4E86DC09) samples EMPTY t4/t5 fog
+// (the producer never writes valid fog for view 1), while the LEFT composite
+// samples valid teal fog in the SAME slots — proven: CLEAR_FULL turns the right
+// eye magenta but leaves the left teal, and self/producer shifts of the right's
+// own (empty) output stay black. UE renders left-eye then right-eye, so we cache
+// the LEFT composite's bound R11 fog SRVs (their left/[0,half) teal) and copy that
+// into the RIGHT composite's bound R11 SRVs' SBS-right half [half,width) — the
+// exact region the right composite samples. Uses each draw's ACTUAL bound
+// resources (robust to resolve ping-pong) and does NOT swap descriptor heaps
+// (no device-removal risk like the SRV-table redirect).
+static bool sn2_try_composite_xeye_fog_copy(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state)
+{
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_FOG_COMPOSITE_XEYE");
+    // 2026-05-26: SELF-SHIFT mode. RenderDoc proved the RIGHT composite's OWN bound fog
+    // input (e.g. 29002/29003) holds the right-eye fog in its LEFT half [0,half) with the
+    // right half [half,width) EMPTY (store-position bug), and the right composite samples
+    // the right half -> black. Copy each right-composite fog SRV's own left half -> its
+    // right half (via a temp, since a resource can't be COPY_SOURCE+COPY_DEST at once).
+    // This uses the right eye's OWN computed fog (correct parallax) — NOT a cross-eye copy
+    // of the left eye's pixels.
+    static const bool self_shift = env_flag_enabled_a("UEVR_SN2_FOG_COMPOSITE_SELF_SHIFT");
+    if (!enabled && !self_shift) return false;
+    if (!sn2_past_init_race()) return false;
+    if (command_list == nullptr || state.current_pso == nullptr) return false;
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (dev == nullptr) return false;
+    auto& reg = render::ShaderOverrideRegistry::get();
+    const uint32_t ps_crc = reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso));
+    if (ps_crc != env_u32_a("UEVR_SN2_FOG_RESOLVE_SHADOW_COMPOSITE_PS", 0x4E86DC09u)) return false;
+    const int view_id = cmdlist_view_id(state);
+    const bool is_right = (view_id == 1) || (state.last_viewport_bucket == StereoTraceBucket::Right);
+    const bool is_left = (!is_right) && ((view_id == 0) || (state.last_viewport_bucket == StereoTraceBucket::Left));
+    if (!is_left && !is_right) return false;
+
+    struct Found { ID3D12Resource* res{}; D3D12_RESOURCE_DESC desc{}; };
+    std::array<Found, 4> found{};
+    UINT found_n = 0;
+    const UINT kSearch = 256;
+    for (size_t ti = 0; ti < state.last_graphics_root_desc_tables.size() && found_n < found.size(); ++ti) {
+        const uint64_t table_gpu = state.last_graphics_root_desc_tables[ti];
+        if (table_gpu == 0) continue;
+        BindlessHeapState hs{};
+        SIZE_T cpu_base = 0;
+        if (!bindless_heap_registry().resolve_state(table_gpu, hs, cpu_base) ||
+            hs.heap == nullptr || hs.stride == 0) {
+            continue;
+        }
+        const uint64_t off = table_gpu - hs.gpu_base;
+        const uint64_t heap_bytes = static_cast<uint64_t>(hs.stride) * hs.num_descriptors;
+        const UINT remaining = (off < heap_bytes) ? static_cast<UINT>((heap_bytes - off) / hs.stride) : 0u;
+        const UINT cc = std::min(kSearch, remaining);
+        for (UINT slot = 0; slot < cc && found_n < found.size(); ++slot) {
+            const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * hs.stride;
+            sn2_descriptor_registry::Entry e{};
+            if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(slot_cpu, e) || e.resource == nullptr) {
+                continue;
+            }
+            const auto rd = e.has_resource_desc ? e.resource_desc : e.resource->GetDesc();
+            if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                rd.Format != DXGI_FORMAT_R11G11B10_FLOAT ||
+                rd.Width < 1024 || rd.Width > 1536 || rd.Height < 256 || rd.Height > 900) {
+                continue;
+            }
+            // EXCLUDE the scene-color target (the flags=0x5 R11 = RT+UAV, bound as u0).
+            // The UWEFogResolveCS outputs are UAV-only (flags=0x4). Cross-eye copying
+            // the scene color produces a ghosted left-eye image (the doubled logo).
+            if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+                continue;
+            }
+            bool dup = false;
+            for (UINT k = 0; k < found_n; ++k) if (found[k].res == e.resource) { dup = true; break; }
+            if (dup) continue;
+            found[found_n].res = e.resource;
+            found[found_n].desc = rd;
+            ++found_n;
+        }
+    }
+    if (found_n == 0) return false;
+
+    static std::mutex mu;
+    struct Cache { Microsoft::WRL::ComPtr<ID3D12Resource> tex; UINT w{}, h{}; DXGI_FORMAT fmt{DXGI_FORMAT_UNKNOWN}; bool primed{false}; };
+    static Cache cache[4];
+    std::scoped_lock lk{mu};
+    constexpr auto kPix = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        if (a == b) return;
+        D3D12_RESOURCE_BARRIER br{};
+        br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        br.Transition.pResource = r;
+        br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        br.Transition.StateBefore = a;
+        br.Transition.StateAfter = b;
+        command_list->ResourceBarrier(1, &br);
+    };
+    UINT acted = 0;
+    for (UINT i = 0; i < found_n && i < 4; ++i) {
+        Cache& c = cache[i];
+        const auto& d = found[i].desc;
+        const UINT width = static_cast<UINT>(d.Width);
+        const UINT half = width / 2;
+        if (half == 0) continue;
+        if (!c.tex || c.w < width || c.h < d.Height || c.fmt != d.Format) {
+            c.tex.Reset();
+            D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd = d; rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+            if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                    D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&c.tex))) || !c.tex) {
+                c.tex.Reset(); continue;
+            }
+            c.w = width; c.h = d.Height; c.fmt = d.Format; c.primed = false;
+        }
+        D3D12_TEXTURE_COPY_LOCATION dst{}; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION src{}; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+        D3D12_BOX lbox{}; lbox.left = 0; lbox.top = 0; lbox.front = 0; lbox.right = half; lbox.bottom = d.Height; lbox.back = 1;
+        if (self_shift) {
+            // Within-texture left-half -> right-half on the RIGHT composite's own input.
+            if (is_right) {
+                tr(found[i].res, kPix, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                tr(c.tex.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                dst.pResource = c.tex.Get(); src.pResource = found[i].res;
+                command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &lbox);            // res[0,half) -> temp
+                tr(found[i].res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                tr(c.tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                dst.pResource = found[i].res; src.pResource = c.tex.Get();
+                command_list->CopyTextureRegion(&dst, half, 0, 0, &src, &lbox);         // temp -> res[half,width)
+                tr(found[i].res, D3D12_RESOURCE_STATE_COPY_DEST, kPix);
+                tr(c.tex.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+                ++acted;
+            }
+            // is_left: no-op in self-shift mode.
+        } else if (is_left) {
+            // cache the left composite's left half [0,half) (the valid teal fog).
+            tr(found[i].res, kPix, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            tr(c.tex.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            dst.pResource = c.tex.Get(); src.pResource = found[i].res;
+            command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &lbox);
+            tr(found[i].res, D3D12_RESOURCE_STATE_COPY_SOURCE, kPix);
+            tr(c.tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            c.primed = true; ++acted;
+        } else if (is_right && c.primed) {
+            // fill the right composite's SBS-right half [half,width) from the cached left fog.
+            tr(found[i].res, kPix, D3D12_RESOURCE_STATE_COPY_DEST);
+            tr(c.tex.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            dst.pResource = found[i].res; src.pResource = c.tex.Get();
+            command_list->CopyTextureRegion(&dst, half, 0, 0, &src, &lbox);
+            tr(found[i].res, D3D12_RESOURCE_STATE_COPY_DEST, kPix);
+            tr(c.tex.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            ++acted;
+        }
+    }
+    if (acted > 0) {
+        static std::atomic<uint64_t> seq{0};
+        const auto n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 48 || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-CompositeXeye] {} ps=0x{:08x} view={} found={} acted={} seq={}",
+                is_left ? "cache-left" : "fill-right", ps_crc, view_id, found_n, acted, n);
+        }
+    }
+    return acted > 0;
+}
+
+static bool sn2_try_begin_fog_resolve_shadow_redirect(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2EyePairingRedirectScope& scope)
+{
+    const bool discover_mode = env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_DISCOVER");
+    const bool discover_all = env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_DISCOVER_ALL");
+    const bool redirect_enabled = sn2_fog_resolve_shadow_redirect_enabled();
+    const int view_id = cmdlist_view_id(state);
+
+    auto log_gate = [&](const char* reason, uint32_t ps_crc = 0) {
+        if (!discover_mode && !env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_GATE_LOG")) {
+            return;
+        }
+        static std::atomic<uint64_t> gate_log_seq{0};
+        const auto n = gate_log_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 64 || (n % 12000) == 0) {
+            SPDLOG_WARN(
+                "[SN2-FogResolveShadow-Gate] reason={} redirect={} discover={} ps=0x{:08x} view={} bucket={} pso=0x{:x} tables={} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) seq={}",
+                reason ? reason : "?",
+                redirect_enabled ? 1 : 0,
+                discover_mode ? 1 : 0,
+                ps_crc,
+                view_id,
+                static_cast<int>(state.last_viewport_bucket),
+                reinterpret_cast<uintptr_t>(state.current_pso),
+                state.last_graphics_root_desc_tables.size(),
+                state.viewport0.TopLeftX,
+                state.viewport0.TopLeftY,
+                state.viewport0.Width,
+                state.viewport0.Height,
+                n);
+        }
+    };
+
+    if (!redirect_enabled && !discover_mode) {
+        log_gate("disabled");
+        return false;
+    }
+    if (!sn2_past_init_race()) {
+        log_gate("init_race");
+        return false;
+    }
+    if (command_list == nullptr) {
+        log_gate("null_command_list");
+        return false;
+    }
+    if (state.current_pso == nullptr) {
+        log_gate("null_pso");
+        return false;
+    }
+
+    if (view_id != 1 && state.last_viewport_bucket != StereoTraceBucket::Right) {
+        static std::atomic<uint64_t> not_right_log_seq{0};
+        const auto n = not_right_log_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((discover_mode || env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_GATE_LOG")) &&
+            (n <= 4 || (n % 20000) == 0)) {
+            SPDLOG_WARN(
+                "[SN2-FogResolveShadow-Gate] reason=not_right redirect={} discover={} view={} bucket={} pso=0x{:x} tables={} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) seq={}",
+                redirect_enabled ? 1 : 0,
+                discover_mode ? 1 : 0,
+                view_id,
+                static_cast<int>(state.last_viewport_bucket),
+                reinterpret_cast<uintptr_t>(state.current_pso),
+                state.last_graphics_root_desc_tables.size(),
+                state.viewport0.TopLeftX,
+                state.viewport0.TopLeftY,
+                state.viewport0.Width,
+                state.viewport0.Height,
+                n);
+        }
+        return false;
+    }
+
+    auto& reg = render::ShaderOverrideRegistry::get();
+    const uint32_t ps_crc = reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso));
+    const uint32_t target_ps = env_u32_a("UEVR_SN2_FOG_RESOLVE_SHADOW_COMPOSITE_PS", 0x4E86DC09u);
+    if (discover_mode && ps_crc == 0) {
+        log_gate("ps_zero", ps_crc);
+        return false;
+    }
+    if (ps_crc != target_ps) {
+        if (discover_mode && !discover_all) {
+            return false;
+        }
+        if (!discover_mode) {
+            log_gate("ps_mismatch", ps_crc);
+            return false;
+        }
+    }
+
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (dev == nullptr) {
+        log_gate("null_device", ps_crc);
+        return false;
+    }
+    if (!sn2_uwe_fog_mirror::ensure_scratch_heap(dev)) {
+        log_gate("scratch_heap_ensure_failed", ps_crc);
+        return false;
+    }
+    ID3D12DescriptorHeap* scratch_heap = sn2_uwe_fog_mirror::scratch_heap().heap.Get();
+    if (scratch_heap == nullptr) {
+        log_gate("scratch_heap_null", ps_crc);
+        return false;
+    }
+
+    const UINT kSearch = static_cast<UINT>(std::clamp(
+        env_int_a("UEVR_SN2_FOG_RESOLVE_SHADOW_SCAN_SLOTS", 256), 1, 512));
+    // Unsafe diagnostic only. This rebinds ExponentialPixelMain's t2 scalar/
+    // coverage input to an R11 fog-color shadow. It proved the hook can reach
+    // t2, but it can crash the game/driver path immediately after the composite
+    // redirect, so require an explicit second opt-in before allowing it.
+    const bool patch_t2_with_first_r11 =
+        env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_PATCH_T2_WITH_FIRST_R11") &&
+        env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_UNSAFE_T2_PATCH");
+    const UINT requested_max_total_patches = static_cast<UINT>(std::clamp(
+        env_int_a("UEVR_SN2_FOG_RESOLVE_SHADOW_MAX_PATCHES", 2), 1, 16));
+    const UINT max_total_patches = patch_t2_with_first_r11
+        ? std::max<UINT>(requested_max_total_patches, 3)
+        : requested_max_total_patches;
+    const int only_root = env_int_a("UEVR_SN2_FOG_RESOLVE_SHADOW_ROOT", -1);
+    const int only_slot = env_int_a("UEVR_SN2_FOG_RESOLVE_SHADOW_SLOT", -1);
+    const int slot_window_first = env_int_a("UEVR_SN2_FOG_RESOLVE_SHADOW_FIRST_SLOT", -1);
+    const int slot_window_count = std::clamp(
+        env_int_a("UEVR_SN2_FOG_RESOLVE_SHADOW_SLOT_COUNT", 0), 0, 16);
+    const int cand_log_max = std::max(0, env_int_a("UEVR_SN2_FOG_RESOLVE_SHADOW_CAND_LOG_MAX", 32));
+    const int allslot_log_max = std::max(0, env_int_a("UEVR_SN2_FOG_RESOLVE_SHADOW_ALLSLOT_LOG_MAX", 256));
+    struct PatchSlot {
+        UINT slot{};
+        D3D12_CPU_DESCRIPTOR_HANDLE shadow_srv{};
+    };
+    struct Plan {
+        UINT root{};
+        uint64_t original_gpu{};
+        SIZE_T source_cpu{};
+        UINT stride{};
+        UINT copy_count{};
+        UINT patch_count{};
+        std::array<PatchSlot, 16> patches{};
+        UINT scratch_base{};
+        SIZE_T scratch_cpu{};
+        UINT64 scratch_gpu{};
+        bool has_t2_slot{};
+        bool t2_already_patched{};
+        UINT t2_slot{};
+        D3D12_CPU_DESCRIPTOR_HANDLE first_r11_shadow_srv{};
+        UINT first_r11_slot{};
+    };
+
+    std::array<Plan, 32> plans{};
+    UINT plan_count = 0;
+    UINT total_patches = 0;
+    UINT resolved_slots = 0;
+    UINT r11_slots = 0;
+    BindlessHeapState source_heap{};
+    bool have_source_heap = false;
+    static std::atomic<uint64_t> cand_log_seq{0};
+
+    for (size_t ti = 0;
+         ti < state.last_graphics_root_desc_tables.size() &&
+         plan_count < plans.size() &&
+         total_patches < max_total_patches;
+         ++ti) {
+        if (only_root >= 0 && static_cast<int>(ti) != only_root) continue;
+        const uint64_t table_gpu = state.last_graphics_root_desc_tables[ti];
+        if (table_gpu == 0) continue;
+
+        BindlessHeapState heap_state{};
+        SIZE_T cpu_base = 0;
+        if (!bindless_heap_registry().resolve_state(table_gpu, heap_state, cpu_base) ||
+            heap_state.heap == nullptr || heap_state.stride == 0) {
+            continue;
+        }
+        if (!have_source_heap) {
+            source_heap = heap_state;
+            have_source_heap = true;
+        } else if (heap_state.heap != source_heap.heap) {
+            // A draw can bind only one CBV/SRV/UAV heap. If state tracking says
+            // otherwise, stay conservative rather than rebinding a partial heap set.
+            continue;
+        }
+
+        const uint64_t off = table_gpu - heap_state.gpu_base;
+        const uint64_t heap_bytes = static_cast<uint64_t>(heap_state.stride) * heap_state.num_descriptors;
+        const UINT remaining_desc = (off < heap_bytes)
+            ? static_cast<UINT>((heap_bytes - off) / heap_state.stride)
+            : 0u;
+        const UINT copy_count = std::min(kSearch, remaining_desc);
+        if (copy_count == 0) continue;
+
+        Plan plan{};
+        plan.root = static_cast<UINT>(ti);
+        plan.original_gpu = table_gpu;
+        plan.source_cpu = cpu_base;
+        plan.stride = heap_state.stride;
+        UINT max_patch_slot = 0;
+
+        for (UINT slot = 0;
+             slot < copy_count &&
+             plan.patch_count < plan.patches.size() &&
+             total_patches < max_total_patches;
+             ++slot) {
+            if (only_slot >= 0 && static_cast<int>(slot) != only_slot) continue;
+            if (slot_window_first >= 0 && slot_window_count > 0) {
+                const int slot_i = static_cast<int>(slot);
+                if (slot_i < slot_window_first || slot_i >= slot_window_first + slot_window_count) {
+                    continue;
+                }
+            }
+            const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * heap_state.stride;
+            std::string binding_for_slot;
+            bool is_t2_slot = false;
+            if (patch_t2_with_first_r11 || discover_mode) {
+                binding_for_slot = sn2_root_binding_label(
+                    state.last_graphics_root_signature,
+                    reinterpret_cast<uintptr_t>(state.current_pso),
+                    static_cast<uint32_t>(ti),
+                    slot);
+                is_t2_slot = binding_for_slot == "t2 space0 rel2 range0";
+                if (patch_t2_with_first_r11 && is_t2_slot) {
+                    plan.has_t2_slot = true;
+                    plan.t2_slot = slot;
+                }
+            }
+            sn2_descriptor_registry::Entry entry{};
+            const bool entry_found = sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(slot_cpu, entry);
+            if (!entry_found || entry.resource == nullptr) {
+                if (discover_mode && ps_crc == target_ps) {
+                    const std::string binding = binding_for_slot.empty()
+                        ? sn2_root_binding_label(
+                            state.last_graphics_root_signature,
+                            reinterpret_cast<uintptr_t>(state.current_pso),
+                            static_cast<uint32_t>(ti),
+                            slot)
+                        : binding_for_slot;
+                    const bool likely_primary_srv = binding == "t0 space0 rel0 range0" ||
+                        binding == "t1 space0 rel1 range0" ||
+                        binding == "t2 space0 rel2 range0" ||
+                        binding == "t3 space0 rel3 range0" ||
+                        binding == "t4 space0 rel4 range0" ||
+                        binding == "t5 space0 rel5 range0";
+                    if (likely_primary_srv) {
+                        static std::atomic<uint64_t> miss_seq{0};
+                        const auto mn = miss_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (mn <= static_cast<uint64_t>(allslot_log_max) || (mn % 6000) == 0) {
+                            SPDLOG_WARN("[SN2-FogResolveShadow-AllSlotMiss] ps=0x{:08x} root={} slot={} bind={} reason={} cpu=0x{:x} n={}",
+                                ps_crc,
+                                ti,
+                                slot,
+                                binding,
+                                entry_found ? "no_resource" : "lookup_failed",
+                                static_cast<uintptr_t>(slot_cpu),
+                                mn);
+                        }
+                    }
+                }
+                continue;
+            }
+            ++resolved_slots;
+            const auto rd = entry.has_resource_desc ? entry.resource_desc : entry.resource->GetDesc();
+            const bool r11_candidate =
+                rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                rd.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
+                rd.Width >= 1024 && rd.Width <= 1536 &&
+                rd.Height >= 256 && rd.Height <= 900;
+            if (r11_candidate) {
+                ++r11_slots;
+            }
+            if (discover_mode && ps_crc == target_ps) {
+                static std::atomic<uint64_t> allslot_seq{0};
+                const auto an = allslot_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (an <= static_cast<uint64_t>(allslot_log_max) || (an % 6000) == 0) {
+                    sn2_fog_resolve_shift_trace::Info shifted_info{};
+                    const bool was_shifted = sn2_fog_resolve_shift_trace::lookup(entry.resource, shifted_info);
+                    const std::string binding = sn2_root_binding_label(
+                        state.last_graphics_root_signature,
+                        reinterpret_cast<uintptr_t>(state.current_pso),
+                        static_cast<uint32_t>(ti),
+                        slot);
+                    SPDLOG_WARN("[SN2-FogResolveShadow-AllSlot] ps=0x{:08x} root={} slot={} bind={} res=0x{:x} dim={} srvdim={} {}x{} fmt={} flags=0x{:x} r11={} shifted={} shift_dst_x={} n={}",
+                        ps_crc,
+                        ti,
+                        slot,
+                        binding,
+                        reinterpret_cast<uintptr_t>(entry.resource),
+                        static_cast<unsigned>(rd.Dimension),
+                        entry.has_srv_desc ? static_cast<unsigned>(entry.srv_desc.ViewDimension) : 0u,
+                        static_cast<unsigned>(rd.Width),
+                        rd.Height,
+                        static_cast<unsigned>(rd.Format),
+                        static_cast<unsigned>(rd.Flags),
+                        r11_candidate ? 1 : 0,
+                        was_shifted ? 1 : 0,
+                        was_shifted ? shifted_info.dst_x : 0u,
+                        an);
+                }
+            }
+            if (!r11_candidate) {
+                continue;
+            }
+            const auto cand_n = cand_log_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (cand_n <= static_cast<uint64_t>(cand_log_max) || (cand_n % 600) == 0) {
+                sn2_fog_resolve_shift_trace::Info shifted_info{};
+                const bool was_shifted = sn2_fog_resolve_shift_trace::lookup(entry.resource, shifted_info);
+                const uint64_t shift_now = sn2_fog_resolve_shift_trace::current_seq();
+                const uint64_t shift_age = (was_shifted && shift_now >= shifted_info.seq)
+                    ? (shift_now - shifted_info.seq)
+                    : UINT64_MAX;
+                const std::string binding = binding_for_slot.empty()
+                    ? sn2_root_binding_label(
+                        state.last_graphics_root_signature,
+                        reinterpret_cast<uintptr_t>(state.current_pso),
+                        static_cast<uint32_t>(ti),
+                        slot)
+                    : binding_for_slot;
+                SPDLOG_WARN("[SN2-FogResolveShadow-Cand] ps=0x{:08x} root={} slot={} bind={} res=0x{:x} {}x{} fmt={} flags=0x{:x} rtv_count={} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) shifted={} shift_seq={} shift_age={} shift_from=root{}:slot{} shift_dst_x={} shift_copy_w={} selected={} cand={}",
+                    ps_crc,
+                    ti,
+                    slot,
+                    binding,
+                    reinterpret_cast<uintptr_t>(entry.resource),
+                    static_cast<unsigned>(rd.Width),
+                    rd.Height,
+                    static_cast<unsigned>(rd.Format),
+                    static_cast<unsigned>(rd.Flags),
+                    static_cast<unsigned>(state.last_rtv_count),
+                    state.viewport0.TopLeftX,
+                    state.viewport0.TopLeftY,
+                    state.viewport0.Width,
+                    state.viewport0.Height,
+                    was_shifted ? 1 : 0,
+                    was_shifted ? shifted_info.seq : 0,
+                    was_shifted ? shift_age : 0,
+                    was_shifted ? shifted_info.root : 0,
+                    was_shifted ? shifted_info.slot : 0,
+                    was_shifted ? shifted_info.dst_x : 0,
+                    was_shifted ? shifted_info.copy_w : 0,
+                    total_patches < max_total_patches ? 1 : 0,
+                    cand_n);
+            }
+            if (discover_mode) {
+                continue;
+            }
+            D3D12_CPU_DESCRIPTOR_HANDLE shadow_srv{};
+            if (env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_PIXEL_UPDATE")) {
+                const UINT view_dst_x = (state.viewport0.TopLeftX > 0.0f)
+                    ? static_cast<UINT>(std::max(0.0f, std::round(state.viewport0.TopLeftX)))
+                    : 0u;
+                const UINT view_copy_w = (state.viewport0.Width > 0.0f)
+                    ? static_cast<UINT>(std::max(0.0f, std::round(state.viewport0.Width)))
+                    : 0u;
+                if (!sn2_fog_resolve_shadow::update_from_pixel_source(
+                        dev,
+                        command_list,
+                        entry.resource,
+                        rd,
+                        shadow_srv,
+                        view_dst_x,
+                        view_copy_w)) {
+                    continue;
+                }
+            } else {
+                if (!sn2_fog_resolve_shadow::lookup_srv_for_pixel(command_list, entry.resource, shadow_srv)) {
+                    continue;
+                }
+            }
+            plan.patches[plan.patch_count++] = PatchSlot{slot, shadow_srv};
+            if (patch_t2_with_first_r11 && is_t2_slot) {
+                plan.t2_already_patched = true;
+            }
+            if (patch_t2_with_first_r11 && plan.first_r11_shadow_srv.ptr == 0) {
+                plan.first_r11_shadow_srv = shadow_srv;
+                plan.first_r11_slot = slot;
+            }
+            max_patch_slot = std::max(max_patch_slot, slot);
+            ++total_patches;
+        }
+
+        if (patch_t2_with_first_r11 &&
+            !discover_mode &&
+            plan.has_t2_slot &&
+            !plan.t2_already_patched &&
+            plan.first_r11_shadow_srv.ptr != 0 &&
+            plan.patch_count < plan.patches.size() &&
+            total_patches < max_total_patches) {
+            plan.patches[plan.patch_count++] = PatchSlot{plan.t2_slot, plan.first_r11_shadow_srv};
+            max_patch_slot = std::max(max_patch_slot, plan.t2_slot);
+            ++total_patches;
+            static std::atomic<uint64_t> t2_patch_logs{0};
+            const auto n = t2_patch_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 32 || (n % 600) == 0) {
+                SPDLOG_WARN("[SN2-FogResolveShadow] t2 diagnostic patch#{} root={} t2_slot={} source_slot={} patches={} total={}",
+                    n,
+                    plan.root,
+                    plan.t2_slot,
+                    plan.first_r11_slot,
+                    plan.patch_count,
+                    total_patches);
+            }
+        }
+
+        if (plan.patch_count > 0) {
+            plan.copy_count = std::min<UINT>(kSearch, max_patch_slot + 1);
+            plans[plan_count++] = plan;
+        }
+    }
+
+    if (discover_mode) {
+        static std::atomic<uint64_t> discover_seq{0};
+        const auto n = discover_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 64 || (n % 12000) == 0) {
+            SPDLOG_WARN("[SN2-FogResolveShadow-Discover] ps=0x{:08x} view={} tables={} scan={} resolved={} r11={} rtv_count={} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) seq={}",
+                ps_crc,
+                view_id,
+                state.last_graphics_root_desc_tables.size(),
+                kSearch,
+                resolved_slots,
+                r11_slots,
+                static_cast<unsigned>(state.last_rtv_count),
+                state.viewport0.TopLeftX,
+                state.viewport0.TopLeftY,
+                state.viewport0.Width,
+                state.viewport0.Height,
+                n);
+        }
+        return false;
+    }
+
+    if (total_patches == 0 || !have_source_heap || source_heap.heap == nullptr) {
+        static std::atomic<uint64_t> miss{0};
+        const auto n = miss.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-FogResolveShadow] composite MISS ps=0x{:08x} view={} tables={} scan={} resolved={} r11={} shadows={} seq={}",
+                ps_crc,
+                view_id,
+                state.last_graphics_root_desc_tables.size(),
+                kSearch,
+                resolved_slots,
+                r11_slots,
+                sn2_fog_resolve_shadow::count(),
+                n);
+        }
+        return false;
+    }
+
+    auto& sh = sn2_uwe_fog_mirror::scratch_heap();
+    auto alloc_shadow_table_range = [&sh](UINT count) -> UINT {
+        if (!sh.initialized() || count == 0 || count > sh.capacity) return UINT32_MAX;
+        const UINT range_count = std::max<UINT>(1, sh.capacity / count);
+        const UINT range_idx = sh.next_index.fetch_add(1, std::memory_order_relaxed) % range_count;
+        return range_idx * count;
+    };
+    UINT rebound = 0;
+    for (UINT pi = 0; pi < plan_count; ++pi) {
+        Plan& plan = plans[pi];
+        const UINT scratch_base = alloc_shadow_table_range(plan.copy_count);
+        if (scratch_base == UINT32_MAX) {
+            static std::atomic<uint64_t> alloc_fail{0};
+            const auto n = alloc_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 16 || (n % 600) == 0) {
+                SPDLOG_WARN("[SN2-FogResolveShadow] scratch alloc failed count={} cap={} root={} patches={} seq={}",
+                    plan.copy_count, sh.capacity, plan.root, plan.patch_count, n);
+            }
+            continue;
+        }
+        plan.scratch_base = scratch_base;
+        const auto sc_cpu = sh.heap->GetCPUDescriptorHandleForHeapStart();
+        const auto sc_gpu = sh.heap->GetGPUDescriptorHandleForHeapStart();
+        plan.scratch_cpu = sc_cpu.ptr + static_cast<SIZE_T>(scratch_base) * sh.descriptor_size;
+        plan.scratch_gpu = sc_gpu.ptr + static_cast<UINT64>(scratch_base) * sh.descriptor_size;
+
+        dev->CopyDescriptorsSimple(
+            plan.copy_count,
+            D3D12_CPU_DESCRIPTOR_HANDLE{plan.scratch_cpu},
+            D3D12_CPU_DESCRIPTOR_HANDLE{plan.source_cpu},
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        for (UINT i = 0; i < plan.patch_count; ++i) {
+            D3D12_CPU_DESCRIPTOR_HANDLE dst{
+                plan.scratch_cpu + static_cast<SIZE_T>(plan.patches[i].slot) * plan.stride};
+            dev->CopyDescriptorsSimple(
+                1,
+                dst,
+                plan.patches[i].shadow_srv,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        ++rebound;
+    }
+    if (rebound == 0) return false;
+
+    ID3D12DescriptorHeap* restore_sampler_heap = tls_sampler_heap.heap;
+    ID3D12DescriptorHeap* heaps[2]{scratch_heap, restore_sampler_heap};
+    const UINT heap_count = restore_sampler_heap != nullptr ? 2u : 1u;
+    command_list->SetDescriptorHeaps(heap_count, heaps);
+
+    ++g_sn2_descriptor_table_rebind_depth;
+    for (UINT pi = 0; pi < plan_count && scope.entry_count < scope.entries.size(); ++pi) {
+        const Plan& plan = plans[pi];
+        if (plan.scratch_gpu == 0) continue;
+        command_list->SetGraphicsRootDescriptorTable(plan.root, D3D12_GPU_DESCRIPTOR_HANDLE{plan.scratch_gpu});
+        scope.entries[scope.entry_count++] = {plan.root, plan.original_gpu};
+    }
+    --g_sn2_descriptor_table_rebind_depth;
+
+    if (scope.entry_count == 0) return false;
+    scope.active = true;
+    scope.command_list = command_list;
+    scope.restore_heaps = true;
+    scope.restore_cbv_srv_uav_heap = source_heap.heap;
+    scope.restore_sampler_heap = restore_sampler_heap;
+
+    static std::atomic<uint64_t> apply{0};
+    const auto n = apply.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 32 || (n % 600) == 0) {
+        SPDLOG_WARN("[SN2-FogResolveShadow] composite redirect#{} ps=0x{:08x} view={} tables={} patches={} roots={}",
+            n, ps_crc, view_id, rebound, total_patches, scope.entry_count);
+    }
+    return true;
+}
+
 static bool sn2_try_begin_consumer_srv_redirect(
     ID3D12GraphicsCommandList* command_list,
     const CommandListCorrelationState& state,
@@ -10492,6 +17965,7 @@ static bool sn2_try_begin_consumer_srv_redirect(
     int found_slot = -1;
     const sn2_uwe_fog_mirror::Mirror* found_mirror = nullptr;
     uint64_t found_table_gpu = 0;
+    SIZE_T found_cpu_base = 0;
     UINT found_stride = 0;
     const size_t num_tables = state.last_graphics_root_desc_tables.size();
     for (size_t ti = 0; ti < num_tables && found_root < 0; ++ti) {
@@ -10510,6 +17984,7 @@ static bool sn2_try_begin_consumer_srv_redirect(
             found_slot = static_cast<int>(i);
             found_mirror = m;
             found_table_gpu = table_gpu;
+            found_cpu_base = cpu_base;
             found_stride = this_stride;
             break;
         }
@@ -10624,9 +18099,7 @@ static bool sn2_try_begin_consumer_srv_redirect(
     D3D12_GPU_DESCRIPTOR_HANDLE scratch_gpu_base{
         sc_gpu.ptr + static_cast<UINT64>(scratch_base) * sh.descriptor_size};
 
-    const uint64_t off2 = found_table_gpu - tls_bindless_heap.gpu_base;
-    D3D12_CPU_DESCRIPTOR_HANDLE src_base{
-        tls_bindless_heap.cpu_base + static_cast<SIZE_T>(off2)};
+    D3D12_CPU_DESCRIPTOR_HANDLE src_base{found_cpu_base};
     dev->CopyDescriptorsSimple(kSearch, scratch_cpu_base, src_base,
                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
@@ -10651,6 +18124,176 @@ static bool sn2_try_begin_consumer_srv_redirect(
             ps_crc, n, found_root, found_slot, found_table_gpu, found_mirror->srv_gpu.ptr);
     }
     return true;
+}
+
+// =============================================================================
+// 2026-05-27: REAL-FOG t5 cross-eye descriptor redirect (UEVR_SN2_FOG_T5_XEYE_REDIRECT).
+//
+// The right eye's SLW basepass (B9BE2499 / DE7C3822 / 32040A0D) samples its OWN
+// (empty) IntegratedLightScattering froxel volume via an RDG-assigned t5 SRV
+// descriptor. CPU-side uniform-buffer redirects (view+0x2658, FFogUniformParameters,
+// View-UB 0xFC0) provably do NOT reach this binding. Here we capture view 0's (left)
+// FILLED froxel volume resource at the left-eye draw, then at the right-eye draw
+// overwrite the right eye's fog-volume descriptor IN-PLACE in the bound heap with a
+// fresh SRV of view 0's resource (no SetDescriptorHeaps swap — that device-removed).
+// The right basepass then samples view 0's REAL fog content; view 1 keeps its own
+// per-eye froxel UVW (the main View UB is untouched) so parallax stays correct.
+static std::atomic<ID3D12Resource*> g_sn2_t5_view0_fog_vol{nullptr};
+
+inline bool sn2_fog_t5_xeye_is_target_crc(uint32_t crc) {
+    return crc == 0xB9BE2499u || crc == 0xDE7C3822u || crc == 0x32040A0Du;
+}
+
+inline bool sn2_is_fog_froxel_volume(const D3D12_RESOURCE_DESC& d) {
+    // Matches Sn2ViewUbDecode's ILS-volume shape (wider than the raw froxel grid).
+    return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+        && d.Format == DXGI_FORMAT_R11G11B10_FLOAT
+        && d.Width  >= 40 && d.Width  <= 192
+        && d.Height >= 20 && d.Height <= 128
+        && d.DepthOrArraySize >= 32 && d.DepthOrArraySize <= 80;
+}
+
+static void sn2_fog_t5_xeye_redirect(ID3D12GraphicsCommandList* command_list,
+                                     const CommandListCorrelationState& state) {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_FOG_T5_XEYE_REDIRECT");
+    if (!enabled) return;
+    if (command_list == nullptr || state.current_pso == nullptr) return;
+
+    auto& reg = render::ShaderOverrideRegistry::get();
+    const uint32_t ps_crc = reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso));
+    if (!sn2_fog_t5_xeye_is_target_crc(ps_crc)) return;
+
+    const bool is_left  = state.last_viewport_bucket == StereoTraceBucket::Left;
+    const bool is_right = state.last_viewport_bucket == StereoTraceBucket::Right;
+
+    // DIAGNOSTIC: confirm the consumer draws reach this hook, with eye + table count.
+    static std::atomic<uint64_t> seen_n{0};
+    const auto sn = seen_n.fetch_add(1, std::memory_order_relaxed);
+    if (sn < 32 || (sn % 1200) == 0) {
+        int nz_cbv = 0;
+        for (size_t k = 0; k < state.last_graphics_root_cbv.size(); ++k) {
+            if (state.last_graphics_root_cbv[k] != 0) ++nz_cbv;
+        }
+        SPDLOG_WARN("[SN2-FogT5Xeye-Diag] seen#{} ps=0x{:08x} eye_bucket={} tables={} root_cbvs_nz={} heap_cpu=0x{:x} heap_stride={} heaps={}",
+            sn + 1, ps_crc, static_cast<int>(state.last_viewport_bucket),
+            state.last_graphics_root_desc_tables.size(), nz_cbv,
+            static_cast<uintptr_t>(tls_bindless_heap.cpu_base), tls_bindless_heap.stride,
+            bindless_heap_registry().count());
+    }
+
+    if (!is_left && !is_right) return;
+    if (bindless_heap_registry().count() == 0) return;
+
+    // The fog volume is BINDLESS — not in a root descriptor table. The consumer reads it via a
+    // uint32 bindless INDEX stored in one of its root CBVs; the index addresses the mega-heap
+    // (tls_bindless_heap). Find that index field by scanning the root CBVs for a uint32 that
+    // resolves (mega-heap[idx]) to a fog-froxel-shaped resource. Cache (root_param, byte_off).
+    const SIZE_T heap_cpu_base = tls_bindless_heap.cpu_base;
+    const uint64_t heap_stride = tls_bindless_heap.stride;
+    if (heap_cpu_base == 0 || heap_stride == 0) return;
+    constexpr uint32_t kMaxIdx = 2000000u;  // sanity bound for a candidate bindless index
+
+    auto resolve_idx = [&](uint32_t idx) -> ID3D12Resource* {
+        if (idx == 0 || idx >= kMaxIdx) return nullptr;
+        const SIZE_T cpu = heap_cpu_base + static_cast<SIZE_T>(idx) * heap_stride;
+        return sn2_descriptor_registry::lookup_resource_by_cpu_ptr_or_hash(cpu);
+    };
+
+    static std::atomic<int> cached_root{-1};
+    static std::atomic<int> cached_off{-1};
+    uint32_t fog_idx = 0;
+    ID3D12Resource* idx_res = nullptr;
+
+    const int cr = cached_root.load(std::memory_order_relaxed);
+    const int co = cached_off.load(std::memory_order_relaxed);
+    if (cr >= 0 && co >= 0 && cr < static_cast<int>(state.last_graphics_root_cbv.size())) {
+        const D3D12_GPU_VIRTUAL_ADDRESS va = state.last_graphics_root_cbv[cr];
+        if (va != 0) {
+            uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, static_cast<UINT>(co) + 4);
+            if (cpu != nullptr) {
+                const uint32_t idx = *reinterpret_cast<uint32_t*>(cpu + co);
+                ID3D12Resource* r = resolve_idx(idx);
+                if (r != nullptr && sn2_is_fog_froxel_volume(r->GetDesc())) { fog_idx = idx; idx_res = r; }
+            }
+        }
+    }
+    if (idx_res == nullptr) {
+        // Discover the index field.
+        const int nrcbv = static_cast<int>(state.last_graphics_root_cbv.size());
+        for (int rp = 0; rp < nrcbv && idx_res == nullptr; ++rp) {
+            const D3D12_GPU_VIRTUAL_ADDRESS va = state.last_graphics_root_cbv[rp];
+            if (va == 0) continue;
+            UINT win = 16384;  // fog bindless index sits deep in the View-UB fog sub-block
+            uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, win);
+            if (cpu == nullptr) { win = 10240; cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, win); }
+            if (cpu == nullptr) continue;
+            for (UINT off = 0; off + 4 <= win; off += 4) {
+                const uint32_t idx = *reinterpret_cast<uint32_t*>(cpu + off);
+                ID3D12Resource* r = resolve_idx(idx);
+                if (r != nullptr && sn2_is_fog_froxel_volume(r->GetDesc())) {
+                    fog_idx = idx; idx_res = r;
+                    cached_root.store(rp, std::memory_order_relaxed);
+                    cached_off.store(static_cast<int>(off), std::memory_order_relaxed);
+                    SPDLOG_WARN("[SN2-FogT5Xeye] DISCOVERED fog bindless idx field: root_cbv={} off=0x{:x} idx={} res=0x{:x}",
+                        rp, off, idx, reinterpret_cast<uintptr_t>(r));
+                    break;
+                }
+            }
+        }
+    }
+    if (idx_res == nullptr) return;
+
+    if (is_left) {
+        g_sn2_t5_view0_fog_vol.store(idx_res, std::memory_order_relaxed);
+        static std::atomic<uint64_t> cap_n{0};
+        const auto n = cap_n.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8 || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-FogT5Xeye] LEFT 0x{:08x} captured view0 fog idx={} vol=0x{:x} (n={})",
+                ps_crc, fog_idx, reinterpret_cast<uintptr_t>(idx_res), n + 1);
+        }
+        return;
+    }
+
+    // RIGHT eye: overwrite the mega-heap descriptor at view 1's fog index with an SRV of
+    // view 0's captured volume → the right consumer samples view 0's REAL fog.
+    ID3D12Resource* v0 = g_sn2_t5_view0_fog_vol.load(std::memory_order_relaxed);
+    if (v0 == nullptr || v0 == idx_res) return;
+
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (dev == nullptr) return;
+
+    static ID3D12DescriptorHeap* src_heap = nullptr;
+    if (src_heap == nullptr) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 1;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&src_heap))) || src_heap == nullptr) {
+            src_heap = nullptr;
+            return;
+        }
+    }
+    const auto src_cpu = src_heap->GetCPUDescriptorHandleForHeapStart();
+    const auto vd = v0->GetDesc();
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = vd.Format;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture3D.MostDetailedMip = 0;
+    sd.Texture3D.MipLevels = vd.MipLevels ? vd.MipLevels : 1;
+    sd.Texture3D.ResourceMinLODClamp = 0.0f;
+    dev->CreateShaderResourceView(v0, &sd, src_cpu);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dst{heap_cpu_base + static_cast<SIZE_T>(fog_idx) * heap_stride};
+    dev->CopyDescriptorsSimple(1, dst, src_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    static std::atomic<uint64_t> redir_n{0};
+    const auto n = redir_n.fetch_add(1, std::memory_order_relaxed);
+    if (n < 16 || (n % 600) == 0) {
+        SPDLOG_WARN("[SN2-FogT5Xeye] RIGHT 0x{:08x} redirect#{} fog_idx={} view1_vol=0x{:x} -> view0_vol=0x{:x}",
+            ps_crc, n + 1, fog_idx,
+            reinterpret_cast<uintptr_t>(idx_res), reinterpret_cast<uintptr_t>(v0));
+    }
 }
 
 // =============================================================================
@@ -10932,6 +18575,288 @@ static bool sn2_try_begin_eye_pairing_redirect(
     if (n <= 16 || (n % 600) == 0) {
         SPDLOG_WARN("[SN2-EyePairing] right-eye 0x{:08x} redirect#{} tables_rebound={} slot_swaps={} forced={} (pair_count={})",
             ps_crc, n, rebound_tables, total_swaps_this_draw, force_right_eye ? 1 : 0, sn2_eye_pairing::pair_count());
+    }
+    return true;
+}
+
+static bool sn2_require_mirror_for_synth_rtv() {
+    static const bool e = []() {
+        const char* v = std::getenv("UEVR_SN2_REQUIRE_MIRROR_FOR_SYNTH_RTV");
+        return v == nullptr || (v[0] && v[0] != '0');
+    }();
+    return e;
+}
+
+static bool sn2_synthetic_mirror_srv_redirect_enabled() {
+    static const bool e = []() {
+        const char* v = std::getenv("UEVR_SN2_SYNTHETIC_MIRROR_SRV_REDIRECT");
+        return v == nullptr || (v[0] && v[0] != '0');
+    }();
+    return e;
+}
+
+static const sn2_uwe_fog_mirror::Mirror* sn2_find_fog_mirror_for_resource(ID3D12Resource* res) {
+    if (res == nullptr) return nullptr;
+    if (const auto* direct = sn2_uwe_fog_mirror::registry().find(res)) {
+        return direct;
+    }
+    return sn2_uwe_fog_mirror::find_bucket_shadow(res);
+}
+
+static bool sn2_try_begin_mirror_rtv_redirect(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2MirrorRtvRedirectScope& scope,
+    uint32_t ps_crc,
+    const char* tag)
+{
+    if (!sn2_uwe_fog_mirror::env_enabled()) return false;
+    if (command_list == nullptr || state.last_rtv_count == 0 || state.last_rtv_count > 8) return false;
+
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (dev == nullptr || !sn2_uwe_fog_mirror::ensure_mirror_rtv_heap(dev)) return false;
+
+    static std::mutex rtv_cache_mu;
+    static std::unordered_map<ID3D12Resource*, D3D12_CPU_DESCRIPTOR_HANDLE> mirror_rtv_cache;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE new_rtvs[8]{};
+    bool any_substituted = false;
+    for (UINT i = 0; i < state.last_rtv_count; ++i) {
+        const uint64_t handle = state.last_rtv_handles[i];
+        D3D12_CPU_DESCRIPTOR_HANDLE orig_h{};
+        orig_h.ptr = static_cast<SIZE_T>(handle);
+        scope.restore_rtvs[i] = orig_h;
+        new_rtvs[i] = orig_h;
+        if (handle == 0) continue;
+
+        ID3D12Resource* res = sn2_rt_snapshot::lookup_rtv(handle);
+        const auto* m = sn2_find_fog_mirror_for_resource(res);
+        if (m == nullptr || m->resource == nullptr) continue;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE mirror_rtv_cpu{};
+        {
+            std::scoped_lock _{rtv_cache_mu};
+            auto it = mirror_rtv_cache.find(m->resource.Get());
+            if (it != mirror_rtv_cache.end()) {
+                mirror_rtv_cpu = it->second;
+            } else if (mirror_rtv_cache.size() >= 256u) {
+                static std::atomic<bool> cap_logged{false};
+                if (!cap_logged.exchange(true, std::memory_order_relaxed)) {
+                    SPDLOG_WARN("[SN2-GfxRtvRedirect] mirror_rtv_cache cap reached (256). New mirrors will not be redirected.");
+                }
+            } else {
+                const UINT idx = sn2_uwe_fog_mirror::alloc_rtv_slot();
+                if (idx != UINT32_MAX) {
+                    auto& rh = sn2_uwe_fog_mirror::mirror_rtv_heap();
+                    const auto base = rh.heap->GetCPUDescriptorHandleForHeapStart();
+                    mirror_rtv_cpu.ptr = base.ptr + static_cast<SIZE_T>(idx) * rh.descriptor_size;
+
+                    const auto& rd = m->desc;
+                    D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{};
+                    rtv_desc.Format = rd.Format;
+                    if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                        rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+                        rtv_desc.Texture3D.MipSlice = 0;
+                        rtv_desc.Texture3D.FirstWSlice = 0;
+                        rtv_desc.Texture3D.WSize = static_cast<UINT>(rd.DepthOrArraySize);
+                    } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+                        rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                        rtv_desc.Texture2D.MipSlice = 0;
+                    } else {
+                        mirror_rtv_cpu.ptr = 0;
+                    }
+                    if (mirror_rtv_cpu.ptr != 0) {
+                        dev->CreateRenderTargetView(m->resource.Get(), &rtv_desc, mirror_rtv_cpu);
+                        mirror_rtv_cache[m->resource.Get()] = mirror_rtv_cpu;
+                        SPDLOG_WARN("[SN2-GfxRtvRedirect] created mirror RTV for resource 0x{:x} fmt={} dim={}x{}x{}",
+                            reinterpret_cast<uintptr_t>(m->resource.Get()),
+                            static_cast<unsigned>(rd.Format),
+                            static_cast<unsigned>(rd.Width),
+                            static_cast<unsigned>(rd.Height),
+                            static_cast<unsigned>(rd.DepthOrArraySize));
+                    }
+                }
+            }
+        }
+
+        if (mirror_rtv_cpu.ptr != 0) {
+            new_rtvs[i] = mirror_rtv_cpu;
+            any_substituted = true;
+            static std::atomic<uint64_t> redir_seq{0};
+            const auto n = redir_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 16 || (n % 600) == 0) {
+                SPDLOG_WARN("[SN2-GfxRtvRedirect] {}#{} ps_crc=0x{:08x} slot {} orig=0x{:x} -> mirror=0x{:x}",
+                            tag ? tag : "dup", n, ps_crc, i,
+                            static_cast<uintptr_t>(orig_h.ptr),
+                            static_cast<uintptr_t>(mirror_rtv_cpu.ptr));
+            }
+        }
+    }
+
+    if (!any_substituted) return false;
+
+    scope.command_list = command_list;
+    scope.restore_rtv_count = state.last_rtv_count;
+    if (state.has_dsv && state.last_dsv_handle != 0) {
+        scope.restore_has_dsv = true;
+        scope.restore_dsv.ptr = static_cast<SIZE_T>(state.last_dsv_handle);
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE* dsv_ptr = scope.restore_has_dsv ? &scope.restore_dsv : nullptr;
+    command_list->OMSetRenderTargets(scope.restore_rtv_count, new_rtvs, FALSE, dsv_ptr);
+    scope.active = true;
+    return true;
+}
+
+static bool sn2_try_begin_synthetic_mirror_srv_redirect(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2EyePairingRedirectScope& scope,
+    uint32_t ps_crc)
+{
+    if (!sn2_synthetic_mirror_srv_redirect_enabled()) return false;
+    if (!sn2_uwe_fog_mirror::env_enabled()) return false;
+    if (command_list == nullptr || state.current_pso == nullptr) return false;
+    if (bindless_heap_registry().count() == 0) return false;
+
+    ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+    if (dev == nullptr || !sn2_eye_pairing::ensure_scratch_heap(dev)) return false;
+    ID3D12DescriptorHeap* scratch_heap = sn2_eye_pairing::scratch_descriptor_heap();
+    if (scratch_heap == nullptr) return false;
+
+    struct PatchSlot {
+        UINT slot = 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE mirror_srv{};
+    };
+    struct TablePlan {
+        UINT root = 0;
+        uint64_t original_gpu = 0;
+        SIZE_T source_cpu = 0;
+        UINT stride = 0;
+        UINT copy_count = 0;
+        SIZE_T scratch_cpu = 0;
+        UINT64 scratch_gpu = 0;
+        std::array<PatchSlot, 64> patches{};
+        UINT patch_count = 0;
+    };
+
+    constexpr UINT kSearch = 256;
+    std::array<TablePlan, 8> plans{};
+    UINT plan_count = 0;
+    UINT total_patches = 0;
+    BindlessHeapState source_heap{};
+    bool have_source_heap = false;
+
+    const size_t num_tables = state.last_graphics_root_desc_tables.size();
+    for (size_t ti = 0; ti < num_tables && ti < plans.size(); ++ti) {
+        const uint64_t table_gpu = state.last_graphics_root_desc_tables[ti];
+        if (table_gpu == 0) continue;
+
+        BindlessHeapState heap_state{};
+        SIZE_T cpu_base = 0;
+        if (!bindless_heap_registry().resolve_state(table_gpu, heap_state, cpu_base)) continue;
+
+        if (!have_source_heap) {
+            source_heap = heap_state;
+            have_source_heap = true;
+        } else if (heap_state.heap != source_heap.heap) {
+            static std::atomic<uint64_t> mixed_heap_logs{0};
+            const auto n = mixed_heap_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || (n % 600) == 0) {
+                SPDLOG_WARN("[SN2-SyntheticMirrorSrv] skip mixed heap root={} heap={:p} source_heap={:p}",
+                    ti, static_cast<void*>(heap_state.heap), static_cast<void*>(source_heap.heap));
+            }
+            continue;
+        }
+
+        const uint64_t off = table_gpu - heap_state.gpu_base;
+        const uint64_t heap_bytes = static_cast<uint64_t>(heap_state.stride) * heap_state.num_descriptors;
+        const UINT remaining_desc = (off < heap_bytes && heap_state.stride != 0)
+            ? static_cast<UINT>((heap_bytes - off) / heap_state.stride)
+            : 0u;
+        const UINT copy_count = std::min(kSearch, remaining_desc);
+        if (copy_count == 0) continue;
+
+        TablePlan plan{};
+        plan.root = static_cast<UINT>(ti);
+        plan.original_gpu = table_gpu;
+        plan.source_cpu = cpu_base;
+        plan.stride = heap_state.stride;
+        plan.copy_count = copy_count;
+
+        for (UINT slot = 0; slot < copy_count && plan.patch_count < plan.patches.size(); ++slot) {
+            const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * heap_state.stride;
+            ID3D12Resource* srv_res = nullptr;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+            bool has_srv_desc = false;
+            if (!sn2_descriptor_registry::lookup_srv_by_cpu_ptr_or_hash(slot_cpu, srv_res, srv_desc, has_srv_desc) ||
+                srv_res == nullptr) {
+                continue;
+            }
+            const auto* m = sn2_find_fog_mirror_for_resource(srv_res);
+            if (m == nullptr || m->srv_cpu.ptr == 0) continue;
+            plan.patches[plan.patch_count++] = {slot, m->srv_cpu};
+        }
+
+        if (plan.patch_count != 0) {
+            total_patches += plan.patch_count;
+            plans[plan_count++] = plan;
+        }
+    }
+
+    if (plan_count == 0 || total_patches == 0 || !have_source_heap || source_heap.heap == nullptr) {
+        return false;
+    }
+
+    UINT rebound_tables = 0;
+    for (UINT pi = 0; pi < plan_count; ++pi) {
+        TablePlan& plan = plans[pi];
+        UINT64 scratch_gpu = 0;
+        const SIZE_T scratch_cpu = sn2_eye_pairing::alloc_scratch(plan.copy_count, &scratch_gpu);
+        if (scratch_cpu == 0 || scratch_gpu == 0) continue;
+        plan.scratch_cpu = scratch_cpu;
+        plan.scratch_gpu = scratch_gpu;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE dst{scratch_cpu};
+        D3D12_CPU_DESCRIPTOR_HANDLE src{plan.source_cpu};
+        dev->CopyDescriptorsSimple(plan.copy_count, dst, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        for (UINT i = 0; i < plan.patch_count; ++i) {
+            D3D12_CPU_DESCRIPTOR_HANDLE patch{
+                scratch_cpu + static_cast<SIZE_T>(plan.patches[i].slot) * plan.stride};
+            dev->CopyDescriptorsSimple(
+                1, patch, plan.patches[i].mirror_srv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        ++rebound_tables;
+    }
+
+    if (rebound_tables == 0) return false;
+
+    ID3D12DescriptorHeap* restore_sampler_heap = tls_sampler_heap.heap;
+    ID3D12DescriptorHeap* heaps[2]{scratch_heap, restore_sampler_heap};
+    const UINT heap_count = restore_sampler_heap != nullptr ? 2u : 1u;
+    command_list->SetDescriptorHeaps(heap_count, heaps);
+
+    ++g_sn2_descriptor_table_rebind_depth;
+    for (UINT pi = 0; pi < plan_count && scope.entry_count < scope.entries.size(); ++pi) {
+        const TablePlan& plan = plans[pi];
+        if (plan.scratch_gpu == 0) continue;
+        D3D12_GPU_DESCRIPTOR_HANDLE h{plan.scratch_gpu};
+        command_list->SetGraphicsRootDescriptorTable(plan.root, h);
+        scope.entries[scope.entry_count++] = {plan.root, plan.original_gpu};
+    }
+    --g_sn2_descriptor_table_rebind_depth;
+
+    if (scope.entry_count == 0) return false;
+    scope.active = true;
+    scope.command_list = command_list;
+    scope.restore_heaps = true;
+    scope.restore_cbv_srv_uav_heap = source_heap.heap;
+    scope.restore_sampler_heap = restore_sampler_heap;
+
+    static std::atomic<uint64_t> redir{0};
+    const auto n = redir.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 16 || (n % 600) == 0) {
+        SPDLOG_WARN("[SN2-SyntheticMirrorSrv] redirect#{} ps_crc=0x{:08x} tables={} slots={}",
+            n, ps_crc, rebound_tables, total_patches);
     }
     return true;
 }
@@ -11771,6 +19696,193 @@ static bool sn2_forensics_try_begin_mutations(
     return applied;
 }
 
+// === 2026-05-26: real right-eye View CB capture for the 0x13b00f0c dup =======
+// RenderDoc forensics (transient-off capture) proved the underwater teal is
+// introduced by PS 0x13b00f0c — a ~25k-tri basepass GEOMETRY draw that samples
+// two Texture3D fog volumes — which runs ONLY for the left eye (vp.x=0). The
+// right eye never issues it, so its water stays black. Duplicating it onto the
+// right viewport renders the geometry but needs the RIGHT eye's View CB to
+// project correctly; earlier dups used a guessed -10240 delta / synth donor and
+// produced the "wrong perspective" the user rejected.
+//
+// The same frame's right-eye SLW basepass draws (0xb9be2499 @ vp.x=640) run
+// BEFORE the left 0x13b00f0c in submission order and bind the engine's own
+// right-eye FViewUniformShaderParameters as a root CBV. We capture that VA here
+// (validated by the reg149 ViewSize/InvSize self-consistency signature) and feed
+// it to the dup, so the duplicated geometry uses the real right view — no delta.
+namespace sn2_view_ub_id {
+    // FViewUniformShaderParameters layout in SN2's dumped DXIL:
+    //   reg148 @ byte 2368 = ViewRectMin / viewport origin (x,y,...)
+    //   reg149 @ byte 2384 = ViewSizeAndInvSize (W,H,1/W,1/H)
+    //   reg152 @ byte 2432 = BufferSizeAndInvSize
+    // Earlier notes used byte 2400/reg150 as ViewRectMin; char13b2/RenderDoc
+    // disproved that for the active b9be2499/13b00f0c View UB. Right-eye
+    // donor CB at eid 17211 has +0x940=[640,0,...] and +0x960=[0,0,...].
+    inline bool looks_like_view_ub(const uint8_t* b) {
+        float vw, vh, ivw, ivh;
+        std::memcpy(&vw, b + 2384, 4);
+        std::memcpy(&vh, b + 2384 + 4, 4);
+        std::memcpy(&ivw, b + 2384 + 8, 4);
+        std::memcpy(&ivh, b + 2384 + 12, 4);
+        if (!(vw > 64.0f && vw < 8192.0f && vh > 64.0f && vh < 8192.0f)) return false;
+        if (ivw <= 0.0f || ivh <= 0.0f) return false;
+        return std::fabs(ivw - 1.0f / vw) < 1e-4f && std::fabs(ivh - 1.0f / vh) < 1e-4f;
+    }
+    inline float view_rect_min_x(const uint8_t* b) {
+        float x; std::memcpy(&x, b + 2368, 4); return x;
+    }
+    inline float view_rect_min_y(const uint8_t* b) {
+        float y; std::memcpy(&y, b + 2368 + 4, 4); return y;
+    }
+    inline float view_size_x(const uint8_t* b) {
+        float x; std::memcpy(&x, b + 2384, 4); return x;
+    }
+    inline float view_size_y(const uint8_t* b) {
+        float y; std::memcpy(&y, b + 2384 + 4, 4); return y;
+    }
+}
+
+namespace sn2_right_view_capture {
+    inline bool enabled() {
+        static const bool e = []() {
+            if (sn2_water_basepass_dup::right_eye_underwater_fix_enabled()) return true;
+            const char* v = std::getenv("UEVR_SN2_DUP_USE_CAPTURED_RIGHT_VIEW");
+            return v && v[0] && v[0] != '0';
+        }();
+        return e;
+    }
+    inline std::atomic<uint64_t>& slot() {
+        static std::atomic<uint64_t> va{0};
+        return va;
+    }
+    inline std::atomic<int>& rect_x_slot() {
+        static std::atomic<int> rx{-1};
+        return rx;
+    }
+    inline bool diag_enabled() {
+        static const bool e = []() {
+            const char* v = std::getenv("UEVR_SN2_RIGHT_VIEW_CAPTURE_DIAG");
+            return v && v[0] && v[0] != '0';
+        }();
+        return e;
+    }
+    inline uint64_t log_every() {
+        static const uint64_t e = static_cast<uint64_t>(
+            std::max(1200, env_int_a("UEVR_SN2_RIGHT_VIEW_CAPTURE_LOG_EVERY", 60000)));
+        return e;
+    }
+    // Called for every graphics draw. Among the draw's root CBVs that match the
+    // View-UB signature, pick the candidate whose reg148/+0x940 viewport origin best
+    // matches the draw's own viewport.x — so on a right-bucket draw we capture
+    // the View UB that actually belongs to the right viewport rather than the
+    // first View-shaped UB (which could be a shadow/secondary view). For the
+    // diag (UEVR_SN2_RIGHT_VIEW_CAPTURE_DIAG) we log candidates for BOTH eyes so
+                // the L/R viewport-origin structure is visible.
+    inline void observe(const CommandListCorrelationState& s) {
+        if (!enabled()) return;
+        const bool is_right = (s.last_viewport_bucket == StereoTraceBucket::Right);
+        const bool is_left  = (s.last_viewport_bucket == StereoTraceBucket::Left);
+        if (!is_right && !is_left) return;
+        const float vpx = s.has_viewport ? s.viewport0.TopLeftX : -1.0f;
+
+        uint64_t best_va = 0; float best_rx = 0.0f; float best_dist = 1e30f; size_t best_root = 0;
+        for (size_t p = 0; p < s.last_graphics_root_cbv.size(); ++p) {
+            const uint64_t va = static_cast<uint64_t>(s.last_graphics_root_cbv[p]);
+            if (va == 0) continue;
+            uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, 5168);
+            if (cpu == nullptr || !sn2_view_ub_id::looks_like_view_ub(cpu)) continue;
+            const float rx = sn2_view_ub_id::view_rect_min_x(cpu);
+            if (diag_enabled()) {
+                static std::atomic<uint64_t> dseq{0};
+                const auto dn = dseq.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (dn <= 80 || (dn % 4000) == 0) {
+                    SPDLOG_WARN("[SN2-RVC-Diag] #{} eye={} vpx={:.0f} root={} va=0x{:x} originX@0x940={:.1f}",
+                        dn, is_right ? "R" : "L", vpx, p, va, rx);
+                }
+                // One-shot per eye: dump the .x of regs 144..156 so ViewRectMin.x
+                // (the field that is 0 for L / viewport.x for R) can be located.
+                static std::atomic<int> dumped_l{0}, dumped_r{0};
+                std::atomic<int>& flag = is_right ? dumped_r : dumped_l;
+                if (flag.exchange(1) == 0) {
+                    std::string s;
+                    for (int reg = 144; reg <= 156; ++reg) {
+                        float f; std::memcpy(&f, cpu + reg * 16, 4);
+                        s += fmt::format("r{}={:.1f} ", reg, f);
+                    }
+                    SPDLOG_WARN("[SN2-RVC-Dump] eye={} vpx={:.0f} va=0x{:x} | {}",
+                        is_right ? "R" : "L", vpx, va, s);
+                }
+            }
+            const float dist = (vpx >= 0.0f) ? std::fabs(rx - vpx) : 0.0f;
+            if (dist < best_dist) { best_dist = dist; best_va = va; best_rx = rx; best_root = p; }
+        }
+        if (is_right && best_va != 0) {
+            slot().store(best_va, std::memory_order_relaxed);
+            rect_x_slot().store(static_cast<int>(best_rx), std::memory_order_relaxed);
+            static std::atomic<uint64_t> seq{0};
+            const auto n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            const uint64_t every = log_every();
+            if (n <= 4 || (every != 0 && (n % every) == 0)) {
+                SPDLOG_WARN("[SN2-RightViewCapture] #{} captured right View CB va=0x{:x} "
+                            "root={} originX={} (vpx={:.0f} matchDist={:.0f})",
+                            n, best_va, best_root,
+                            rect_x_slot().load(std::memory_order_relaxed), vpx, best_dist);
+            }
+        }
+    }
+    // Re-validate the cached VA at use time (guards against upload-ring recycle)
+    // and return it, or 0 if it no longer looks like a View UB.
+    inline uint64_t get_validated() {
+        const uint64_t va = slot().load(std::memory_order_relaxed);
+        if (va == 0) return 0;
+        uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, 5168);
+        if (cpu != nullptr && sn2_view_ub_id::looks_like_view_ub(cpu)) return va;
+        return 0;
+    }
+}
+
+// === 2026-05-26: diagnostic right-eye View UB viewport-origin patch ==========
+// Char13b2/RenderDoc showed the active View UB stores viewport origin at
+// reg148/+0x940, not the older reg150/+0x960 guess. This diagnostic patch writes
+// that origin to the draw's viewport origin on right-bucket draws. It is NOT the
+// primary 0x13b00f0c fix path; the main use is validating/correcting captured
+// right View UBs and avoiding the stale +0x960 assumption.
+namespace sn2_right_viewrect_patch {
+    inline bool enabled() {
+        static const bool e = []() {
+            const char* v = std::getenv("UEVR_SN2_PATCH_RIGHT_VIEWRECT");
+            return v && v[0] && v[0] != '0';
+        }();
+        return e;
+    }
+    // reg148 viewport origin @ byte 2368: float4 (x,y,?,?).
+    inline void patch(const CommandListCorrelationState& s) {
+        if (!enabled()) return;
+        if (s.last_viewport_bucket != StereoTraceBucket::Right) return;
+        if (!s.has_viewport) return;
+        const float vpx = s.viewport0.TopLeftX;
+        const float vpy = s.viewport0.TopLeftY;
+        if (vpx <= 0.0f) return;  // nothing to fix for a 0-origin right viewport
+        for (size_t p = 0; p < s.last_graphics_root_cbv.size(); ++p) {
+            const uint64_t va = static_cast<uint64_t>(s.last_graphics_root_cbv[p]);
+            if (va == 0) continue;
+            uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, 5168);
+            if (cpu == nullptr || !sn2_view_ub_id::looks_like_view_ub(cpu)) continue;
+            float cur_x = sn2_view_ub_id::view_rect_min_x(cpu);
+            if (std::fabs(cur_x - vpx) < 0.5f) continue;  // already correct
+            std::memcpy(cpu + 2368, &vpx, 4);
+            std::memcpy(cpu + 2368 + 4, &vpy, 4);
+            static std::atomic<uint64_t> seq{0};
+            const auto n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 6 || (n % 2000) == 0) {
+                SPDLOG_WARN("[SN2-ViewRectPatch] #{} right View UB va=0x{:x} root={} "
+                            "originX@0x940 {:.0f}->{:.0f} (vpy={:.0f})",
+                            n, va, p, cur_x, vpx, vpy);
+            }
+        }
+    }
+}
+
 // Duplicate a LEFT-eye water-material basepass draw for the right eye.
 // Counterpart of sn2_try_duplicate_fog_voxelize_right (above) but for the
 // SLW basepass MRT slot 6 fill chain. See Sn2WaterBasepassDupHook.hpp for
@@ -11808,6 +19920,31 @@ static void sn2_try_duplicate_slw_basepass_right(
 
     auto& registry = render::ShaderOverrideRegistry::get();
     const uint32_t ps_crc = registry.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso));
+    const bool underwater_fix_shape_target =
+        sn2_water_basepass_dup::right_eye_underwater_fix_enabled() &&
+        index_count_per_instance == 76608 &&
+        instance_count == 1 &&
+        state.last_rtv_count == 1 &&
+        state.viewport0.Width >= 256.0f &&
+        state.viewport0.Height >= 256.0f;
+
+    if (underwater_fix_shape_target && ps_crc != 0x13B00F0Cu) {
+        static std::atomic<uint64_t> shape_seq{0};
+        const auto n = shape_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 600) == 0) {
+            SPDLOG_WARN(
+                "[SN2-RightEyeUnderwaterFix] shape-target fallback #{} ps_crc=0x{:08x} "
+                "pso=0x{:x} rtv_count={} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) idx={} inst={}",
+                n,
+                ps_crc,
+                reinterpret_cast<uintptr_t>(state.current_pso),
+                static_cast<unsigned>(state.last_rtv_count),
+                state.viewport0.TopLeftX, state.viewport0.TopLeftY,
+                state.viewport0.Width, state.viewport0.Height,
+                index_count_per_instance,
+                instance_count);
+        }
+    }
 
     // 2026-05-22: Diagnostic probe for specific PSes — log every entry to the
     // dup function so we can see exactly which gate is blocking. Env-gated to
@@ -11949,7 +20086,9 @@ static void sn2_try_duplicate_slw_basepass_right(
     //   (c) JSON config file (UEVR_SN2_DUP_CONFIG_FILE) — per-PSO entry with
     //       optional per-CRC view_cb_roots + mode override.
     const bool is_water_basepass = sn2_water_basepass_dup::is_water_basepass_ps_crc(ps_crc);
-    const bool is_any_mrt = sn2_water_basepass_dup::is_any_mrt_dup_ps_crc(ps_crc);
+    const bool is_any_mrt =
+        sn2_water_basepass_dup::is_any_mrt_dup_ps_crc(ps_crc) ||
+        underwater_fix_shape_target;
     const bool is_config_entry = sn2_dup_config::has_entry(ps_crc);
     // Trace which gate filters target CRCs.
     {
@@ -12059,20 +20198,79 @@ static void sn2_try_duplicate_slw_basepass_right(
     const D3D12_GPU_VIRTUAL_ADDRESS synth_right_va =
         (dup_mode == sn2_dup_config::DupMode::SynthesizeRightCb)
             ? sn2_right_cb_synth::get_right_va() : 0;
-    for (uint32_t root : view_roots) {
-        if (root >= state.last_graphics_root_cbv.size()) continue;
-        const uint64_t lv = state.last_graphics_root_cbv[root];
-        if (lv == 0) continue;
-        uint64_t rv = 0;
-        if (dup_mode == sn2_dup_config::DupMode::SynthesizeRightCb) {
-            if (synth_right_va == 0) continue;  // donor not yet snapshotted
-            rv = synth_right_va;
-        } else {
-            rv = sn2_dup_config::compute_right_view_va_for(ps_crc, lv);
+    // 2026-05-26: captured-right-view mode (UEVR_SN2_DUP_USE_CAPTURED_RIGHT_VIEW).
+    // Auto-detect THIS draw's View-CB root(s) by content and swap each to the
+    // engine's own right-eye View CB captured from a right-bucket draw — the
+    // principled replacement for the -10240 delta / synth donor. Used for the
+    // 0x13b00f0c basepass-geometry dup so the right water projects correctly.
+    const bool use_captured_right = sn2_right_view_capture::enabled();
+    if (use_captured_right) {
+        const uint64_t captured_right_va = sn2_right_view_capture::get_validated();
+        if (captured_right_va == 0) {
+            static std::atomic<uint64_t> miss{0};
+            const auto n = miss.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || (n % 1200) == 0) {
+                SPDLOG_INFO("[SN2-RightViewCapture] dup skip ps_crc=0x{:08x} — no validated right View CB yet (#{} skips)",
+                    ps_crc, n);
+            }
+            return;  // don't dup with a wrong view
         }
-        if (rv == 0) continue;
-        if (swap_count >= swaps.size()) break;
-        swaps[swap_count++] = {static_cast<UINT>(root), lv, rv};
+        // 2026-05-26 FROXEL-PARALLAX FIX TEST: optionally restrict the View-CB swap to
+        // a specific root subset (UEVR_SN2_DUP_VIEW_SWAP_ROOTS=8 etc.). 0x13b00f0c
+        // computes its froxel UV in the PIXEL shader from the View CB (world->View-proj
+        // ->NDC->UV). Swapping the PS View CB to the right eye makes the PS sample the
+        // LEFT froxel volume with RIGHT-NDC coords -> mismatch -> black. So we want to
+        // swap ONLY the VERTEX-shader View CB (geometry -> right viewport) and KEEP the
+        // PS View CB = left (so the PS samples the left froxel at matching left-NDC).
+        // Empty list = swap all View-UB-looking roots (legacy behavior).
+        static const std::unordered_set<UINT> swap_root_allow = []() {
+            std::unordered_set<UINT> out;
+            char buf[256]{};
+            const auto len = GetEnvironmentVariableA("UEVR_SN2_DUP_VIEW_SWAP_ROOTS", buf, sizeof(buf));
+            if (len == 0 || len >= sizeof(buf)) return out;
+            std::string s{buf, len}; size_t pos = 0;
+            while (pos < s.size()) {
+                while (pos < s.size() && (s[pos] == ',' || s[pos] == ' ')) ++pos;
+                if (pos >= s.size()) break;
+                size_t end = pos;
+                while (end < s.size() && s[end] != ',' && s[end] != ' ') ++end;
+                std::string tok = s.substr(pos, end - pos);
+                if (!tok.empty()) { char* t=nullptr; auto v=std::strtoul(tok.c_str(),&t,0); if(t!=tok.c_str()) out.insert((UINT)v); }
+                pos = end;
+            }
+            return out;
+        }();
+        for (size_t root = 0; root < state.last_graphics_root_cbv.size(); ++root) {
+            if (!swap_root_allow.empty() && swap_root_allow.find((UINT)root) == swap_root_allow.end()) continue;
+            if (swap_root_allow.empty() &&
+                sn2_water_basepass_dup::right_eye_underwater_fix_enabled() &&
+                (ps_crc == 0x13B00F0Cu || underwater_fix_shape_target) &&
+                root != 4) {
+                continue;
+            }
+            const uint64_t lv = static_cast<uint64_t>(state.last_graphics_root_cbv[root]);
+            if (lv == 0) continue;
+            uint8_t* lcpu = sn2_upload_buf_map::gpu_va_to_cpu(lv, 5168);
+            if (lcpu == nullptr || !sn2_view_ub_id::looks_like_view_ub(lcpu)) continue;
+            if (swap_count >= swaps.size()) break;
+            swaps[swap_count++] = {static_cast<UINT>(root), lv, captured_right_va};
+        }
+    } else {
+        for (uint32_t root : view_roots) {
+            if (root >= state.last_graphics_root_cbv.size()) continue;
+            const uint64_t lv = state.last_graphics_root_cbv[root];
+            if (lv == 0) continue;
+            uint64_t rv = 0;
+            if (dup_mode == sn2_dup_config::DupMode::SynthesizeRightCb) {
+                if (synth_right_va == 0) continue;  // donor not yet snapshotted
+                rv = synth_right_va;
+            } else {
+                rv = sn2_dup_config::compute_right_view_va_for(ps_crc, lv);
+            }
+            if (rv == 0) continue;
+            if (swap_count >= swaps.size()) break;
+            swaps[swap_count++] = {static_cast<UINT>(root), lv, rv};
+        }
     }
     if (swap_count == 0) {
         static std::atomic<uint64_t> miss{0};
@@ -12132,6 +20330,144 @@ static void sn2_try_duplicate_slw_basepass_right(
             instance_count);
     }
 
+    // Narrow diagnostic for the 0x13b00f0c replay. This answers the current
+    // question without a full StereoForensics capture: which View roots were
+    // swapped, what RTs were bound, and which fixed-SRV resources the replay
+    // will sample. Gated because the draw can fire every frame.
+    static const bool dup_detail_log = env_flag_enabled_a("UEVR_SN2_DUP_DETAIL_LOG");
+    if (dup_detail_log) {
+        const int detail_max = std::max(0, env_int_a("UEVR_SN2_DUP_DETAIL_LOG_MAX", 24));
+        const bool detail_now = static_cast<int>(n) <= detail_max || (n % 600) == 0;
+        if (detail_now) {
+            for (size_t i = 0; i < swap_count; ++i) {
+                uint8_t* lcpu = sn2_upload_buf_map::gpu_va_to_cpu(swaps[i].left_va, 5168);
+                uint8_t* rcpu = sn2_upload_buf_map::gpu_va_to_cpu(swaps[i].right_va, 5168);
+                const bool lv = lcpu != nullptr && sn2_view_ub_id::looks_like_view_ub(lcpu);
+                const bool rv = rcpu != nullptr && sn2_view_ub_id::looks_like_view_ub(rcpu);
+                SPDLOG_WARN(
+                    "[SN2-WaterBasepassDup-Detail] dup#{} swap{} root={} "
+                    "L=0x{:x} valid={} origin=({:.0f},{:.0f}) size=({:.0f},{:.0f}) "
+                    "R=0x{:x} valid={} origin=({:.0f},{:.0f}) size=({:.0f},{:.0f})",
+                    n,
+                    i,
+                    swaps[i].root_param,
+                    swaps[i].left_va,
+                    lv ? 1 : 0,
+                    lv ? sn2_view_ub_id::view_rect_min_x(lcpu) : -1.0f,
+                    lv ? sn2_view_ub_id::view_rect_min_y(lcpu) : -1.0f,
+                    lv ? sn2_view_ub_id::view_size_x(lcpu) : -1.0f,
+                    lv ? sn2_view_ub_id::view_size_y(lcpu) : -1.0f,
+                    swaps[i].right_va,
+                    rv ? 1 : 0,
+                    rv ? sn2_view_ub_id::view_rect_min_x(rcpu) : -1.0f,
+                    rv ? sn2_view_ub_id::view_rect_min_y(rcpu) : -1.0f,
+                    rv ? sn2_view_ub_id::view_size_x(rcpu) : -1.0f,
+                    rv ? sn2_view_ub_id::view_size_y(rcpu) : -1.0f);
+            }
+
+            const auto& rtvs = state.last_rtv_handles;
+            const UINT rtv_n = std::min<UINT>(static_cast<UINT>(state.last_rtv_count), 8u);
+            for (UINT i = 0; i < rtv_n; ++i) {
+                ID3D12Resource* res = rtvs[i] != 0 ? sn2_rt_snapshot::lookup_rtv(rtvs[i]) : nullptr;
+                if (res == nullptr) {
+                    SPDLOG_WARN("[SN2-WaterBasepassDup-Detail] dup#{} rtv{} handle=0x{:x} res=null",
+                        n, i, rtvs[i]);
+                    continue;
+                }
+                const auto rd = res->GetDesc();
+                SPDLOG_WARN(
+                    "[SN2-WaterBasepassDup-Detail] dup#{} rtv{} res=0x{:x} dim={} {}x{} depth={} fmt={} flags=0x{:x}",
+                    n,
+                    i,
+                    reinterpret_cast<uintptr_t>(res),
+                    static_cast<unsigned>(rd.Dimension),
+                    static_cast<unsigned long long>(rd.Width),
+                    rd.Height,
+                    rd.DepthOrArraySize,
+                    static_cast<unsigned>(rd.Format),
+                    static_cast<unsigned>(rd.Flags));
+            }
+
+            const UINT slot_scan = static_cast<UINT>(std::clamp(
+                env_int_a("UEVR_SN2_DUP_DETAIL_SLOT_SCAN", 16), 1, 64));
+            for (size_t ti = 0; ti < state.last_graphics_root_desc_tables.size(); ++ti) {
+                const uint64_t table_gpu = state.last_graphics_root_desc_tables[ti];
+                if (table_gpu == 0) continue;
+                BindlessHeapState heap_state{};
+                SIZE_T cpu_base = 0;
+                if (!bindless_heap_registry().resolve_state(table_gpu, heap_state, cpu_base) ||
+                    heap_state.heap == nullptr || heap_state.stride == 0) {
+                    continue;
+                }
+                const uint64_t off = table_gpu - heap_state.gpu_base;
+                const uint64_t heap_bytes = static_cast<uint64_t>(heap_state.stride) * heap_state.num_descriptors;
+                const UINT remaining_desc = (off < heap_bytes)
+                    ? static_cast<UINT>((heap_bytes - off) / heap_state.stride)
+                    : 0u;
+                const UINT count = std::min(slot_scan, remaining_desc);
+                for (UINT slot = 0; slot < count; ++slot) {
+                    const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * heap_state.stride;
+                    sn2_descriptor_registry::Entry entry{};
+                    if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(slot_cpu, entry) ||
+                        entry.resource == nullptr) {
+                        continue;
+                    }
+                    const auto rd = entry.has_resource_desc ? entry.resource_desc : entry.resource->GetDesc();
+                    const std::string binding = sn2_root_binding_label(
+                        state.last_graphics_root_signature,
+                        reinterpret_cast<uintptr_t>(state.current_pso),
+                        static_cast<uint32_t>(ti),
+                        slot);
+                    // Keep the log compact: fixed shader registers plus any 3D
+                    // texture input are the interesting pieces for 0x13b00f0c.
+                    const bool likely_fixed = binding.rfind("t", 0) == 0 || binding.rfind("u", 0) == 0;
+                    const bool tex3d = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+                    if (!likely_fixed && !tex3d) {
+                        continue;
+                    }
+                    SPDLOG_WARN(
+                        "[SN2-WaterBasepassDup-Detail] dup#{} srv root={} slot={} bind={} res=0x{:x} dim={} srvdim={} {}x{} depth={} fmt={} flags=0x{:x}",
+                        n,
+                        ti,
+                        slot,
+                        binding,
+                        reinterpret_cast<uintptr_t>(entry.resource),
+                        static_cast<unsigned>(rd.Dimension),
+                        entry.has_srv_desc ? static_cast<unsigned>(entry.srv_desc.ViewDimension) : 0u,
+                        static_cast<unsigned long long>(rd.Width),
+                        rd.Height,
+                        rd.DepthOrArraySize,
+                        static_cast<unsigned>(rd.Format),
+                        static_cast<unsigned>(rd.Flags));
+                }
+            }
+        }
+    }
+
+    if (underwater_fix_shape_target && sn2_underwater_deferred::enabled()) {
+        std::array<UINT, 8> swap_roots{};
+        std::array<uint64_t, 8> swap_right_vas{};
+        for (size_t i = 0; i < swap_count && i < swap_roots.size(); ++i) {
+            swap_roots[i] = swaps[i].root_param;
+            swap_right_vas[i] = swaps[i].right_va;
+        }
+        sn2_underwater_deferred::capture(
+            command_list,
+            state,
+            right_viewport,
+            right_scissor,
+            use_scissor,
+            swap_roots,
+            swap_right_vas,
+            swap_count,
+            index_count_per_instance,
+            instance_count,
+            start_index_location,
+            base_vertex_location,
+            start_instance_location);
+        return;
+    }
+
     // Apply right-eye state. ViewCbOnly mode skips the viewport+scissor swap
     // (used for passes that don't render geometry to a per-eye region but do
     // need the View matrices to match the right eye — e.g. compute-driven
@@ -12141,6 +20477,7 @@ static void sn2_try_duplicate_slw_basepass_right(
     const bool shift_viewport =
         (dup_mode != sn2_dup_config::DupMode::ViewCbOnly) &&
         (dup_mode != sn2_dup_config::DupMode::SynthesizeRightCb);
+
     if (shift_viewport) {
         command_list->RSSetViewports(1, &right_viewport);
         if (use_scissor) {
@@ -12289,115 +20626,76 @@ static void sn2_try_duplicate_slw_basepass_right(
         }
     }
 
-    // 2026-05-22 Stage V4 — graphics RTV redirect (for VoxelizePS).
-    // VoxelizePS writes to a 3D volume via RTV slots (rasterizer to slice via
-    // GS). The mirror infra now allocates parallel 3D resources for these
-    // (54×30×48 R11G11B10F). Here we substitute the RTV bindings with mirror
-    // RTVs before re-issuing the right-eye dup. Lazy RTV creation: first dup
-    // that hits a given mirror creates the RTV in our RTV heap, caches it.
-    static std::mutex rtv_cache_mu;
-    static std::unordered_map<ID3D12Resource*, D3D12_CPU_DESCRIPTOR_HANDLE> mirror_rtv_cache;
-    bool rtv_redirect_applied = false;
-    D3D12_CPU_DESCRIPTOR_HANDLE orig_rtv_handles_cpu[8]{};
-    UINT orig_rtv_count = 0;
+    Sn2MirrorRtvRedirectScope mirror_rtv_scope{};
+    const bool rtv_redirect_applied =
+        (dup_mode == sn2_dup_config::DupMode::SynthesizeRightCb) &&
+        sn2_try_begin_mirror_rtv_redirect(command_list, state, mirror_rtv_scope, ps_crc, "indexed");
     if (dup_mode == sn2_dup_config::DupMode::SynthesizeRightCb &&
-        sn2_uwe_fog_mirror::env_enabled() &&
-        state.last_rtv_count > 0 && state.last_rtv_count <= 8)
+        state.last_rtv_count > 0 &&
+        sn2_require_mirror_for_synth_rtv() &&
+        !rtv_redirect_applied)
     {
-        ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
-        if (dev != nullptr && sn2_uwe_fog_mirror::ensure_mirror_rtv_heap(dev)) {
-            D3D12_CPU_DESCRIPTOR_HANDLE new_rtvs[8]{};
-            bool any_substituted = false;
-            for (UINT i = 0; i < state.last_rtv_count; ++i) {
-                const uint64_t handle = state.last_rtv_handles[i];
-                D3D12_CPU_DESCRIPTOR_HANDLE orig_h{};
-                orig_h.ptr = static_cast<SIZE_T>(handle);
-                orig_rtv_handles_cpu[i] = orig_h;
-                new_rtvs[i] = orig_h;
-                if (handle == 0) continue;
-                ID3D12Resource* res = sn2_rt_snapshot::lookup_rtv(handle);
-                if (res == nullptr) continue;
-                const auto* m = sn2_uwe_fog_mirror::registry().find(res);
-                if (m == nullptr || m->resource == nullptr) continue;
-                // Lazy: get/create mirror RTV for this resource.
-                D3D12_CPU_DESCRIPTOR_HANDLE mirror_rtv_cpu{};
-                {
-                    std::scoped_lock _{rtv_cache_mu};
-                    auto it = mirror_rtv_cache.find(m->resource.Get());
-                    if (it != mirror_rtv_cache.end()) {
-                        mirror_rtv_cpu = it->second;
-                    } else if (mirror_rtv_cache.size() >= 256u) {
-                        // 2026-05-22: Cap cache. RTV heap is 1024 but practical
-                        // unique fog resources should stay <256. Hitting cap
-                        // means churn — log once, then skip new entries to
-                        // avoid heap exhaustion + log spam.
-                        static std::atomic<bool> cap_logged{false};
-                        if (!cap_logged.exchange(true, std::memory_order_relaxed)) {
-                            SPDLOG_WARN("[SN2-GfxRtvRedirect] mirror_rtv_cache cap reached (256). New mirrors will not be redirected.");
-                        }
-                    } else {
-                        const UINT idx = sn2_uwe_fog_mirror::alloc_rtv_slot();
-                        if (idx != UINT32_MAX) {
-                            auto& rh = sn2_uwe_fog_mirror::mirror_rtv_heap();
-                            const auto base = rh.heap->GetCPUDescriptorHandleForHeapStart();
-                            mirror_rtv_cpu.ptr = base.ptr + static_cast<SIZE_T>(idx) * rh.descriptor_size;
-                            // Build RTV desc for 3D texture, full WSize coverage.
-                            const auto& rd = m->desc;
-                            D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{};
-                            rtv_desc.Format = rd.Format;
-                            if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
-                                rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
-                                rtv_desc.Texture3D.MipSlice = 0;
-                                rtv_desc.Texture3D.FirstWSlice = 0;
-                                rtv_desc.Texture3D.WSize = static_cast<UINT>(rd.DepthOrArraySize);
-                            } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-                                rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-                                rtv_desc.Texture2D.MipSlice = 0;
-                            }
-                            dev->CreateRenderTargetView(m->resource.Get(), &rtv_desc, mirror_rtv_cpu);
-                            mirror_rtv_cache[m->resource.Get()] = mirror_rtv_cpu;
-                            SPDLOG_WARN("[SN2-GfxRtvRedirect] created mirror RTV for resource 0x{:x} fmt={} dim={}x{}x{}",
-                                reinterpret_cast<uintptr_t>(m->resource.Get()),
-                                static_cast<unsigned>(rd.Format),
-                                static_cast<unsigned>(rd.Width),
-                                static_cast<unsigned>(rd.Height),
-                                static_cast<unsigned>(rd.DepthOrArraySize));
-                        }
-                    }
-                }
-                if (mirror_rtv_cpu.ptr != 0) {
-                    new_rtvs[i] = mirror_rtv_cpu;
-                    any_substituted = true;
-                    static std::atomic<uint64_t> redir_seq{0};
-                    const auto n = redir_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (n <= 16 || (n % 600) == 0) {
-                        SPDLOG_WARN("[SN2-GfxRtvRedirect] #{} slot {} orig=0x{:x} → mirror=0x{:x}",
-                                    n, i, static_cast<uintptr_t>(orig_h.ptr),
-                                    static_cast<uintptr_t>(mirror_rtv_cpu.ptr));
-                    }
-                }
-            }
-            if (any_substituted) {
-                orig_rtv_count = state.last_rtv_count;
-                // 2026-05-22: Preserve game's DSV binding if it had one. Passing
-                // nullptr DSV blindly was the suspected freeze cause — game's
-                // depth state was getting silently dropped on every dup, and
-                // GPU state coherence eventually broke. We now thread the DSV
-                // captured by the OMSetRenderTargets hook.
-                D3D12_CPU_DESCRIPTOR_HANDLE dsv_h{};
-                D3D12_CPU_DESCRIPTOR_HANDLE* dsv_ptr = nullptr;
-                if (state.has_dsv && state.last_dsv_handle != 0) {
-                    dsv_h.ptr = static_cast<SIZE_T>(state.last_dsv_handle);
-                    dsv_ptr = &dsv_h;
-                }
-                command_list->OMSetRenderTargets(orig_rtv_count, new_rtvs, FALSE, dsv_ptr);
-                rtv_redirect_applied = true;
+        static std::atomic<uint64_t> skip_no_mirror{0};
+        const auto sn = skip_no_mirror.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (sn <= 16 || (sn % 600) == 0) {
+            SPDLOG_WARN("[SN2-WaterBasepassDup] skip synth replay#{} ps_crc=0x{:08x}: no mirror RTV redirect for {} RTVs",
+                sn, ps_crc, static_cast<unsigned>(state.last_rtv_count));
+        }
+        if (uav_redirect_root != UINT_MAX && uav_redirect_orig_table_gpu != 0) {
+            D3D12_GPU_DESCRIPTOR_HANDLE restore{uav_redirect_orig_table_gpu};
+            command_list->SetGraphicsRootDescriptorTable(uav_redirect_root, restore);
+        }
+        if (shift_viewport) {
+            command_list->RSSetViewports(1, &state.viewport0);
+            if (use_scissor) {
+                command_list->RSSetScissorRects(1, &state.scissor0);
             }
         }
+        for (size_t i = 0; i < swap_count; ++i) {
+            command_list->SetGraphicsRootConstantBufferView(
+                swaps[i].root_param,
+                static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(swaps[i].left_va));
+        }
+        return;
     }
 
     Sn2EyePairingRedirectScope eye_pairing_scope{};
     sn2_try_begin_eye_pairing_redirect(command_list, state, eye_pairing_scope, true);
+    Sn2EyePairingRedirectScope mirror_srv_scope{};
+    sn2_try_begin_synthetic_mirror_srv_redirect(command_list, state, mirror_srv_scope, ps_crc);
+
+    // Coverage isolation: substitute the duplicated draw's pixel shader with a
+    // constant debug color. If this still does not show in the right eye, the
+    // replay is being rejected by coverage/depth/stencil or missing the target
+    // viewport. If it shows, the replay reaches the composite and the remaining
+    // issue is the original shader inputs/gates.
+    Sn2DebugColorScope dup_debug_color_scope{};
+    if (env_flag_enabled_a("UEVR_SN2_DUP_DEBUG_COLOR") && sn2_debug_color::env_enabled()) {
+        ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+        auto* current_pso_ps = static_cast<ID3D12PipelineState*>(state.current_pso);
+        if (dev != nullptr && current_pso_ps != nullptr) {
+            ID3D12PipelineState* replacement = sn2_debug_color::get_or_create_replacement(dev, current_pso_ps);
+            if (replacement != nullptr) {
+                command_list->SetPipelineState(replacement);
+                dup_debug_color_scope.active = true;
+                dup_debug_color_scope.command_list = command_list;
+                dup_debug_color_scope.restore_pso = current_pso_ps;
+                static std::atomic<uint64_t> dbg_seq{0};
+                const auto dn = dbg_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (dn <= 8 || (dn % 600) == 0) {
+                    SPDLOG_WARN("[SN2-WaterBasepassDup-DebugColor] #{} ps_crc=0x{:08x} replacement={:p}",
+                        dn, ps_crc, static_cast<void*>(replacement));
+                }
+            } else {
+                static std::atomic<uint64_t> dbg_miss_seq{0};
+                const auto dn = dbg_miss_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (dn <= 16 || (dn % 600) == 0) {
+                    SPDLOG_WARN("[SN2-WaterBasepassDup-DebugColor] #{} ps_crc=0x{:08x} replacement=null pso={:p}",
+                        dn, ps_crc, static_cast<void*>(current_pso_ps));
+                }
+            }
+        }
+    }
 
     // Re-issue the draw.
     original(
@@ -12408,6 +20706,8 @@ static void sn2_try_duplicate_slw_basepass_right(
         base_vertex_location,
         start_instance_location);
 
+    dup_debug_color_scope.restore();
+    mirror_srv_scope.restore();
     eye_pairing_scope.restore();
 
     // 2026-05-23: Snapshot the basepass RT immediately after the dup draw
@@ -12437,19 +20737,7 @@ static void sn2_try_duplicate_slw_basepass_right(
         }
     }
 
-    // Restore RTV bindings.
-    if (rtv_redirect_applied && orig_rtv_count > 0) {
-        // 2026-05-22: Restore game's DSV too. The OMSetRenderTargets hook
-        // captured it; threading it through here means the game's depth state
-        // matches what it had before our redirect — no silent DSV reset.
-        D3D12_CPU_DESCRIPTOR_HANDLE dsv_h{};
-        D3D12_CPU_DESCRIPTOR_HANDLE* dsv_ptr = nullptr;
-        if (state.has_dsv && state.last_dsv_handle != 0) {
-            dsv_h.ptr = static_cast<SIZE_T>(state.last_dsv_handle);
-            dsv_ptr = &dsv_h;
-        }
-        command_list->OMSetRenderTargets(orig_rtv_count, orig_rtv_handles_cpu, FALSE, dsv_ptr);
-    }
+    mirror_rtv_scope.restore();
 
     // Restore game's original descriptor table at the redirected root.
     if (uav_redirect_root != UINT_MAX && uav_redirect_orig_table_gpu != 0) {
@@ -12471,10 +20759,483 @@ static void sn2_try_duplicate_slw_basepass_right(
     }
 }
 
+namespace sn2_underwater_deferred {
+struct PendingReplay {
+    bool valid{false};
+    ID3D12GraphicsCommandList* command_list{nullptr};
+    ID3D12PipelineState* pso{nullptr};
+    ID3D12RootSignature* root_signature{nullptr};
+    CommandListCorrelationState state{};
+    D3D12_VIEWPORT right_viewport{};
+    D3D12_RECT right_scissor{};
+    bool use_scissor{false};
+    UINT index_count_per_instance{};
+    UINT instance_count{};
+    UINT start_index_location{};
+    INT base_vertex_location{};
+    UINT start_instance_location{};
+    uint32_t right_draws_seen{};
+    uint64_t last_replay_frame{};
+    uint64_t seq{};
+};
+
+static std::mutex g_mu;
+static PendingReplay g_pending;
+
+bool enabled() {
+    static const bool e = env_flag_enabled_a("UEVR_SN2_UNDERWATER_DEFER_REPLAY");
+    return e;
+}
+
+bool after_draw() {
+    static const bool e = env_flag_enabled_a("UEVR_SN2_UNDERWATER_DEFER_AFTER_DRAW");
+    return e;
+}
+
+static bool debug_color_enabled() {
+    static const bool e = env_flag_enabled_a("UEVR_SN2_UNDERWATER_DEFER_DEBUG_COLOR");
+    return e;
+}
+
+static bool clear_after_replay_enabled() {
+    static const bool e = env_flag_enabled_a("UEVR_SN2_UNDERWATER_DEFER_CLEAR_AFTER");
+    return e;
+}
+
+static bool repeat_enabled() {
+    static const bool e = env_flag_enabled_a("UEVR_SN2_UNDERWATER_DEFER_REPEAT");
+    return e;
+}
+
+static uint32_t trigger_right_draw_count() {
+    static const uint32_t n = static_cast<uint32_t>(
+        std::max(1, env_int_a("UEVR_SN2_UNDERWATER_DEFER_TRIGGER_N", 1)));
+    return n;
+}
+
+static uint32_t anchor_ps_crc() {
+    static const uint32_t crc = env_u32_a("UEVR_SN2_UNDERWATER_DEFER_ANCHOR_PS", 0);
+    return crc;
+}
+
+static bool require_same_rtv() {
+    static const bool same = []() {
+        char value[32]{};
+        const auto len = GetEnvironmentVariableA(
+            "UEVR_SN2_UNDERWATER_DEFER_REQUIRE_SAME_RTV",
+            value,
+            static_cast<DWORD>(sizeof(value)));
+        if (len > 0 && len < sizeof(value)) {
+            std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
+            return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+        }
+        // A PS anchor is explicitly for replaying at a later pass, which may be
+        // a different scene-color target from the original left-only draw.
+        return anchor_ps_crc() == 0;
+    }();
+    return same;
+}
+
+static bool anchor_trace_enabled() {
+    static const bool e = env_flag_enabled_a("UEVR_SN2_UNDERWATER_DEFER_ANCHOR_TRACE");
+    return e;
+}
+
+static uint32_t anchor_trace_max() {
+    static const uint32_t n = env_u32_a("UEVR_SN2_UNDERWATER_DEFER_ANCHOR_TRACE_MAX", 96);
+    return n;
+}
+
+static void bind_graphics_state(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& s,
+    ID3D12PipelineState* pso,
+    ID3D12RootSignature* root_signature,
+    const D3D12_VIEWPORT* viewport,
+    const D3D12_RECT* scissor)
+{
+    if (command_list == nullptr) return;
+    if (s.descriptor_heap_count > 0) {
+        command_list->SetDescriptorHeaps(s.descriptor_heap_count, s.descriptor_heaps.data());
+    }
+    if (root_signature != nullptr) {
+        command_list->SetGraphicsRootSignature(root_signature);
+    }
+    if (pso != nullptr) {
+        command_list->SetPipelineState(pso);
+    }
+    for (UINT root = 0; root < s.last_graphics_root_desc_tables.size(); ++root) {
+        const uint64_t table = s.last_graphics_root_desc_tables[root];
+        if (table != 0) {
+            command_list->SetGraphicsRootDescriptorTable(root, D3D12_GPU_DESCRIPTOR_HANDLE{table});
+        }
+    }
+    for (UINT root = 0; root < s.last_graphics_root_cbv.size(); ++root) {
+        const uint64_t va = s.last_graphics_root_cbv[root];
+        if (va != 0) {
+            command_list->SetGraphicsRootConstantBufferView(root, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(va));
+        }
+    }
+    for (UINT root = 0; root < s.last_graphics_root_srv.size(); ++root) {
+        const uint64_t va = s.last_graphics_root_srv[root];
+        if (va != 0) {
+            command_list->SetGraphicsRootShaderResourceView(root, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(va));
+        }
+    }
+    for (UINT root = 0; root < s.last_graphics_root_uav.size(); ++root) {
+        const uint64_t va = s.last_graphics_root_uav[root];
+        if (va != 0) {
+            command_list->SetGraphicsRootUnorderedAccessView(root, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(va));
+        }
+    }
+    for (UINT root = 0; root < s.last_graphics_root_constants_count.size(); ++root) {
+        const UINT count = s.last_graphics_root_constants_count[root];
+        if (count != 0) {
+            command_list->SetGraphicsRoot32BitConstants(root, count, s.last_graphics_root_constants[root].data(), 0);
+        }
+    }
+    if (s.has_primitive_topology) {
+        command_list->IASetPrimitiveTopology(s.primitive_topology);
+    }
+    if (s.has_index_buffer) {
+        command_list->IASetIndexBuffer(&s.index_buffer_view);
+    }
+    if (s.max_vertex_buffer_slot > 0) {
+        std::array<D3D12_VERTEX_BUFFER_VIEW, CommandListCorrelationState::MAX_TRACKED_VERTEX_BUFFERS> views{};
+        for (UINT i = 0; i < s.max_vertex_buffer_slot && i < views.size(); ++i) {
+            views[i] = s.has_vertex_buffer[i] ? s.vertex_buffer_views[i] : D3D12_VERTEX_BUFFER_VIEW{};
+        }
+        command_list->IASetVertexBuffers(0, s.max_vertex_buffer_slot, views.data());
+    }
+    if (viewport != nullptr) {
+        command_list->RSSetViewports(1, viewport);
+    }
+    if (scissor != nullptr) {
+        command_list->RSSetScissorRects(1, scissor);
+    }
+}
+
+void capture(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& left_state,
+    const D3D12_VIEWPORT& right_viewport,
+    const D3D12_RECT& right_scissor,
+    bool use_scissor,
+    const std::array<UINT, 8>& swap_roots,
+    const std::array<uint64_t, 8>& swap_right_vas,
+    size_t swap_count,
+    UINT index_count_per_instance,
+    UINT instance_count,
+    UINT start_index_location,
+    INT base_vertex_location,
+    UINT start_instance_location)
+{
+    if (!enabled() || command_list == nullptr) return;
+    if (left_state.current_pso == nullptr ||
+        left_state.last_graphics_root_signature == 0 ||
+        !left_state.has_index_buffer ||
+        !left_state.has_primitive_topology) {
+        static std::atomic<uint64_t> miss{0};
+        const auto n = miss.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 600) == 0) {
+            SPDLOG_WARN(
+                "[SN2-UnderwaterDeferred] capture skipped: pso={} rootsig=0x{:x} ib={} topo={} (#{})",
+                left_state.current_pso != nullptr ? 1 : 0,
+                left_state.last_graphics_root_signature,
+                left_state.has_index_buffer ? 1 : 0,
+                left_state.has_primitive_topology ? 1 : 0,
+                n);
+        }
+        return;
+    }
+
+    std::scoped_lock _{g_mu};
+    auto& p = g_pending;
+    p.valid = true;
+    p.command_list = command_list;
+    p.pso = static_cast<ID3D12PipelineState*>(left_state.current_pso);
+    p.root_signature = reinterpret_cast<ID3D12RootSignature*>(left_state.last_graphics_root_signature);
+    p.state = left_state;
+    for (size_t i = 0; i < swap_count && i < swap_roots.size(); ++i) {
+        const UINT root = swap_roots[i];
+        if (root < p.state.last_graphics_root_cbv.size()) {
+            p.state.last_graphics_root_cbv[root] = swap_right_vas[i];
+        }
+    }
+    p.right_viewport = right_viewport;
+    p.right_scissor = right_scissor;
+    p.use_scissor = use_scissor;
+    p.index_count_per_instance = index_count_per_instance;
+    p.instance_count = instance_count;
+    p.start_index_location = start_index_location;
+    p.base_vertex_location = base_vertex_location;
+    p.start_instance_location = start_instance_location;
+    p.right_draws_seen = 0;
+    p.last_replay_frame = UINT64_MAX;
+    p.seq++;
+
+    static std::atomic<uint64_t> cap_seq{0};
+    const auto n = cap_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 16 || (n % 600) == 0) {
+        SPDLOG_WARN(
+            "[SN2-UnderwaterDeferred] captured#{} seq={} pso=0x{:x} rtv0=0x{:x} "
+            "R=({:.0f},{:.0f},{:.0f}x{:.0f}) triggerN={} rootswaps={} idx={}",
+            n,
+            p.seq,
+            reinterpret_cast<uintptr_t>(p.pso),
+            p.state.last_rtv0_handle,
+            p.right_viewport.TopLeftX,
+            p.right_viewport.TopLeftY,
+            p.right_viewport.Width,
+            p.right_viewport.Height,
+            trigger_right_draw_count(),
+            static_cast<unsigned>(swap_count),
+            p.index_count_per_instance);
+    }
+}
+
+void try_replay(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& current,
+    Sn2DrawIndexedInstancedFn original)
+{
+    if (!enabled() || command_list == nullptr || original == nullptr) return;
+    if (current.last_viewport_bucket != StereoTraceBucket::Right) return;
+
+    const uint32_t anchor_crc = anchor_ps_crc();
+    const uint32_t current_ps_crc =
+        current.current_pso != nullptr
+            ? render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(
+                reinterpret_cast<uintptr_t>(current.current_pso))
+            : 0u;
+
+    PendingReplay p{};
+    uint64_t replay_target_rtv0 = current.last_rtv0_handle;
+    {
+        std::scoped_lock _{g_mu};
+        if (!g_pending.valid || g_pending.command_list != command_list) return;
+        if (require_same_rtv() &&
+            g_pending.state.last_rtv0_handle != 0 &&
+            current.last_rtv0_handle != 0 &&
+            g_pending.state.last_rtv0_handle != current.last_rtv0_handle) {
+            return;
+        }
+        if (anchor_trace_enabled() && current.current_pso != nullptr) {
+            static std::atomic<uint64_t> trace_seq{0};
+            const auto tn = trace_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (tn <= anchor_trace_max() || (tn % 6000) == 0) {
+                SPDLOG_WARN(
+                    "[SN2-UnderwaterDeferred-AnchorTrace] #{} ps=0x{:08x} anchor=0x{:08x} "
+                    "rtv0=0x{:x} captured_rtv0=0x{:x} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) bucket={}",
+                    tn,
+                    current_ps_crc,
+                    anchor_crc,
+                    current.last_rtv0_handle,
+                    g_pending.state.last_rtv0_handle,
+                    current.viewport0.TopLeftX,
+                    current.viewport0.TopLeftY,
+                    current.viewport0.Width,
+                    current.viewport0.Height,
+                    static_cast<int>(current.last_viewport_bucket));
+            }
+        }
+        if (anchor_crc != 0 && current_ps_crc != anchor_crc) {
+            return;
+        }
+        const uint64_t present_frame = g_sn2_d3d12_present_frame_index.load(std::memory_order_relaxed);
+        if (repeat_enabled() && g_pending.last_replay_frame == present_frame) {
+            return;
+        }
+        if (anchor_crc == 0) {
+            g_pending.right_draws_seen++;
+            if (g_pending.right_draws_seen < trigger_right_draw_count()) {
+                return;
+            }
+        }
+        p = g_pending;
+        if (repeat_enabled()) {
+            g_pending.right_draws_seen = 0;
+            g_pending.last_replay_frame = present_frame;
+        } else {
+            g_pending.valid = false;
+        }
+    }
+
+    static std::atomic<uint64_t> replay_seq{0};
+    const auto n = replay_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 16 || (n % 600) == 0) {
+        SPDLOG_WARN(
+            "[SN2-UnderwaterDeferred] replay#{} seq={} before_right_draw={} pso=0x{:x} "
+            "rtv0=0x{:x} current_ps=0x{:08x} current_rtv0=0x{:x} idx={}",
+            n,
+            p.seq,
+            p.right_draws_seen,
+            reinterpret_cast<uintptr_t>(p.pso),
+            p.state.last_rtv0_handle,
+            current_ps_crc,
+            replay_target_rtv0,
+            p.index_count_per_instance);
+    }
+
+    const auto current_pso = static_cast<ID3D12PipelineState*>(current.current_pso);
+    const auto current_root_sig = reinterpret_cast<ID3D12RootSignature*>(current.last_graphics_root_signature);
+    bind_graphics_state(
+        command_list,
+        p.state,
+        p.pso,
+        p.root_signature,
+        &p.right_viewport,
+        p.use_scissor ? &p.right_scissor : nullptr);
+
+    Sn2DebugColorScope debug_color_scope{};
+    if (debug_color_enabled() && sn2_debug_color::env_enabled()) {
+        ID3D12Device* dev = (g_d3d12_hook != nullptr) ? g_d3d12_hook->get_device() : nullptr;
+        if (dev != nullptr && p.pso != nullptr) {
+            ID3D12PipelineState* replacement = sn2_debug_color::get_or_create_replacement(dev, p.pso);
+            if (replacement != nullptr) {
+                command_list->SetPipelineState(replacement);
+                debug_color_scope.active = true;
+                debug_color_scope.command_list = command_list;
+                debug_color_scope.restore_pso = p.pso;
+                static std::atomic<uint64_t> dbg_seq{0};
+                const auto dn = dbg_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (dn <= 8 || (dn % 600) == 0) {
+                    SPDLOG_WARN(
+                        "[SN2-UnderwaterDeferred-DebugColor] #{} replay_seq={} replacement=0x{:x}",
+                        dn,
+                        p.seq,
+                        reinterpret_cast<uintptr_t>(replacement));
+                }
+            }
+        }
+    }
+
+    original(
+        command_list,
+        p.index_count_per_instance,
+        p.instance_count,
+        p.start_index_location,
+        p.base_vertex_location,
+        p.start_instance_location);
+
+    if (clear_after_replay_enabled() && (replay_target_rtv0 != 0 || p.state.last_rtv0_handle != 0)) {
+        if (replay_target_rtv0 == 0) {
+            replay_target_rtv0 = p.state.last_rtv0_handle;
+        }
+        const float color[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+        const D3D12_VIEWPORT& clear_vp =
+            (replay_target_rtv0 == current.last_rtv0_handle && current.has_viewport)
+                ? current.viewport0
+                : p.right_viewport;
+        D3D12_RECT rect{
+            static_cast<LONG>(clear_vp.TopLeftX),
+            static_cast<LONG>(clear_vp.TopLeftY),
+            static_cast<LONG>(clear_vp.TopLeftX + clear_vp.Width),
+            static_cast<LONG>(clear_vp.TopLeftY + clear_vp.Height)
+        };
+        command_list->ClearRenderTargetView(
+            D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(replay_target_rtv0)},
+            color,
+            1,
+            &rect);
+        static std::atomic<uint64_t> clear_seq{0};
+        const auto cn = clear_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (cn <= 8 || (cn % 600) == 0) {
+            SPDLOG_WARN(
+                "[SN2-UnderwaterDeferred-ClearAfter] #{} replay_seq={} rtv0=0x{:x} rect=({}, {}, {}, {})",
+                cn,
+                p.seq,
+                replay_target_rtv0,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom);
+        }
+    }
+    debug_color_scope.restore();
+    bind_graphics_state(
+        command_list,
+        current,
+        current_pso,
+        current_root_sig,
+        current.has_viewport ? &current.viewport0 : nullptr,
+        current.has_scissor ? &current.scissor0 : nullptr);
+}
+} // namespace sn2_underwater_deferred
+
 // Same config-driven replay path as sn2_try_duplicate_slw_basepass_right, but
 // for DrawInstanced producers. This is required for SN2's foreground fog-volume
 // writers (for example 24x24x24 volume draws) which never pass through
 // DrawIndexedInstanced.
+// 2026-05-24 RIGHT-EYE FIX attempt: duplicate left-only FULLSCREEN post-process passes onto the
+// right eye. The right eye lacks the underwater color-grade (uniform teal cast) because ~17 fullscreen
+// pixel shaders run for the LEFT eye only. Fullscreen = screen-space (NO per-eye matrices), so we just
+// shift the viewport to the right half and re-issue the draw — no CB swap needed. Gated by
+// UEVR_SN2_DUP_FULLSCREEN_RIGHT; CRC set overridable via UEVR_SN2_DUP_FULLSCREEN_CRCS=comma-hex.
+static void sn2_try_duplicate_fullscreen_right(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2DrawInstancedFn original,
+    UINT vertex_count_per_instance,
+    UINT instance_count,
+    UINT start_vertex_location,
+    UINT start_instance_location
+) {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_DUP_FULLSCREEN_RIGHT");
+    if (!enabled || command_list == nullptr || original == nullptr ||
+        state.current_pso == nullptr || !state.has_viewport || state.viewport_count != 1 ||
+        state.viewport_width <= 0.0f || state.viewport_height <= 0.0f ||
+        state.last_viewport_bucket != StereoTraceBucket::Left ||
+        vertex_count_per_instance > 6) {
+        return;
+    }
+    auto& registry = render::ShaderOverrideRegistry::get();
+    const uint32_t ps_crc = registry.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso));
+    if (ps_crc == 0) return;
+    static const std::unordered_set<uint32_t> crcs = []() {
+        std::unordered_set<uint32_t> s = {
+            0x1f6ec0bdu,0x6aaee08eu,0x569c196au,0x20488e6du,0x1e6d9efeu,0x4d478396u,0x6fdef36fu,
+            0x1f958d46u,0xdde44bfcu,0x59a1efd9u,0x80776e21u,0x4e5b7e7du,0x259beb60u,0x89872979u,
+            0xc24ba8c0u,0xfc91443au,0x5e1e86ceu };
+        char buf[1024]{};
+        const auto n = GetEnvironmentVariableA("UEVR_SN2_DUP_FULLSCREEN_CRCS", buf, sizeof(buf));
+        if (n > 0 && n < sizeof(buf)) {
+            s.clear();
+            char* ctx = nullptr;
+            for (char* tok = strtok_s(buf, ", ", &ctx); tok != nullptr; tok = strtok_s(nullptr, ", ", &ctx)) {
+                const uint32_t v = static_cast<uint32_t>(strtoul(tok, nullptr, 16));
+                if (v != 0) s.insert(v);
+            }
+        }
+        return s;
+    }();
+    if (crcs.find(ps_crc) == crcs.end()) return;
+
+    D3D12_VIEWPORT right_viewport = state.viewport0;
+    right_viewport.TopLeftX = state.viewport0.TopLeftX + state.viewport0.Width;
+    if (right_viewport.Width <= 0.0f || right_viewport.Height <= 0.0f) return;
+    D3D12_RECT right_scissor{};
+    const bool use_scissor = state.has_scissor && state.scissor_count == 1;
+    if (use_scissor) {
+        const auto dx = static_cast<LONG>(right_viewport.TopLeftX - state.viewport0.TopLeftX);
+        right_scissor = state.scissor0;
+        right_scissor.left += dx;
+        right_scissor.right += dx;
+    }
+    command_list->RSSetViewports(1, &right_viewport);
+    if (use_scissor) command_list->RSSetScissorRects(1, &right_scissor);
+    original(command_list, vertex_count_per_instance, instance_count, start_vertex_location, start_instance_location);
+    command_list->RSSetViewports(1, &state.viewport0);
+    if (use_scissor) command_list->RSSetScissorRects(1, &state.scissor0);
+
+    static std::atomic<uint64_t> dn{0};
+    const auto n = dn.fetch_add(1, std::memory_order_relaxed);
+    if (n < 16 || (n % 600) == 0) {
+        SPDLOG_WARN("[SN2-DupFullscreenRight] dup ps_crc=0x{:08x} vcount={} n={}",
+            ps_crc, vertex_count_per_instance, n + 1);
+    }
+}
+
 static void sn2_try_duplicate_slw_basepass_right_draw_instanced(
     ID3D12GraphicsCommandList* command_list,
     const CommandListCorrelationState& state,
@@ -12573,6 +21334,25 @@ static void sn2_try_duplicate_slw_basepass_right_draw_instanced(
     const bool shift_viewport =
         (dup_mode != sn2_dup_config::DupMode::ViewCbOnly) &&
         (dup_mode != sn2_dup_config::DupMode::SynthesizeRightCb);
+
+    Sn2MirrorRtvRedirectScope mirror_rtv_scope{};
+    const bool rtv_redirect_applied =
+        (dup_mode == sn2_dup_config::DupMode::SynthesizeRightCb) &&
+        sn2_try_begin_mirror_rtv_redirect(command_list, state, mirror_rtv_scope, ps_crc, "draw");
+    if (dup_mode == sn2_dup_config::DupMode::SynthesizeRightCb &&
+        state.last_rtv_count > 0 &&
+        sn2_require_mirror_for_synth_rtv() &&
+        !rtv_redirect_applied)
+    {
+        static std::atomic<uint64_t> skip_no_mirror{0};
+        const auto sn = skip_no_mirror.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (sn <= 16 || (sn % 600) == 0) {
+            SPDLOG_WARN("[SN2-WaterBasepassDup-Draw] skip synth replay#{} ps_crc=0x{:08x}: no mirror RTV redirect for {} RTVs",
+                sn, ps_crc, static_cast<unsigned>(state.last_rtv_count));
+        }
+        return;
+    }
+
     if (shift_viewport) {
         command_list->RSSetViewports(1, &right_viewport);
         if (use_scissor) {
@@ -12608,12 +21388,18 @@ static void sn2_try_duplicate_slw_basepass_right_draw_instanced(
             instance_count);
     }
 
+    Sn2EyePairingRedirectScope mirror_srv_scope{};
+    sn2_try_begin_synthetic_mirror_srv_redirect(command_list, state, mirror_srv_scope, ps_crc);
+
     original(
         command_list,
         vertex_count_per_instance,
         instance_count,
         start_vertex_location,
         start_instance_location);
+
+    mirror_srv_scope.restore();
+    mirror_rtv_scope.restore();
 
     if (shift_viewport) {
         command_list->RSSetViewports(1, &state.viewport0);
@@ -12681,6 +21467,96 @@ void WINAPI D3D12Hook::draw_instanced(
         forensics_ps_crc,
         forensics_cs_crc,
         eye_bucket);
+
+    // RenderDoc/PIX/Nsight per-event marker: eye + pixel CRC + vert/inst count
+    // + engine call-site RVA. Gated by UEVR_SN2_RDOC_TAGS(_MARKERS).
+    if (sn2_rdoc_tags::markers_enabled() && command_list != nullptr) {
+        const std::string src = sn2_rdoc_tags::format_rva(reinterpret_cast<uintptr_t>(_ReturnAddress()));
+        char detail[160];
+        std::snprintf(detail, sizeof(detail), "DRAW ps=0x%08x v=%u i=%u src=%s",
+                      forensics_ps_crc, vertex_count_per_instance, instance_count, src.c_str());
+        sn2_rdoc_tags::mark(command_list, eye_bucket, detail);
+    }
+
+    // 2026-05-24 FULLSCREEN per-eye probe. The right eye lacks the underwater teal CAST (a uniform
+    // full-image tint = a fullscreen color-grade post-process). Find fullscreen pixel shaders
+    // (vertex_count<=6 = fullscreen tri/quad) that run for the LEFT eye but NOT the right — those are
+    // the underwater-grade candidates to duplicate onto the right eye. Gated by UEVR_SN2_FULLSCREEN_EYE_PROBE.
+    {
+        static const bool fs_probe = env_flag_enabled_a("UEVR_SN2_FULLSCREEN_EYE_PROBE");
+        if (fs_probe && forensics_ps_crc != 0 && vertex_count_per_instance <= 6 &&
+            (eye_bucket == 1 || eye_bucket == 2)) {
+            static std::mutex fs_mu;
+            static std::unordered_set<uint32_t> fs_left, fs_right;
+            static std::atomic<uint64_t> fs_n{0};
+            {
+                std::scoped_lock _{fs_mu};
+                if (eye_bucket == 1) fs_left.insert(forensics_ps_crc);
+                else fs_right.insert(forensics_ps_crc);
+            }
+            const auto n = fs_n.fetch_add(1, std::memory_order_relaxed);
+            if ((n % 1500) == 1200) {
+                std::string lo;
+                { std::scoped_lock _{fs_mu};
+                  for (auto c : fs_left) {
+                      if (fs_right.find(c) == fs_right.end()) {
+                          char t[16]; std::snprintf(t, sizeof(t), "%08x ", c); lo += t;
+                          if (lo.size() > 500) break;
+                      }
+                  } }
+                SPDLOG_WARN("[SN2-FSEyeProbe] LEFT-ONLY fullscreen PS CRCs (vcount<=6): {}",
+                    lo.empty() ? "(none)" : lo.c_str());
+            }
+        }
+    }
+
+    // 2026-05-24 NARROW-the-grade: skip selected fullscreen PS on the LEFT eye to find which of the
+    // 17 left-only fullscreen passes is the underwater color-grade (skipping it removes the left's
+    // teal cast). Gated by UEVR_SN2_SKIP_FULLSCREEN_LEFT; CRC subset via UEVR_SN2_SKIP_FULLSCREEN_CRCS
+    // (default = all 17). Bisect the subset across relaunches (no rebuild) to isolate the grade CRC.
+    bool fullscreen_left_skip = false;
+    {
+        static const bool fs_skip_enabled = env_flag_enabled_a("UEVR_SN2_SKIP_FULLSCREEN_LEFT");
+        if (fs_skip_enabled && forensics_ps_crc != 0 && vertex_count_per_instance <= 6 && eye_bucket == 1) {
+            static const std::unordered_set<uint32_t> skip_crcs = []() {
+                std::unordered_set<uint32_t> s = {
+                    0x1f6ec0bdu,0x6aaee08eu,0x569c196au,0x20488e6du,0x1e6d9efeu,0x4d478396u,0x6fdef36fu,
+                    0x1f958d46u,0xdde44bfcu,0x59a1efd9u,0x80776e21u,0x4e5b7e7du,0x259beb60u,0x89872979u,
+                    0xc24ba8c0u,0xfc91443au,0x5e1e86ceu };
+                char buf[1024]{};
+                const auto n = GetEnvironmentVariableA("UEVR_SN2_SKIP_FULLSCREEN_CRCS", buf, sizeof(buf));
+                if (n > 0 && n < sizeof(buf)) {
+                    s.clear();
+                    char* ctx = nullptr;
+                    for (char* tok = strtok_s(buf, ", ", &ctx); tok != nullptr; tok = strtok_s(nullptr, ", ", &ctx)) {
+                        const uint32_t v = static_cast<uint32_t>(strtoul(tok, nullptr, 16));
+                        if (v != 0) s.insert(v);
+                    }
+                }
+                return s;
+            }();
+            if (skip_crcs.find(forensics_ps_crc) != skip_crcs.end()) {
+                fullscreen_left_skip = true;
+            }
+        }
+    }
+
+    sn2_try_snapshot_bound_fog_t5(s, "DrawInstanced", forensics_ps_crc);
+    sn2_bindless_fog_trace::scan_graphics(
+        command_list,
+        s,
+        (eye_bucket == 1) ? 0 : (eye_bucket == 2) ? 1 : -1,
+        forensics_ps_crc,
+        "DrawInstanced");
+    sn2_fog_lineage_trace::trace_consumer_draw(
+        s,
+        "DrawInstanced",
+        forensics_ps_crc,
+        vertex_count_per_instance,
+        instance_count,
+        start_vertex_location,
+        0,
+        start_instance_location);
     record_draw_event_from_state(
         "D3D12Hook::DrawInstanced",
         "draw",
@@ -12706,6 +21582,7 @@ void WINAPI D3D12Hook::draw_instanced(
         start_vertex_location,
         0,
         start_instance_location);
+    sn2_log_fogconsumer_srv_snapshot(command_list, s);
     sn2_log_copyrect_draw_snapshot(
         command_list,
         s,
@@ -12730,6 +21607,11 @@ void WINAPI D3D12Hook::draw_instanced(
     }
     // Phase 5 v4: env-driven skip of right-eye SkyAtmos draws (diagnostic).
     if (sky_skip) {
+        return;
+    }
+    // 2026-05-24 narrow-the-grade: skip selected fullscreen PS on the LEFT eye.
+    if (fullscreen_left_skip) {
+        reg.hunter_inc_draw_skipped();
         return;
     }
     // Per-eye selective skip — evaluated at draw time so viewport (and thus
@@ -12796,6 +21678,24 @@ void WINAPI D3D12Hook::draw_instanced(
         sn2_begin_copyrect_cbv_override(command_list, s, copyrect_cbv_scope);
         Sn2CopyRectScratchScope copyrect_scope{};
         sn2_begin_copyrect_scratch_table(command_list, s, copyrect_scope);
+        // 2026-05-25: UWEFogResolveCS shadow-output fix for fullscreen
+        // ExponentialPixelMain composites that arrive via DrawInstanced.
+        Sn2EyePairingRedirectScope fog_resolve_shadow_scope{};
+        if (env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_DISCOVER") && s.current_pso != nullptr) {
+            static std::atomic<uint64_t> call_log{0};
+            const auto n = call_log.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 24 || (n % 12000) == 0) {
+                SPDLOG_WARN("[SN2-FogResolveShadow-Call] draw ps=0x{:08x} eye={} tables={} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) seq={}",
+                    render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s.current_pso)),
+                    static_cast<int>(s.last_viewport_bucket),
+                    s.last_graphics_root_desc_tables.size(),
+                    s.viewport0.TopLeftX, s.viewport0.TopLeftY, s.viewport0.Width, s.viewport0.Height,
+                    n);
+            }
+        }
+        sn2_try_begin_fog_resolve_shadow_redirect(command_list, s, fog_resolve_shadow_scope);
+        sn2_try_composite_xeye_fog_copy(command_list, s);
+        sn2_try_fog_viewub_gate_fix(command_list, s);
         Sn2ForensicsMutationScope forensics_mutation_scope{};
         sn2_forensics_try_begin_mutations(
             command_list,
@@ -12805,9 +21705,50 @@ void WINAPI D3D12Hook::draw_instanced(
             forensics_cs_crc,
             eye_bucket,
             forensics_mutation_scope);
+        // === Plan A-iii (THE FIX): right-eye fog COMPOSITE cb2 redirect ===
+        // The right ExponentialPixelMain reads a NaN in cb2 (graphics root param 5 =
+        // shared fog params) → no fog applied → black water. Capture the left draw's
+        // clean cb2 and rebind the right draw's to it. See SN2_FOG_FIX_PLAN.md.
+        bool comp_cb_applied = false; UINT64 comp_cb_orig = 0; UINT comp_cb_param = 0;
+        if (sn2_fog_right_vol_redirect::composite_cb_enabled() && command_list != nullptr &&
+            forensics_ps_crc == sn2_fog_right_vol_redirect::composite_ps_crc()) {
+            const UINT p = sn2_fog_right_vol_redirect::composite_cb_param();
+            const uint64_t cur = (p < s.last_graphics_root_cbv.size()) ? static_cast<uint64_t>(s.last_graphics_root_cbv[p]) : 0;
+            const int v = cmdlist_view_id(s);
+            if (v == 1) {
+                const uint64_t lv = sn2_fog_right_vol_redirect::left_composite_cb2_va();
+                if (lv != 0 && lv != cur) {
+                    comp_cb_orig = cur; comp_cb_param = p;
+                    command_list->SetGraphicsRootConstantBufferView(p, lv);
+                    comp_cb_applied = true;
+                    if (sn2_fog_right_vol_redirect::log_enabled()) {
+                        const auto sn = sn2_fog_right_vol_redirect::next_composite_cb_seq();
+                        if (sn <= 64 || (sn % 600) == 0)
+                            SPDLOG_WARN("[SN2-FogRVRedirect][COMP] seq={} right composite cb2(p{}) 0x{:x}->0x{:x}", sn, p, cur, lv);
+                    }
+                }
+            } else if (v == 0 && cur != 0) {
+                sn2_fog_right_vol_redirect::cache_left_composite_cb2(cur);
+            }
+        }
+        sn2_log_fog_composite_uv_cb_snapshot(s, "DrawInstanced");
+        Sn2Pso3069CbvScope fog_uv_cbv_scope{};
+        sn2_begin_fog_composite_uv_cb_patch(command_list, s, fog_uv_cbv_scope);
+        const auto deferred_indexed_original = sn2_draw_indexed_original_for(command_list);
+        if (!sn2_underwater_deferred::after_draw() && deferred_indexed_original != nullptr) {
+            sn2_underwater_deferred::try_replay(command_list, s, deferred_indexed_original);
+        }
         const auto timing = gpu_timestamp_timing::begin(command_list, "draw", s);
         original(command_list, vertex_count_per_instance, instance_count, start_vertex_location, start_instance_location);
         gpu_timestamp_timing::end(command_list, timing);
+        if (sn2_underwater_deferred::after_draw() && deferred_indexed_original != nullptr) {
+            sn2_underwater_deferred::try_replay(command_list, s, deferred_indexed_original);
+        }
+        if (comp_cb_applied && command_list != nullptr) {
+            command_list->SetGraphicsRootConstantBufferView(comp_cb_param, comp_cb_orig);
+        }
+        fog_uv_cbv_scope.restore();
+        fog_resolve_shadow_scope.restore();
         sn2_capture_water_chain_rtv_phase(command_list, s, water_rt_pair, "post");
         sn2_note_draw_output_for_copyrect_fix(s);
         sn2_note_copyrect_post_draw_output(command_list, s);
@@ -12828,8 +21769,31 @@ void WINAPI D3D12Hook::draw_instanced(
             instance_count,
             start_vertex_location,
             start_instance_location);
+        sn2_try_duplicate_fullscreen_right(
+            command_list,
+            s,
+            original,
+            vertex_count_per_instance,
+            instance_count,
+            start_vertex_location,
+            start_instance_location);
         sn2_eye_pairing::exit_synthetic_draw();
     }
+}
+
+// Forward decls for the volume cross-eye copy (full definition ~sn2_fog_xeye below)
+// so draw_indexed_instanced (above the namespace) can call them.
+namespace sn2_fog_xeye {
+    bool enabled();
+    void capture_graphics(const CommandListCorrelationState& st, int eye);
+    void note_compute_resource(uint32_t cs_crc, uint32_t root, uint32_t slot, int eye, ID3D12Resource* vol, const D3D12_RESOURCE_DESC& desc);
+    void begin_dispatch_capture();
+    bool consume_post_dispatch_copy_request();
+    void apply_copy(ID3D12GraphicsCommandList* cl, const char* reason, uint32_t cs_crc, int fog_eye);
+}
+
+namespace sn2_underwater_deferred {
+    bool after_draw();
 }
 
 void WINAPI D3D12Hook::draw_indexed_instanced(
@@ -12844,6 +21808,9 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
     const auto slot = command_list != nullptr ? &(*(void***)command_list)[DRAW_INDEXED_INSTANCED_VTABLE_INDEX] : nullptr;
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::draw_indexed_instanced)*>() : nullptr;
+    if (original != nullptr) {
+        g_sn2_deferred_draw_indexed_original.store(original, std::memory_order_relaxed);
+    }
 
     if (is_stereo_trace_enabled()) {
         increment_bucket(
@@ -12882,6 +21849,101 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         forensics_ps_crc,
         forensics_cs_crc,
         eye_bucket2);
+
+    // RenderDoc/PIX/Nsight per-event marker. Gated by UEVR_SN2_RDOC_TAGS(_MARKERS).
+    if (sn2_rdoc_tags::markers_enabled() && command_list != nullptr) {
+        const std::string src = sn2_rdoc_tags::format_rva(reinterpret_cast<uintptr_t>(_ReturnAddress()));
+        char detail[160];
+        std::snprintf(detail, sizeof(detail), "DRAWIDX ps=0x%08x idx=%u i=%u src=%s",
+                      forensics_ps_crc, index_count_per_instance, instance_count, src.c_str());
+        sn2_rdoc_tags::mark(command_list, eye_bucket2, detail);
+    }
+
+    // 2026-05-24 LIVE fog-CONSUMER per-eye counter. After ruling out the fog producer/volume
+    // (block3), the question is whether the RIGHT eye even RUNS the basepass draw that SAMPLES the
+    // fog volume (a per-view skip) or runs it with bad inputs. Detect a fog-volume Texture3D
+    // R11G11B10F SRV bound to this PIXEL draw and tally per eye. Gated by UEVR_SN2_FOG_CONSUMER_COUNT
+    // (needs command-list hooks + sn2_descriptor_registry enabled).
+    {
+        static const bool fcc = env_flag_enabled_a("UEVR_SN2_FOG_CONSUMER_COUNT");
+        if (fcc && (eye_bucket2 == 1 || eye_bucket2 == 2)) {
+            bool samples_fog = false;
+            std::uintptr_t fog_res = 0;
+            for (size_t ti = 0; ti < s2.last_graphics_root_desc_tables.size() && !samples_fog; ++ti) {
+                const uint64_t tg = s2.last_graphics_root_desc_tables[ti];
+                if (tg == 0) continue;
+                SIZE_T cpu_base = 0; UINT stride = 0;
+                if (!bindless_heap_registry().resolve(tg, cpu_base, stride) || stride == 0) continue;
+                for (UINT slot = 0; slot < 24 && !samples_fog; ++slot) {
+                    ID3D12Resource* res = sn2_descriptor_registry::lookup_resource_by_cpu_ptr_or_hash(
+                        cpu_base + static_cast<SIZE_T>(slot) * stride);
+                    if (res == nullptr) continue;
+                    const auto rdsc = res->GetDesc();
+                    if (rdsc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+                        rdsc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+                        samples_fog = true;
+                        fog_res = reinterpret_cast<std::uintptr_t>(res);
+                    }
+                }
+            }
+            if (samples_fog) {
+                static std::atomic<uint64_t> left_n{0}, right_n{0};
+                if (eye_bucket2 == 1) left_n.fetch_add(1, std::memory_order_relaxed);
+                else right_n.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<uint64_t> logn{0};
+                const auto l = logn.fetch_add(1, std::memory_order_relaxed);
+                if (l < 60 || (l % 2000) == 0) {
+                    SPDLOG_WARN("[SN2-FogConsumer] eye={} ps_crc=0x{:08x} fogTex=0x{:x} leftTotal={} rightTotal={}",
+                        eye_bucket2, forensics_ps_crc, fog_res, left_n.load(), right_n.load());
+                }
+                // Dump the consumer's view UB ViewSize/SPSB per eye: scan each bound root CBV for the
+                // ViewSize 640x720 float pattern (the FViewUniform layout offset is unknown, so search),
+                // and log it + the following 6 floats (SPSB family). If the RIGHT eye's view-rect here is
+                // wrong/zeroed while LEFT's is valid, the consumer's screen->froxel mapping is the bug.
+                static std::atomic<uint64_t> vdump{0};
+                if (vdump.load(std::memory_order_relaxed) < 40) {
+                    for (size_t ci = 0; ci < s2.last_graphics_root_cbv.size(); ++ci) {
+                        const auto va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(s2.last_graphics_root_cbv[ci]);
+                        if (va == 0) continue;
+                        uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, 2048);
+                        if (cpu == nullptr) continue;
+                        for (uint32_t off = 0; off + 32 <= 2048; off += 4) {
+                            const float vx = *reinterpret_cast<const float*>(cpu + off);
+                            const float vy = *reinterpret_cast<const float*>(cpu + off + 4);
+                            if (vx >= 600.0f && vx <= 700.0f && vy >= 680.0f && vy <= 760.0f) {
+                                const float* f = reinterpret_cast<const float*>(cpu + off);
+                                const auto vd = vdump.fetch_add(1, std::memory_order_relaxed);
+                                if (vd < 40) {
+                                    SPDLOG_WARN("[SN2-FogConsumerView] eye={} ps=0x{:08x} cbvSlot={} off={} "
+                                        "f=[{:.1f},{:.1f},{:.5f},{:.5f}, {:.1f},{:.1f},{:.1f},{:.1f}]",
+                                        eye_bucket2, forensics_ps_crc, ci, off,
+                                        f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+                                }
+                                break; // one hit per CBV is enough
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    sn2_try_snapshot_bound_fog_t5(s2, "DrawIndexedInstanced", forensics_ps_crc);
+    sn2_bindless_fog_trace::scan_graphics(
+        command_list,
+        s2,
+        (eye_bucket2 == 1) ? 0 : (eye_bucket2 == 2) ? 1 : -1,
+        forensics_ps_crc,
+        "DrawIndexedInstanced");
+    sn2_fog_lineage_trace::trace_consumer_draw(
+        s2,
+        "DrawIndexedInstanced",
+        forensics_ps_crc,
+        index_count_per_instance,
+        instance_count,
+        start_index_location,
+        base_vertex_location,
+        start_instance_location);
     record_draw_event_from_state(
         "D3D12Hook::DrawIndexedInstanced",
         "draw_indexed",
@@ -12906,6 +21968,7 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         start_index_location,
         base_vertex_location,
         start_instance_location);
+    sn2_log_fogconsumer_srv_snapshot(command_list, s2);
     sn2_log_copyrect_draw_snapshot(
         command_list,
         s2,
@@ -13018,7 +22081,8 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
             const auto n = GetEnvironmentVariableA("UEVR_SN2_DE7C3822_DUMP", buf, sizeof(buf));
             return n != 0 && n < sizeof(buf) && buf[0] && buf[0] != '0';
         }();
-        if (de7_dump && s2.current_pso != nullptr) {
+        const bool fog_volume_snapshot = sn2_fog_volume_snapshot_enabled();
+        if ((de7_dump || fog_volume_snapshot) && s2.current_pso != nullptr) {
             const uint32_t crc_d = reg2.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso));
             if (crc_d == 0xDE7C3822u) {
                 static std::atomic<uint64_t> de7_log_count{0};
@@ -13060,22 +22124,31 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
                             }
                         }
                     }
-                    SPDLOG_WARN(
-                        "[SN2-DE7Dump] n={} L={} R={} eye={} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) "
-                        "scissor=({},{},{},{}) "
-                        "rt0=0x{:x}[{}x{}x{} f{}] t5=0x{:x}[{}x{}x{} f{}] "
-                        "cb4=0x{:x} cb5=0x{:x} cb6=0x{:x} cb7=0x{:x}",
-                        n, de7_left.load(), de7_right.load(),
-                        bucket == 1 ? "L" : (bucket == 2 ? "R" : "?"),
-                        s2.viewport0.TopLeftX, s2.viewport0.TopLeftY,
-                        s2.viewport0.Width, s2.viewport0.Height,
-                        s2.scissor0.left, s2.scissor0.top, s2.scissor0.right, s2.scissor0.bottom,
-                        reinterpret_cast<uintptr_t>(rt0_res), rt0_w, rt0_h, rt0_d, rt0_fmt,
-                        reinterpret_cast<uintptr_t>(t5_res), t5_w, t5_h, t5_d, t5_fmt,
-                        s2.last_graphics_root_cbv[4],
-                        s2.last_graphics_root_cbv[5],
-                        s2.last_graphics_root_cbv[6],
-                        s2.last_graphics_root_cbv[7]);
+                    if (fog_volume_snapshot && t5_res != nullptr) {
+                        const int view_id =
+                            (bucket == 1) ? 0 :
+                            (bucket == 2) ? 1 :
+                            -1;
+                        sn2_fog_volume_snapshot::maybe_queue(t5_res, "DE7T5", view_id);
+                    }
+                    if (de7_dump && (n <= 32 || (n % 60) == 0)) {
+                        SPDLOG_WARN(
+                            "[SN2-DE7Dump] n={} L={} R={} eye={} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) "
+                            "scissor=({},{},{},{}) "
+                            "rt0=0x{:x}[{}x{}x{} f{}] t5=0x{:x}[{}x{}x{} f{}] "
+                            "cb4=0x{:x} cb5=0x{:x} cb6=0x{:x} cb7=0x{:x}",
+                            n, de7_left.load(), de7_right.load(),
+                            bucket == 1 ? "L" : (bucket == 2 ? "R" : "?"),
+                            s2.viewport0.TopLeftX, s2.viewport0.TopLeftY,
+                            s2.viewport0.Width, s2.viewport0.Height,
+                            s2.scissor0.left, s2.scissor0.top, s2.scissor0.right, s2.scissor0.bottom,
+                            reinterpret_cast<uintptr_t>(rt0_res), rt0_w, rt0_h, rt0_d, rt0_fmt,
+                            reinterpret_cast<uintptr_t>(t5_res), t5_w, t5_h, t5_d, t5_fmt,
+                            s2.last_graphics_root_cbv[4],
+                            s2.last_graphics_root_cbv[5],
+                            s2.last_graphics_root_cbv[6],
+                            s2.last_graphics_root_cbv[7]);
+                    }
                 }
             }
         }
@@ -13237,6 +22310,29 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         // the original descriptor table after the draw.
         Sn2ConsumerSrvRedirectScope consumer_srv_scope{};
         sn2_try_begin_consumer_srv_redirect(command_list, s2, consumer_srv_scope);
+        // 2026-05-27: REAL-FOG t5 cross-eye redirect — point the right eye's SLW fog
+        // volume descriptor at view 0's filled IntegratedLightScattering volume.
+        sn2_fog_t5_xeye_redirect(command_list, s2);
+        // 2026-05-25: UWEFogResolveCS shadow-output fix. Resolve updates
+        // shadow copies of the two R11 fog outputs; the right-eye composite
+        // redirects only the matching fixed-register SRV slots to those shadows.
+        // This avoids writing into the original 29002/29003 history resources.
+        Sn2EyePairingRedirectScope fog_resolve_shadow_scope{};
+        if (env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_SHADOW_DISCOVER") && s2.current_pso != nullptr) {
+            static std::atomic<uint64_t> call_log{0};
+            const auto n = call_log.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 24 || (n % 12000) == 0) {
+                SPDLOG_WARN("[SN2-FogResolveShadow-Call] draw_indexed ps=0x{:08x} eye={} tables={} vp=({:.0f},{:.0f},{:.0f}x{:.0f}) seq={}",
+                    render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso)),
+                    static_cast<int>(s2.last_viewport_bucket),
+                    s2.last_graphics_root_desc_tables.size(),
+                    s2.viewport0.TopLeftX, s2.viewport0.TopLeftY, s2.viewport0.Width, s2.viewport0.Height,
+                    n);
+            }
+        }
+        sn2_try_begin_fog_resolve_shadow_redirect(command_list, s2, fog_resolve_shadow_scope);
+        sn2_try_composite_xeye_fog_copy(command_list, s2);
+        sn2_try_fog_viewub_gate_fix(command_list, s2);
         // 2026-05-22: per-eye SRV pairing observation + multi-slot redirect.
         // Observation records LEFT/RIGHT resource bindings; redirect fires on
         // right-eye DE7C3822 (or env-listed CRCs) and substitutes paired right
@@ -13293,9 +22389,146 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
                 }
             }
         }
+        // === Plan A-iii (THE FIX): right-eye fog COMPOSITE cb2 redirect (indexed draw) ===
+        // ExponentialPixelMain is a DrawIndexedInstanced; both eyes' composites land here.
+        // Left (view 0) caches its clean cb2; right (view 1) rebinds its NaN cb2 to it.
+        bool comp_cb_applied2 = false; UINT64 comp_cb_orig2 = 0; UINT comp_cb_param2 = 0;
+        if (sn2_fog_right_vol_redirect::composite_cb_enabled() && command_list != nullptr && s2.current_pso != nullptr) {
+            const uint32_t comp_ps = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso));
+            if (comp_ps == sn2_fog_right_vol_redirect::composite_ps_crc()) {
+                const UINT p = sn2_fog_right_vol_redirect::composite_cb_param();
+                const uint64_t cur = (p < s2.last_graphics_root_cbv.size()) ? static_cast<uint64_t>(s2.last_graphics_root_cbv[p]) : 0;
+                const int v = cmdlist_view_id(s2);
+                if (v == 1) {
+                    const uint64_t lv = sn2_fog_right_vol_redirect::left_composite_cb2_va();
+                    if (lv != 0 && lv != cur) {
+                        comp_cb_orig2 = cur; comp_cb_param2 = p;
+                        command_list->SetGraphicsRootConstantBufferView(p, lv);
+                        comp_cb_applied2 = true;
+                        if (sn2_fog_right_vol_redirect::log_enabled()) {
+                            const auto sn = sn2_fog_right_vol_redirect::next_composite_cb_seq();
+                            if (sn <= 64 || (sn % 600) == 0)
+                                SPDLOG_WARN("[SN2-FogRVRedirect][COMP] seq={} right composite(idx) cb2(p{}) 0x{:x}->0x{:x}", sn, p, cur, lv);
+                        }
+                    }
+                } else if (v == 0 && cur != 0) {
+                    sn2_fog_right_vol_redirect::cache_left_composite_cb2(cur);
+                }
+            }
+        }
+        sn2_log_fog_composite_uv_cb_snapshot(s2, "DrawIndexedInstanced");
+        Sn2Pso3069CbvScope fog_uv_cbv_scope{};
+        sn2_begin_fog_composite_uv_cb_patch(command_list, s2, fog_uv_cbv_scope);
+        // Volume cross-eye CONTENT copy at the SLW basepass (0xDE7C3822, the teal
+        // producer that binds the ILS volume in a resolvable graphics root table):
+        // capture the per-eye volume, and just before the RIGHT basepass draw copy
+        // left->right so the right basepass renders the left's lit (teal) fog. This
+        // defeats the bindless indirection (it edits the resource CONTENT, not a slot).
+        if (sn2_fog_xeye::enabled() && command_list != nullptr && s2.current_pso != nullptr) {
+            const uint32_t xeye_ps = render::ShaderOverrideRegistry::get()
+                .d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso));
+            if (xeye_ps == 0xDE7C3822u) {
+                const int b = static_cast<int>(s2.last_viewport_bucket);
+                const int eye = (b == 1) ? 0 : (b == 2) ? 1 : -1;
+                static std::atomic<uint64_t> hit{0};
+                const auto h = hit.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (h <= 16)
+                    SPDLOG_WARN("[SN2-FogXEye-Dbg] DE7 draw bucket={} eye={} ntab={}",
+                        b, eye, (int)s2.last_graphics_root_desc_tables.size());
+                if (eye == 0 || eye == 1) sn2_fog_xeye::capture_graphics(s2, eye);
+                if (eye == 1) sn2_fog_xeye::apply_copy(command_list, "DE7Fallback", xeye_ps, eye);
+            }
+        }
+        // === Sn2DyeFill — dye GPU tap (2026-05-25) ===
+        // Additive, default OFF (UEVR_SN2_DYE_FILL=1). At known water/fog
+        // consumers, flood the caller-named bindless 3D fog volume index
+        // (UEVR_SN2_DYE_IDX or sequence) with a dye color on a time gate so the
+        // host stereoscope.dye tool can see which on-screen region that index feeds.
+        if (sn2_dye_fill::enabled() && command_list != nullptr && s2.current_pso != nullptr) {
+            const uint32_t dye_ps = render::ShaderOverrideRegistry::get()
+                .d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso));
+            if (dye_ps == 0xDE7C3822u || dye_ps == 0xB9BE2499u || dye_ps == 0x4E86DC09u) {
+                sn2_dye_fill::fill(command_list);
+            }
+        }
+        // === StereoScope event ledger: "draw" event (2026-05-25) ===
+        // Additive, default OFF (UEVR_SN2_EVENT_LEDGER=1). Read-only scan of the
+        // recorded root tables -> one JSON line. Emitted just before the engine
+        // composite draw, mirroring the composite-shift fix's placement.
+        if (sn2_event_ledger::enabled()) {
+            const uint32_t ledger_ps_crc = (s2.current_pso != nullptr)
+                ? reg2.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso))
+                : 0;
+            sn2_event_ledger::emit_draw(
+                command_list, s2, ledger_ps_crc,
+                index_count_per_instance, instance_count,
+                start_index_location, base_vertex_location, start_instance_location,
+                reinterpret_cast<uintptr_t>(_ReturnAddress()));
+        }
+        // StereoScope bindless View-UB decoder: at the fog consumers (SLW basepass,
+        // SLW consumer, composite) scan the bound root CBVs for the bindless index that
+        // resolves to the ILS fog volume. Gated by UEVR_SN2_VIEWUB_DECODE.
+        // === THE FIX (2026-05-25): at the SLW basepass (0xDE7C3822) draw, also run the
+        // per-frame litness copy (LIT->DARK ILS volumes by bindless index) so whichever
+        // volume the right eye reads is teal. Gated by UEVR_SN2_VIEWUB_FIX; the
+        // once-per-frame guard inside handles dedup across the many DE7 draws.
+        if ((sn2_viewub_decode::enabled() ||
+             sn2_viewub_decode::chain_scan_enabled() ||
+             sn2_viewub_decode::root_constant_scan_enabled() ||
+             sn2_viewub_decode::table_cbv_scan_enabled() ||
+             sn2_litness::fix_enabled() ||
+             sn2_litness::descriptor_substitute_enabled()) && s2.current_pso != nullptr) {
+            const uint32_t vps = render::ShaderOverrideRegistry::get()
+                .d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso));
+            const bool known_consumer = sn2_viewub_decode::chain_known_consumer_ps(vps);
+            const int b = static_cast<int>(s2.last_viewport_bucket);
+            const int view = (b == 1) ? 0 : (b == 2) ? 1 : -1;
+            sn2_viewub_decode::note_draw_probe(view, vps, known_consumer);
+            if (known_consumer || (sn2_viewub_decode::chain_scan_enabled() && sn2_viewub_decode::chain_scan_any_ps())) {
+                if (sn2_viewub_decode::enabled() || sn2_viewub_decode::chain_scan_enabled() ||
+                    sn2_viewub_decode::root_constant_scan_enabled() ||
+                    sn2_viewub_decode::table_cbv_scan_enabled()) {
+                    sn2_viewub_decode::scan_graphics(s2, view, vps);
+                }
+                if (vps == 0xDE7C3822u && sn2_litness::fix_enabled()) {
+                    sn2_viewub_decode::apply_litness_copy(command_list);
+                }
+                sn2_viewub_decode::apply_litness_descriptor_substitute(command_list, view, vps);
+            }
+        }
+        // === THE FIX (2026-05-24): right-eye fog composite copy-shift ===
+        // Must run BEFORE the engine composite draw so it samples the now-populated
+        // right half. Gated by UEVR_SN2_FOG_RIGHT_COMPOSITE_SHIFT.
+        sn2_apply_right_composite_fog_shift(command_list, s2);
+        // === StereoScope live mutation: hot-reloaded per-eye SKIP-DRAW (2026-05-25) ===
+        // Additive, default OFF (UEVR_SN2_LIVE_MUTATE=1). When a loaded skip rule
+        // matches this draw's PS CRC + eye, the real engine draw is suppressed
+        // (all pre/post hook bookkeeping still runs). Map Left=1->eye0, Right=2->eye1.
+        bool sn2_live_mutate_skip_draw = false;
+        if (sn2_live_mutate::enabled()) {
+            const uint32_t mutate_ps_crc = (s2.current_pso != nullptr)
+                ? reg2.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(s2.current_pso))
+                : 0;
+            const int mutate_eye =
+                (s2.last_viewport_bucket == StereoTraceBucket::Left)  ? 0 :
+                (s2.last_viewport_bucket == StereoTraceBucket::Right) ? 1 : -1;
+            sn2_live_mutate_skip_draw = sn2_live_mutate::should_skip(mutate_ps_crc, mutate_eye);
+        }
+        if (!sn2_underwater_deferred::after_draw()) {
+            sn2_underwater_deferred::try_replay(command_list, s2, original);
+        }
         const auto timing = gpu_timestamp_timing::begin(command_list, "draw_indexed", s2);
-        original(command_list, index_count_per_instance, instance_count, start_index_location, base_vertex_location, start_instance_location);
+        if (!sn2_live_mutate_skip_draw) {
+            original(command_list, index_count_per_instance, instance_count, start_index_location, base_vertex_location, start_instance_location);
+        }
         gpu_timestamp_timing::end(command_list, timing);
+        if (sn2_underwater_deferred::after_draw()) {
+            sn2_underwater_deferred::try_replay(command_list, s2, original);
+        }
+        if (comp_cb_applied2 && command_list != nullptr) {
+            command_list->SetGraphicsRootConstantBufferView(comp_cb_param2, comp_cb_orig2);
+        }
+        fog_uv_cbv_scope.restore();
         sn2_capture_water_chain_rtv_phase(command_list, s2, water_rt_pair, "post");
         sn2_note_draw_output_for_copyrect_fix(s2);
         sn2_note_copyrect_post_draw_output(command_list, s2);
@@ -13490,6 +22723,16 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         water_chain_scope.restore();
         pso3069_cbv_scope.restore();
         pso3069_fog_scope.restore();
+        // 2026-05-26: snapshot the engine's real right-eye View CB from this draw
+        // if it's a right-bucket draw (observe() self-gates on env + bucket). Runs
+        // BEFORE the dup so a same-frame right draw (e.g. 0xb9be2499 @ vp.x=640)
+        // is captured before the left 0x13b00f0c dup consumes it.
+        sn2_right_view_capture::observe(s2);
+        // 2026-05-26 diagnostic — fix the right-eye View UB reg148/+0x940 so
+        // its fog/screen-UV consumers sample in-range. Runs for every draw; self-
+        // gates on env + right bucket. Must run BEFORE the GPU executes the right
+        // draws (patch the upload buffer the bound root CBV points at).
+        sn2_right_viewrect_patch::patch(s2);
         // 2026-05-22: gate observations during synthetic right-eye dups
         // so they don't pollute the L↔R pairing classification.
         sn2_eye_pairing::enter_synthetic_draw();
@@ -13512,6 +22755,865 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
             base_vertex_location,
             start_instance_location);
         sn2_eye_pairing::exit_synthetic_draw();
+    }
+}
+
+// === Volume content CROSS-EYE copy (2026-05-25) ============================
+// Every SRV/slot redirect failed because the SLW/fog consumer reads the
+// IntegratedLightScattering volume via the bindless View UB, NOT a root slot.
+// So instead of redirecting WHICH volume is read, copy the LEFT volume's lit
+// (teal) CONTENT into the RIGHT volume's resource. The right consumer then reads
+// its own volume (via bindless) and finds the left's teal content. Capture the
+// per-eye volume resources at the producers (eye = sn2_get_current_fog_view(),
+// reliable during ComputeVolumetricFog), then CopyResource(right<-left) just
+// before the reconstruct/resolve consumer dispatch. Gated UEVR_SN2_FOG_VOLUME_XEYE_COPY=1.
+namespace sn2_fog_xeye {
+    static const bool g_enabled = []() {
+        const char* v = std::getenv("UEVR_SN2_FOG_VOLUME_XEYE_COPY");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    inline bool enabled() { return g_enabled; }
+    static std::mutex g_mtx;
+    static ID3D12Resource* g_left = nullptr;
+    static ID3D12Resource* g_right = nullptr;
+    static D3D12_RESOURCE_DESC g_left_desc{};
+    static D3D12_RESOURCE_DESC g_right_desc{};
+    static uint64_t g_left_seq = 0;
+    static uint64_t g_right_seq = 0;
+    static std::atomic<uint64_t> g_seq{0};
+    thread_local bool tl_post_dispatch_copy = false;
+    thread_local ID3D12Resource* tl_copy_left = nullptr;
+    thread_local ID3D12Resource* tl_copy_right = nullptr;
+    thread_local D3D12_RESOURCE_DESC tl_copy_desc{};
+    thread_local uint64_t tl_copy_left_seq = 0;
+    thread_local uint64_t tl_copy_right_seq = 0;
+    thread_local uint64_t tl_copy_key = 0;
+
+    struct Pair {
+        ID3D12Resource* left = nullptr;
+        ID3D12Resource* right = nullptr;
+        D3D12_RESOURCE_DESC desc{};
+        uint64_t left_seq = 0;
+        uint64_t right_seq = 0;
+    };
+    static std::unordered_map<uint64_t, Pair> g_pairs;
+
+    const std::unordered_set<uint32_t>& copy_crc_allowlist() {
+        static const auto crcs = sn2_parse_u32_set_env("UEVR_SN2_FOG_VOLUME_XEYE_COPY_CRCS", 16);
+        return crcs;
+    }
+
+    bool copy_crc_allowed(uint32_t cs_crc) {
+        const auto& crcs = copy_crc_allowlist();
+        return crcs.empty() || crcs.contains(cs_crc);
+    }
+
+    uint64_t max_total_copies() {
+        static const auto v = static_cast<uint64_t>(
+            std::max(0, env_int_a("UEVR_SN2_FOG_VOLUME_XEYE_MAX_COPIES", 0)));
+        return v;
+    }
+
+    static std::atomic<uint64_t> g_total_copy_attempts{0};
+
+    bool is_ils_volume(const D3D12_RESOURCE_DESC& d) {
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            && d.Format == DXGI_FORMAT_R11G11B10_FLOAT
+            && d.Width >= 40 && d.Width <= 192
+            && d.Height >= 20 && d.Height <= 128
+            && d.DepthOrArraySize >= 32 && d.DepthOrArraySize <= 80;
+    }
+
+    bool same_copy_desc(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b) {
+        return a.Dimension == b.Dimension &&
+            a.Alignment == b.Alignment &&
+            a.Width == b.Width &&
+            a.Height == b.Height &&
+            a.DepthOrArraySize == b.DepthOrArraySize &&
+            a.MipLevels == b.MipLevels &&
+            a.Format == b.Format &&
+            a.SampleDesc.Count == b.SampleDesc.Count &&
+            a.SampleDesc.Quality == b.SampleDesc.Quality &&
+            a.Layout == b.Layout &&
+            a.Flags == b.Flags;
+    }
+
+    uint64_t pair_key(uint32_t cs_crc, uint32_t root, uint32_t slot, const D3D12_RESOURCE_DESC& d) {
+        uint64_t h = 14695981039346656037ull;
+        auto mix = [&](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ull;
+        };
+        static const int mode = env_int_a("UEVR_SN2_FOG_VOLUME_XEYE_PAIR_MODE", 1);
+        mix(cs_crc);
+        if (mode <= 0) {
+            // Strict mode: exact descriptor table binding. Useful for proving
+            // a producer pair, but too brittle for SN2's fog RDG/bindless path.
+            mix(root);
+            mix(slot);
+        } else if (mode >= 2) {
+            // Broad diagnostic mode: desc-only family.
+            mix(0xD35C0A1Du);
+        } else {
+            // Default: same compute shader + same volume shape. Root/slot
+            // layout can differ between left/right permutations.
+            mix(0xC5C5C5C5u);
+        }
+        mix(static_cast<uint64_t>(d.Dimension));
+        mix(static_cast<uint64_t>(d.Format));
+        mix(static_cast<uint64_t>(d.Width));
+        mix(static_cast<uint64_t>(d.Height));
+        mix(static_cast<uint64_t>(d.DepthOrArraySize));
+        mix(static_cast<uint64_t>(d.MipLevels));
+        mix(static_cast<uint64_t>(d.Flags));
+        return h;
+    }
+
+    void release_pending_copy() {
+        if (tl_copy_left != nullptr) {
+            tl_copy_left->Release();
+            tl_copy_left = nullptr;
+        }
+        if (tl_copy_right != nullptr) {
+            tl_copy_right->Release();
+            tl_copy_right = nullptr;
+        }
+        tl_copy_left_seq = 0;
+        tl_copy_right_seq = 0;
+        tl_copy_key = 0;
+        tl_post_dispatch_copy = false;
+    }
+
+    inline void store(int eye, ID3D12Resource* vol, const D3D12_RESOURCE_DESC& desc, const char* source) {
+        if (vol == nullptr || (eye != 0 && eye != 1)) return;
+        std::scoped_lock _{g_mtx};
+        ID3D12Resource** slot = (eye == 0) ? &g_left : &g_right;
+        D3D12_RESOURCE_DESC* desc_slot = (eye == 0) ? &g_left_desc : &g_right_desc;
+        uint64_t* seq_slot = (eye == 0) ? &g_left_seq : &g_right_seq;
+        if (*slot == vol && same_copy_desc(*desc_slot, desc)) return;
+        vol->AddRef();
+        if (*slot != nullptr) (*slot)->Release();
+        *slot = vol;
+        *desc_slot = desc;
+        *seq_slot = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto c = *seq_slot;
+        if (c <= 16 || (c % 600) == 0)
+            SPDLOG_WARN("[SN2-FogXEye] captured source={} eye={} vol=0x{:x} dim={}x{}x{} fmt={} flags=0x{:x} (L=0x{:x} R=0x{:x}) seq={}",
+                source != nullptr ? source : "?",
+                eye,
+                reinterpret_cast<uintptr_t>(vol),
+                (unsigned)desc.Width,
+                desc.Height,
+                desc.DepthOrArraySize,
+                (int)desc.Format,
+                (unsigned)desc.Flags,
+                reinterpret_cast<uintptr_t>(g_left), reinterpret_cast<uintptr_t>(g_right), c);
+    }
+
+    void note_resource(const char* source, int eye, ID3D12Resource* vol, const D3D12_RESOURCE_DESC* desc) {
+        if (!enabled() || vol == nullptr || (eye != 0 && eye != 1)) {
+            return;
+        }
+        D3D12_RESOURCE_DESC local = desc != nullptr ? *desc : vol->GetDesc();
+        if (!is_ils_volume(local)) {
+            return;
+        }
+        store(eye, vol, local, source);
+    }
+
+    void note_compute_resource(uint32_t cs_crc, uint32_t root, uint32_t slot, int eye, ID3D12Resource* vol, const D3D12_RESOURCE_DESC& desc) {
+        if (!enabled() || vol == nullptr || (eye != 0 && eye != 1) || !is_ils_volume(desc)) {
+            return;
+        }
+        if (!copy_crc_allowed(cs_crc)) {
+            static std::atomic<uint64_t> filtered{0};
+            const auto n = filtered.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 16 || (n % 1200) == 0) {
+                SPDLOG_WARN(
+                    "[SN2-FogXEye] filtered producer cs=0x{:08x} r{}.s{} eye={} dim={}x{}x{} n={} allowlist={}",
+                    cs_crc,
+                    root,
+                    slot,
+                    eye,
+                    (unsigned)desc.Width,
+                    desc.Height,
+                    desc.DepthOrArraySize,
+                    n,
+                    env_value_a("UEVR_SN2_FOG_VOLUME_XEYE_COPY_CRCS"));
+            }
+            return;
+        }
+
+        char source[64]{};
+        std::snprintf(source, sizeof(source), "ComputeRoot cs=0x%08x r%u.s%u", cs_crc, root, slot);
+        store(eye, vol, desc, source);
+
+        const uint64_t key = pair_key(cs_crc, root, slot, desc);
+        const uint64_t max_seq_gap = static_cast<uint64_t>(
+            std::max(1, env_int_a("UEVR_SN2_FOG_VOLUME_XEYE_MAX_SEQ_GAP", 512)));
+        uint64_t seq = 0;
+        ID3D12Resource* pending_left = nullptr;
+        ID3D12Resource* pending_right = nullptr;
+        uint64_t pending_left_seq = 0;
+        uint64_t pending_right_seq = 0;
+        {
+            std::scoped_lock _{g_mtx};
+            Pair& p = g_pairs[key];
+            if ((p.left != nullptr || p.right != nullptr) && !same_copy_desc(p.desc, desc)) {
+                if (p.left != nullptr) p.left->Release();
+                if (p.right != nullptr) p.right->Release();
+                p = Pair{};
+            }
+            p.desc = desc;
+            seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            ID3D12Resource** dst = eye == 0 ? &p.left : &p.right;
+            uint64_t* dst_seq = eye == 0 ? &p.left_seq : &p.right_seq;
+            if (*dst != vol) {
+                vol->AddRef();
+                if (*dst != nullptr) (*dst)->Release();
+                *dst = vol;
+            }
+            *dst_seq = seq;
+
+            const bool left_is_fresh = p.left_seq != 0 && seq >= p.left_seq && (seq - p.left_seq) <= max_seq_gap;
+            if (eye == 1 && left_is_fresh && p.left != nullptr && p.right != nullptr && p.left != p.right) {
+                pending_left = p.left;
+                pending_right = p.right;
+                pending_left_seq = p.left_seq;
+                pending_right_seq = p.right_seq;
+                pending_left->AddRef();
+                pending_right->AddRef();
+            }
+        }
+
+        if (pending_left != nullptr && pending_right != nullptr) {
+            release_pending_copy();
+            tl_copy_left = pending_left;
+            tl_copy_right = pending_right;
+            tl_copy_desc = desc;
+            tl_copy_left_seq = pending_left_seq;
+            tl_copy_right_seq = pending_right_seq;
+            tl_copy_key = key;
+            tl_post_dispatch_copy = true;
+
+            static std::atomic<uint64_t> match_log{0};
+            const auto n = match_log.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 32 || (n % 600) == 0) {
+                SPDLOG_WARN(
+                    "[SN2-FogXEye] matched key=0x{:016x} cs=0x{:08x} r{}.s{} L=0x{:x}(seq={}) R=0x{:x}(seq={}) dim={}x{}x{} match_n={}",
+                    key,
+                    cs_crc,
+                    root,
+                    slot,
+                    reinterpret_cast<uintptr_t>(pending_left),
+                    pending_left_seq,
+                    reinterpret_cast<uintptr_t>(pending_right),
+                    pending_right_seq,
+                    (unsigned)desc.Width,
+                    desc.Height,
+                    desc.DepthOrArraySize,
+                    n);
+            }
+        }
+    }
+
+    void begin_dispatch_capture() {
+        release_pending_copy();
+    }
+
+    bool consume_post_dispatch_copy_request() {
+        const bool result = tl_post_dispatch_copy;
+        tl_post_dispatch_copy = false;
+        return result;
+    }
+
+    // Scan a GRAPHICS draw's root descriptor tables for the ILS volume SRV (the SLW
+    // basepass may bind it in a resolvable graphics root table) and store it by eye.
+    // Kept as a diagnostic fallback only; the normal path is producer-side
+    // CreateSRV/CreateUAV/compute-root capture above.
+    inline void capture_graphics(const CommandListCorrelationState& st, int eye) {
+        if ((eye != 0 && eye != 1)) return;
+        int resolved_tables = 0, srv_hits = 0;
+        for (size_t root = 0; root < st.last_graphics_root_desc_tables.size(); ++root) {
+            const uint64_t table_gpu = st.last_graphics_root_desc_tables[root];
+            if (table_gpu == 0) continue;
+            SIZE_T cpu_base = 0; UINT stride = 0;
+            if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) continue;
+            ++resolved_tables;
+            for (int slot = 0; slot < 128; ++slot) {
+                const SIZE_T scpu = cpu_base + static_cast<SIZE_T>(slot) * static_cast<SIZE_T>(stride);
+                sn2_descriptor_registry::Entry e{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(scpu, e) ||
+                    e.kind != sn2_descriptor_registry::Kind::SRV ||
+                    e.resource == nullptr || !e.has_resource_desc) continue;
+                ++srv_hits;
+                if (is_ils_volume(e.resource_desc)) { store(eye, e.resource, e.resource_desc, "GraphicsRootFallback"); return; }
+            }
+        }
+        static std::atomic<uint64_t> miss{0};
+        const auto m = miss.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (m <= 16)
+            SPDLOG_WARN("[SN2-FogXEye-Dbg] capture_graphics eye={} ntab={} resolved={} srv_hits={} -> no ILS vol",
+                eye, (int)st.last_graphics_root_desc_tables.size(), resolved_tables, srv_hits);
+    }
+
+    D3D12_RESOURCE_STATES copy_state_before() {
+        static const int mode = env_int_a("UEVR_SN2_FOG_VOLUME_XEYE_COPY_STATE", 1);
+        switch (mode) {
+        case 2:
+            return static_cast<D3D12_RESOURCE_STATES>(
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        case 3:
+            return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        case 4:
+            return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        case 1:
+        default:
+            return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+    }
+
+    bool snapshot_enabled() {
+        static const bool v = env_flag_enabled_a("UEVR_SN2_FOG_VOLUME_XEYE_SNAPSHOT");
+        return v;
+    }
+
+    // Copy LEFT content -> RIGHT resource. The default call site is post-dispatch
+    // for the right-eye fog producer, so UAV is the least-wrong state to restore.
+    // Override with UEVR_SN2_FOG_VOLUME_XEYE_COPY_STATE if a capture proves a
+    // different RDG state at the copy point.
+    void apply_copy(ID3D12GraphicsCommandList* cl, const char* reason, uint32_t cs_crc, int fog_eye) {
+        if (!enabled() || cl == nullptr) return;
+        const bool had_pending = (tl_copy_left != nullptr || tl_copy_right != nullptr);
+        auto release_pending_on_failure = [&]() {
+            if (had_pending) {
+                release_pending_copy();
+            }
+        };
+        if (fog_eye != 1 && !env_flag_enabled_a("UEVR_SN2_FOG_VOLUME_XEYE_COPY_ANY_EYE")) {
+            release_pending_on_failure();
+            return;
+        }
+        if (!copy_crc_allowed(cs_crc)) {
+            static std::atomic<uint64_t> filtered{0};
+            const auto n = filtered.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 16 || (n % 1200) == 0) {
+                SPDLOG_WARN("[SN2-FogXEye] skip copy filtered cs=0x{:08x} reason={} n={} allowlist={}",
+                    cs_crc,
+                    reason != nullptr ? reason : "?",
+                    n,
+                    env_value_a("UEVR_SN2_FOG_VOLUME_XEYE_COPY_CRCS"));
+            }
+            release_pending_on_failure();
+            return;
+        }
+
+        ID3D12Resource* L = nullptr;
+        ID3D12Resource* R = nullptr;
+        D3D12_RESOURCE_DESC ld{};
+        D3D12_RESOURCE_DESC rd{};
+        uint64_t lseq = 0;
+        uint64_t rseq = 0;
+        uint64_t key = 0;
+        if (tl_copy_left != nullptr && tl_copy_right != nullptr) {
+            L = tl_copy_left;
+            R = tl_copy_right;
+            ld = tl_copy_desc;
+            rd = tl_copy_desc;
+            lseq = tl_copy_left_seq;
+            rseq = tl_copy_right_seq;
+            key = tl_copy_key;
+        } else if (env_flag_enabled_a("UEVR_SN2_FOG_VOLUME_XEYE_ALLOW_GLOBAL_COPY")) {
+            std::scoped_lock _{g_mtx};
+            L = g_left;
+            R = g_right;
+            ld = g_left_desc;
+            rd = g_right_desc;
+            lseq = g_left_seq;
+            rseq = g_right_seq;
+        } else {
+            release_pending_on_failure();
+            return;
+        }
+        if (L == nullptr || R == nullptr || L == R) {
+            release_pending_on_failure();
+            return;
+        }
+        if (!same_copy_desc(ld, rd)) {
+            static std::atomic<uint64_t> bad_desc{0};
+            const auto n = bad_desc.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 16 || (n % 600) == 0) {
+                SPDLOG_WARN(
+                    "[SN2-FogXEye] skip copy desc mismatch reason={} cs=0x{:08x} L=0x{:x} {}x{}x{} fmt={} R=0x{:x} {}x{}x{} fmt={} n={}",
+                    reason != nullptr ? reason : "?",
+                    cs_crc,
+                    reinterpret_cast<uintptr_t>(L),
+                    (unsigned)ld.Width, ld.Height, ld.DepthOrArraySize, (int)ld.Format,
+                    reinterpret_cast<uintptr_t>(R),
+                    (unsigned)rd.Width, rd.Height, rd.DepthOrArraySize, (int)rd.Format,
+                    n);
+            }
+            release_pending_on_failure();
+            return;
+        }
+        const uint64_t max_copies = max_total_copies();
+        if (max_copies > 0) {
+            const auto attempt = g_total_copy_attempts.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (attempt > max_copies) {
+                if (attempt <= max_copies + 16 || (attempt % 1200) == 0) {
+                    SPDLOG_WARN("[SN2-FogXEye] skip copy maxed reason={} cs=0x{:08x} attempt={} max={}",
+                        reason != nullptr ? reason : "?",
+                        cs_crc,
+                        attempt,
+                        max_copies);
+                }
+                release_pending_on_failure();
+                return;
+            }
+        }
+        auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+            D3D12_RESOURCE_BARRIER br{};
+            br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            br.Transition.pResource = r;
+            br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            br.Transition.StateBefore = a;
+            br.Transition.StateAfter = b;
+            cl->ResourceBarrier(1, &br);
+        };
+        const auto S = copy_state_before();
+        barrier(R, S, D3D12_RESOURCE_STATE_COPY_DEST);
+        barrier(L, S, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cl->CopyResource(R, L);
+        barrier(R, D3D12_RESOURCE_STATE_COPY_DEST, S);
+        barrier(L, D3D12_RESOURCE_STATE_COPY_SOURCE, S);
+        if (snapshot_enabled() && sn2_rt_snapshot::initialized()) {
+            static std::atomic<uint64_t> snap_n{0};
+            const auto sn = snap_n.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (sn <= static_cast<uint64_t>(std::max(0, env_int_a("UEVR_SN2_FOG_VOLUME_XEYE_SNAPSHOT_MAX", 8)))) {
+                char tag[32]{};
+                std::snprintf(tag, sizeof(tag), "XEYECOPY-R_%llu", (unsigned long long)sn);
+                sn2_rt_snapshot::schedule_capture(cl, R, S, tag);
+            }
+        }
+        static std::atomic<uint64_t> n{0};
+        const auto c = n.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (c <= 32 || (c % 600) == 0)
+            SPDLOG_WARN("[SN2-FogXEye] copied reason={} key=0x{:016x} cs=0x{:08x} state=0x{:x} L=0x{:x}(seq={}) -> R=0x{:x}(seq={}) dim={}x{}x{} seq={}",
+                reason != nullptr ? reason : "?",
+                key,
+                cs_crc,
+                (unsigned)S,
+                reinterpret_cast<uintptr_t>(L),
+                lseq,
+                reinterpret_cast<uintptr_t>(R),
+                rseq,
+                (unsigned)ld.Width,
+                ld.Height,
+                ld.DepthOrArraySize,
+                c);
+        release_pending_copy();
+    }
+}
+
+namespace sn2_lightscatter_bind_probe {
+    constexpr uint32_t k_default_crc = 0xD1F85C42u; // FVolumetricFogLightScatteringCS
+
+    inline bool enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_LIGHTSCATTER_BIND_PROBE");
+        return e;
+    }
+
+    inline uint32_t target_crc() {
+        static const uint32_t c = env_u32_a("UEVR_SN2_LIGHTSCATTER_BIND_PROBE_CRC", k_default_crc);
+        return c;
+    }
+
+    inline uint32_t target_crc2() {
+        static const uint32_t c = env_u32_a("UEVR_SN2_LIGHTSCATTER_BIND_PROBE_CRC2", 0u);
+        return c;
+    }
+
+    inline bool is_target_crc(uint32_t cs_crc) {
+        const uint32_t target = target_crc();
+        const uint32_t target2 = target_crc2();
+        return (target != 0 && cs_crc == target) || (target2 != 0 && cs_crc == target2);
+    }
+
+    inline bool is_history_crc(uint32_t cs_crc) {
+        return cs_crc == k_default_crc || cs_crc == target_crc();
+    }
+
+    inline bool discovery_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_LIGHTSCATTER_BIND_PROBE_DISCOVER");
+        return e;
+    }
+
+    inline bool matches_dispatch(uint32_t cs_crc, UINT x, UINT y, UINT z) {
+        if (!enabled()) {
+            return false;
+        }
+        const uint32_t target = target_crc();
+        if (is_target_crc(cs_crc)) {
+            return true;
+        }
+        if (!discovery_enabled() && target != 0) {
+            return false;
+        }
+
+        // Discovery mode: keep this bounded to volumetric-looking compute work.
+        // Current SN2 fog candidates show up as 3D dispatches (old capture: 7x8x12;
+        // current live run: 48x12x12). This avoids scanning every 1D/2D utility pass.
+        if (z > 1 && x <= 128 && y <= 64) {
+            return true;
+        }
+        return false;
+    }
+
+    inline int max_rows() {
+        static const int n = std::clamp(env_int_a("UEVR_SN2_LIGHTSCATTER_BIND_PROBE_MAX", 96), 0, 4096);
+        return n;
+    }
+
+    inline UINT table_slot_limit() {
+        static const UINT n = static_cast<UINT>(std::clamp(env_int_a("UEVR_SN2_LIGHTSCATTER_BIND_PROBE_TABLE_SLOTS", 96), 1, 512));
+        return n;
+    }
+
+    inline bool history_snapshot_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_LIGHTSCATTER_HISTORY_SNAPSHOT");
+        return e;
+    }
+
+    inline bool output_snapshot_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_LIGHTSCATTER_OUTPUT_SNAPSHOT");
+        return e;
+    }
+
+    inline uint32_t history_snapshot_max() {
+        static const uint32_t n = env_u32_a("UEVR_SN2_LIGHTSCATTER_HISTORY_SNAPSHOT_MAX", 8);
+        return n;
+    }
+
+    inline uint32_t output_snapshot_max() {
+        static const uint32_t n = env_u32_a("UEVR_SN2_LIGHTSCATTER_OUTPUT_SNAPSHOT_MAX", 24);
+        return n;
+    }
+
+    inline bool should_log(uint64_t n) {
+        const int max = max_rows();
+        return max > 0 && (n <= static_cast<uint64_t>(max) || (n % 600) == 0);
+    }
+
+    inline const char* eye_name(const CommandListCorrelationState& state) {
+        const int last_known = state.last_known_eye_bucket;
+        const int viewport = static_cast<int>(state.last_viewport_bucket);
+        const int bucket = (last_known == static_cast<int>(StereoTraceBucket::Left) ||
+                            last_known == static_cast<int>(StereoTraceBucket::Right))
+            ? last_known
+            : viewport;
+        if (bucket == static_cast<int>(StereoTraceBucket::Left)) return "LEFT";
+        if (bucket == static_cast<int>(StereoTraceBucket::Right)) return "RIGHT";
+        return "?";
+    }
+
+    inline char matrix_cluster_tag(const CommandListCorrelationState& state) {
+        if (state.last_compute_root_cbv.size() <= 4) return 'U';
+        const auto va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(state.last_compute_root_cbv[4]);
+        if (va == 0) return 'U';
+        uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, 0x80);
+        if (cpu == nullptr) return 'U';
+        float r4x = 0.0f;
+        std::memcpy(&r4x, cpu + 0x40, sizeof(r4x));
+        if (!std::isfinite(r4x)) return 'U';
+        return r4x >= 0.7f ? 'B' : 'A';
+    }
+
+    inline bool is_snapshot_texture3d(const D3D12_RESOURCE_DESC& desc) {
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) return false;
+        const bool is_r11 = desc.Format == DXGI_FORMAT_R11G11B10_FLOAT;
+        const bool is_rgba16 = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        const bool large_froxel =
+            is_r11 &&
+            desc.Width >= 40 && desc.Width <= 80 &&
+            desc.Height >= 10 && desc.Height <= 40 &&
+            desc.DepthOrArraySize >= 24 && desc.DepthOrArraySize <= 64;
+        const bool small_history =
+            (is_r11 || is_rgba16) &&
+            desc.Width >= 8 && desc.Width <= 16 &&
+            desc.Height >= 8 && desc.Height <= 16 &&
+            desc.DepthOrArraySize >= 20 && desc.DepthOrArraySize <= 32;
+        return large_froxel || small_history;
+    }
+
+    inline void append_limited(std::string& out, const std::string& text, size_t limit = 3600) {
+        if (out.size() >= limit) return;
+        if (out.size() + text.size() > limit) {
+            out += " ...";
+            return;
+        }
+        out += text;
+    }
+
+    inline void append_cbv(std::string& out, const char* prefix, uint32_t root, uint32_t slot, D3D12_GPU_VIRTUAL_ADDRESS va, UINT size_bytes) {
+        if (va == 0) return;
+        const UINT read_bytes = std::min<UINT>(std::max<UINT>(size_bytes, 512u), 4096u);
+        uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, read_bytes);
+        float r4[4]{};
+        float r5[4]{};
+        float r6[4]{};
+        float r7[4]{};
+        float v148[4]{};
+        float v149[4]{};
+        float v150[4]{};
+        uint64_t h256 = 0;
+        uint64_t h1024 = 0;
+        if (cpu != nullptr) {
+            std::memcpy(r4, cpu + 0x40, sizeof(r4));
+            std::memcpy(r5, cpu + 0x50, sizeof(r5));
+            std::memcpy(r6, cpu + 0x60, sizeof(r6));
+            std::memcpy(r7, cpu + 0x70, sizeof(r7));
+            if (read_bytes >= 0x970) {
+                std::memcpy(v148, cpu + 0x940, sizeof(v148));
+                std::memcpy(v149, cpu + 0x950, sizeof(v149));
+                std::memcpy(v150, cpu + 0x960, sizeof(v150));
+            }
+            h256 = fnv1a64_bytes(cpu, 256);
+            h1024 = fnv1a64_bytes(cpu, std::min<UINT>(read_bytes, 1024u));
+        }
+        const bool has_slot = slot != UINT32_MAX;
+        char label[32]{};
+        if (has_slot) {
+            std::snprintf(label, sizeof(label), "%s%us%u", prefix, root, slot);
+        } else {
+            std::snprintf(label, sizeof(label), "%s%u", prefix, root);
+        }
+        char buf[1024]{};
+        std::snprintf(
+            buf,
+            sizeof(buf),
+            " %s va=0x%llx sz=0x%x map=%d h256=0x%llx h1024=0x%llx "
+            "r4=(%.4g,%.4g,%.4g,%.4g) r5=(%.4g,%.4g,%.4g,%.4g) "
+            "r6=(%.4g,%.4g,%.4g,%.4g) r7=(%.4g,%.4g,%.4g,%.4g) "
+            "v148=(%.4g,%.4g,%.4g,%.4g) v149=(%.4g,%.4g,%.4g,%.4g) v150=(%.4g,%.4g,%.4g,%.4g);",
+            label,
+            static_cast<unsigned long long>(va),
+            static_cast<unsigned>(size_bytes),
+            cpu != nullptr ? 1 : 0,
+            static_cast<unsigned long long>(h256),
+            static_cast<unsigned long long>(h1024),
+            r4[0], r4[1], r4[2], r4[3],
+            r5[0], r5[1], r5[2], r5[3],
+            r6[0], r6[1], r6[2], r6[3],
+            r7[0], r7[1], r7[2], r7[3],
+            v148[0], v148[1], v148[2], v148[3],
+            v149[0], v149[1], v149[2], v149[3],
+            v150[0], v150[1], v150[2], v150[3]);
+        append_limited(out, buf);
+    }
+
+    inline void append_resource(std::string& out, const char* kind, uint32_t root, uint32_t slot, ID3D12Resource* res, const D3D12_RESOURCE_DESC& d, const D3D12_SHADER_RESOURCE_VIEW_DESC* srv_desc) {
+        if (res == nullptr) return;
+        char buf[384]{};
+        std::snprintf(
+            buf,
+            sizeof(buf),
+            " r%us%u:%s res=0x%llx dim=%u %ux%ux%u fmt=%u flags=0x%x srvDim=%u;",
+            root,
+            slot,
+            kind,
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(res)),
+            static_cast<unsigned>(d.Dimension),
+            static_cast<unsigned>(d.Width),
+            static_cast<unsigned>(d.Height),
+            static_cast<unsigned>(d.DepthOrArraySize),
+            static_cast<unsigned>(d.Format),
+            static_cast<unsigned>(d.Flags),
+            srv_desc != nullptr ? static_cast<unsigned>(srv_desc->ViewDimension) : 0u);
+        append_limited(out, buf);
+    }
+
+    inline void log_dispatch(
+        const CommandListCorrelationState& state,
+        uint32_t cs_crc,
+        UINT thread_group_count_x,
+        UINT thread_group_count_y,
+        UINT thread_group_count_z)
+    {
+        if (!matches_dispatch(cs_crc, thread_group_count_x, thread_group_count_y, thread_group_count_z)) {
+            return;
+        }
+
+        static std::atomic<uint64_t> seq{0};
+        const auto n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!should_log(n)) {
+            return;
+        }
+
+        std::string root_cbvs;
+        for (uint32_t root = 0; root < 8 && root < state.last_compute_root_cbv.size(); ++root) {
+            const auto va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(state.last_compute_root_cbv[root]);
+            if (va != 0) {
+                append_cbv(root_cbvs, "cbv", root, UINT32_MAX, va, 4096);
+            }
+        }
+
+        std::string table_bindings;
+        UINT cbv_logged = 0;
+        UINT tex3d_logged = 0;
+        const UINT slot_limit = table_slot_limit();
+        ID3D12Resource* hist_t6 = nullptr;
+        ID3D12Resource* hist_t7 = nullptr;
+        D3D12_RESOURCE_DESC hist_t6_desc{};
+        D3D12_RESOURCE_DESC hist_t7_desc{};
+        struct OutputCandidate {
+            ID3D12Resource* res{};
+            D3D12_RESOURCE_DESC desc{};
+            uint32_t root{};
+            uint32_t slot{};
+            char kind{};
+        };
+        std::array<OutputCandidate, 64> output_candidates{};
+        uint32_t output_candidate_count = 0;
+        for (uint32_t root = 0; root < 8 && root < state.last_compute_root_desc_tables.size(); ++root) {
+            const uint64_t table_gpu = state.last_compute_root_desc_tables[root];
+            if (table_gpu == 0) continue;
+            SIZE_T cpu_base = 0;
+            UINT stride = 0;
+            if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) {
+                continue;
+            }
+            for (UINT slot = 0; slot < slot_limit; ++slot) {
+                const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * stride;
+                sn2_descriptor_registry::Entry entry{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(slot_cpu, entry)) {
+                    continue;
+                }
+                if (entry.kind == sn2_descriptor_registry::Kind::CBV && entry.has_cbv_desc && cbv_logged < 24) {
+                    append_cbv(table_bindings, "tcbv", root, slot, entry.cbv_desc.BufferLocation, entry.cbv_desc.SizeInBytes);
+                    ++cbv_logged;
+                    continue;
+                }
+                if (entry.resource != nullptr && entry.has_resource_desc &&
+                    entry.resource_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+                    tex3d_logged < 24) {
+                    if (is_history_crc(cs_crc) && root == 0 && slot == 6) {
+                        hist_t6 = entry.resource;
+                        hist_t6_desc = entry.resource_desc;
+                    } else if (is_history_crc(cs_crc) && root == 0 && slot == 7) {
+                        hist_t7 = entry.resource;
+                        hist_t7_desc = entry.resource_desc;
+                    }
+                    if (is_target_crc(cs_crc) &&
+                        (entry.kind == sn2_descriptor_registry::Kind::UAV ||
+                         entry.kind == sn2_descriptor_registry::Kind::SRV) &&
+                        is_snapshot_texture3d(entry.resource_desc) &&
+                        output_candidate_count < output_candidates.size()) {
+                        bool already = false;
+                        for (uint32_t oi = 0; oi < output_candidate_count; ++oi) {
+                            if (output_candidates[oi].res == entry.resource) {
+                                already = true;
+                                break;
+                            }
+                        }
+                        if (already) {
+                            const char* kind = entry.kind == sn2_descriptor_registry::Kind::SRV ? "SRV" :
+                                entry.kind == sn2_descriptor_registry::Kind::UAV ? "UAV" : "RES";
+                            append_resource(table_bindings, kind, root, slot, entry.resource, entry.resource_desc, entry.has_srv_desc ? &entry.srv_desc : nullptr);
+                            ++tex3d_logged;
+                            continue;
+                        }
+                        const char candidate_kind =
+                            entry.kind == sn2_descriptor_registry::Kind::UAV ? 'O' : 'I';
+                        output_candidates[output_candidate_count++] =
+                            OutputCandidate{entry.resource, entry.resource_desc, root, slot, candidate_kind};
+                    }
+                    const char* kind = entry.kind == sn2_descriptor_registry::Kind::SRV ? "SRV" :
+                        entry.kind == sn2_descriptor_registry::Kind::UAV ? "UAV" : "RES";
+                    append_resource(table_bindings, kind, root, slot, entry.resource, entry.resource_desc, entry.has_srv_desc ? &entry.srv_desc : nullptr);
+                    ++tex3d_logged;
+                }
+            }
+        }
+
+        if (history_snapshot_enabled() && is_history_crc(cs_crc)) {
+            static std::atomic<uint32_t> queued{0};
+            const char cluster = matrix_cluster_tag(state);
+            auto queue_one = [&](ID3D12Resource* res, const D3D12_RESOURCE_DESC& desc, const char* tag_prefix) {
+                if (res == nullptr) return;
+                if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) return;
+                if (desc.Width == 0 || desc.Height == 0 || desc.DepthOrArraySize == 0) return;
+                const uint32_t before = queued.fetch_add(1, std::memory_order_relaxed);
+                if (before >= history_snapshot_max()) {
+                    queued.fetch_sub(1, std::memory_order_relaxed);
+                    return;
+                }
+                sn2_rt_snapshot::queue_intent_named(res, tag_prefix, cluster, n);
+                SPDLOG_WARN(
+                    "[SN2-LightScatterHistSnap] queued={} seq={} cluster={} {} res=0x{:x} dim={}x{}x{} fmt={}",
+                    before + 1,
+                    n,
+                    cluster,
+                    tag_prefix,
+                    reinterpret_cast<uintptr_t>(res),
+                    static_cast<unsigned>(desc.Width),
+                    desc.Height,
+                    desc.DepthOrArraySize,
+                    static_cast<unsigned>(desc.Format));
+            };
+            queue_one(hist_t6, hist_t6_desc, "LSH6");
+            queue_one(hist_t7, hist_t7_desc, "LSH7");
+        }
+
+        if (output_snapshot_enabled() && is_target_crc(cs_crc)) {
+            static std::atomic<uint32_t> queued{0};
+            const char cluster = matrix_cluster_tag(state);
+            for (uint32_t i = 0; i < output_candidate_count; ++i) {
+                const auto& out = output_candidates[i];
+                const uint32_t before = queued.fetch_add(1, std::memory_order_relaxed);
+                if (before >= output_snapshot_max()) {
+                    queued.fetch_sub(1, std::memory_order_relaxed);
+                    break;
+                }
+                char tag[16]{};
+                if (cs_crc == k_default_crc && out.kind == 'O' && out.root == 0) {
+                    std::snprintf(tag, sizeof(tag), "LSO%u", out.slot);
+                } else {
+                    std::snprintf(tag, sizeof(tag), "CS%c%u_%u", out.kind, out.root, out.slot);
+                }
+                sn2_rt_snapshot::queue_intent_named(out.res, tag, cluster, n);
+                SPDLOG_WARN(
+                    "[SN2-LightScatterOutSnap] queued={} seq={} cluster={} {} kind={} root={} slot={} res=0x{:x} dim={}x{}x{} fmt={}",
+                    before + 1,
+                    n,
+                    cluster,
+                    tag,
+                    out.kind,
+                    out.root,
+                    out.slot,
+                    reinterpret_cast<uintptr_t>(out.res),
+                    static_cast<unsigned>(out.desc.Width),
+                    out.desc.Height,
+                    out.desc.DepthOrArraySize,
+                    static_cast<unsigned>(out.desc.Format));
+            }
+        }
+
+        SPDLOG_WARN(
+            "[SN2-LightScatterBind] seq={} eye={} viewport_bucket={} known_bucket={} cs=0x{:08x} pso=0x{:x} "
+            "dim={}x{}x{} rootsig=0x{:x} root_cbvs:{} table:{}",
+            n,
+            eye_name(state),
+            static_cast<int>(state.last_viewport_bucket),
+            state.last_known_eye_bucket,
+            cs_crc,
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            thread_group_count_x,
+            thread_group_count_y,
+            thread_group_count_z,
+            state.last_compute_root_signature,
+            root_cbvs.empty() ? " (none)" : root_cbvs.c_str(),
+            table_bindings.empty() ? " (none)" : table_bindings.c_str());
     }
 }
 
@@ -13550,11 +23652,188 @@ void WINAPI D3D12Hook::dispatch(
     if (dispatch_state.current_pso != nullptr) {
         current_cs_crc = reg.d3d12_pso_compute_crc32(reinterpret_cast<uintptr_t>(dispatch_state.current_pso));
     }
+    // RenderDoc/PIX/Nsight per-event marker: eye + compute CRC + thread-group
+    // dims + engine call-site RVA. Gated by UEVR_SN2_RDOC_TAGS(_MARKERS).
+    if (sn2_rdoc_tags::markers_enabled() && command_list != nullptr) {
+        const std::string src = sn2_rdoc_tags::format_rva(reinterpret_cast<uintptr_t>(_ReturnAddress()));
+        char detail[160];
+        std::snprintf(detail, sizeof(detail), "DISP cs=0x%08x grp=%ux%ux%u src=%s",
+                      current_cs_crc, thread_group_count_x, thread_group_count_y,
+                      thread_group_count_z, src.c_str());
+        sn2_rdoc_tags::mark(command_list, dispatch_eye_bucket, detail);
+    }
+    // === StereoScope event ledger: "dispatch" event (2026-05-25) ===
+    // Additive, default OFF (UEVR_SN2_EVENT_LEDGER=1). Read-only scan of the
+    // recorded compute root tables -> one JSON line with thread-group dims.
+    if (sn2_event_ledger::enabled()) {
+        sn2_event_ledger::emit_dispatch(
+            dispatch_state, current_cs_crc,
+            thread_group_count_x, thread_group_count_y, thread_group_count_z);
+    }
+    // Current runtime question: do the two eyes bind the same physical temporal-history
+    // Texture3Ds at FVolumetricFogLightScatteringCS, or distinct textures with bad right-eye
+    // content? Trace only when explicitly requested.
+    sn2_lightscatter_bind_probe::log_dispatch(
+        dispatch_state,
+        current_cs_crc,
+        thread_group_count_x,
+        thread_group_count_y,
+        thread_group_count_z);
+    // StereoScope bindless View-UB decoder at the fog compute consumers
+    // (UWEFogReconstruct/Resolve, per-eye MainCS). Gated by UEVR_SN2_VIEWUB_DECODE.
+    if (sn2_viewub_decode::enabled() && current_cs_crc != 0 &&
+        (current_cs_crc == 0xf996b96bu || current_cs_crc == 0x0930dd4eu ||
+         current_cs_crc == 0x5af52812u)) {
+        const int b = static_cast<int>(dispatch_state.last_viewport_bucket);
+        sn2_viewub_decode::scan_compute(dispatch_state, (b == 1) ? 0 : (b == 2) ? 1 : -1, current_cs_crc);
+    }
+    // Volume cross-eye CONTENT copy: capture the per-eye ILS volume at the MainCS
+    // (0x5af52812, binds it as a scannable root-table SRV — the consumer reads it
+    // bindless, so this is the only scannable handle), then copy left->right just
+    // before the reconstruct/resolve consumer reads it. Needs the per-view fog hook
+    // (UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_PER_VIEW_HOOK=1) for the eye label.
     if (sn2_missing_pass_diff::env_enabled() && current_cs_crc != 0) {
         sn2_missing_pass_diff::record(
             current_cs_crc,
             dispatch_eye_bucket,
             'C');
+    }
+
+    // 2026-05-23 ROOT-CAUSE FIX (dispatch record-time): the secondary-eye fog "view" UB
+    // (a 256-byte struct, view-rect/ViewSize@+176 / ScreenPositionScaleBias@+192) is bound
+    // to fog producer dispatches with its view-rect block ZEROED, while the primary eye's
+    // is valid. Froxel<->screen mapping /0 -> garbage right-eye fog. The engine wrote the UB
+    // just before this Dispatch call; patch it NOW (before original() records the dispatch)
+    // so the GPU reads the correct view-rect at execute. Cache the last VALID fog view UB's
+    // view-rect (primary eye dispatches first) and copy it into the zeroed (secondary) one;
+    // both eyes share the same render resolution so the view-rect is identical.
+    {
+        static const bool fog_vub_dispatch_fix = env_flag_enabled_a("UEVR_SN2_FOG_VIEWUB_PATCH");
+        if (fog_vub_dispatch_fix && current_cs_crc != 0 &&
+            (dispatch_eye_bucket == 1 || dispatch_eye_bucket == 2)) {
+            const size_t nslots = std::min<size_t>(dispatch_state.last_compute_root_cbv.size(), 12);
+            for (size_t i = 0; i < nslots; ++i) {
+                const auto va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(dispatch_state.last_compute_root_cbv[i]);
+                if (va == 0) continue;
+                uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, 256);
+                if (cpu == nullptr) continue;
+                sn2_upload_buf_map::FogWin fw;
+                const int cls = sn2_upload_buf_map::fog_vub_classify(cpu, fw);
+                if (cls == 1 || cls == 2) {
+                    // DIAGNOSTIC: log every fog-view-UB-class root CBV (valid or zeroed) so we can
+                    // see whether block3 ever appears as a ROOT CBV (vs descriptor-table bound).
+                    static std::atomic<uint64_t> diagn{0};
+                    const auto dg = diagn.fetch_add(1, std::memory_order_relaxed);
+                    if (dg < 60) {
+                        bool cache_match = false;
+                        { std::scoped_lock _{sn2_upload_buf_map::g_fog_vub_mutex};
+                          for (auto& e : sn2_upload_buf_map::g_fog_vub_cache)
+                              if (memcmp(e.header, fw.header, 144) == 0) { cache_match = true; break; } }
+                        SPDLOG_WARN("[SN2-FogVUBDiag] cls={} slot={} eye={} cs=0x{:08x} vsize={}x{} hdr=0x{:x} cacheMatch={}",
+                            cls, i, dispatch_eye_bucket, current_cs_crc, (int)fw.vsx, (int)fw.vsy,
+                            (unsigned)(*(const uint32_t*)fw.header ^ *(const uint32_t*)(fw.header + 64)),
+                            cache_match ? 1 : 0);
+                    }
+                }
+                if (cls == 1) {
+                    // VALID fog view UB: cache its 144-byte matrix header + 112-byte view-rect
+                    // (keyed by header) so the zeroed secondary-eye copy can be matched precisely.
+                    std::scoped_lock _{sn2_upload_buf_map::g_fog_vub_mutex};
+                    bool found = false;
+                    for (auto& e : sn2_upload_buf_map::g_fog_vub_cache) {
+                        if (memcmp(e.header, fw.header, 144) == 0) { found = true; break; }
+                    }
+                    if (!found && sn2_upload_buf_map::g_fog_vub_cache.size() < 64) {
+                        sn2_upload_buf_map::FogCacheEntry ce;
+                        memcpy(ce.header, fw.header, 144);
+                        memcpy(ce.viewrect, fw.viewrect, 112);
+                        sn2_upload_buf_map::g_fog_vub_cache.push_back(ce);
+                    }
+                } else if (cls == 2) {
+                    // ZEROED view-rect candidate: patch ONLY if its matrix header EXACTLY matches a
+                    // cached valid block3 (view1 header == view0 header per CB diff). Random zeroed
+                    // CBVs won't match any cached header -> never touched. This precise guard is what
+                    // prevents corrupting unrelated constant buffers (the loose version crashed).
+                    std::scoped_lock _{sn2_upload_buf_map::g_fog_vub_mutex};
+                    for (auto& e : sn2_upload_buf_map::g_fog_vub_cache) {
+                        if (memcmp(e.header, fw.header, 144) != 0) continue;
+                        if (sn2_upload_buf_map::fog_vub_write_viewrect(cpu, e.viewrect)) {
+                            static std::atomic<uint64_t> dn{0};
+                            const auto n = dn.fetch_add(1, std::memory_order_relaxed);
+                            if (n < 24 || (n % 600) == 0) {
+                                SPDLOG_WARN("[SN2-FogViewUBFix][dispatch] patched cs_crc=0x{:08x} slot={} eye={} n={}",
+                                    current_cs_crc, i, dispatch_eye_bucket, n + 1);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2026-05-24 PRECISE fog view-UB patch (descriptor-table resolution). block3 is bound to the
+    // fog producer via a DESCRIPTOR TABLE, not a root CBV (proven by SN2-FogVUBDiag). The buffer-scan
+    // patch (present/ECL) patched 640x720 copies that may NOT be the exact copy the producer reads ->
+    // no visual change. Here we resolve the producer's compute descriptor-table CBVs to their EXACT
+    // backing buffer (cbv_desc.BufferLocation) and patch THAT window — the definitive test of whether
+    // block3's zeroed view-rect is the cause. Gated by UEVR_SN2_FOG_TABLE_PATCH (needs command-list
+    // hooks + sn2_descriptor_registry enabled for CBV recording).
+    {
+        static const bool fog_table_fix = env_flag_enabled_a("UEVR_SN2_FOG_TABLE_PATCH");
+        if (fog_table_fix && current_cs_crc != 0 &&
+            (dispatch_eye_bucket == 1 || dispatch_eye_bucket == 2)) {
+            const size_t ntab = dispatch_state.last_compute_root_desc_tables.size();
+            for (size_t ti = 0; ti < ntab; ++ti) {
+                const uint64_t table_gpu = dispatch_state.last_compute_root_desc_tables[ti];
+                if (table_gpu == 0) continue;
+                SIZE_T cpu_base = 0; UINT stride = 0;
+                if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride)) continue;
+                if (stride == 0) continue;
+                for (UINT slot = 0; slot < 32; ++slot) {
+                    const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * stride;
+                    sn2_descriptor_registry::Entry ent;
+                    if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(slot_cpu, ent)) continue;
+                    if (!ent.has_cbv_desc) continue;
+                    const UINT sz = ent.cbv_desc.SizeInBytes;
+                    if (sz < 192 || sz > 1024) continue;  // fog view UB (block3) is ~256B
+                    uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(ent.cbv_desc.BufferLocation, 256);
+                    if (cpu == nullptr) continue;
+                    sn2_upload_buf_map::FogWin fw;
+                    const int cls = sn2_upload_buf_map::fog_vub_classify(cpu, fw);
+                    if (cls == 1) {
+                        std::scoped_lock _{sn2_upload_buf_map::g_fog_vub_mutex};
+                        bool found = false;
+                        for (auto& e : sn2_upload_buf_map::g_fog_vub_cache)
+                            if (memcmp(e.header, fw.header, 144) == 0) { found = true; break; }
+                        if (!found && sn2_upload_buf_map::g_fog_vub_cache.size() < 64) {
+                            sn2_upload_buf_map::FogCacheEntry ce;
+                            memcpy(ce.header, fw.header, 144);
+                            memcpy(ce.viewrect, fw.viewrect, 112);
+                            sn2_upload_buf_map::g_fog_vub_cache.push_back(ce);
+                            static std::atomic<uint64_t> tc{0};
+                            const auto t = tc.fetch_add(1, std::memory_order_relaxed);
+                            if (t < 16)
+                                SPDLOG_WARN("[SN2-FogTablePatch][cache] tbl={} slot={} eye={} cs=0x{:08x} sz={} ViewSize={}x{}",
+                                    ti, slot, dispatch_eye_bucket, current_cs_crc, sz, (int)fw.vsx, (int)fw.vsy);
+                        }
+                    } else if (cls == 2) {
+                        std::scoped_lock _{sn2_upload_buf_map::g_fog_vub_mutex};
+                        for (auto& e : sn2_upload_buf_map::g_fog_vub_cache) {
+                            if (memcmp(e.header, fw.header, 144) != 0) continue;
+                            if (sn2_upload_buf_map::fog_vub_write_viewrect(cpu, e.viewrect)) {
+                                static std::atomic<uint64_t> tp{0};
+                                const auto t = tp.fetch_add(1, std::memory_order_relaxed);
+                                if (t < 30 || (t % 600) == 0)
+                                    SPDLOG_WARN("[SN2-FogTablePatch] PATCHED EXACT block3 tbl={} slot={} eye={} cs=0x{:08x} sz={} n={}",
+                                        ti, slot, dispatch_eye_bucket, current_cs_crc, sz, t + 1);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // 2026-05-23: Per-(eye, cs_crc) FIRST-DISPATCH inspector — logs UAV
@@ -13629,6 +23908,12 @@ void WINAPI D3D12Hook::dispatch(
         thread_group_count_y,
         thread_group_count_z,
         "Dispatch");
+    sn2_fog_lineage_trace::trace_compute_dispatch(
+        dispatch_state,
+        current_cs_crc,
+        thread_group_count_x,
+        thread_group_count_y,
+        thread_group_count_z);
     UINT effective_thread_group_count_x = thread_group_count_x;
     UINT effective_thread_group_count_y = thread_group_count_y;
     UINT effective_thread_group_count_z = thread_group_count_z;
@@ -13646,6 +23931,9 @@ void WINAPI D3D12Hook::dispatch(
     // as the producer hook lands. See Sn2RDGPassHook.hpp.
     if (dispatch_state.current_pso != nullptr) {
         sn2_rdg_pass_hook::on_dispatch(reinterpret_cast<uintptr_t>(dispatch_state.current_pso));
+    }
+    if (sn2_fog_xeye::enabled()) {
+        sn2_fog_xeye::begin_dispatch_capture();
     }
     sn2_fog_compute::note_dispatch(
         command_list,
@@ -13710,6 +23998,90 @@ void WINAPI D3D12Hook::dispatch(
                 effective_thread_group_count_y,
                 effective_thread_group_count_z,
                 view_id);
+        }
+    }
+
+    // === Plan A-ii CB redirect (UEVR_SN2_FOG_RV_CB_REDIRECT) + A-i SRV redirect ===
+    // ROOT: the right-eye UWEFogReconstructCS gets a GARBAGE cb2 (root param 5) and a
+    // NaN cb3 (root param 6); its per-eye cb0/cb1 (params 3/4 = UV + matrices) are
+    // CORRECT. We capture the LEFT reconstruct run's clean cb2/cb3 (occurrence-1) and
+    // rebind the RIGHT run's cb2/cb3 to them (occurrence-2), leaving cb0/cb1 alone — so
+    // the engine's own correct trig produces TRUE per-eye fog. The A-i SRV path (rebind
+    // the right vol) is retained but off by default. See moddingkit/runs/SN2_FOG_FIX_PLAN.md.
+    bool rv_redirect_applied = false;
+    UINT64 rv_orig_table_gpu = 0;
+    bool rv_cb_applied = false;
+    UINT64 rv_cb2_orig = 0, rv_cb3_orig = 0;
+    UINT rv_cb2_param = 0, rv_cb3_param = 0;
+    if (sn2_fog_right_vol_redirect::enabled() &&
+        command_list != nullptr &&
+        current_cs_crc != 0 &&
+        sn2_fog_right_vol_redirect::is_relevant_crc(current_cs_crc))
+    {
+        const auto rv_state = read_cmdlist_state(command_list);
+        ID3D12Device* rv_dev = g_d3d12_hook != nullptr ? g_d3d12_hook->get_device() : nullptr;
+        const bool bindless_ok = tls_bindless_heap.cpu_base != 0 &&
+            tls_bindless_heap.gpu_base != 0 && tls_bindless_heap.stride != 0;
+
+        if (current_cs_crc == sn2_fog_right_vol_redirect::main_crc()) {
+            // MainCS view1 is the per-frame boundary right before reconstruct/resolve.
+            if (cmdlist_view_id(rv_state) == 1) {
+                bool captured = false;
+                if (sn2_fog_right_vol_redirect::srv_redirect_enabled() && bindless_ok && rv_dev != nullptr) {
+                    const uint64_t mt = rv_state.last_compute_root_desc_tables[0];
+                    if (mt != 0 && mt >= tls_bindless_heap.gpu_base) {
+                        const SIZE_T mcpu = tls_bindless_heap.cpu_base + static_cast<SIZE_T>(mt - tls_bindless_heap.gpu_base);
+                        sn2_fog_right_vol_redirect::capture_right_vol(rv_dev, mcpu, tls_bindless_heap.stride);  // also resets counters
+                        captured = true;
+                    }
+                }
+                if (!captured) {
+                    sn2_fog_right_vol_redirect::reset_frame_counters_only();
+                }
+            }
+        } else if (sn2_fog_right_vol_redirect::is_consumer_crc(current_cs_crc)) {
+            const int occ = sn2_fog_right_vol_redirect::consumer_occurrence(current_cs_crc);
+            const bool is_recon = (current_cs_crc == sn2_fog_right_vol_redirect::recon_crc());
+
+            // --- A-ii: CB redirect on the reconstruct (it carries the garbage cb2/cb3). ---
+            if (sn2_fog_right_vol_redirect::cb_redirect_enabled() && is_recon) {
+                const auto& cbp = sn2_fog_right_vol_redirect::recon_cb_params();
+                const uint64_t cur2 = rv_state.last_compute_root_cbv[cbp[0]];
+                const uint64_t cur3 = rv_state.last_compute_root_cbv[cbp[1]];
+                if (occ == 1) {
+                    sn2_fog_right_vol_redirect::cache_left_recon_cbvs(cur2, cur3);  // LEFT = clean
+                } else if (occ >= 2) {
+                    const uint64_t lv2 = sn2_fog_right_vol_redirect::left_recon_cb2_va();
+                    const uint64_t lv3 = sn2_fog_right_vol_redirect::left_recon_cb3_va();
+                    if (lv2 != 0 && lv3 != 0) {
+                        rv_cb2_orig = cur2; rv_cb3_orig = cur3;
+                        rv_cb2_param = cbp[0]; rv_cb3_param = cbp[1];
+                        command_list->SetComputeRootConstantBufferView(cbp[0], lv2);
+                        command_list->SetComputeRootConstantBufferView(cbp[1], lv3);
+                        rv_cb_applied = true;
+                        if (sn2_fog_right_vol_redirect::log_enabled()) {
+                            const auto sn = sn2_fog_right_vol_redirect::next_cb_redirect_seq();
+                            if (sn <= 64 || (sn % 600) == 0) {
+                                SPDLOG_WARN("[SN2-FogRVRedirect][CB] seq={} recon-right cb2(p{}) 0x{:x}->0x{:x} cb3(p{}) 0x{:x}->0x{:x}",
+                                            sn, cbp[0], cur2, lv2, cbp[1], cur3, lv3);
+                            }
+                        }
+                    }
+                }
+            }
+            // --- A-i: SRV redirect (off by default) ---
+            if (sn2_fog_right_vol_redirect::srv_redirect_enabled() && occ >= 2 &&
+                bindless_ok && rv_dev != nullptr) {
+                const uint64_t st_gpu = rv_state.last_compute_root_desc_tables[0];
+                if (st_gpu != 0 && st_gpu >= tls_bindless_heap.gpu_base) {
+                    const SIZE_T scpu = tls_bindless_heap.cpu_base + static_cast<SIZE_T>(st_gpu - tls_bindless_heap.gpu_base);
+                    if (sn2_fog_right_vol_redirect::redirect_consumer(
+                            rv_dev, command_list, current_cs_crc, scpu, st_gpu, tls_bindless_heap.stride)) {
+                        rv_redirect_applied = true;
+                        rv_orig_table_gpu = st_gpu;
+                    }
+                }
+            }
         }
     }
 
@@ -13864,13 +24236,61 @@ void WINAPI D3D12Hook::dispatch(
         }
     }
 
+    // === StereoScope live mutation: hot-reloaded per-eye SKIP-DISPATCH (2026-05-25) ===
+    // Additive, default OFF (UEVR_SN2_LIVE_MUTATE=1). When a loaded skip rule
+    // matches this dispatch's CS CRC + eye, the real engine dispatch is
+    // suppressed (all surrounding bookkeeping still runs). Map StereoTraceBucket
+    // Left=1->eye0, Right=2->eye1, else -1.
+    bool sn2_live_mutate_skip_dispatch = false;
+    if (sn2_live_mutate::enabled()) {
+        const int mutate_eye =
+            (dispatch_state.last_viewport_bucket == StereoTraceBucket::Left)  ? 0 :
+            (dispatch_state.last_viewport_bucket == StereoTraceBucket::Right) ? 1 : -1;
+        sn2_live_mutate_skip_dispatch = sn2_live_mutate::should_skip(current_cs_crc, mutate_eye);
+    }
+
+    UINT sn2_fog_sbs_compute_restore_root = UINT_MAX;
+    uint64_t sn2_fog_sbs_compute_restore_va = 0;
+    const bool sn2_fog_sbs_compute_applied = sn2_begin_fog_sbs_compute_rect_patch(
+        command_list,
+        dispatch_state,
+        current_cs_crc,
+        sn2_fog_sbs_compute_restore_root,
+        sn2_fog_sbs_compute_restore_va);
+
     if (original != nullptr) {
         const auto timing = gpu_timestamp_timing::begin(command_list, "dispatch", dispatch_state);
-        original(command_list,
-            effective_thread_group_count_x,
-            effective_thread_group_count_y,
-            effective_thread_group_count_z);
+        if (!sn2_live_mutate_skip_dispatch) {
+            original(command_list,
+                effective_thread_group_count_x,
+                effective_thread_group_count_y,
+                effective_thread_group_count_z);
+        }
         gpu_timestamp_timing::end(command_list, timing);
+    }
+
+    if (sn2_fog_sbs_compute_applied &&
+        command_list != nullptr &&
+        sn2_fog_sbs_compute_restore_root != UINT_MAX &&
+        sn2_fog_sbs_compute_restore_va != 0) {
+        command_list->SetComputeRootConstantBufferView(
+            sn2_fog_sbs_compute_restore_root,
+            static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(sn2_fog_sbs_compute_restore_va));
+    }
+
+    if (!sn2_live_mutate_skip_dispatch) {
+        sn2_apply_fog_resolve_post_shift(
+            command_list,
+            dispatch_state,
+            current_cs_crc);
+    }
+
+    if (sn2_fog_xeye::enabled() && sn2_fog_xeye::consume_post_dispatch_copy_request()) {
+        sn2_fog_xeye::apply_copy(
+            command_list,
+            "PostProducerDispatch",
+            current_cs_crc,
+            sn2_get_current_fog_view());
     }
 
     // Restore game's original SRV table after right-eye redirect.
@@ -13878,6 +24298,19 @@ void WINAPI D3D12Hook::dispatch(
         D3D12_GPU_DESCRIPTOR_HANDLE restore{};
         restore.ptr = srv_redirect_orig_table_gpu;
         command_list->SetComputeRootDescriptorTable(srv_redirect_root_index, restore);
+    }
+
+    // Restore after Plan A-i right-vol redirect (so subsequent dispatches on this
+    // list keep the game's table).
+    if (rv_redirect_applied && command_list != nullptr) {
+        D3D12_GPU_DESCRIPTOR_HANDLE rv_restore{};
+        rv_restore.ptr = rv_orig_table_gpu;
+        command_list->SetComputeRootDescriptorTable(0, rv_restore);
+    }
+    // Restore after Plan A-ii CB redirect (rebind the right run's original cb2/cb3).
+    if (rv_cb_applied && command_list != nullptr) {
+        command_list->SetComputeRootConstantBufferView(rv_cb2_param, rv_cb2_orig);
+        command_list->SetComputeRootConstantBufferView(rv_cb3_param, rv_cb3_orig);
     }
 
     sn2_fog_compute::try_replay_after_right_scatter(command_list, dispatch_state, current_cs_crc);
@@ -14154,6 +24587,116 @@ void WINAPI D3D12Hook::dispatch(
             }
         }
     }
+
+    // === SN2 PER-VIEW LIGHT INJECTION (root-cause attempt, default OFF) ===
+    // UEVR_SN2_FORCE_PERVIEW_LIGHTINJECT=1. The right eye's froxel volume exists
+    // but is UNDER-LIT: the per-view light-scatter / light-injection compute does
+    // not run for view 1. Here, when the LEFT eye runs one of the RE-named
+    // light-scatter CSes, we RE-ISSUE that dispatch for the right eye with the
+    // View CB at the configured compute root(s) swapped from the LEFT VA to the
+    // RIGHT VA (left_va + pool stride), so view 1's volume gets lit. Modeled on
+    // the proven Sn2UweFogComputeDupHook mechanism (fog consumers); this targets
+    // the lighting PRODUCERS instead. See Sn2PerViewLightInject.hpp for the honest
+    // assessment (likely needs one live tuning pass on CRCs/roots/delta).
+    if (sn2_perview_lightinject::g_depth == 0 &&
+        command_list != nullptr &&
+        original != nullptr &&
+        (sn2_perview_lightinject::enabled() || sn2_perview_lightinject::probe_enabled())) {
+        const auto& li_state = dispatch_state;
+
+        // PROBE: log every compute dispatch's CRC + eye + root state so the live
+        // light-scatter CS CRCs (and the View CB root) can be confirmed.
+        if (sn2_perview_lightinject::probe_enabled() && current_cs_crc != 0) {
+            static std::atomic<uint64_t> li_probe_seq{0};
+            const auto n = li_probe_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 512 || (n % 3000) == 0) {
+                SPDLOG_WARN(
+                    "[SN2-PerViewLightInjectProbe] seq={} eye={} cs_crc=0x{:08x} pso=0x{:x} root_sig=0x{:x} "
+                    "dim={}x{}x{} cbv0=0x{:x} cbv1=0x{:x} cbv2=0x{:x} cbv3=0x{:x} cbv4=0x{:x} cbv5=0x{:x} "
+                    "matched={}",
+                    n,
+                    (li_state.last_viewport_bucket == StereoTraceBucket::Left ? "LEFT"
+                        : li_state.last_viewport_bucket == StereoTraceBucket::Right ? "RIGHT" : "?"),
+                    current_cs_crc,
+                    reinterpret_cast<uintptr_t>(li_state.current_pso),
+                    li_state.last_compute_root_signature,
+                    effective_thread_group_count_x, effective_thread_group_count_y, effective_thread_group_count_z,
+                    li_state.last_compute_root_cbv[0],
+                    li_state.last_compute_root_cbv[1],
+                    li_state.last_compute_root_cbv[2],
+                    li_state.last_compute_root_cbv[3],
+                    li_state.last_compute_root_cbv[4],
+                    li_state.last_compute_root_cbv[5],
+                    sn2_perview_lightinject::is_lightinject_cs_crc(current_cs_crc) ? 1 : 0);
+            }
+        }
+
+        // DUPLICATE: only when the master enable is on, the CS CRC matches a
+        // light-scatter producer, and this dispatch is the LEFT eye (bucket 1).
+        // We re-issue for the right eye by swapping the View CB root(s) to the
+        // right-eye VA. (bucket: 1=LEFT, 2=RIGHT; only mirror LEFT -> RIGHT.)
+        if (sn2_perview_lightinject::enabled() &&
+            current_cs_crc != 0 &&
+            dispatch_eye_bucket == 1 &&
+            sn2_perview_lightinject::is_lightinject_cs_crc(current_cs_crc)) {
+            const auto& roots = sn2_perview_lightinject::active_view_cb_roots();
+            struct LiSwap { UINT root_param; uint64_t left_va; uint64_t right_va; };
+            std::array<LiSwap, 8> swaps{};
+            size_t swap_count = 0;
+            for (uint32_t root : roots) {
+                if (root >= li_state.last_compute_root_cbv.size()) continue;
+                const uint64_t lv = li_state.last_compute_root_cbv[root];
+                if (lv == 0) continue;
+                const uint64_t rv = sn2_perview_lightinject::compute_right_view_va(lv);
+                if (rv == 0) continue;
+                if (swap_count >= swaps.size()) break;
+                swaps[swap_count++] = {static_cast<UINT>(root), lv, rv};
+            }
+
+            if (swap_count > 0) {
+                static std::atomic<uint64_t> li_dup_count{0};
+                const auto n = li_dup_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (static_cast<int>(n) <= sn2_perview_lightinject::log_max_rows() || (n % 600) == 0) {
+                    SPDLOG_WARN(
+                        "[SN2-PerViewLightInject] dup#{} cs_crc=0x{:08x} swaps={} root0={} L0=0x{:x}->R0=0x{:x} "
+                        "delta={} dim={}x{}x{} (re-issued light-scatter for RIGHT eye)",
+                        n,
+                        current_cs_crc,
+                        static_cast<int>(swap_count),
+                        swaps[0].root_param,
+                        swaps[0].left_va,
+                        swaps[0].right_va,
+                        sn2_perview_lightinject::view_cb_offset_delta(),
+                        effective_thread_group_count_x,
+                        effective_thread_group_count_y,
+                        effective_thread_group_count_z);
+                }
+
+                // Bind right-eye View CB(s).
+                for (size_t i = 0; i < swap_count; ++i) {
+                    command_list->SetComputeRootConstantBufferView(
+                        swaps[i].root_param,
+                        static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(swaps[i].right_va));
+                }
+
+                // Re-issue the dispatch (guarded so the hook re-entry is a no-op).
+                ++sn2_perview_lightinject::g_depth;
+                original(command_list,
+                    effective_thread_group_count_x,
+                    effective_thread_group_count_y,
+                    effective_thread_group_count_z);
+                --sn2_perview_lightinject::g_depth;
+
+                // Restore the LEFT-eye View CB(s) so the rest of the LEFT pass is
+                // unaffected.
+                for (size_t i = 0; i < swap_count; ++i) {
+                    command_list->SetComputeRootConstantBufferView(
+                        swaps[i].root_param,
+                        static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(swaps[i].left_va));
+                }
+            }
+        }
+    }
 }
 
 void WINAPI D3D12Hook::copy_buffer_region(
@@ -14200,6 +24743,26 @@ void WINAPI D3D12Hook::copy_buffer_region(
         0,
         dst_offset,
         src_offset);
+
+    // 2026-05-27: passive default-CBV shadowing. If this is a CPU-upload -> GPU-default
+    // copy of a CBV-sized region, shadow the destination bytes (read from the mapped upload
+    // source) keyed by destination GPU VA, so the chain scan can later read the View UB
+    // bytes that are otherwise GPU-only. No GPU work, no barriers, no state mutation.
+    if (sn2_default_cbv_shadow::enabled() && dst_buffer != nullptr && src_buffer != nullptr &&
+        num_bytes >= 256 && num_bytes <= sn2_default_cbv_shadow::max_shadow_bytes()) {
+        const uint64_t src_va = src_buffer->GetGPUVirtualAddress();
+        if (src_va != 0) {
+            const uint8_t* src_cpu = sn2_upload_buf_map::gpu_va_to_cpu(src_va + src_offset, num_bytes);
+            if (src_cpu != nullptr) {
+                const uint64_t dst_va = dst_buffer->GetGPUVirtualAddress();
+                if (dst_va != 0) {
+                    sn2_default_cbv_shadow::note_copy(
+                        dst_va + dst_offset, src_cpu, static_cast<uint32_t>(num_bytes),
+                        sn2_rt_snapshot::g_frame_counter.load(std::memory_order_relaxed));
+                }
+            }
+        }
+    }
 
     if (original != nullptr) {
         original(command_list, dst_buffer, dst_offset, src_buffer, src_offset, num_bytes);
@@ -14431,10 +24994,56 @@ void WINAPI D3D12Hook::execute_indirect(
             hunter_eye_bucket,
             false,
             false);
+        sn2_rdg_pass_hook::on_dispatch(reinterpret_cast<uintptr_t>(hunter_state.current_pso));
     }
     if (reg.hunter_should_skip_graphics(command_list)) {
         reg.hunter_inc_execute_indirect_skipped();
         return;
+    }
+
+    if (sn2_indirect_arg_trace::enabled() &&
+        sn2_indirect_arg_trace::armed() &&
+        command_list != nullptr &&
+        argument_buffer != nullptr)
+    {
+        ID3D12Device* device = d3d12 != nullptr ? d3d12->get_device() : nullptr;
+        if (device != nullptr) {
+            sn2_gpu_readback::init(device);
+        }
+
+        const auto state = read_cmdlist_state(command_list);
+        const int view_id = cmdlist_view_id(state);
+        void* current_pso = state.current_pso;
+        uint32_t cs_crc = 0;
+        uint32_t ps_crc = 0;
+        uint32_t ms_crc = 0;
+        if (current_pso != nullptr) {
+            const uintptr_t pso_key = reinterpret_cast<uintptr_t>(current_pso);
+            cs_crc = reg.d3d12_pso_compute_crc32(pso_key);
+            ps_crc = reg.d3d12_pso_pixel_crc32(pso_key);
+            ms_crc = reg.d3d12_pso_mesh_crc32(pso_key);
+        }
+        sn2_command_signature_registry::Entry sig_info{};
+        const bool sig_known = sn2_command_signature_registry::lookup(command_signature, sig_info);
+        const char* sig_kind = sig_known
+            ? sn2_command_signature_registry::kind(sig_info)
+            : sn2_indirect_arg_trace::inferred_kind(cs_crc, ms_crc, ps_crc);
+
+        static std::atomic<uint64_t> trace_seq{0};
+        const uint64_t seq = trace_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        sn2_indirect_arg_trace::schedule(
+            command_list,
+            argument_buffer,
+            argument_buffer_offset,
+            count_buffer,
+            count_buffer_offset,
+            sig_known ? &sig_info : nullptr,
+            sig_kind,
+            max_command_count,
+            view_id,
+            cs_crc,
+            ps_crc,
+            seq);
     }
 
     // 2026-05-19: SN2 right-eye fog/tile compute dispatches <0,1,1> per user's
@@ -14597,6 +25206,26 @@ void WINAPI D3D12Hook::dispatch_mesh(
     reg.hunter_inc_dispatch_mesh_hit();
     const auto state = base_command_list != nullptr ? read_cmdlist_state(base_command_list) : g_cmdlist_state_empty;
     const int eye_bucket = cmdlist_eye_bucket(state);
+    const int view_id = cmdlist_view_id(state);
+    uintptr_t pso_key = state.current_pso != nullptr ? reinterpret_cast<uintptr_t>(state.current_pso) : 0;
+    uint32_t trace_ps_crc = 0;
+    uint32_t trace_ms_crc = 0;
+    uint32_t trace_as_crc = 0;
+    if (pso_key != 0) {
+        trace_ps_crc = reg.d3d12_pso_pixel_crc32(pso_key);
+        trace_ms_crc = reg.d3d12_pso_mesh_crc32(pso_key);
+        trace_as_crc = reg.d3d12_pso_amplification_crc32(pso_key);
+    }
+    sn2_dispatch_mesh_trace::note(
+        view_id,
+        eye_bucket,
+        pso_key,
+        trace_as_crc,
+        trace_ms_crc,
+        trace_ps_crc,
+        thread_group_count_x,
+        thread_group_count_y,
+        thread_group_count_z);
     if (state.current_pso != nullptr) {
         reg.hunter_record_draw_event(
             reinterpret_cast<uintptr_t>(state.current_pso),
@@ -14609,6 +25238,24 @@ void WINAPI D3D12Hook::dispatch_mesh(
     const uint32_t forensics_ps_crc = state.current_pso != nullptr
         ? reg.d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(state.current_pso))
         : 0;
+    // Direct (non-ExecuteIndirect) DispatchMesh: log the per-eye thread-group
+    // counts so right-absent / right-empty mesh dispatches are visible the same
+    // way as the indirect [SN2-EI] trace. Args are direct, so no GPU readback.
+    if (sn2_indirect_arg_trace::enabled() && sn2_indirect_arg_trace::armed()) {
+        const uint32_t forensics_cs_crc = state.current_pso != nullptr
+            ? reg.d3d12_pso_compute_crc32(reinterpret_cast<uintptr_t>(state.current_pso))
+            : 0;
+        sn2_indirect_arg_trace::record_direct(
+            "MESH",
+            cmdlist_view_id(state),
+            static_cast<int>(state.last_viewport_bucket),
+            reinterpret_cast<uintptr_t>(state.current_pso),
+            forensics_cs_crc,
+            forensics_ps_crc,
+            thread_group_count_x,
+            thread_group_count_y,
+            thread_group_count_z);
+    }
     const bool forensics_skip = render::StereoForensics::get().should_skip_event(
         "dispatch_mesh",
         forensics_ps_crc,
@@ -14644,6 +25291,50 @@ void WINAPI D3D12Hook::dispatch_mesh(
         const auto timing = gpu_timestamp_timing::begin(base_command_list, "dispatch_mesh", state);
         original(command_list, thread_group_count_x, thread_group_count_y, thread_group_count_z);
         gpu_timestamp_timing::end(base_command_list, timing);
+    }
+}
+
+void WINAPI D3D12Hook::ia_set_primitive_topology(
+    ID3D12GraphicsCommandList* command_list,
+    D3D_PRIMITIVE_TOPOLOGY primitive_topology
+) {
+    update_cmdlist_primitive_topology(command_list, primitive_topology);
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[IA_SET_PRIMITIVE_TOPOLOGY_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::ia_set_primitive_topology)*>() : nullptr;
+    if (original != nullptr) {
+        original(command_list, primitive_topology);
+    }
+}
+
+void WINAPI D3D12Hook::ia_set_index_buffer(
+    ID3D12GraphicsCommandList* command_list,
+    const D3D12_INDEX_BUFFER_VIEW* view
+) {
+    update_cmdlist_index_buffer(command_list, view);
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[IA_SET_INDEX_BUFFER_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::ia_set_index_buffer)*>() : nullptr;
+    if (original != nullptr) {
+        original(command_list, view);
+    }
+}
+
+void WINAPI D3D12Hook::ia_set_vertex_buffers(
+    ID3D12GraphicsCommandList* command_list,
+    UINT start_slot,
+    UINT num_views,
+    const D3D12_VERTEX_BUFFER_VIEW* views
+) {
+    update_cmdlist_vertex_buffers(command_list, start_slot, num_views, views);
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[IA_SET_VERTEX_BUFFERS_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::ia_set_vertex_buffers)*>() : nullptr;
+    if (original != nullptr) {
+        original(command_list, start_slot, num_views, views);
     }
 }
 
@@ -19209,6 +29900,1307 @@ static bool sn2_consume_pso3069_capture_log_token(uint64_t seq) {
     return true;
 }
 
+// Per-eye SRV capture for the visible fog-apply consumer PS 0x4E86DC09
+// (ExponentialPixelMain). It samples 2D t1-t5; the right eye renders above-water
+// because one of those inputs is empty/garbage for view1. Resolve every bound
+// graphics root descriptor-table slot 0-9 per eye and log resource+dims so we can
+// diff L vs R and find the divergent input. Gated by UEVR_SN2_FOGCONSUMER_SRV_DIAG.
+static void sn2_log_fogconsumer_srv_snapshot(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state)
+{
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_FOGCONSUMER_SRV_DIAG");
+    if (!enabled || command_list == nullptr || state.current_pso == nullptr) {
+        return;
+    }
+    static const uint32_t target = env_u32_a("UEVR_SN2_FOGCONSUMER_SRV_DIAG_PS", 0x4E86DC09u);
+    const uint32_t ps_crc = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(
+        reinterpret_cast<uintptr_t>(state.current_pso));
+    if (ps_crc != target) {
+        return;
+    }
+    const int view_id = cmdlist_view_id(state);
+    if (view_id != 0 && view_id != 1) {
+        return;
+    }
+    static std::atomic<int> l_cnt{0};
+    static std::atomic<int> r_cnt{0};
+    const int n = (view_id == 0 ? l_cnt : r_cnt).fetch_add(1, std::memory_order_relaxed);
+    if (n >= 6) {
+        return;
+    }
+    for (uint32_t root = 0; root < state.last_graphics_root_desc_tables.size(); ++root) {
+        const uint64_t table = state.last_graphics_root_desc_tables[root];
+        if (table == 0) {
+            continue;
+        }
+        for (UINT slot = 0; slot <= 9; ++slot) {
+            const auto info = sn2_resolve_pso3069_slot(table, slot);
+            if (!info.in_heap || info.resource == nullptr) {
+                continue;
+            }
+            SPDLOG_WARN(
+                "[SN2-FogConsumerSRV] eye={} ps=0x{:08x} root={} slot={} res=0x{:x} kind={} dim={} fmt={} {}x{}x{} known={}",
+                view_id, ps_crc, root, slot,
+                reinterpret_cast<uint64_t>(info.resource),
+                info.kind ? info.kind : "?",
+                static_cast<int>(info.dimension), static_cast<int>(info.format),
+                info.width, info.height, info.depth_or_array,
+                info.known_descriptor ? 1 : 0);
+        }
+    }
+}
+
+namespace sn2_fog_uv_cb {
+    struct Rows {
+        bool mapped{};
+        std::array<uint8_t, 16> row0{};
+        std::array<uint8_t, 16> row1{};
+        std::array<float, 4> row0f{};
+        std::array<float, 4> row1f{};
+        uint64_t hash{};
+    };
+
+    struct LeftSnapshot {
+        bool valid{};
+        uint32_t root{};
+        uint64_t cbv{};
+        Rows rows{};
+        uint64_t seq{};
+    };
+
+    static std::mutex g_mutex;
+    static std::unordered_map<uint64_t, std::array<LeftSnapshot, 16>> g_left_by_key;
+    static std::atomic<uint64_t> g_left_seq{0};
+    static std::atomic<uint64_t> g_diag_count{0};
+    static std::atomic<uint64_t> g_hit_count{0};
+    static std::atomic<uint64_t> g_apply_count{0};
+    static std::atomic<uint64_t> g_table_summary_count{0};
+    static std::atomic<uint64_t> g_table_detail_count{0};
+    static std::atomic<uint64_t> g_sbs_apply_count{0};
+    static std::atomic<uint64_t> g_resolve_xmax_seen_count{0};
+    static std::atomic<uint64_t> g_resolve_xmax_miss_count{0};
+    static std::atomic<uint64_t> g_resolve_xmax_apply_count{0};
+    static std::atomic<int> g_sbs_recon_count{0};
+    static std::atomic<int> g_sbs_resolve_count{0};
+
+    inline bool diag_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_FOG_UV_CB_DIAG");
+        return e;
+    }
+
+    inline int fix_mode() {
+        static const int m = env_int_a("UEVR_SN2_FOG_COMPOSITE_UV_CB_FIX", 0);
+        return m;
+    }
+
+    inline bool sbs_rect_fix_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_FOG_SBS_RECT_FIX");
+        return e;
+    }
+
+    inline bool resolve_xmax_fix_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_RIGHT_XMAX_FIX");
+        return e;
+    }
+
+    inline bool resolve_xmax_patch_all() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_FOG_RESOLVE_RIGHT_XMAX_ALL");
+        return e;
+    }
+
+    inline bool resolve_xmax_scan_roots() {
+        static const bool e = []() {
+            const char* v = std::getenv("UEVR_SN2_FOG_RESOLVE_RIGHT_XMAX_SCAN_ROOTS");
+            if (v == nullptr || v[0] == '\0') {
+                return true;
+            }
+            return v[0] != '0';
+        }();
+        return e;
+    }
+
+    inline int resolve_xmax_log_max() {
+        static const int n = std::max(0, env_int_a("UEVR_SN2_FOG_RESOLVE_RIGHT_XMAX_LOG_MAX", 96));
+        return n;
+    }
+
+    inline int effective_fix_mode() {
+        if (sbs_rect_fix_enabled()) {
+            return 5;
+        }
+        return fix_mode();
+    }
+
+    inline bool enabled() {
+        return diag_enabled() || fix_mode() != 0 || sbs_rect_fix_enabled() ||
+            resolve_xmax_fix_enabled();
+    }
+
+    inline uint32_t target_ps() {
+        static const uint32_t crc = env_u32_a("UEVR_SN2_FOG_UV_CB_PS", 0x4E86DC09u);
+        return crc;
+    }
+
+    inline bool target_matches(uint32_t ps_crc) {
+        const uint32_t configured = target_ps();
+        if (configured != 0) {
+            return ps_crc == configured;
+        }
+        return ps_crc == 0x4E86DC09u || ps_crc == 0xB9BE2499u || ps_crc == 0xDE7C3822u;
+    }
+
+    inline int forced_root() {
+        static const int root = env_int_a("UEVR_SN2_FOG_UV_CB_ROOT", -1);
+        return root;
+    }
+
+    inline uint32_t row0() {
+        static const uint32_t r = static_cast<uint32_t>(std::max(0, env_int_a("UEVR_SN2_FOG_UV_CB_ROW0", 12)));
+        return r;
+    }
+
+    inline uint32_t row1() {
+        static const uint32_t r = static_cast<uint32_t>(std::max(0, env_int_a("UEVR_SN2_FOG_UV_CB_ROW1", 13)));
+        return r;
+    }
+
+    inline size_t patch_bytes() {
+        static const size_t n = static_cast<size_t>(std::max(256, env_int_a("UEVR_SN2_FOG_UV_CB_BYTES", 4096)));
+        return (n + 255u) & ~size_t{255u};
+    }
+
+    inline int log_max() {
+        static const int n = std::max(0, env_int_a("UEVR_SN2_FOG_UV_CB_LOG_MAX", 96));
+        return n;
+    }
+
+    inline bool table_cb_scan_enabled() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_FOG_UV_TABLE_CB_SCAN");
+        return e;
+    }
+
+    inline uint32_t sbs_rect_root() {
+        static const uint32_t r = static_cast<uint32_t>(
+            std::clamp(env_int_a("UEVR_SN2_FOG_SBS_RECT_ROOT", 5), 0, 15));
+        return r;
+    }
+
+    inline uint32_t sbs_rect_row() {
+        static const uint32_t r = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_FOG_SBS_RECT_ROW", 0)));
+        return r;
+    }
+
+    inline float sbs_half_width() {
+        static const float v = static_cast<float>(
+            env_double_a("UEVR_SN2_FOG_SBS_RECT_HALF_WIDTH", 0.25));
+        return v;
+    }
+
+    inline float sbs_scale_y() {
+        static const float v = static_cast<float>(
+            env_double_a("UEVR_SN2_FOG_SBS_RECT_SCALE_Y", -0.499));
+        return v;
+    }
+
+    inline float sbs_center_x() {
+        static const float v = static_cast<float>(
+            env_double_a("UEVR_SN2_FOG_SBS_RECT_CENTER_X", 0.75));
+        return v;
+    }
+
+    inline float sbs_center_y() {
+        static const float v = static_cast<float>(
+            env_double_a("UEVR_SN2_FOG_SBS_RECT_CENTER_Y", 0.499));
+        return v;
+    }
+
+    inline bool sbs_patch_y() {
+        static const bool e = []() {
+            const char* v = std::getenv("UEVR_SN2_FOG_SBS_RECT_PATCH_Y");
+            if (v == nullptr || v[0] == '\0') {
+                return true;
+            }
+            return v[0] != '0';
+        }();
+        return e;
+    }
+
+    inline bool sbs_scan_roots() {
+        static const bool e = env_flag_enabled_a("UEVR_SN2_FOG_SBS_RECT_SCAN_ROOTS");
+        return e;
+    }
+
+    inline uint32_t sbs_compute_root() {
+        static const uint32_t r = static_cast<uint32_t>(
+            std::clamp(env_int_a("UEVR_SN2_FOG_SBS_RECT_COMPUTE_ROOT", 5), 0, 15));
+        return r;
+    }
+
+    inline bool sbs_compute_enabled() {
+        static const bool e = []() {
+            const char* v = std::getenv("UEVR_SN2_FOG_SBS_RECT_COMPUTE");
+            if (v == nullptr || v[0] == '\0') {
+                return true;
+            }
+            return v[0] != '0';
+        }();
+        return sbs_rect_fix_enabled() && e;
+    }
+
+    inline uint32_t resolve_xmax_root() {
+        // RenderDoc UWEFogResolveCS binding map on the transient-off UEVR
+        // capture: shader CB1 is D3D12 compute root parameter 4. CB1[149].x
+        // is the per-dispatch X limit checked before any stores.
+        static const uint32_t r = static_cast<uint32_t>(
+            std::clamp(env_int_a("UEVR_SN2_FOG_RESOLVE_RIGHT_XMAX_ROOT", 4), 0, 15));
+        return r;
+    }
+
+    inline uint32_t resolve_xmax_row() {
+        static const uint32_t r = static_cast<uint32_t>(
+            std::max(0, env_int_a("UEVR_SN2_FOG_RESOLVE_RIGHT_XMAX_ROW", 149)));
+        return r;
+    }
+
+    inline float resolve_xmax_value() {
+        static const float v = static_cast<float>(
+            env_double_a("UEVR_SN2_FOG_RESOLVE_RIGHT_XMAX", 1280.0));
+        return v;
+    }
+
+    inline bool sbs_graphics_enabled() {
+        static const bool e = []() {
+            const char* v = std::getenv("UEVR_SN2_FOG_SBS_RECT_GRAPHICS");
+            if (v == nullptr || v[0] == '\0') {
+                return true;
+            }
+            return v[0] != '0';
+        }();
+        return sbs_rect_fix_enabled() && e;
+    }
+
+    inline bool sbs_compute_target_matches(uint32_t cs_crc) {
+        // UWEFogReconstructCS + UWEFogResolveCS. MainCS is only used as the
+        // per-frame ordering reset because compute eye labels are often absent.
+        return cs_crc == sn2_fog_right_vol_redirect::recon_crc() ||
+            cs_crc == sn2_fog_right_vol_redirect::resolve_crc();
+    }
+
+    inline void sbs_note_compute_boundary(uint32_t cs_crc, int view_id, int eye_bucket) {
+        if ((!sbs_rect_fix_enabled() && !resolve_xmax_fix_enabled()) ||
+            cs_crc != sn2_fog_right_vol_redirect::main_crc()) {
+            return;
+        }
+        const bool right = view_id == 1 || eye_bucket == 2;
+        if (right) {
+            g_sbs_recon_count.store(0, std::memory_order_relaxed);
+            g_sbs_resolve_count.store(0, std::memory_order_relaxed);
+        }
+    }
+
+    inline bool sbs_compute_is_right_eye(uint32_t cs_crc, int view_id, int eye_bucket) {
+        if (view_id == 1 || eye_bucket == 2) {
+            return true;
+        }
+        if (view_id == 0 || eye_bucket == 1) {
+            return false;
+        }
+        if (cs_crc == sn2_fog_right_vol_redirect::recon_crc()) {
+            return g_sbs_recon_count.fetch_add(1, std::memory_order_relaxed) + 1 >= 2;
+        }
+        if (cs_crc == sn2_fog_right_vol_redirect::resolve_crc()) {
+            return g_sbs_resolve_count.fetch_add(1, std::memory_order_relaxed) + 1 >= 2;
+        }
+        return false;
+    }
+
+    inline uint32_t table_cb_scan_slots() {
+        static const uint32_t n = static_cast<uint32_t>(
+            std::clamp(env_int_a("UEVR_SN2_FOG_UV_TABLE_SCAN_SLOTS", 128), 1, 2048));
+        return n;
+    }
+
+    inline int table_cb_log_max() {
+        static const int n = std::max(0, env_int_a("UEVR_SN2_FOG_UV_TABLE_CB_LOG_MAX", 96));
+        return n;
+    }
+
+    inline size_t required_row_bytes() {
+        const size_t off0 = static_cast<size_t>(row0()) * 16u;
+        const size_t off1 = static_cast<size_t>(row1()) * 16u;
+        return std::max(off0, off1) + 16u;
+    }
+
+    static bool finite(float v) {
+        return v == v && v > -1000000.0f && v < 1000000.0f;
+    }
+
+    static bool uvish(const std::array<float, 4>& f) {
+        int n = 0;
+        for (const float v : f) {
+            if (finite(v) && v >= -0.05f && v <= 1.05f) {
+                ++n;
+            }
+        }
+        return n >= 2;
+    }
+
+    static float row_delta_score(const std::array<float, 4>& l, const std::array<float, 4>& r) {
+        float score = 0.0f;
+        for (size_t i = 0; i < l.size(); ++i) {
+            if (finite(l[i]) && finite(r[i])) {
+                score = std::max(score, std::abs(r[i] - l[i]));
+            }
+        }
+        return score;
+    }
+
+    static bool looks_like_right_half_uv(const Rows& left, const Rows& right) {
+        const auto test = [](const std::array<float, 4>& l, const std::array<float, 4>& r) {
+            if (!uvish(l) || !uvish(r)) {
+                return false;
+            }
+            const float d0 = r[0] - l[0];
+            const float d2 = r[2] - l[2];
+            const bool shifted = (d0 > 0.30f && d0 < 0.70f) || (d2 > 0.30f && d2 < 0.70f);
+            const bool right_half = r[0] > 0.35f || r[2] > 0.35f;
+            const bool left_half = l[0] < 0.65f || l[2] < 0.65f;
+            return shifted && right_half && left_half;
+        };
+        return test(left.row0f, right.row0f) || test(left.row1f, right.row1f);
+    }
+
+    static Rows read(D3D12_GPU_VIRTUAL_ADDRESS va) {
+        Rows out{};
+        if (va == 0) {
+            return out;
+        }
+        const uint32_t r0 = row0();
+        const uint32_t r1 = row1();
+        const size_t off0 = static_cast<size_t>(r0) * 16u;
+        const size_t off1 = static_cast<size_t>(r1) * 16u;
+        const size_t required = std::max(off0, off1) + 16u;
+        uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, required);
+        if (cpu == nullptr) {
+            return out;
+        }
+
+        __try {
+            std::memcpy(out.row0.data(), cpu + off0, out.row0.size());
+            std::memcpy(out.row1.data(), cpu + off1, out.row1.size());
+            std::memcpy(out.row0f.data(), out.row0.data(), sizeof(float) * out.row0f.size());
+            std::memcpy(out.row1f.data(), out.row1.data(), sizeof(float) * out.row1f.size());
+            out.hash = sn2_descriptor_registry::fnv1a64(out.row0.data(), out.row0.size());
+            out.hash ^= sn2_descriptor_registry::fnv1a64(out.row1.data(), out.row1.size()) + 0x9e3779b97f4a7c15ull + (out.hash << 6) + (out.hash >> 2);
+            out.mapped = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            out = {};
+        }
+        return out;
+    }
+
+    static bool copy_original_cb(D3D12_GPU_VIRTUAL_ADDRESS va, std::vector<uint8_t>& out) {
+        const size_t n = patch_bytes();
+        uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, n);
+        if (cpu == nullptr && sn2_upload_buf_map::try_map_for_gpu_va(va, n)) {
+            cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, n);
+        }
+        if (cpu == nullptr) {
+            return false;
+        }
+        out.resize(n);
+        __try {
+            std::memcpy(out.data(), cpu, n);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            out.clear();
+            return false;
+        }
+        return true;
+    }
+
+    static bool read_cb_row(
+        D3D12_GPU_VIRTUAL_ADDRESS va,
+        uint32_t row,
+        std::array<float, 4>& out)
+    {
+        if (va == 0) {
+            return false;
+        }
+        const size_t off = static_cast<size_t>(row) * 16u;
+        uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, off + 16u);
+        if (cpu == nullptr && sn2_upload_buf_map::try_map_for_gpu_va(va, off + 16u)) {
+            cpu = sn2_upload_buf_map::gpu_va_to_cpu(va, off + 16u);
+        }
+        if (cpu == nullptr) {
+            return false;
+        }
+        __try {
+            std::memcpy(out.data(), cpu + off, sizeof(float) * out.size());
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            out = {};
+            return false;
+        }
+        return true;
+    }
+
+    static bool looks_like_resolve_xmax_row(const std::array<float, 4>& f) {
+        // RenderDoc UWEFogResolveCS CB1[149] was:
+        // (640,720,1/640,1/720). We patch x to the full SBS width (1280),
+        // but y and reciprocal terms should still look like a screen limit row.
+        return finite(f[0]) && finite(f[1]) && finite(f[2]) && finite(f[3]) &&
+            f[0] >= 256.0f && f[0] <= 4096.0f &&
+            f[1] >= 256.0f && f[1] <= 4096.0f &&
+            f[2] > 0.00001f && f[2] < 0.01f &&
+            f[3] > 0.00001f && f[3] < 0.01f;
+    }
+
+    static bool select_resolve_xmax_root(
+        const CommandListCorrelationState::RootSlotArray& cbvs,
+        uint32_t& root,
+        D3D12_GPU_VIRTUAL_ADDRESS& va,
+        std::array<float, 4>& row_before)
+    {
+        root = UINT_MAX;
+        va = 0;
+        row_before = {};
+
+        const uint32_t row = resolve_xmax_row();
+        const uint32_t preferred = resolve_xmax_root();
+        auto try_root = [&](uint32_t r) -> bool {
+            if (r >= cbvs.size() || cbvs[r] == 0) {
+                return false;
+            }
+            std::array<float, 4> candidate{};
+            if (!read_cb_row(static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(cbvs[r]), row, candidate)) {
+                return false;
+            }
+            if (resolve_xmax_scan_roots() && !looks_like_resolve_xmax_row(candidate)) {
+                return false;
+            }
+            root = r;
+            va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(cbvs[r]);
+            row_before = candidate;
+            return true;
+        };
+
+        if (try_root(preferred)) {
+            return true;
+        }
+        if (!resolve_xmax_scan_roots()) {
+            return false;
+        }
+        for (uint32_t r = 0; r < cbvs.size(); ++r) {
+            if (r == preferred) {
+                continue;
+            }
+            if (try_root(r)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    struct SbsPatchResult {
+        bool ok{};
+        std::array<float, 4> before{};
+        std::array<float, 4> after{};
+    };
+
+    static SbsPatchResult patch_sbs_rect_row(std::vector<uint8_t>& cb) {
+        SbsPatchResult out{};
+        const size_t off = static_cast<size_t>(sbs_rect_row()) * 16u;
+        if (off + 16u > cb.size()) {
+            return out;
+        }
+
+        std::memcpy(out.before.data(), cb.data() + off, sizeof(float) * out.before.size());
+        out.after = out.before;
+        out.after[0] = sbs_half_width();
+        out.after[2] = sbs_center_x();
+        if (sbs_patch_y()) {
+            out.after[1] = sbs_scale_y();
+            out.after[3] = sbs_center_y();
+        }
+        std::memcpy(cb.data() + off, out.after.data(), sizeof(float) * out.after.size());
+        out.ok = true;
+        return out;
+    }
+
+    static SbsPatchResult patch_row_x(
+        std::vector<uint8_t>& cb,
+        uint32_t row,
+        float value)
+    {
+        SbsPatchResult out{};
+        const size_t off = static_cast<size_t>(row) * 16u;
+        if (off + 16u > cb.size()) {
+            return out;
+        }
+
+        std::memcpy(out.before.data(), cb.data() + off, sizeof(float) * out.before.size());
+        out.after = out.before;
+        out.after[0] = value;
+        std::memcpy(cb.data() + off, out.after.data(), sizeof(float) * out.after.size());
+        out.ok = true;
+        return out;
+    }
+
+    static uint32_t select_sbs_cbv_root(const CommandListCorrelationState::RootSlotArray& cbvs, bool compute) {
+        const int forced = forced_root();
+        const uint32_t preferred = compute ? sbs_compute_root() : sbs_rect_root();
+        const size_t required = static_cast<size_t>(sbs_rect_row()) * 16u + 16u;
+
+        auto usable = [&](uint32_t root) {
+            if (root >= cbvs.size() || cbvs[root] == 0) {
+                return false;
+            }
+            return sn2_upload_buf_map::gpu_va_to_cpu(
+                static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(cbvs[root]),
+                std::max<size_t>(required, 256u)) != nullptr;
+        };
+
+        if (forced >= 0) {
+            const uint32_t r = static_cast<uint32_t>(forced);
+            return usable(r) ? r : UINT_MAX;
+        }
+        if (usable(preferred)) {
+            return preferred;
+        }
+        if (sbs_scan_roots()) {
+            for (uint32_t root = 0; root < cbvs.size(); ++root) {
+                if (usable(root)) {
+                    return root;
+                }
+            }
+        }
+        return UINT_MAX;
+    }
+
+    static bool make_sbs_patched_cb(
+        D3D12_GPU_VIRTUAL_ADDRESS original_va,
+        std::vector<uint8_t>& patched,
+        SbsPatchResult& patch)
+    {
+        if (!copy_original_cb(original_va, patched)) {
+            return false;
+        }
+        patch = patch_sbs_rect_row(patched);
+        return patch.ok;
+    }
+
+    static uint64_t class_key(const CommandListCorrelationState& state, uint32_t ps_crc) {
+        return (static_cast<uint64_t>(ps_crc) << 32) ^
+            (reinterpret_cast<uintptr_t>(state.current_pso) & 0xffffffffull);
+    }
+
+    static void log_bound_table_cbvs(
+        const CommandListCorrelationState& state,
+        const char* draw_kind,
+        int view_id,
+        uint32_t ps_crc)
+    {
+        if (!table_cb_scan_enabled()) {
+            return;
+        }
+
+        const int max_logs = table_cb_log_max();
+        if (max_logs <= 0) {
+            return;
+        }
+
+        const auto summary_n = g_table_summary_count.fetch_add(1, std::memory_order_relaxed);
+        if (summary_n >= static_cast<uint64_t>(max_logs)) {
+            return;
+        }
+
+        const uint32_t scan_slots = table_cb_scan_slots();
+        uint32_t nonzero_tables = 0;
+        uint32_t resolved_tables = 0;
+        uint32_t scanned_slots = 0;
+        uint32_t entries = 0;
+        uint32_t cbv_entries = 0;
+        uint32_t mapped_cbvs = 0;
+        uint32_t uvish_cbvs = 0;
+
+        for (uint32_t root = 0; root < state.last_graphics_root_desc_tables.size(); ++root) {
+            const uint64_t table_gpu = state.last_graphics_root_desc_tables[root];
+            if (table_gpu == 0) {
+                continue;
+            }
+            ++nonzero_tables;
+
+            SIZE_T cpu_base = 0;
+            UINT stride = 0;
+            if (!bindless_heap_registry().resolve(table_gpu, cpu_base, stride) || stride == 0) {
+                continue;
+            }
+            ++resolved_tables;
+
+            for (uint32_t slot = 0; slot < scan_slots; ++slot) {
+                ++scanned_slots;
+                const SIZE_T slot_cpu = cpu_base + static_cast<SIZE_T>(slot) * static_cast<SIZE_T>(stride);
+                sn2_descriptor_registry::Entry entry{};
+                if (!sn2_descriptor_registry::lookup_entry_by_cpu_ptr_or_hash(slot_cpu, entry)) {
+                    continue;
+                }
+                ++entries;
+                if (entry.kind != sn2_descriptor_registry::Kind::CBV || !entry.has_cbv_desc) {
+                    continue;
+                }
+                ++cbv_entries;
+
+                const Rows rows = read(entry.cbv_desc.BufferLocation);
+                if (rows.mapped) {
+                    ++mapped_cbvs;
+                }
+                const bool row0_uv = rows.mapped && uvish(rows.row0f);
+                const bool row1_uv = rows.mapped && uvish(rows.row1f);
+                if (row0_uv || row1_uv) {
+                    ++uvish_cbvs;
+                }
+
+                const auto detail_n = g_table_detail_count.fetch_add(1, std::memory_order_relaxed);
+                if (detail_n < static_cast<uint64_t>(max_logs)) {
+                    SPDLOG_WARN(
+                        "[SN2-FogUV-TableCBV] n={} kind={} eye={} ps=0x{:08x} root={} slot={} "
+                        "table=0x{:x} cpu=0x{:x} cbv=0x{:x} size={} mapped={} uvish={}/{} rows={},{} "
+                        "r0=({:.6f},{:.6f},{:.6f},{:.6f}) r1=({:.6f},{:.6f},{:.6f},{:.6f}) hash=0x{:016x}",
+                        detail_n + 1,
+                        draw_kind ? draw_kind : "?",
+                        view_id,
+                        ps_crc,
+                        root,
+                        slot,
+                        table_gpu,
+                        static_cast<uintptr_t>(slot_cpu),
+                        static_cast<uint64_t>(entry.cbv_desc.BufferLocation),
+                        entry.cbv_desc.SizeInBytes,
+                        rows.mapped ? 1 : 0,
+                        row0_uv ? 1 : 0,
+                        row1_uv ? 1 : 0,
+                        row0(),
+                        row1(),
+                        rows.row0f[0], rows.row0f[1], rows.row0f[2], rows.row0f[3],
+                        rows.row1f[0], rows.row1f[1], rows.row1f[2], rows.row1f[3],
+                        rows.hash);
+                }
+            }
+        }
+
+        SPDLOG_WARN(
+            "[SN2-FogUV-TableScan] n={} kind={} eye={} ps=0x{:08x} roots_nonzero={} roots_resolved={} "
+            "scan_slots={} slots_scanned={} entries={} cbvs={} mapped_cbvs={} uvish_cbvs={} registry={} heaps={}",
+            summary_n + 1,
+            draw_kind ? draw_kind : "?",
+            view_id,
+            ps_crc,
+            nonzero_tables,
+            resolved_tables,
+            scan_slots,
+            scanned_slots,
+            entries,
+            cbv_entries,
+            mapped_cbvs,
+            uvish_cbvs,
+            sn2_descriptor_registry::registry_size(),
+            bindless_heap_registry().count());
+    }
+}
+
+static void sn2_log_fog_composite_uv_cb_snapshot(
+    const CommandListCorrelationState& state,
+    const char* draw_kind)
+{
+    if (!sn2_fog_uv_cb::diag_enabled() || state.current_pso == nullptr) {
+        return;
+    }
+
+    const uint32_t ps_crc = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(
+        reinterpret_cast<uintptr_t>(state.current_pso));
+    if (!sn2_fog_uv_cb::target_matches(ps_crc)) {
+        return;
+    }
+    const int view_id = cmdlist_view_id(state);
+    if (view_id != 0 && view_id != 1) {
+        return;
+    }
+
+    const int max_logs = sn2_fog_uv_cb::log_max();
+    if (max_logs <= 0) {
+        return;
+    }
+
+    const uint64_t base_n = sn2_fog_uv_cb::g_diag_count.load(std::memory_order_relaxed);
+    if (base_n >= static_cast<uint64_t>(max_logs)) {
+        return;
+    }
+
+    const auto hit_n = sn2_fog_uv_cb::g_hit_count.fetch_add(1, std::memory_order_relaxed);
+    if (hit_n < 48 || (hit_n % 1000) == 0) {
+        uint32_t mapped_roots = 0;
+        uint32_t nonzero_roots = 0;
+        for (uint32_t root = 0; root < state.last_graphics_root_cbv.size(); ++root) {
+            const auto va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(state.last_graphics_root_cbv[root]);
+            if (va == 0) {
+                continue;
+            }
+            ++nonzero_roots;
+            if (sn2_upload_buf_map::gpu_va_to_cpu(va, std::max<size_t>(
+                    (static_cast<size_t>(sn2_fog_uv_cb::row1()) + 1u) * 16u,
+                    256u)) != nullptr) {
+                ++mapped_roots;
+            }
+        }
+        SPDLOG_WARN(
+            "[SN2-FogUV-Hit] n={} kind={} eye={} ps=0x{:08x} nonzero_cbv_roots={} mapped_cbv_roots={} forced_root={} rows={},{}",
+            hit_n + 1,
+            draw_kind ? draw_kind : "?",
+            view_id,
+            ps_crc,
+            nonzero_roots,
+            mapped_roots,
+            sn2_fog_uv_cb::forced_root(),
+            sn2_fog_uv_cb::row0(),
+            sn2_fog_uv_cb::row1());
+    }
+
+    sn2_fog_uv_cb::log_bound_table_cbvs(state, draw_kind, view_id, ps_crc);
+
+    const int root_forced = sn2_fog_uv_cb::forced_root();
+    bool logged_row = false;
+    for (uint32_t root = 0; root < state.last_graphics_root_cbv.size(); ++root) {
+        if (root_forced >= 0 && root != static_cast<uint32_t>(root_forced)) {
+            continue;
+        }
+        const auto va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(state.last_graphics_root_cbv[root]);
+        const auto rows = sn2_fog_uv_cb::read(va);
+        if (!rows.mapped || (!sn2_fog_uv_cb::uvish(rows.row0f) && !sn2_fog_uv_cb::uvish(rows.row1f))) {
+            continue;
+        }
+
+        const auto n = sn2_fog_uv_cb::g_diag_count.fetch_add(1, std::memory_order_relaxed);
+        if (n >= static_cast<uint64_t>(max_logs)) {
+            return;
+        }
+        SPDLOG_WARN(
+            "[SN2-FogUV-CB] n={} kind={} eye={} ps=0x{:08x} root={} cbv=0x{:x} rows={},{} "
+            "r0=({:.6f},{:.6f},{:.6f},{:.6f}) r1=({:.6f},{:.6f},{:.6f},{:.6f}) hash=0x{:016x}",
+            n + 1,
+            draw_kind ? draw_kind : "?",
+            view_id,
+            ps_crc,
+            root,
+            static_cast<uint64_t>(va),
+            sn2_fog_uv_cb::row0(),
+            sn2_fog_uv_cb::row1(),
+            rows.row0f[0], rows.row0f[1], rows.row0f[2], rows.row0f[3],
+            rows.row1f[0], rows.row1f[1], rows.row1f[2], rows.row1f[3],
+            rows.hash);
+        logged_row = true;
+    }
+
+    if (!logged_row && hit_n < 48) {
+        SPDLOG_WARN(
+            "[SN2-FogUV-NoRows] kind={} eye={} ps=0x{:08x} no mapped UV-like rows at rows={},{}",
+            draw_kind ? draw_kind : "?",
+            view_id,
+            ps_crc,
+            sn2_fog_uv_cb::row0(),
+            sn2_fog_uv_cb::row1());
+    }
+}
+
+static bool sn2_begin_fog_composite_uv_cb_patch(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    Sn2Pso3069CbvScope& scope)
+{
+    const int mode = sn2_fog_uv_cb::effective_fix_mode();
+    if (mode == 0 ||
+        command_list == nullptr ||
+        state.current_pso == nullptr ||
+        g_sn2_water_chain_cbv_rebind_depth != 0) {
+        return false;
+    }
+
+    const uint32_t ps_crc = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(
+        reinterpret_cast<uintptr_t>(state.current_pso));
+    if (!sn2_fog_uv_cb::target_matches(ps_crc)) {
+        return false;
+    }
+
+    const int view_id = cmdlist_view_id(state);
+    if (view_id != 0 && view_id != 1) {
+        return false;
+    }
+
+    if (mode == 5) {
+        if (!sn2_fog_uv_cb::sbs_graphics_enabled() || view_id != 1) {
+            return false;
+        }
+
+        const uint32_t chosen_root = sn2_fog_uv_cb::select_sbs_cbv_root(
+            state.last_graphics_root_cbv,
+            false);
+        if (chosen_root == UINT_MAX) {
+            return false;
+        }
+
+        const auto right_va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(
+            state.last_graphics_root_cbv[chosen_root]);
+        std::vector<uint8_t> patched;
+        sn2_fog_uv_cb::SbsPatchResult patch{};
+        if (!sn2_fog_uv_cb::make_sbs_patched_cb(right_va, patched, patch)) {
+            return false;
+        }
+
+        auto* d3d12 = g_d3d12_hook;
+        ID3D12Device* device = d3d12 != nullptr ? d3d12->get_device() : nullptr;
+        if (device == nullptr) {
+            return false;
+        }
+
+        const auto n = sn2_fog_uv_cb::g_sbs_apply_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        const std::string upload_name = fmt::format(
+            "sn2_fog_sbs_gfx_{:08x}_root{}_row{}_{}",
+            ps_crc,
+            chosen_root,
+            sn2_fog_uv_cb::sbs_rect_row(),
+            n);
+        const auto patched_va = bind_override_uploads::get_or_create(device, upload_name, patched);
+        if (patched_va == 0) {
+            return false;
+        }
+
+        scope.active = true;
+        scope.command_list = command_list;
+        scope.restore_cbvs[chosen_root] = right_va;
+        scope.active_cbvs[chosen_root] = patched_va;
+        scope.restore_root[chosen_root] = true;
+
+        ++g_sn2_water_chain_cbv_rebind_depth;
+        command_list->SetGraphicsRootConstantBufferView(chosen_root, patched_va);
+        --g_sn2_water_chain_cbv_rebind_depth;
+
+        if (n <= 64 || (n % 300) == 0) {
+            SPDLOG_WARN(
+                "[SN2-FogSBSRectFix][GFX] count={} ps=0x{:08x} root={} row={} cb=0x{:x}->0x{:x} "
+                "before=({:.6f},{:.6f},{:.6f},{:.6f}) after=({:.6f},{:.6f},{:.6f},{:.6f})",
+                n,
+                ps_crc,
+                chosen_root,
+                sn2_fog_uv_cb::sbs_rect_row(),
+                static_cast<uint64_t>(right_va),
+                static_cast<uint64_t>(patched_va),
+                patch.before[0], patch.before[1], patch.before[2], patch.before[3],
+                patch.after[0], patch.after[1], patch.after[2], patch.after[3]);
+        }
+
+        return true;
+    }
+
+    const uint64_t key = sn2_fog_uv_cb::class_key(state, ps_crc);
+    const int root_forced = sn2_fog_uv_cb::forced_root();
+
+    if (view_id == 0) {
+        std::array<sn2_fog_uv_cb::LeftSnapshot, 16> snaps{};
+        bool any = false;
+        for (uint32_t root = 0; root < state.last_graphics_root_cbv.size() && root < snaps.size(); ++root) {
+            if (root_forced >= 0 && root != static_cast<uint32_t>(root_forced)) {
+                continue;
+            }
+            const auto va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(state.last_graphics_root_cbv[root]);
+            auto rows = sn2_fog_uv_cb::read(va);
+            if (!rows.mapped || (!sn2_fog_uv_cb::uvish(rows.row0f) && !sn2_fog_uv_cb::uvish(rows.row1f))) {
+                continue;
+            }
+            auto& snap = snaps[root];
+            snap.valid = true;
+            snap.root = root;
+            snap.cbv = static_cast<uint64_t>(va);
+            snap.rows = rows;
+            snap.seq = sn2_fog_uv_cb::g_left_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            any = true;
+        }
+        if (any) {
+            std::scoped_lock _{sn2_fog_uv_cb::g_mutex};
+            sn2_fog_uv_cb::g_left_by_key[key] = snaps;
+        }
+        return false;
+    }
+
+    std::array<sn2_fog_uv_cb::LeftSnapshot, 16> lefts{};
+    {
+        std::scoped_lock _{sn2_fog_uv_cb::g_mutex};
+        const auto it = sn2_fog_uv_cb::g_left_by_key.find(key);
+        if (it == sn2_fog_uv_cb::g_left_by_key.end()) {
+            return false;
+        }
+        lefts = it->second;
+    }
+
+    uint32_t chosen_root = UINT_MAX;
+    sn2_fog_uv_cb::Rows right_rows{};
+    sn2_fog_uv_cb::LeftSnapshot left{};
+    for (uint32_t root = 0; root < state.last_graphics_root_cbv.size() && root < lefts.size(); ++root) {
+        if (root_forced >= 0 && root != static_cast<uint32_t>(root_forced)) {
+            continue;
+        }
+        if (!lefts[root].valid) {
+            continue;
+        }
+        const auto va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(state.last_graphics_root_cbv[root]);
+        auto rows = sn2_fog_uv_cb::read(va);
+        if (!rows.mapped) {
+            continue;
+        }
+        const bool forced = root_forced >= 0;
+        if (!forced && !sn2_fog_uv_cb::looks_like_right_half_uv(lefts[root].rows, rows)) {
+            continue;
+        }
+        chosen_root = root;
+        right_rows = rows;
+        left = lefts[root];
+        break;
+    }
+
+    if (chosen_root == UINT_MAX) {
+        return false;
+    }
+
+    const auto right_va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(state.last_graphics_root_cbv[chosen_root]);
+    std::vector<uint8_t> patched;
+    if (!sn2_fog_uv_cb::copy_original_cb(right_va, patched)) {
+        return false;
+    }
+
+    const size_t off0 = static_cast<size_t>(sn2_fog_uv_cb::row0()) * 16u;
+    const size_t off1 = static_cast<size_t>(sn2_fog_uv_cb::row1()) * 16u;
+    if (off0 + 16u > patched.size() || off1 + 16u > patched.size()) {
+        return false;
+    }
+
+    if (mode == 1 || mode == 2) {
+        std::memcpy(patched.data() + off0, left.rows.row0.data(), left.rows.row0.size());
+    }
+    if (mode == 1 || mode == 3) {
+        std::memcpy(patched.data() + off1, left.rows.row1.data(), left.rows.row1.size());
+    }
+    if (mode == 4) {
+        // Diagnostic variant: keep right data but translate common x rect fields
+        // from SBS-right space back into eye-local space.
+        const float bias = static_cast<float>(env_double_a("UEVR_SN2_FOG_UV_CB_X_BIAS", 0.5));
+        auto patch_row = [&](size_t off) {
+            float f[4]{};
+            std::memcpy(f, patched.data() + off, sizeof(f));
+            if (sn2_fog_uv_cb::finite(f[0])) f[0] -= bias;
+            if (sn2_fog_uv_cb::finite(f[2])) f[2] -= bias;
+            std::memcpy(patched.data() + off, f, sizeof(f));
+        };
+        patch_row(off0);
+        patch_row(off1);
+    }
+
+    auto* d3d12 = g_d3d12_hook;
+    ID3D12Device* device = d3d12 != nullptr ? d3d12->get_device() : nullptr;
+    if (device == nullptr) {
+        return false;
+    }
+
+    const auto n = sn2_fog_uv_cb::g_apply_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const std::string upload_name = fmt::format(
+        "sn2_fog_uv_cb_{:016x}_root{}_mode{}_{}",
+        key,
+        chosen_root,
+        mode,
+        n);
+    const auto patched_va = bind_override_uploads::get_or_create(device, upload_name, patched);
+    if (patched_va == 0) {
+        return false;
+    }
+
+    scope.active = true;
+    scope.command_list = command_list;
+    scope.restore_cbvs[chosen_root] = right_va;
+    scope.active_cbvs[chosen_root] = patched_va;
+    scope.restore_root[chosen_root] = true;
+
+    ++g_sn2_water_chain_cbv_rebind_depth;
+    command_list->SetGraphicsRootConstantBufferView(chosen_root, patched_va);
+    --g_sn2_water_chain_cbv_rebind_depth;
+
+    if (n <= 64 || (n % 300) == 0) {
+        SPDLOG_WARN(
+            "[SN2-FogUV-CBFix] count={} mode={} ps=0x{:08x} root={} cb=0x{:x}->0x{:x} "
+            "left_cb=0x{:x} left_seq={} rows={},{} "
+            "left_r0=({:.6f},{:.6f},{:.6f},{:.6f}) right_r0=({:.6f},{:.6f},{:.6f},{:.6f}) "
+            "left_r1=({:.6f},{:.6f},{:.6f},{:.6f}) right_r1=({:.6f},{:.6f},{:.6f},{:.6f})",
+            n,
+            mode,
+            ps_crc,
+            chosen_root,
+            static_cast<uint64_t>(right_va),
+            static_cast<uint64_t>(patched_va),
+            left.cbv,
+            left.seq,
+            sn2_fog_uv_cb::row0(),
+            sn2_fog_uv_cb::row1(),
+            left.rows.row0f[0], left.rows.row0f[1], left.rows.row0f[2], left.rows.row0f[3],
+            right_rows.row0f[0], right_rows.row0f[1], right_rows.row0f[2], right_rows.row0f[3],
+            left.rows.row1f[0], left.rows.row1f[1], left.rows.row1f[2], left.rows.row1f[3],
+            right_rows.row1f[0], right_rows.row1f[1], right_rows.row1f[2], right_rows.row1f[3]);
+    }
+
+    return true;
+}
+
+static bool sn2_begin_fog_sbs_compute_rect_patch(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    uint32_t cs_crc,
+    UINT& restore_root,
+    uint64_t& restore_va)
+{
+    restore_root = UINT_MAX;
+    restore_va = 0;
+
+    if (command_list == nullptr ||
+        cs_crc == 0 ||
+        (!sn2_fog_uv_cb::sbs_compute_enabled() &&
+         !sn2_fog_uv_cb::resolve_xmax_fix_enabled())) {
+        return false;
+    }
+
+    const int view_id = cmdlist_view_id(state);
+    const int eye_bucket = cmdlist_eye_bucket(state);
+    sn2_fog_uv_cb::sbs_note_compute_boundary(cs_crc, view_id, eye_bucket);
+
+    if (sn2_fog_uv_cb::resolve_xmax_fix_enabled() &&
+        cs_crc == sn2_fog_right_vol_redirect::resolve_crc())
+    {
+        const auto seen_n = sn2_fog_uv_cb::g_resolve_xmax_seen_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        const bool treat_as_right = sn2_fog_uv_cb::resolve_xmax_patch_all() ||
+            sn2_fog_uv_cb::sbs_compute_is_right_eye(cs_crc, view_id, eye_bucket);
+        if (!treat_as_right) {
+            const int max_logs = sn2_fog_uv_cb::resolve_xmax_log_max();
+            if (static_cast<int>(seen_n) <= max_logs) {
+                SPDLOG_WARN(
+                    "[SN2-FogResolveXMaxFix][CS-MISS] reason=not_right seen={} cs=0x{:08x} eye_id={} bucket={} patch_all={}",
+                    seen_n,
+                    cs_crc,
+                    view_id,
+                    eye_bucket,
+                    sn2_fog_uv_cb::resolve_xmax_patch_all() ? 1 : 0);
+            }
+            return false;
+        }
+
+        uint32_t chosen_root = UINT_MAX;
+        D3D12_GPU_VIRTUAL_ADDRESS right_va = 0;
+        std::array<float, 4> selected_row{};
+        if (!sn2_fog_uv_cb::select_resolve_xmax_root(
+                state.last_compute_root_cbv,
+                chosen_root,
+                right_va,
+                selected_row)) {
+            const auto miss_n = sn2_fog_uv_cb::g_resolve_xmax_miss_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            const int max_logs = sn2_fog_uv_cb::resolve_xmax_log_max();
+            if (static_cast<int>(miss_n) <= max_logs) {
+                SPDLOG_WARN(
+                    "[SN2-FogResolveXMaxFix][CS-MISS] reason=no_cbv seen={} miss={} cs=0x{:08x} eye_id={} bucket={} preferred_root={} row={} scan={} "
+                    "roots=({:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x})",
+                    seen_n,
+                    miss_n,
+                    cs_crc,
+                    view_id,
+                    eye_bucket,
+                    sn2_fog_uv_cb::resolve_xmax_root(),
+                    sn2_fog_uv_cb::resolve_xmax_row(),
+                    sn2_fog_uv_cb::resolve_xmax_scan_roots() ? 1 : 0,
+                    static_cast<uint64_t>(state.last_compute_root_cbv[0]),
+                    static_cast<uint64_t>(state.last_compute_root_cbv[1]),
+                    static_cast<uint64_t>(state.last_compute_root_cbv[2]),
+                    static_cast<uint64_t>(state.last_compute_root_cbv[3]),
+                    static_cast<uint64_t>(state.last_compute_root_cbv[4]),
+                    static_cast<uint64_t>(state.last_compute_root_cbv[5]),
+                    static_cast<uint64_t>(state.last_compute_root_cbv[6]),
+                    static_cast<uint64_t>(state.last_compute_root_cbv[7]));
+            }
+            return false;
+        }
+
+        std::vector<uint8_t> patched;
+        if (!sn2_fog_uv_cb::copy_original_cb(right_va, patched)) {
+            const auto miss_n = sn2_fog_uv_cb::g_resolve_xmax_miss_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            const int max_logs = sn2_fog_uv_cb::resolve_xmax_log_max();
+            if (static_cast<int>(miss_n) <= max_logs) {
+                SPDLOG_WARN(
+                    "[SN2-FogResolveXMaxFix][CS-MISS] reason=copy_failed seen={} miss={} cs=0x{:08x} root={} cb=0x{:x}",
+                    seen_n,
+                    miss_n,
+                    cs_crc,
+                    chosen_root,
+                    static_cast<uint64_t>(right_va));
+            }
+            return false;
+        }
+
+        const auto row = sn2_fog_uv_cb::resolve_xmax_row();
+        auto patch = sn2_fog_uv_cb::patch_row_x(
+            patched,
+            row,
+            sn2_fog_uv_cb::resolve_xmax_value());
+        if (!patch.ok) {
+            const auto miss_n = sn2_fog_uv_cb::g_resolve_xmax_miss_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            const int max_logs = sn2_fog_uv_cb::resolve_xmax_log_max();
+            if (static_cast<int>(miss_n) <= max_logs) {
+                SPDLOG_WARN(
+                    "[SN2-FogResolveXMaxFix][CS-MISS] reason=patch_failed seen={} miss={} cs=0x{:08x} root={} row={} cb=0x{:x}",
+                    seen_n,
+                    miss_n,
+                    cs_crc,
+                    chosen_root,
+                    row,
+                    static_cast<uint64_t>(right_va));
+            }
+            return false;
+        }
+
+        auto* d3d12 = g_d3d12_hook;
+        ID3D12Device* device = d3d12 != nullptr ? d3d12->get_device() : nullptr;
+        if (device == nullptr) {
+            const auto miss_n = sn2_fog_uv_cb::g_resolve_xmax_miss_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            const int max_logs = sn2_fog_uv_cb::resolve_xmax_log_max();
+            if (static_cast<int>(miss_n) <= max_logs) {
+                SPDLOG_WARN(
+                    "[SN2-FogResolveXMaxFix][CS-MISS] reason=no_device seen={} miss={} cs=0x{:08x}",
+                    seen_n,
+                    miss_n,
+                    cs_crc);
+            }
+            return false;
+        }
+
+        const auto n = sn2_fog_uv_cb::g_resolve_xmax_apply_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        const std::string upload_name = fmt::format(
+            "sn2_fog_resolve_xmax_{:08x}_root{}_row{}_{}",
+            cs_crc,
+            chosen_root,
+            row,
+            n);
+        const auto patched_va = bind_override_uploads::get_or_create(device, upload_name, patched);
+        if (patched_va == 0) {
+            const auto miss_n = sn2_fog_uv_cb::g_resolve_xmax_miss_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            const int max_logs = sn2_fog_uv_cb::resolve_xmax_log_max();
+            if (static_cast<int>(miss_n) <= max_logs) {
+                SPDLOG_WARN(
+                    "[SN2-FogResolveXMaxFix][CS-MISS] reason=upload_failed seen={} miss={} cs=0x{:08x} root={} row={} cb=0x{:x}",
+                    seen_n,
+                    miss_n,
+                    cs_crc,
+                    chosen_root,
+                    row,
+                    static_cast<uint64_t>(right_va));
+            }
+            return false;
+        }
+
+        restore_root = chosen_root;
+        restore_va = static_cast<uint64_t>(right_va);
+        command_list->SetComputeRootConstantBufferView(chosen_root, patched_va);
+
+        if (n <= 64 || (n % 300) == 0) {
+            SPDLOG_WARN(
+                "[SN2-FogResolveXMaxFix][CS] count={} seen={} cs=0x{:08x} eye_id={} bucket={} root={} row={} "
+                "cb=0x{:x}->0x{:x} before=({:.6f},{:.6f},{:.6f},{:.6f}) "
+                "after=({:.6f},{:.6f},{:.6f},{:.6f}) selected=({:.6f},{:.6f},{:.6f},{:.6f}) patch_all={}",
+                n,
+                seen_n,
+                cs_crc,
+                view_id,
+                eye_bucket,
+                chosen_root,
+                row,
+                static_cast<uint64_t>(right_va),
+                static_cast<uint64_t>(patched_va),
+                patch.before[0], patch.before[1], patch.before[2], patch.before[3],
+                patch.after[0], patch.after[1], patch.after[2], patch.after[3],
+                selected_row[0], selected_row[1], selected_row[2], selected_row[3],
+                sn2_fog_uv_cb::resolve_xmax_patch_all() ? 1 : 0);
+        }
+
+        return true;
+    }
+
+    if (!sn2_fog_uv_cb::sbs_compute_enabled()) {
+        return false;
+    }
+
+    if (!sn2_fog_uv_cb::sbs_compute_target_matches(cs_crc)) {
+        return false;
+    }
+    if (!sn2_fog_uv_cb::sbs_compute_is_right_eye(cs_crc, view_id, eye_bucket)) {
+        return false;
+    }
+
+    const uint32_t chosen_root = sn2_fog_uv_cb::select_sbs_cbv_root(
+        state.last_compute_root_cbv,
+        true);
+    if (chosen_root == UINT_MAX) {
+        return false;
+    }
+
+    const auto right_va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(
+        state.last_compute_root_cbv[chosen_root]);
+    std::vector<uint8_t> patched;
+    sn2_fog_uv_cb::SbsPatchResult patch{};
+    if (!sn2_fog_uv_cb::make_sbs_patched_cb(right_va, patched, patch)) {
+        return false;
+    }
+
+    auto* d3d12 = g_d3d12_hook;
+    ID3D12Device* device = d3d12 != nullptr ? d3d12->get_device() : nullptr;
+    if (device == nullptr) {
+        return false;
+    }
+
+    const auto n = sn2_fog_uv_cb::g_sbs_apply_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const std::string upload_name = fmt::format(
+        "sn2_fog_sbs_cs_{:08x}_root{}_row{}_{}",
+        cs_crc,
+        chosen_root,
+        sn2_fog_uv_cb::sbs_rect_row(),
+        n);
+    const auto patched_va = bind_override_uploads::get_or_create(device, upload_name, patched);
+    if (patched_va == 0) {
+        return false;
+    }
+
+    restore_root = chosen_root;
+    restore_va = static_cast<uint64_t>(right_va);
+    command_list->SetComputeRootConstantBufferView(chosen_root, patched_va);
+
+    if (n <= 64 || (n % 300) == 0) {
+        SPDLOG_WARN(
+            "[SN2-FogSBSRectFix][CS] count={} cs=0x{:08x} eye_id={} bucket={} root={} row={} cb=0x{:x}->0x{:x} "
+            "before=({:.6f},{:.6f},{:.6f},{:.6f}) after=({:.6f},{:.6f},{:.6f},{:.6f})",
+            n,
+            cs_crc,
+            view_id,
+            eye_bucket,
+            chosen_root,
+            sn2_fog_uv_cb::sbs_rect_row(),
+            static_cast<uint64_t>(right_va),
+            static_cast<uint64_t>(patched_va),
+            patch.before[0], patch.before[1], patch.before[2], patch.before[3],
+            patch.after[0], patch.after[1], patch.after[2], patch.after[3]);
+    }
+
+    return true;
+}
+
 static void sn2_log_pso3069_draw_snapshot(
     ID3D12GraphicsCommandList* command_list,
     const CommandListCorrelationState& state,
@@ -19532,6 +31524,23 @@ void WINAPI D3D12Hook::set_graphics_root_descriptor_table(
     const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_GRAPHICS_ROOT_DESCRIPTOR_TABLE_VTABLE_INDEX] : nullptr;
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_graphics_root_descriptor_table)*>() : nullptr;
+
+    // Lightweight (Shader-Hunter-only) fast path. Everything below — read_cmdlist_state
+    // (a GLOBAL-mutex lock + full CommandListCorrelationState COPY), root-table tracking,
+    // PSO-CRC map lookups, RDT/bindless tagging — exists only for the heavy diagnostics /
+    // redirect experiments. The hunter records via SetPipelineState + Draw + viewport and
+    // never touches root binds, so when only the hunter is active we skip all of it. This
+    // per-bind work runs MANY times per draw and is the dominant framerate cost; skipping
+    // it is what restores performance. (Redirects are env/manifest-driven and off in a
+    // hunter session, so the passthrough is functionally a no-op for them.)
+    if (sn2_skip_rootbind_bookkeeping()) {
+        if (original != nullptr) {
+            original(command_list, root_parameter_index, base_descriptor);
+        } else if (command_list != nullptr) {
+            command_list->SetGraphicsRootDescriptorTable(root_parameter_index, base_descriptor);
+        }
+        return;
+    }
 
     // Per-cmdlist viewport state. view_id is UE-style (0=left, 1=right);
     // eye_bucket is canonical StereoTraceBucket (1=left, 2=right).
@@ -19908,7 +31917,7 @@ void WINAPI D3D12Hook::set_graphics_root_descriptor_table(
         }
     }
 
-    if (root_parameter_index == 0) {
+    if (root_parameter_index == 0 && sn2_pso3069_diag_enabled()) {
         void* current_pso = state.current_pso;
         if (current_pso != nullptr) {
             const uint32_t crc = render::ShaderOverrideRegistry::get().d3d12_pso_pixel_crc32(reinterpret_cast<uintptr_t>(current_pso));
@@ -20413,6 +32422,8 @@ void WINAPI D3D12Hook::set_descriptor_heaps(
     UINT num_descriptor_heaps,
     ID3D12DescriptorHeap* const* descriptor_heaps
 ) {
+    update_cmdlist_descriptor_heaps(command_list, num_descriptor_heaps, descriptor_heaps);
+
     auto d3d12 = g_d3d12_hook;
     const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_DESCRIPTOR_HEAPS_VTABLE_INDEX] : nullptr;
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
@@ -20489,6 +32500,18 @@ void WINAPI D3D12Hook::set_compute_root_descriptor_table(
     const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_COMPUTE_ROOT_DESCRIPTOR_TABLE_VTABLE_INDEX] : nullptr;
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_compute_root_descriptor_table)*>() : nullptr;
+
+    // Lightweight (Shader-Hunter-only) fast path — see set_graphics_root_descriptor_table.
+    // This compute variant additionally walks a 65536-slot bindless range per call when a
+    // fog view is active, so skipping it in lightweight mode is especially valuable.
+    if (sn2_skip_rootbind_bookkeeping()) {
+        if (original != nullptr) {
+            original(command_list, root_parameter_index, base_descriptor);
+        } else if (command_list != nullptr) {
+            command_list->SetComputeRootDescriptorTable(root_parameter_index, base_descriptor);
+        }
+        return;
+    }
 
     const auto state = read_cmdlist_state(command_list);
     update_cmdlist_root_desc_table(command_list, false, root_parameter_index, base_descriptor);
@@ -20578,6 +32601,12 @@ void WINAPI D3D12Hook::set_compute_root_32bit_constant(
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_compute_root_32bit_constant)*>() : nullptr;
 
+    if (sn2_skip_rootbind_bookkeeping()) {  // hunter-only fast path
+        if (original != nullptr) { original(command_list, root_parameter_index, src_data, dest_offset_in_32bit_values); }
+        else if (command_list != nullptr) { command_list->SetComputeRoot32BitConstant(root_parameter_index, src_data, dest_offset_in_32bit_values); }
+        return;
+    }
+
     const auto state = read_cmdlist_state(command_list);
     auto effective_src_data = src_data;
     auto effective_dest_offset = dest_offset_in_32bit_values;
@@ -20594,6 +32623,13 @@ void WINAPI D3D12Hook::set_compute_root_32bit_constant(
     const uint64_t payload[2]{effective_src_data, effective_dest_offset};
     const auto hash = fnv1a64_bytes(payload, sizeof(payload));
     update_cmdlist_root_constants_hash(command_list, false, root_parameter_index, hash);
+    update_cmdlist_root_constants_values(
+        command_list,
+        false,
+        root_parameter_index,
+        &effective_src_data,
+        1,
+        effective_dest_offset);
     record_root_bind_event(
         "D3D12Hook::SetComputeRoot32BitConstant",
         command_list,
@@ -20621,6 +32657,12 @@ void WINAPI D3D12Hook::set_graphics_root_32bit_constant(
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_graphics_root_32bit_constant)*>() : nullptr;
 
+    if (sn2_skip_rootbind_bookkeeping()) {  // hunter-only fast path
+        if (original != nullptr) { original(command_list, root_parameter_index, src_data, dest_offset_in_32bit_values); }
+        else if (command_list != nullptr) { command_list->SetGraphicsRoot32BitConstant(root_parameter_index, src_data, dest_offset_in_32bit_values); }
+        return;
+    }
+
     const auto state = read_cmdlist_state(command_list);
     auto effective_src_data = src_data;
     auto effective_dest_offset = dest_offset_in_32bit_values;
@@ -20637,6 +32679,13 @@ void WINAPI D3D12Hook::set_graphics_root_32bit_constant(
     const uint64_t payload[2]{effective_src_data, effective_dest_offset};
     const auto hash = fnv1a64_bytes(payload, sizeof(payload));
     update_cmdlist_root_constants_hash(command_list, true, root_parameter_index, hash);
+    update_cmdlist_root_constants_values(
+        command_list,
+        true,
+        root_parameter_index,
+        &effective_src_data,
+        1,
+        effective_dest_offset);
     record_root_bind_event(
         "D3D12Hook::SetGraphicsRoot32BitConstant",
         command_list,
@@ -20665,6 +32714,12 @@ void WINAPI D3D12Hook::set_compute_root_32bit_constants(
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_compute_root_32bit_constants)*>() : nullptr;
 
+    if (sn2_skip_rootbind_bookkeeping()) {  // hunter-only fast path
+        if (original != nullptr) { original(command_list, root_parameter_index, num_32bit_values_to_set, src_data, dest_offset_in_32bit_values); }
+        else if (command_list != nullptr) { command_list->SetComputeRoot32BitConstants(root_parameter_index, num_32bit_values_to_set, src_data, dest_offset_in_32bit_values); }
+        return;
+    }
+
     const auto state = read_cmdlist_state(command_list);
     std::vector<uint32_t> override_values{};
     const void* effective_src_data = src_data;
@@ -20684,6 +32739,13 @@ void WINAPI D3D12Hook::set_compute_root_32bit_constants(
 
     const auto hash = fnv1a64_bytes(effective_src_data, static_cast<size_t>(effective_count) * sizeof(uint32_t));
     update_cmdlist_root_constants_hash(command_list, false, root_parameter_index, hash);
+    update_cmdlist_root_constants_values(
+        command_list,
+        false,
+        root_parameter_index,
+        effective_src_data,
+        effective_count,
+        effective_dest_offset);
     record_root_bind_event(
         "D3D12Hook::SetComputeRoot32BitConstants",
         command_list,
@@ -20712,6 +32774,12 @@ void WINAPI D3D12Hook::set_graphics_root_32bit_constants(
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_graphics_root_32bit_constants)*>() : nullptr;
 
+    if (sn2_skip_rootbind_bookkeeping()) {  // hunter-only fast path
+        if (original != nullptr) { original(command_list, root_parameter_index, num_32bit_values_to_set, src_data, dest_offset_in_32bit_values); }
+        else if (command_list != nullptr) { command_list->SetGraphicsRoot32BitConstants(root_parameter_index, num_32bit_values_to_set, src_data, dest_offset_in_32bit_values); }
+        return;
+    }
+
     const auto state = read_cmdlist_state(command_list);
     std::vector<uint32_t> override_values{};
     const void* effective_src_data = src_data;
@@ -20731,6 +32799,13 @@ void WINAPI D3D12Hook::set_graphics_root_32bit_constants(
 
     const auto hash = fnv1a64_bytes(effective_src_data, static_cast<size_t>(effective_count) * sizeof(uint32_t));
     update_cmdlist_root_constants_hash(command_list, true, root_parameter_index, hash);
+    update_cmdlist_root_constants_values(
+        command_list,
+        true,
+        root_parameter_index,
+        effective_src_data,
+        effective_count,
+        effective_dest_offset);
     record_root_bind_event(
         "D3D12Hook::SetGraphicsRoot32BitConstants",
         command_list,
@@ -20756,6 +32831,12 @@ void WINAPI D3D12Hook::set_compute_root_constant_buffer_view(
     const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_COMPUTE_ROOT_CONSTANT_BUFFER_VIEW_VTABLE_INDEX] : nullptr;
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_compute_root_constant_buffer_view)*>() : nullptr;
+
+    if (sn2_skip_rootbind_bookkeeping()) {  // hunter-only fast path
+        if (original != nullptr) { original(command_list, root_parameter_index, gpu_va); }
+        else if (command_list != nullptr) { command_list->SetComputeRootConstantBufferView(root_parameter_index, gpu_va); }
+        return;
+    }
 
     const auto state = read_cmdlist_state(command_list);
     D3D12_GPU_VIRTUAL_ADDRESS effective_gpu_va = gpu_va;
@@ -20942,6 +33023,12 @@ void WINAPI D3D12Hook::set_graphics_root_constant_buffer_view(
     const auto slot = command_list != nullptr ? &(*(void***)command_list)[SET_GRAPHICS_ROOT_CONSTANT_BUFFER_VIEW_VTABLE_INDEX] : nullptr;
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::set_graphics_root_constant_buffer_view)*>() : nullptr;
+
+    if (sn2_skip_rootbind_bookkeeping()) {  // hunter-only fast path
+        if (original != nullptr) { original(command_list, root_parameter_index, gpu_va); }
+        else if (command_list != nullptr) { command_list->SetGraphicsRootConstantBufferView(root_parameter_index, gpu_va); }
+        return;
+    }
 
     // 2026-05-22: Binding ledger record CBV bindings.
     if (sn2_resource_binding_ledger::env_enabled() && command_list != nullptr) {
@@ -21262,7 +33349,7 @@ void WINAPI D3D12Hook::set_graphics_root_constant_buffer_view(
     // Without this, "no [SN2-PathA] lines" is ambiguous between
     // (a) hook not installed, (b) env var not set, (c) hook installed but
     // never receives a basepass binding (game stuck at menu).
-    {
+    if (sn2_fog_path_a::enabled_env() || env_flag_enabled_a("UEVR_SN2_PATHA_DIAG")) {
         static std::atomic<uint64_t> any_call{0};
         const auto n = any_call.fetch_add(1, std::memory_order_relaxed);
         if (n < 4 || n == 100 || n == 1000) {

@@ -378,6 +378,7 @@ public:
     void attempt_hook_subnautica2_setup_volumetric_fog_ub();
     void attempt_hook_subnautica2_lightscat_store_midhook();
     void attempt_hook_subnautica2_volumetric_fog_param_trace();
+    void attempt_hook_subnautica2_reproj_ring_trace();
     void attempt_hook_subnautica2_fog_alias_thunk();
     void attempt_hook_subnautica2_light_affects_view();
     void attempt_hook_subnautica2_try_add_mesh_batch_probe();
@@ -626,6 +627,9 @@ private:
     static void subnautica2_volfog_param_trace_FB53B0(safetyhook::Context& ctx);
     static void subnautica2_volfog_param_trace_FB5320(safetyhook::Context& ctx);
     static void subnautica2_volfog_param_trace_FB5270(safetyhook::Context& ctx);
+    static void subnautica2_reproj_ring_clear_midhook(safetyhook::Context& ctx);
+    static void subnautica2_reproj_ring_assign_midhook(safetyhook::Context& ctx);
+    static void subnautica2_reproj_ring_direct_store_midhook(safetyhook::Context& ctx);
     static void subnautica2_fog_alias_thunk_hook(
         void* graph_builder,
         void* scene_renderer,
@@ -677,6 +681,24 @@ private:
     static void subnautica2_single_layer_water_hook(void* scene_renderer, FRDGBuilder* graph_builder, void* views, void* scene_textures, void* single_layer_water_prepass_result, bool should_render_volumetric_cloud, void* scene_without_water_textures, void* lumen_frame_temporaries, bool camera_underwater);
     static void subnautica2_single_layer_water_inner_hook(void* scene_renderer, FRDGBuilder* graph_builder, void* views, void* scene_textures, void* scene_without_water_textures, void* single_layer_water_prepass_result);
     static void subnautica2_single_layer_water_scene_without_water_hook(safetyhook::Context& ctx);
+    void attempt_hook_subnautica2_mesh_pass_trace();
+    void attempt_hook_subnautica2_nanite_multiview_fix();
+    void attempt_hook_subnautica2_stereo_culling_frustum_fix();
+    void attempt_hook_subnautica2_nanite_raster_trace();
+    void attempt_hook_subnautica2_relevance_trace();
+    static bool subnautica2_nanite_should_draw_scene_views_in_one_pass_hook(void* view_info);
+    static void subnautica2_setup_view_frustum_hook(void* view_info);
+    static char subnautica2_nanite_raster_orchestrator_hook(
+        void* a1, void* a2, void* a3, void* a4, void* a5, uint32_t a6,
+        void* a7, void* a8, uint8_t a9, int a10, void* a11, uint8_t a12,
+        void* a13, void* a14);
+    static void subnautica2_nanite_raster_body_call_8127_midhook(safetyhook::Context& ctx);
+    static void subnautica2_nanite_raster_body_call_8a9b_midhook(safetyhook::Context& ctx);
+    static void subnautica2_nanite_raster_body_call_9054_midhook(safetyhook::Context& ctx);
+    static void* subnautica2_create_mesh_pass_hook(void* view_info, uint32_t mesh_pass);
+    static void subnautica2_parallel_mesh_dispatch_pass_setup_midhook(safetyhook::Context& ctx);
+    static void subnautica2_parallel_mesh_build_rendering_commands_hook(void* pass, void* graph_builder, void* gpu_scene, void* draw_params);
+    static void subnautica2_compute_relevance_add_primitive_midhook(safetyhook::Context& ctx);
 
     // FViewport
     static void* viewport_destructor_hook(void* viewport, void* a2, void* a3, void* a4);
@@ -734,6 +756,9 @@ private:
     safetyhook::MidHook m_subnautica2_volfog_param_trace_FB53B0{};
     safetyhook::MidHook m_subnautica2_volfog_param_trace_FB5320{};
     safetyhook::MidHook m_subnautica2_volfog_param_trace_FB5270{};
+    safetyhook::MidHook m_subnautica2_reproj_ring_clear_hook{};
+    safetyhook::MidHook m_subnautica2_reproj_ring_assign_hook{};
+    safetyhook::MidHook m_subnautica2_reproj_ring_direct_store_hook{};
     safetyhook::InlineHook m_subnautica2_fog_alias_thunk_hook{};
     safetyhook::InlineHook m_subnautica2_light_affects_view_hook{};
     safetyhook::MidHook m_subnautica2_try_add_mesh_batch_probe{};
@@ -763,6 +788,16 @@ private:
     safetyhook::InlineHook m_subnautica2_volumetric_fog_per_view_hook{};
     safetyhook::MidHook m_subnautica2_compute_volumetric_fog_view_index_hook{};
     safetyhook::MidHook m_subnautica2_single_layer_water_scene_without_water_hook{};
+    safetyhook::InlineHook m_subnautica2_nanite_should_draw_scene_views_in_one_pass_hook{};
+    safetyhook::InlineHook m_subnautica2_setup_view_frustum_hook{};
+    safetyhook::InlineHook m_subnautica2_nanite_raster_orchestrator_hook{};
+    safetyhook::MidHook m_subnautica2_nanite_raster_body_call_8127_hook{};
+    safetyhook::MidHook m_subnautica2_nanite_raster_body_call_8a9b_hook{};
+    safetyhook::MidHook m_subnautica2_nanite_raster_body_call_9054_hook{};
+    safetyhook::InlineHook m_subnautica2_create_mesh_pass_hook{};
+    safetyhook::MidHook m_subnautica2_parallel_mesh_dispatch_pass_setup_hook{};
+    safetyhook::InlineHook m_subnautica2_parallel_mesh_build_rendering_commands_hook{};
+    safetyhook::MidHook m_subnautica2_compute_relevance_add_primitive_hook{};
     std::vector<safetyhook::MidHook> m_ue57_slate_elements_hooks{};
     safetyhook::MidHook m_ue55_slate_output_texture_register_hook{};
     safetyhook::InlineHook m_gameviewportclient_draw_hook{};
@@ -844,6 +879,7 @@ private:
     bool m_attempted_hook_subnautica2_setup_volumetric_fog_ub{false};
     bool m_attempted_hook_subnautica2_lightscat_store_midhook{false};
     bool m_attempted_hook_subnautica2_volumetric_fog_param_trace{false};
+    bool m_attempted_hook_subnautica2_reproj_ring_trace{false};
     bool m_attempted_hook_subnautica2_fog_alias_thunk{false};
     bool m_attempted_hook_subnautica2_light_affects_view{false};
     bool m_attempted_hook_subnautica2_try_add_mesh_batch_probe{false};
@@ -858,6 +894,10 @@ private:
     bool m_attempted_hook_subnautica2_slw_per_view{false};
     bool m_attempted_hook_subnautica2_volumetric_fog_per_view{false};
     bool m_attempted_hook_subnautica2_single_layer_water_scene_without_water{false};
+    bool m_attempted_hook_subnautica2_mesh_pass_trace{false};
+    bool m_attempted_hook_subnautica2_nanite_multiview_fix{false};
+    bool m_attempted_hook_subnautica2_stereo_culling_frustum_fix{false};
+    bool m_attempted_hook_subnautica2_nanite_raster_trace{false};
     bool m_uses_old_rendertarget_manager{false};
     bool m_rendertarget_manager_embedded_in_stereo_device{false}; // 4.17 and below...?
     bool m_special_detected{false};

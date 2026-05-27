@@ -119,36 +119,25 @@ struct Storage {
     };
     std::unordered_map<ID3D12PipelineState*, OriginalDesc> original_descs;
 
-    // Compiled magenta PS bytecode (one copy, reused).
+    // Compiled debug-color PS bytecode (one copy, reused).
     Microsoft::WRL::ComPtr<ID3DBlob> magenta_ps_blob;
 };
 
 Storage& storage() { static Storage s; return s; }
 
-// 6-MRT replacement that outputs teal to SV_Target0..4 and SV_Target6.
-// Matches the SLW basepass MainPS (0xDE7C3822) output signature so D3D12
-// pipeline validation accepts the substituted PSO. RGB tuned for the
-// right-eye underwater fix: pushes the right eye towards left-eye teal.
+bool diag_enabled() {
+    static const bool e = env_truthy("UEVR_SN2_DEBUG_COLOR_DIAG");
+    return e;
+}
+
+// Single-target replacement. The current coverage probe is for 0x13B00F0C,
+// which binds one scene-color RT; writing only SV_Target0 also keeps the clone
+// broadly compatible with MRT PSOs because extra RTVs simply receive no PS
+// output.
 constexpr const char* kMagentaHlsl = R"HLSL(
 struct PSIn { float4 pos : SV_Position; };
-struct PSOut {
-    float4 t0 : SV_Target0;
-    float4 t1 : SV_Target1;
-    float4 t2 : SV_Target2;
-    float4 t3 : SV_Target3;
-    float4 t4 : SV_Target4;
-    float4 t6 : SV_Target6;
-};
-PSOut main(PSIn i) {
-    PSOut o;
-    float4 teal = float4(0.05, 0.35, 0.45, 1.0);
-    o.t0 = teal;
-    o.t1 = teal;
-    o.t2 = teal;
-    o.t3 = teal;
-    o.t4 = teal;
-    o.t6 = teal;
-    return o;
+float4 main(PSIn i) : SV_Target0 {
+    return float4(1.0, 0.0, 1.0, 1.0);
 }
 )HLSL";
 
@@ -269,6 +258,10 @@ std::unordered_set<uint32_t> override_crcs() {
                     std::string content((std::istreambuf_iterator<char>(f)),
                                          std::istreambuf_iterator<char>());
                     auto parsed = parse_crc_csv(content);
+                    if (diag_enabled()) {
+                        SPDLOG_WARN("[SN2-DebugColor-Diag] parsed override file '{}' count={} content='{}'",
+                                    override_file_path(), parsed.size(), content);
+                    }
                     std::scoped_lock _{s.mu};
                     s.live_set = std::move(parsed);
                     s.last_mtime = mtime;
@@ -290,15 +283,27 @@ bool should_override(uint32_t ps_crc, int eye_bucket) {
     (void)override_crcs();
     auto& s = storage();
     std::scoped_lock _{s.mu};
+    bool result = false;
     if (s.live_set.find(ps_crc) != s.live_set.end()) {
         const int t = target_eye_bucket();
-        return t == -1 || eye_bucket == t;
+        result = (t == -1 || eye_bucket == t);
+    } else {
+        const auto it = s.forensics_color_eye_by_crc.find(ps_crc);
+        result = (it != s.forensics_color_eye_by_crc.end()) &&
+            (it->second == -1 || it->second == eye_bucket);
     }
-    const auto it = s.forensics_color_eye_by_crc.find(ps_crc);
-    if (it == s.forensics_color_eye_by_crc.end()) {
-        return false;
+    if (diag_enabled() && (ps_crc == 0x13B00F0Cu || result)) {
+        static std::atomic<uint64_t> seq{0};
+        const auto n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 64 || (n % 600) == 0) {
+            SPDLOG_WARN("[SN2-DebugColor-Diag] should_override ps=0x{:08x} eye={} live={} forensics={} target_eye={} result={} n={}",
+                        ps_crc, eye_bucket,
+                        s.live_set.find(ps_crc) != s.live_set.end() ? 1 : 0,
+                        s.forensics_color_eye_by_crc.find(ps_crc) != s.forensics_color_eye_by_crc.end() ? 1 : 0,
+                        target_eye_bucket(), result ? 1 : 0, n);
+        }
     }
-    return it->second == -1 || it->second == eye_bucket;
+    return result;
 }
 
 void note_override_applied(uint32_t ps_crc, int eye_bucket, const char* kind) {
@@ -334,7 +339,7 @@ void note_override_applied(uint32_t ps_crc, int eye_bucket, const char* kind) {
 
 void note_create_graphics_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
                               ID3D12PipelineState* pso) {
-    if (!env_enabled() || desc == nullptr || pso == nullptr) return;
+    if (desc == nullptr || pso == nullptr) return;
     auto& s = storage();
     Storage::OriginalDesc od{};
     od.desc = *desc;
@@ -363,6 +368,16 @@ void note_create_graphics_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
     }
     std::scoped_lock _{s.mu};
     s.original_descs[pso] = std::move(od);
+    if (diag_enabled()) {
+        static std::atomic<uint64_t> seq{0};
+        const auto n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n % 500) == 0) {
+            SPDLOG_WARN("[SN2-DebugColor-Diag] cached graphics PSO #{} pso=0x{:x} rts={} ps_bytes={} input_elems={} cache_size={}",
+                        n, reinterpret_cast<uintptr_t>(pso), desc->NumRenderTargets,
+                        static_cast<unsigned>(desc->PS.BytecodeLength),
+                        desc->InputLayout.NumElements, s.original_descs.size());
+        }
+    }
 }
 
 ID3D12PipelineState* get_or_create_replacement(ID3D12Device* device,
@@ -380,7 +395,15 @@ ID3D12PipelineState* get_or_create_replacement(ID3D12Device* device,
     {
         std::scoped_lock _{s.mu};
         auto it = s.original_descs.find(original);
-        if (it == s.original_descs.end()) return nullptr;
+        if (it == s.original_descs.end()) {
+            static std::atomic<uint64_t> miss_seq{0};
+            const auto n = miss_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || (n % 3000) == 0) {
+                SPDLOG_WARN("[SN2-DebugColor] missing cached original desc for pso=0x{:x} cache_size={} n={}",
+                            reinterpret_cast<uintptr_t>(original), s.original_descs.size(), n);
+            }
+            return nullptr;
+        }
         od = it->second;
     }
     auto pin_bc = [](const std::vector<uint8_t>& v) -> D3D12_SHADER_BYTECODE {
@@ -404,8 +427,11 @@ ID3D12PipelineState* get_or_create_replacement(ID3D12Device* device,
     Microsoft::WRL::ComPtr<ID3D12PipelineState> replacement;
     HRESULT hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&replacement));
     if (FAILED(hr)) {
-        SPDLOG_WARN("[SN2-DebugColor] CreateGraphicsPipelineState(replacement) hr=0x{:08x} for pso=0x{:x}",
-                    static_cast<uint32_t>(hr), reinterpret_cast<uintptr_t>(original));
+        SPDLOG_WARN("[SN2-DebugColor] CreateGraphicsPipelineState(replacement) hr=0x{:08x} for pso=0x{:x} rts={} dsv={} ps_bytes={} vs_bytes={} input_elems={} topo={}",
+                    static_cast<uint32_t>(hr), reinterpret_cast<uintptr_t>(original),
+                    od.desc.NumRenderTargets, static_cast<unsigned>(od.desc.DSVFormat),
+                    static_cast<unsigned>(od.ps_bc.size()), static_cast<unsigned>(od.vs_bc.size()),
+                    od.desc.InputLayout.NumElements, static_cast<unsigned>(od.desc.PrimitiveTopologyType));
         return nullptr;
     }
     static std::atomic<uint64_t> seq{0};

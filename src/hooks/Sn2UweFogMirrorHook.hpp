@@ -137,11 +137,11 @@ inline bool matches_uwe_fog_signature(const D3D12_RESOURCE_DESC& desc) {
             w == 32 && h == 32 && d == 8) {
             return true;
         }
-        // 3) VoxelizePS-target IntegratedLightScattering 3D 54×30×48 R11G11B10F.
-        //    CONFIRMED via live RTV dims diagnostic (2026-05-22 phase V3b).
-        //    Has flags 0x5 (RT|UAV).
+        // 3) VoxelizePS-target IntegratedLightScattering 3D R11G11B10F.
+        //    Observed live as 54×30×48 and 50×26×48 depending on resolution /
+        //    scene state. Has flags 0x5 (RT|UAV).
         if (desc.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
-            w == 54 && h == 30 && d == 48) {
+            w >= 40 && w <= 80 && h >= 20 && h <= 40 && d == 48) {
             return true;
         }
         // 4) Distant sky light LUT: small R16G16B16A16F cubemap-ish 3D.

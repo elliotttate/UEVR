@@ -44,6 +44,22 @@ constexpr auto SLOW_POSE_UPDATE_LOG_INTERVAL = std::chrono::seconds(2);
 constexpr auto SLOW_POSE_UPDATE_LOG_THRESHOLD_MS = 10.0;
 constexpr auto STALE_POSE_REFRESH_MIN_AGE_MS = 50LL;
 
+bool env_truthy(const char* name) {
+    char value[32]{};
+    const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+    if (len == 0 || len >= sizeof(value)) {
+        return false;
+    }
+
+    std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
+    return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+}
+
+bool frame_profiler_log_enabled() {
+    static const bool enabled = env_truthy("UEVR_OPENXR_FRAME_PROFILER_LOG");
+    return enabled;
+}
+
 struct ScopedOpenXRTiming {
     OpenXR::FrameTimingStats& stats;
     std::chrono::steady_clock::time_point start{std::chrono::steady_clock::now()};
@@ -3141,6 +3157,10 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
 }
 
 void OpenXR::log_frame_timing_stats_if_needed() {
+    if (!frame_profiler_log_enabled()) {
+        return;
+    }
+
     const auto now = std::chrono::steady_clock::now();
 
     if (this->last_frame_timing_log.time_since_epoch().count() == 0) {

@@ -27,6 +27,11 @@
 //                                                            invoke Sn2CaptureSidecar
 //                                                            so UEVR↔RD bridge has
 //                                                            both halves automatically
+//   UEVR_SN2_RDC_AUTOCAPTURE=N                                automatically trigger a
+//                                                            capture on internal frame N
+//                                                            (no trigger file needed)
+//   UEVR_SN2_RDC_AUTOCAPTURE_EVERY=K                          additionally trigger a
+//                                                            capture every K frames
 //
 // USAGE
 //   while game running:
@@ -50,6 +55,10 @@ const std::string& trigger_file_path();
 const std::string& output_template();
 bool also_emit_sidecar();
 
+// Autocapture config (frame-N + every-K). Returns 0 when unset/disabled.
+uint64_t autocapture_frame();        // UEVR_SN2_RDC_AUTOCAPTURE  (one-shot on frame N)
+uint64_t autocapture_every();        // UEVR_SN2_RDC_AUTOCAPTURE_EVERY (every K frames)
+
 // Initialize: probe + load renderdoc.dll, fetch RENDERDOC_API_1_6_0.
 // Idempotent. Returns true if successfully initialized.
 bool init();
@@ -60,12 +69,12 @@ bool is_loaded();
 // Called from Present hook every frame. Checks for trigger file existence.
 // If present, calls api->TriggerCapture() and (optionally) emits sidecar.
 //
-// d3d12_queue: the ID3D12CommandQueue* used by the present chain. RD's
-//   in-app API for D3D12 expects the queue as its "device pointer".
+// d3d12_device: the ID3D12Device* used by the present chain. RD's
+//   in-app API for D3D12 expects the device as its "device pointer".
 // hwnd:        the window the swap chain targets.
 // Either may be null — wildcard capture fallback still attempts but is
 // less reliable.
-void on_present(uint64_t frame_count, void* d3d12_queue = nullptr, void* hwnd = nullptr);
+void on_present(uint64_t frame_count, void* d3d12_device = nullptr, void* hwnd = nullptr);
 
 // Programmatic trigger (no file). Call when you want to capture from C++.
 void request_capture_next_frame();

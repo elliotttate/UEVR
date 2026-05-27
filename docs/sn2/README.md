@@ -15,6 +15,7 @@ A comprehensive set of UEVR modules and analysis tools built to diagnose and fix
 | [FILE_LOCATIONS.md](FILE_LOCATIONS.md) | Quick-reference map of every file path |
 | [ENV_VARS.md](ENV_VARS.md) | Every UEVR_SN2_* env var with description |
 | [GLOSSARY.md](GLOSSARY.md) | Domain terms used throughout the codebase |
+| [SHADER_OVERRIDES_AND_DXIL_PATCHING.md](SHADER_OVERRIDES_AND_DXIL_PATCHING.md) | UEVR shader replacement, DXIL text patch, bytecode override, per-eye payload, and bind-override workflow |
 | [NEXT_SESSION.md](NEXT_SESSION.md) | Concrete plan to finish the right-eye fog fix |
 | [STEREO_FORENSICS_STATUS_2026_05_23.md](STEREO_FORENSICS_STATUS_2026_05_23.md) | Status of the unified Stereo Forensics Layer and remaining 1-8 roadmap |
 | [STEREO_FORENSICS_DB_WORKFLOW.md](STEREO_FORENSICS_DB_WORKFLOW.md) | Required durable knowledge DB workflow for captures, findings, evidence, and fix rules |
@@ -51,24 +52,36 @@ Use `launch_phase_u.ps1` for the full pipeline (synth + mirror + screenshot + ma
 
 ## The Bug (One-Liner)
 
-VoxelizePS (`0x9D14FCF0`) writes the IntegratedLightScattering 3D volume only for LEFT eye. The consumer (`0x37558DE4`, SLW water material PS) reads it on both eyes — RIGHT eye samples LEFT-projected data with right matrices → wrong fog → washed-out sky.
+The visible underwater teal source is the geometry draw using PS `0x13b00f0c` (VS `0x833a1657`, `DrawIndexedInstanced`, `index_count=76608`). It runs for the left viewport only. The right-eye water/fog consumers run, but this teal-carrying draw is missing on the right, so the right eye shows the washed/above-water-looking state.
+
+> 2026-05-26 late update: the `UWEFogResolveCS` store-position theory was disproven by dye tests. UEVR shader overrides still work and remain useful for probes, but the current fix candidate is replaying the left-only `0x13b00f0c` draw onto the right viewport using the captured real right-eye View CB.
 
 ## The Fix Approach (One-Liner)
 
-**Bucket-shadow**: allocate a parallel "mirror" 3D volume per fog texture. On right-eye dup of VoxelizePS, write to mirror with synthesized right-eye View CB. On right-eye `0x37558DE4`, redirect SRV to read from mirror instead of original.
+Replay the missing `0x13b00f0c` underwater draw for the right viewport, swapping only the validated right-eye View CB root that worked in testing.
+
+Current one-switch candidate:
+
+```cmd
+set UEVR_SN2_FIX_RIGHT_EYE_UNDERWATER=1
+```
+
+That wrapper auto-targets PS `0x13b00f0c`, enables captured right View CB discovery, suppresses the old broad water-basepass replay list, and defaults the View-CB swap to root 4 for this draw. If PSO CRC recording is unavailable in an inject-after-run session, it falls back to the known draw shape (`index_count=76608`, `instance_count=1`, one RTV, left viewport) so the wrapper can still replay the target draw.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full detail.
 
-## Current Status (2026-05-22)
+## Current Status (2026-05-26)
 
 **Working pieces:**
-- Synth right-eye View CB (donor snapshot mechanism)
-- Mirror allocation for fog 3D textures (54×30×48 R11G11B10F)
-- Graphics RTV redirect for the writer (VoxelizePS dup → mirror)
+- `UEVR_SN2_FIX_RIGHT_EYE_UNDERWATER=1` enables the required command-list hooks and upload-buffer tracking.
+- Captured-right View CB discovery validates a real right-eye View UB (`originX=640` in the 1280x720 menu run).
+- The wrapper replays the left-only `0x13b00f0c` draw onto the right viewport with `swaps=1 root0=4`.
+- The fallback path handles `ps_crc=0` by matching the target draw shape instead of requiring PSO CRC availability.
 
 **Open issues:**
-- LEFT-eye flicker with synth pipeline active (DSV restore + state barrier issues)
-- Consumer SRV redirect not yet wired (the final piece)
-- Wrong fog colors when each eye does get different fog data (donor CB compatibility)
+- Reliable visual validation is still open. Later OpenXR tests proved the first deferred replay point is not final-visible: even a magenta clear after the replay did not appear in the mirror, so that target is probably overwritten.
+- The next probe is late-anchor replay: `UEVR_SN2_UNDERWATER_DEFER_ANCHOR_PS=0xac96b4c1` plus `UEVR_SN2_UNDERWATER_DEFER_ANCHOR_TRACE=1`, so replay happens after a known visible right-eye post-water draw instead of at the early left-only draw location.
+- The draw-shape fallback is intentionally narrow but still a heuristic. If it duplicates extra geometry, tighten it with VS CRC/root-signature/fixed-SRV checks or a learned PSO pointer allowlist.
+- Do not treat the old fog-volume mirror, resolve-copy, or `UWEFogResolveCS store.x += ViewRectMin.x` paths as current fixes for this visible menu bug.
 
-See `runs/SN2_RIGHT_EYE_HANDOFF_2026-05-22.md` for the comprehensive handoff doc.
+See `E:\Github\Subnautica 2\moddingkit\runs\SN2_RIGHT_EYE_HANDOFF_2026_05_26.md` for the comprehensive handoff doc.

@@ -34,6 +34,18 @@ constexpr size_t MAX_PSO_USAGE_ENTRIES = 8;
 constexpr size_t HUNTER_MIN_SCENE_PS_SIZE = 1024;
 constexpr int HUNTER_DEFAULT_RECENT_FRAME_AGE = 30;
 
+bool env_truthy(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' && v[0] != '0' &&
+        std::string_view{v} != "false" && std::string_view{v} != "FALSE" &&
+        std::string_view{v} != "off" && std::string_view{v} != "OFF";
+}
+
+bool verbose_override_scan_log_enabled() {
+    static const bool enabled = env_truthy("UEVR_SHADER_OVERRIDE_VERBOSE_SCAN_LOG");
+    return enabled;
+}
+
 bool verbose_pso_logging_enabled() {
     static const bool enabled = [] {
         char value[16]{};
@@ -2442,9 +2454,11 @@ void ShaderOverrideRegistry::scan_override_directories() {
         m_overrides.size(),
         m_has_active_d3d12_overrides.load(std::memory_order_relaxed),
         m_has_active_d3d11_overrides.load(std::memory_order_relaxed));
-    for (const auto& [k, e] : m_overrides) {
-        spdlog::info("[ShaderOverrideRegistry]   override key={} hash={} compiled={} bytes={} status={} err={}",
-            k, e.target_hash, e.compiled, e.compiled_bytecode.size(), e.status, e.last_error);
+    if (verbose_override_scan_log_enabled()) {
+        for (const auto& [k, e] : m_overrides) {
+            spdlog::info("[ShaderOverrideRegistry]   override key={} hash={} compiled={} bytes={} status={} err={}",
+                k, e.target_hash, e.compiled, e.compiled_bytecode.size(), e.status, e.last_error);
+        }
     }
 }
 
@@ -6199,6 +6213,20 @@ uint32_t ShaderOverrideRegistry::d3d12_pso_compute_crc32(uintptr_t pso_pointer) 
     auto it = m_d3d12_graphics_pso_records.find(pso_pointer);
     if (it == m_d3d12_graphics_pso_records.end()) return 0;
     return it->second.compute_crc32;
+}
+
+uint32_t ShaderOverrideRegistry::d3d12_pso_amplification_crc32(uintptr_t pso_pointer) const {
+    std::scoped_lock _{m_mutex};
+    auto it = m_d3d12_graphics_pso_records.find(pso_pointer);
+    if (it == m_d3d12_graphics_pso_records.end()) return 0;
+    return it->second.amplification_crc32;
+}
+
+uint32_t ShaderOverrideRegistry::d3d12_pso_mesh_crc32(uintptr_t pso_pointer) const {
+    std::scoped_lock _{m_mutex};
+    auto it = m_d3d12_graphics_pso_records.find(pso_pointer);
+    if (it == m_d3d12_graphics_pso_records.end()) return 0;
+    return it->second.mesh_crc32;
 }
 
 bool ShaderOverrideRegistry::hunter_should_skip_draw_per_eye(uintptr_t pso_pointer, int eye_bucket) const {

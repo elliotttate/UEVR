@@ -6,9 +6,40 @@ Every UEVR_SN2_* env var, what it does, where it's read.
 
 | Env Var | Type | Default | Purpose |
 |---|---|---|---|
-| `UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS` | bool | `0` | Required for draw/dispatch/viewport/barrier tracing. Auto-enabled when `UEVR_STEREO_FORENSICS=1` unless bind-only opt-out is set |
+| `UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS` | bool | `0` | Required for draw/dispatch/viewport/barrier tracing. Auto-enabled when `UEVR_STEREO_FORENSICS=1` unless bind-only opt-out is set; also auto-enabled by `UEVR_SN2_FIX_RIGHT_EYE_UNDERWATER=1` |
+| `UEVR_SN2_FIX_RIGHT_EYE_UNDERWATER` | bool | `0` | One-switch current candidate fix. Replays the missing left-only underwater draw (`0x13b00f0c`, shape `DrawIndexedInstanced` 76608/1) to the right viewport using a captured real right-eye View CB, defaulting the swap to root 4 |
 | `UEVR_SN2_DUP_CONFIG_FILE` | path | (none) | Path to dup_cfg JSON |
 | `UEVR_SN2_DUPLICATE_SLW_BASEPASS_RIGHT` | bool | `0` | Enable the dup function |
+
+## Current right-eye underwater draw replay
+
+| Env Var | Type | Default | Purpose |
+|---|---|---|---|
+| `UEVR_SN2_FIX_RIGHT_EYE_UNDERWATER` | bool | `0` | Preferred current test flag. Expands to the narrow `0x13b00f0c` replay path, captured-right View CB discovery, command-list hooks, root bookkeeping, and upload-buffer tracking |
+| `UEVR_SN2_DUP_USE_CAPTURED_RIGHT_VIEW` | bool | `0` | Explicitly enables captured-right View CB mode. The wrapper enables this behavior internally |
+| `UEVR_SN2_DUP_VIEW_SWAP_ROOTS` | csv | wrapper: `4`; legacy: all detected View-UB roots | Restricts which graphics root CBVs are swapped during replay. Root 4 is the validated candidate for `0x13b00f0c`; root 8 alone failed in prior tests |
+| `UEVR_SN2_DUP_ANY_MRT_PS_CRCS` | csv | empty; wrapper adds `0x13b00f0c` | PS CRCs to duplicate regardless of RTV count. Used for the single-RTV teal-source geometry draw |
+| `UEVR_SN2_WATER_BASEPASS_PS_CRCS` | csv | legacy default list | Legacy water-basepass CRC list. When the wrapper is enabled and this env is unset, the legacy list is suppressed to avoid broad replay confounds |
+| `UEVR_SN2_DUP_DETAIL_LOG` | bool | `0` | Logs swapped View roots, RTVs, and sampled fixed SRVs for each duplicate. Use if visual validation fails and you need to verify what the replay actually samples/writes |
+| `UEVR_SN2_DUP_DEBUG_COLOR` | bool | `0` | Replaces the duplicated draw's PS with a debug color. Use only as a coverage/depth/stencil isolation probe |
+| `UEVR_SN2_UNDERWATER_DEFER_REPLAY` | bool | `0` | Captures the left-only `0x13b00f0c` draw state and replays it later instead of immediately in the duplicator |
+| `UEVR_SN2_UNDERWATER_DEFER_AFTER_DRAW` | bool | `0` | Replays after the triggering right-eye draw instead of before it |
+| `UEVR_SN2_UNDERWATER_DEFER_TRIGGER_N` | int | `1` | Old draw-count trigger: replay on the Nth right-eye draw after capture |
+| `UEVR_SN2_UNDERWATER_DEFER_REPEAT` | bool | `0` | Keep the pending replay armed. Throttled to once per present frame |
+| `UEVR_SN2_UNDERWATER_DEFER_CLEAR_AFTER` | bool | `0` | After replay, clear the replay viewport magenta. Diagnostic only |
+| `UEVR_SN2_UNDERWATER_DEFER_DEBUG_COLOR` | bool | `0` | Try to replay with the debug-color PSO clone. May no-op for early-created PSOs whose original desc was not cached |
+| `UEVR_SN2_UNDERWATER_DEFER_ANCHOR_PS` | hex CRC | `0` | Late-anchor mode: replay only when a right-eye draw with this pixel-shader CRC is reached. Works from `DrawInstanced` and `DrawIndexedInstanced` anchors |
+| `UEVR_SN2_UNDERWATER_DEFER_ANCHOR_TRACE` | bool | `0` | Bounded log of right-eye PS CRCs/RTV handles after a pending deferred replay is captured |
+| `UEVR_SN2_UNDERWATER_DEFER_ANCHOR_TRACE_MAX` | int | `96` | Initial row cap for anchor trace logging |
+| `UEVR_SN2_UNDERWATER_DEFER_REQUIRE_SAME_RTV` | bool | draw-count: `1`, anchor: `0` | Require current RTV to match captured draw RTV before replaying. Defaults off in anchor mode because later visible passes may use a different target |
+
+Wrapper fallback behavior:
+
+- Preferred targeting is by PS CRC `0x13b00f0c`.
+- Inject-after-run sessions can miss PSO creation, leaving `ps_crc=0`.
+- When `UEVR_SN2_FIX_RIGHT_EYE_UNDERWATER=1`, the code falls back to the known draw shape:
+  left viewport, one RTV, `index_count=76608`, `instance_count=1`, and a reasonable viewport size.
+- The latest log-validated run is `captures\wrapper_fix_shape_fallback_20260526_171728`.
 
 ## Diagnostic / observation
 

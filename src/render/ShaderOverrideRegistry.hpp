@@ -362,6 +362,8 @@ public:
     uint32_t d3d12_pso_pixel_crc32(uintptr_t pso_pointer) const;
     uint32_t d3d12_pso_geometry_crc32(uintptr_t pso_pointer) const;
     uint32_t d3d12_pso_compute_crc32(uintptr_t pso_pointer) const;
+    uint32_t d3d12_pso_amplification_crc32(uintptr_t pso_pointer) const;
+    uint32_t d3d12_pso_mesh_crc32(uintptr_t pso_pointer) const;
     void hunter_record_set_pipeline_state(void* command_list, void* original_pso);
     // Extended variant: caller passes the current eye bucket (0 Unknown, 1
     // Left, 2 Right, 3 Full, 4 Multi) so per-eye-selective skip can fire.

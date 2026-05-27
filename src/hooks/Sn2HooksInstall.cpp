@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -66,6 +67,7 @@ namespace sn2_hooks_install {
 //   FRDGPass + 0x10 = FRDGEventName.Name (const wchar_t*)
 
 static SafetyHookInline g_setup_parameter_pass_hook{};
+static SafetyHookInline g_execute_pass_hook{};
 
 // Original signature (from IDA): FRDGPass* SetupParameterPass(FRDGBuilder* this, FRDGPass* pass)
 static void* __fastcall setup_parameter_pass_trampoline(void* this_ptr, void* pass_ptr) {
@@ -75,13 +77,55 @@ static void* __fastcall setup_parameter_pass_trampoline(void* this_ptr, void* pa
     // Read the pass name field at +0x10. The pass was just constructed by
     // FRDGPass::FRDGPass (round 11c) which always wrote to +0x10 before
     // SetupParameterPass runs, so the read is safe.
-    if (pass_ptr != nullptr) {
-        const wchar_t* name = *reinterpret_cast<const wchar_t* const*>(
-            reinterpret_cast<const uint8_t*>(pass_ptr) + sn2_rdg_pass_hook::FRDGPASS_NAME_FIELD_OFFSET);
-        sn2_rdg_pass_hook::on_setup_parameter_pass(reinterpret_cast<uintptr_t>(pass_ptr), name);
+    try {
+        if (pass_ptr != nullptr) {
+            const wchar_t* name = *reinterpret_cast<const wchar_t* const*>(
+                reinterpret_cast<const uint8_t*>(pass_ptr) + sn2_rdg_pass_hook::FRDGPASS_NAME_FIELD_OFFSET);
+            sn2_rdg_pass_hook::on_setup_parameter_pass(reinterpret_cast<uintptr_t>(pass_ptr), name);
+        }
+    } catch (const std::exception& e) {
+        SPDLOG_WARN("[SN2-RDGPassHook] setup record failed: {}", e.what());
+    } catch (...) {
+        SPDLOG_WARN("[SN2-RDGPassHook] setup record failed: unknown exception");
     }
 
     return result;
+}
+
+// Original signature:
+//   void FRDGBuilder::ExecutePass(FRHIComputeCommandList& RHICmdList, FRDGPass* Pass)
+static void __fastcall execute_pass_trampoline(void* rhi_cmd_list, void* pass_ptr) {
+    uintptr_t previous_pass = 0;
+    std::string previous_name;
+    try {
+        previous_pass = sn2_rdg_pass_hook::s_tls_current_rdg_pass;
+        previous_name = sn2_rdg_pass_hook::s_tls_current_rdg_pass_name;
+
+        if (pass_ptr != nullptr) {
+            const wchar_t* name = *reinterpret_cast<const wchar_t* const*>(
+                reinterpret_cast<const uint8_t*>(pass_ptr) + sn2_rdg_pass_hook::FRDGPASS_NAME_FIELD_OFFSET);
+            sn2_rdg_pass_hook::on_setup_parameter_pass(reinterpret_cast<uintptr_t>(pass_ptr), name);
+            sn2_rdg_pass_hook::on_execute_pass_begin(reinterpret_cast<uintptr_t>(pass_ptr));
+        }
+    } catch (const std::exception& e) {
+        SPDLOG_WARN("[SN2-RDGPassHook] execute begin failed: {}", e.what());
+    } catch (...) {
+        SPDLOG_WARN("[SN2-RDGPassHook] execute begin failed: unknown exception");
+    }
+
+    g_execute_pass_hook.call<void>(rhi_cmd_list, pass_ptr);
+
+    try {
+        if (pass_ptr != nullptr &&
+            sn2_rdg_pass_hook::s_tls_current_rdg_pass == reinterpret_cast<uintptr_t>(pass_ptr)) {
+            sn2_rdg_pass_hook::s_tls_current_rdg_pass = previous_pass;
+            sn2_rdg_pass_hook::s_tls_current_rdg_pass_name = std::move(previous_name);
+        }
+    } catch (const std::exception& e) {
+        SPDLOG_WARN("[SN2-RDGPassHook] execute end failed: {}", e.what());
+    } catch (...) {
+        SPDLOG_WARN("[SN2-RDGPassHook] execute end failed: unknown exception");
+    }
 }
 
 static bool install_rdg_pass_hook() {
@@ -126,6 +170,41 @@ static bool install_rdg_pass_hook() {
     }
     SPDLOG_INFO("[SN2-RDGPassHook] installed at 0x{:x} (RVA 0x{:x})",
         target, sn2_rdg_pass_hook::SUBNAUTICA2_FRDG_SETUP_PARAMETER_PASS_RVA);
+
+    if (sn2_rdg_pass_hook::SUBNAUTICA2_FRDG_EXECUTE_PASS_RVA == 0) {
+        SPDLOG_WARN("[SN2-RDGPassHook] ExecutePass RVA is 0; pass execution will not be bracketed");
+        return true;
+    }
+    const auto execute_target = exe_base + sn2_rdg_pass_hook::SUBNAUTICA2_FRDG_EXECUTE_PASS_RVA;
+    if (!sn2_is_executable_process_range(execute_target, 0x20)) {
+        SPDLOG_WARN("[SN2-RDGPassHook] bad ExecutePass target VA 0x{:x}", execute_target);
+        return true;
+    }
+
+    // Binfold-symbolized Subnautica 2 build, FRDGBuilder::ExecutePass:
+    // 48 89 5c 24 10 48 89 6c 24 18 48 89 74 24 20 57 ...
+    static constexpr uint8_t k_execute_pass_prologue[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C
+    };
+    if (std::memcmp(reinterpret_cast<void*>(execute_target), k_execute_pass_prologue, sizeof(k_execute_pass_prologue)) != 0) {
+        SPDLOG_WARN("[SN2-RDGPassHook] ExecutePass prologue mismatch at 0x{:x}; binary likely changed", execute_target);
+        return true;
+    }
+
+    g_execute_pass_hook = safetyhook::create_inline(
+        reinterpret_cast<void*>(execute_target),
+        reinterpret_cast<void*>(&execute_pass_trampoline),
+        safetyhook::InlineHook::StartDisabled);
+    if (!g_execute_pass_hook) {
+        SPDLOG_WARN("[SN2-RDGPassHook] ExecutePass safetyhook create failed at 0x{:x}", execute_target);
+        return true;
+    }
+    if (auto e = g_execute_pass_hook.enable(); !e.has_value()) {
+        SPDLOG_WARN("[SN2-RDGPassHook] ExecutePass enable failed at 0x{:x}: {}", execute_target, static_cast<int>(e.error().type));
+        return true;
+    }
+    SPDLOG_INFO("[SN2-RDGPassHook] ExecutePass installed at 0x{:x} (RVA 0x{:x})",
+        execute_target, sn2_rdg_pass_hook::SUBNAUTICA2_FRDG_EXECUTE_PASS_RVA);
     return true;
 }
 
@@ -332,6 +411,221 @@ static void revert_vsm_ub_clamp_patch() {
 }
 
 // ============================================================================
+// Sn2 underwater per-view pass probe (U-A1, 2026-05-26)
+// ============================================================================
+// Hook sub_1426F9B40 (RVA 0x26F9B40): the per-view UWE underwater-fog/integration
+// loop. It walks FSceneRenderer.Views and gates each view on FViewInfo+0x11EC
+// (int) and FViewInfo+0x1200 (float >0). Consumer-replay of 0x13b00f0c is dead,
+// so the real divergence is here. This OBSERVER logs, per view, those two fields
+// (+ the shared scene-water bool) so we can see which one gates the right view
+// out. No mutation. Gated by UEVR_SN2_UNDERWATER_PASS_PROBE=1.
+//
+// FSceneRenderer layout (from the decompile): scene=*(u64*)(this+0x08),
+// view array base=*(u64*)(this+0x10), count=*(i32*)(this+0x18), stride 0x29D0.
+// Water obj = *(u64*)(scene+0x45D8); water bool at +0xA7.
+inline constexpr uint64_t SUBNAUTICA2_UWE_UNDERWATER_PASS_RVA = 0x26F9B40;
+inline constexpr uint64_t SN2_VIEW_STRIDE   = 0x29D0;
+inline constexpr uint64_t SN2_VIEW_F11EC    = 0x11EC;  // int gate
+inline constexpr uint64_t SN2_VIEW_F1200    = 0x1200;  // float >0 gate
+static SafetyHookInline g_uwe_underwater_pass_hook{};
+
+static bool sn2_uwe_probe_enabled() {
+    static const bool e = []() {
+        const char* v = std::getenv("UEVR_SN2_UNDERWATER_PASS_PROBE");
+        return v && v[0] && v[0] != '0';
+    }();
+    return e;
+}
+
+static bool sn2_safe_read(const void* p, void* out, size_t n) {
+    if (p == nullptr) return false;
+    __try {
+        std::memcpy(out, p, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static char __fastcall uwe_underwater_pass_trampoline(void* this_ptr, void* a2, void* a3, uint32_t a4) {
+    if (sn2_uwe_probe_enabled() && this_ptr != nullptr) {
+        static std::atomic<uint64_t> seq{0};
+        const auto n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 24 || (n % 600) == 0) {
+            uint64_t base = 0; int32_t count = 0; uint64_t scene = 0;
+            const auto* t = reinterpret_cast<const uint8_t*>(this_ptr);
+            sn2_safe_read(t + 0x10, &base, sizeof(base));
+            sn2_safe_read(t + 0x18, &count, sizeof(count));
+            sn2_safe_read(t + 0x08, &scene, sizeof(scene));
+            int water_bool = -1;
+            if (scene != 0) {
+                uint64_t water_obj = 0;
+                if (sn2_safe_read(reinterpret_cast<const void*>(scene + 0x45D8), &water_obj, sizeof(water_obj)) && water_obj != 0) {
+                    uint8_t wb = 0;
+                    if (sn2_safe_read(reinterpret_cast<const void*>(water_obj + 0xA7), &wb, sizeof(wb))) water_bool = wb;
+                }
+            }
+            SPDLOG_WARN("[SN2-UWEProbe] #{} this=0x{:x} views_base=0x{:x} count={} sceneWater[0xA7]={}",
+                n, reinterpret_cast<uintptr_t>(this_ptr), base, count, water_bool);
+            if (base != 0 && count > 0 && count <= 8) {
+                for (int i = 0; i < count; ++i) {
+                    const uint64_t view = base + static_cast<uint64_t>(i) * SN2_VIEW_STRIDE;
+                    int32_t f11ec = -1; float f1200 = -999.0f;
+                    sn2_safe_read(reinterpret_cast<const void*>(view + SN2_VIEW_F11EC), &f11ec, sizeof(f11ec));
+                    sn2_safe_read(reinterpret_cast<const void*>(view + SN2_VIEW_F1200), &f1200, sizeof(f1200));
+                    SPDLOG_WARN("[SN2-UWEProbe]   view[{}] addr=0x{:x} +0x11EC={} +0x1200={:.4f}  (gate: 11EC==0||water={}, 1200>0={})",
+                        i, view, f11ec, f1200,
+                        (f11ec == 0 || water_bool > 0) ? 1 : 0,
+                        (f1200 > 0.0f) ? 1 : 0);
+                }
+            }
+        }
+    }
+    return g_uwe_underwater_pass_hook.call<char>(this_ptr, a2, a3, a4);
+}
+
+static bool install_uwe_underwater_pass_probe() {
+    if (!sn2_uwe_probe_enabled()) {
+        return false;
+    }
+    const auto exe_base = reinterpret_cast<uintptr_t>(utility::get_executable());
+    const auto target = exe_base + SUBNAUTICA2_UWE_UNDERWATER_PASS_RVA;
+    if (exe_base == 0 || !sn2_is_executable_process_range(target, 0x20)) {
+        SPDLOG_WARN("[SN2-UWEProbe] target 0x{:x} not in executable range; not installed", target);
+        return false;
+    }
+    g_uwe_underwater_pass_hook = safetyhook::create_inline(
+        reinterpret_cast<void*>(target),
+        reinterpret_cast<void*>(&uwe_underwater_pass_trampoline),
+        safetyhook::InlineHook::StartDisabled);
+    if (!g_uwe_underwater_pass_hook) {
+        SPDLOG_WARN("[SN2-UWEProbe] safetyhook create failed at 0x{:x}", target);
+        return false;
+    }
+    if (auto e = g_uwe_underwater_pass_hook.enable(); !e.has_value()) {
+        SPDLOG_WARN("[SN2-UWEProbe] enable failed at 0x{:x}", target);
+        return false;
+    }
+    SPDLOG_WARN("[SN2-UWEProbe] installed at 0x{:x} (RVA 0x{:x})",
+        target, SUBNAUTICA2_UWE_UNDERWATER_PASS_RVA);
+    return true;
+}
+
+// ============================================================================
+// Sn2 fog history-slot allocator probe (2026-05-26)
+// ============================================================================
+// Mid-hook on the fog temporal-reprojection history slot allocator
+// sub_142D941CB (RVA 0x2D941CB). The history is a scene-level indexed array at
+// FScene+0x2E30 (*(FScene + 8*slot + 0x2E30) = a history-entry pointer; only 2
+// slots used). The allocator iterates candidate objects and assigns the
+// winning candidate to slot v30 with the store:
+//     mov [r13 + r14*8 + 0x2E30], rax     ; RVA 0x2D9424E
+// where rax = selected candidate object (v39), r14 = slot index (v30). v30=r14
+// and v27=rbp are *inherited* registers (non-standard calling convention), so a
+// plain fastcall entry trampoline cannot read the slot. We must use a
+// safetyhook MID-hook at the store so we can read the full register Context.
+//
+// This OBSERVER logs, per selection store: the slot index (r14), the selected
+// candidate object pointer (rax = v39), the derived v40 = *(rax+0x28), and the
+// per-candidate slotKey/flags (v40+0x1DF / v40+0x1DB) that the allocator gates
+// on. Comparing the selected obj / v40 *per slot across frames* makes a
+// two-eye collision on the same history slot visible (both eyes' candidates
+// winning the same slot index, or the same obj ping-ponging between slots).
+// No mutation. Gated by UEVR_SN2_FOG_SLOT_PROBE=1.
+//
+// Offsets (verified against the decompile sub_142D941CB__0x142d941cb.c):
+//   v40     = *(rax + 40)      = *(rax + 0x28)
+//   slotKey = *(uint8_t*)(v40 + 479)  = *(uint8_t*)(v40 + 0x1DF)
+//   flags   = *(uint8_t*)(v40 + 475)  = *(uint8_t*)(v40 + 0x1DB)
+inline constexpr uint64_t SUBNAUTICA2_FOG_SLOT_ALLOC_RVA   = 0x2D941CB;  // function start (sanity)
+inline constexpr uint64_t SUBNAUTICA2_FOG_SLOT_STORE_RVA   = 0x2D9424E;  // mov [r13+r14*8+2E30h], rax
+inline constexpr uint64_t SN2_FOGSLOT_V40_OFF              = 0x28;       // *(rax+40)
+inline constexpr uint64_t SN2_FOGSLOT_SLOTKEY_OFF          = 0x1DF;      // *(v40+479)
+inline constexpr uint64_t SN2_FOGSLOT_FLAGS_OFF            = 0x1DB;      // *(v40+475)
+static SafetyHookMid g_fog_slot_probe_hook{};
+
+static bool sn2_fog_slot_probe_enabled() {
+    static const bool e = []() {
+        const char* v = std::getenv("UEVR_SN2_FOG_SLOT_PROBE");
+        return v && v[0] && v[0] != '0';
+    }();
+    return e;
+}
+
+static void fog_slot_probe_mid(safetyhook::Context& ctx) {
+    if (!sn2_fog_slot_probe_enabled()) {
+        return;
+    }
+    static std::atomic<uint64_t> seq{0};
+    const auto n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Rate limit: first 24 stores in full, then every 600th.
+    if (!(n <= 24 || (n % 600) == 0)) {
+        return;
+    }
+
+    // r14 = slot index (v30), rax = selected candidate object (v39).
+    const uint64_t slot = ctx.r14;
+    const uint64_t obj  = ctx.rax;
+
+    uint64_t v40 = 0;
+    int slot_key = -1;
+    int flags1db = -1;
+    if (obj != 0 && sn2_safe_read(reinterpret_cast<const void*>(obj + SN2_FOGSLOT_V40_OFF), &v40, sizeof(v40)) && v40 != 0) {
+        uint8_t sk = 0, fl = 0;
+        if (sn2_safe_read(reinterpret_cast<const void*>(v40 + SN2_FOGSLOT_SLOTKEY_OFF), &sk, sizeof(sk))) slot_key = sk;
+        if (sn2_safe_read(reinterpret_cast<const void*>(v40 + SN2_FOGSLOT_FLAGS_OFF), &fl, sizeof(fl))) flags1db = fl;
+    }
+
+    SPDLOG_WARN(
+        "[SN2-FogSlot] #{} slot={} obj=0x{:x} v40=0x{:x} slotKey={} flags1DB=0x{:x}",
+        n, slot, obj, v40, slot_key, flags1db);
+}
+
+static bool install_fog_slot_probe() {
+    if (!sn2_fog_slot_probe_enabled()) {
+        return false;
+    }
+    const auto exe_base = reinterpret_cast<uintptr_t>(utility::get_executable());
+    if (exe_base == 0) {
+        SPDLOG_WARN("[SN2-FogSlot] could not resolve executable base; not installed");
+        return false;
+    }
+
+    // Sanity: log a few bytes at the function start. We don't have a verified
+    // prologue for this build, so log-and-proceed (don't hard-fail), but DO
+    // require the store target VA to be in an executable range.
+    const auto fn_start = exe_base + SUBNAUTICA2_FOG_SLOT_ALLOC_RVA;
+    if (sn2_is_executable_process_range(fn_start, 0x10)) {
+        uint8_t pro[8] = {};
+        if (sn2_safe_read(reinterpret_cast<const void*>(fn_start), pro, sizeof(pro))) {
+            SPDLOG_WARN(
+                "[SN2-FogSlot] fn start 0x{:x} (RVA 0x{:x}) prologue: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                fn_start, SUBNAUTICA2_FOG_SLOT_ALLOC_RVA,
+                pro[0], pro[1], pro[2], pro[3], pro[4], pro[5], pro[6], pro[7]);
+        }
+    } else {
+        SPDLOG_WARN("[SN2-FogSlot] fn start 0x{:x} not in executable range (proceeding to store check)", fn_start);
+    }
+
+    const auto target = exe_base + SUBNAUTICA2_FOG_SLOT_STORE_RVA;
+    if (!sn2_is_executable_process_range(target, 0x10)) {
+        SPDLOG_WARN("[SN2-FogSlot] store target 0x{:x} not in executable range; not installed", target);
+        return false;
+    }
+
+    g_fog_slot_probe_hook = safetyhook::create_mid(
+        reinterpret_cast<void*>(target),
+        &fog_slot_probe_mid);
+    if (!g_fog_slot_probe_hook) {
+        SPDLOG_WARN("[SN2-FogSlot] safetyhook create_mid failed at 0x{:x}", target);
+        return false;
+    }
+    SPDLOG_WARN("[SN2-FogSlot] installed mid-hook at 0x{:x} (RVA 0x{:x}); reading r14=slot, rax=obj",
+        target, SUBNAUTICA2_FOG_SLOT_STORE_RVA);
+    return true;
+}
+
+// ============================================================================
 // Public entry point: call once during UEVR startup, after the executable's
 // renderer modules are loaded (i.e. after D3D12CreateDevice).
 // ============================================================================
@@ -342,6 +636,8 @@ void install_all() {
     install_rdg_pass_hook();
     install_material_name_hook();
     install_vsm_ub_clamp_patch();
+    install_uwe_underwater_pass_probe();
+    install_fog_slot_probe();
 }
 
 void revert_all() {
