@@ -1,8 +1,15 @@
 # UEVR Frame Capture + RenderDoc Bridge
 
-There are TWO capture paths now. Choose based on your tolerance for risk:
+> Historical note: this workflow predates the `renderdoc-embedded-port` fork.
+> For the current full RenderDoc integration plan, wrapper-ownership checks, and
+> `.rdc` validation path, see `docs/RENDERDOC_EMBEDDED_PORT.md` and
+> `docs/RENDERDOC_1TO1_AUDIT.md`.
 
-## Path 1 — `Sn2FrameCapture` (RECOMMENDED, no interference)
+This file describes the older SN2-specific bridge flows. For native RenderDoc
+`.rdc` capture, use the suspended `UEVRRenderDocLauncher.exe` flow in
+`docs/RENDERDOC_EMBEDDED_PORT.md`.
+
+## Legacy Path 1 — `Sn2FrameCapture` (no external capture DLL)
 
 A self-contained orchestrator. On file trigger, atomically captures everything UEVR knows about one frame to a unified directory. **No external DLL loaded.**
 
@@ -28,9 +35,11 @@ Set-Content C:\tmp\uevr_frame_cap.txt "go"
 
 UEVR detects the trigger, all sub-modules fire under one capture sequence, and a `manifest.json` is written that points at every artifact.
 
-**Why this is the RECOMMENDED path:** RenderDoc's in-app DLL hooks D3D12 vtables. UEVR also hooks D3D12 vtables. Loading both into the same process causes conflicts (similar class to ImGui interference observed in earlier sessions). Self-contained capture avoids the conflict entirely.
+This path remains useful for UEVR-only sidecars and screenshots. It is no
+longer the preferred native `.rdc` path; the embedded RenderDoc launcher now
+orders RenderDoc first and layers UEVR hooks on RenderDoc wrappers.
 
-## Path 2 — `Sn2RdCapture` (RISK: hook interference)
+## Legacy Path 2 — `Sn2RdCapture` (late RenderDoc API path)
 
 Loads `renderdoc.dll` into the running game process via RD's in-app API + drives `TriggerCapture()`. Produces real `.rdc` files openable in qrenderdoc.
 
@@ -44,7 +53,8 @@ $env:UEVR_SN2_RD_CAPTURE_ALSO_EMIT_SIDECAR = "1"
 Set-Content C:\tmp\rd_capture.txt "go"
 ```
 
-This path is NOT WIRED INTO THE DEFAULT BUILD as of 2026-05-22 — the files exist but `Sn2RdCapture.cpp` is not in `uevr.vcxproj`. If you want to try it, add the file + rebuild. Use with caution: RD's hooks may break UEVR's live patches.
+Late-loading RenderDoc into an already-running game is still degraded. Use the
+suspended launcher for 1:1-compatible native RenderDoc captures.
 
 ---
 

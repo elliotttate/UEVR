@@ -1,25 +1,27 @@
 // Sn2RdCapture.hpp
 //
-// In-process RenderDoc capture trigger. Loads RenderDoc's `renderdoc.dll`
-// via the in-app API (RENDERDOC_GetAPI) from inside the game process.
-// Triggers full .rdc captures on file-trigger from outside.
+// In-process RenderDoc capture trigger. Uses UEVR's shared RenderDoc capture
+// service to drive RenderDoc's in-app API (RENDERDOC_GetAPI) from inside the
+// game process. Triggers full .rdc captures on file-trigger from outside.
 //
 // SOLVES: RenderDoc's injector can't attach to a UEVR-loaded process. The
-// in-app API loads RD's capture machinery INTO our process and we drive it.
+// in-app API finds RD's capture machinery in-process and we drive it.
 //
 // LIMITATIONS
 // -----------
 // - RD's in-app API initialized AFTER device creation = "reduced fidelity"
-//   per RD docs — initial contents of resources may not be captured. The
-//   frame's D3D12 calls + new resources created during the captured frame
-//   are still recorded fully.
+//   per RD docs. Late-loading renderdoc.dll is opt-in only; the complete path
+//   is still to preload or embedded-initialize RenderDoc before D3D12 creation.
 // - Both UEVR and RD hook D3D12 methods. RD's layer initialization may
 //   conflict with UEVR's. We probe + report; user adjusts accordingly.
 //
 // CONFIG
 //   UEVR_SN2_RD_CAPTURE=1                                    enable
 //   UEVR_SN2_RD_CAPTURE_DLL=<path>                            renderdoc.dll path
-//                                                            (default: auto-probe)
+//                                                            (also permits
+//                                                            degraded late-load)
+//   UEVR_SN2_RD_CAPTURE_LOAD_DLL=1                            permit degraded
+//                                                            late-load fallback
 //   UEVR_SN2_RD_CAPTURE_TRIGGER_FILE=C:\tmp\rd_capture.txt    create this file
 //                                                            to trigger one capture
 //   UEVR_SN2_RD_CAPTURE_OUT_TEMPLATE=C:\tmp\uevr_captures\sn2 output template
@@ -36,9 +38,9 @@
 // USAGE
 //   while game running:
 //     touch C:\tmp\rd_capture.txt
-//   → UEVR detects, calls api->TriggerCapture()
-//   → RD captures the NEXT frame
-//   → .rdc lands at OUT_TEMPLATE + "_frameN.rdc"
+//   -> UEVR detects, calls StartFrameCapture(device, hwnd)
+//   -> UEVR ends the capture on the next Present
+//   -> .rdc lands under OUT_TEMPLATE
 //   → If ALSO_EMIT_SIDECAR, sidecar emitted alongside
 //   → Open .rdc in qrenderdoc
 
@@ -59,7 +61,7 @@ bool also_emit_sidecar();
 uint64_t autocapture_frame();        // UEVR_SN2_RDC_AUTOCAPTURE  (one-shot on frame N)
 uint64_t autocapture_every();        // UEVR_SN2_RDC_AUTOCAPTURE_EVERY (every K frames)
 
-// Initialize: probe + load renderdoc.dll, fetch RENDERDOC_API_1_6_0.
+// Initialize: find preloaded RenderDoc or opt-in late-load, then fetch API.
 // Idempotent. Returns true if successfully initialized.
 bool init();
 
@@ -67,7 +69,8 @@ bool init();
 bool is_loaded();
 
 // Called from Present hook every frame. Checks for trigger file existence.
-// If present, calls api->TriggerCapture() and (optionally) emits sidecar.
+// If present, calls Start/EndFrameCapture on the supplied device/window pair
+// and optionally emits sidecar data.
 //
 // d3d12_device: the ID3D12Device* used by the present chain. RD's
 //   in-app API for D3D12 expects the device as its "device pointer".

@@ -134,7 +134,11 @@ UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_set_capture_template(con
 struct UevrRenderDocBootstrapResult {
     void* module;            // HMODULE for renderdoc.dll
     bool  was_preloaded;     // true if renderdoc.dll was in the process before UEVR ran
+    bool  late_loaded;       // true if UEVR loaded renderdoc.dll itself
     bool  api_loaded;        // true if RENDERDOC_GetAPI succeeded
+    bool  capture_safe;      // true when RenderDoc was present before D3D12/DXGI modules
+    bool  d3d12_was_loaded;  // true if d3d12.dll was already loaded before bootstrap
+    bool  dxgi_was_loaded;   // true if dxgi.dll was already loaded before bootstrap
     int   api_version_major;
     int   api_version_minor;
     int   api_version_patch;

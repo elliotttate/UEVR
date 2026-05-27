@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +29,8 @@
 #include "WindowFilter.hpp"
 #include "Framework.hpp"
 #include "render/D3D12Diagnostics.hpp"
+#include "render/RenderDocCaptureService.hpp"
+#include "render/RenderDocDxgiProofHooks.hpp"
 #include "render/ShaderOverrideRegistry.hpp"
 #include "render/ShaderCompiler.hpp"
 #include "render/StereoEye.hpp"
@@ -2271,6 +2274,40 @@ bool should_preserve_present_params_for_current_game() {
     return result;
 }
 
+bool renderdoc_embedded_original_check_enabled() {
+    static const bool enabled =
+        uevr::renderdoc_capture::env_truthy_w(L"UEVR_RENDERDOC_BOOTSTRAP") ||
+        uevr::renderdoc_capture::env_truthy_w(L"UEVR_RENDERDOC_STRICT_ORIGINALS");
+    return enabled;
+}
+
+bool renderdoc_path_looks_renderdoc(std::string path) {
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return path.find("renderdoc.dll") != std::string::npos;
+}
+
+void renderdoc_check_hook_original(void** slot, size_t vtable_index, void* detour, const char* source) {
+    if (!renderdoc_embedded_original_check_enabled() || !uevr::renderdoc_capture::is_api_loaded() ||
+        slot == nullptr || *slot == nullptr) {
+        return;
+    }
+
+    const auto module = uevr::renderdoc_capture::module_path_for_address(*slot);
+    if (module.empty() || renderdoc_path_looks_renderdoc(module)) {
+        return;
+    }
+
+    SPDLOG_WARN("[RenderDoc] strict original check: {} vtable[{}] original=0x{:x} "
+                "module='{}' detour=0x{:x}; capture may bypass RenderDoc serialization",
+                source != nullptr ? source : "D3D12Hook",
+                vtable_index,
+                reinterpret_cast<uintptr_t>(*slot),
+                module,
+                reinterpret_cast<uintptr_t>(detour));
+}
+
 template <typename TInterface>
 void add_unique_pointer_hook(
     TInterface* iface,
@@ -2291,6 +2328,8 @@ void add_unique_pointer_hook(
         return;
     }
 
+    renderdoc_check_hook_original(slot, vtable_index, detour, "D3D12Hook::add_unique_pointer_hook");
+
     auto hook = std::make_unique<PointerHook>(slot, detour);
     lookup.emplace(slot_key, hook.get());
     storage.emplace_back(std::move(hook));
@@ -2305,6 +2344,7 @@ bool D3D12Hook::hook() {
     spdlog::info("Hooking D3D12");
 
     g_d3d12_hook = this;
+    uevr::renderdoc_dxgi_proof::ScopedInternalFactoryProof renderdoc_internal_factory_scope{};
 
     IDXGISwapChain1* swap_chain1{ nullptr };
     IDXGISwapChain3* swap_chain{ nullptr };
@@ -2341,37 +2381,93 @@ bool D3D12Hook::hook() {
 
     spdlog::info("Creating dummy device");
 
-    // Get the original on-disk bytes of the D3D12CreateDevice export
-    const auto original_bytes = utility::get_original_bytes(d3d12_create_device);
+    const bool renderdoc_embedded_mode =
+        uevr::renderdoc_capture::is_api_loaded() &&
+        uevr::renderdoc_capture::env_truthy_w(L"UEVR_RENDERDOC_BOOTSTRAP");
 
-    // Temporarily unhook D3D12CreateDevice
-    // it allows compatibility with ReShade and other overlays that hook it
-    // this is just a dummy device anyways, we don't want the other overlays to be able to use it
-    if (original_bytes) {
-        spdlog::info("D3D12CreateDevice appears to be hooked, temporarily unhooking");
+    if (renderdoc_embedded_mode) {
+        spdlog::info("[RenderDoc] embedded mode: preserving active D3D12CreateDevice hook for dummy device bootstrap");
 
-        std::vector<uint8_t> hooked_bytes(original_bytes->size());
-        memcpy(hooked_bytes.data(), d3d12_create_device, original_bytes->size());
+        HRESULT last_hr = E_FAIL;
+        Microsoft::WRL::ComPtr<ID3D12Device> fallback_device{};
+        for (int attempt = 1; attempt <= 6; ++attempt) {
+            Microsoft::WRL::ComPtr<ID3D12Device> candidate{};
+            last_hr = d3d12_create_device(nullptr, feature_level, IID_PPV_ARGS(&candidate));
+            if (SUCCEEDED(last_hr) && candidate != nullptr) {
+                if (uevr::renderdoc_capture::com_object_looks_renderdoc_wrapped(candidate.Get())) {
+                    device = candidate.Detach();
+                    break;
+                }
 
-        ProtectionOverride protection_override{ d3d12_create_device, original_bytes->size(), PAGE_EXECUTE_READWRITE };
-        memcpy(d3d12_create_device, original_bytes->data(), original_bytes->size());
-        
-        if (FAILED(d3d12_create_device(nullptr, feature_level, IID_PPV_ARGS(&device)))) {
-            spdlog::error("Failed to create D3D12 Dummy device");
-            memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
-            return false;
+                if (fallback_device == nullptr) {
+                    fallback_device = candidate;
+                }
+                if (attempt == 1 || attempt == 6) {
+                    spdlog::warn("[RenderDoc] dummy D3D12 device attempt {} returned an unwrapped device from {}; retrying",
+                                 attempt,
+                                 uevr::renderdoc_capture::com_object_vtable_module(candidate.Get()));
+                }
+            } else if (attempt == 1 || attempt == 6) {
+                spdlog::warn("[RenderDoc] dummy D3D12 device attempt {} failed hr=0x{:08x}; retrying",
+                             attempt, static_cast<uint32_t>(last_hr));
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
 
-        spdlog::info("Restoring hooked bytes for D3D12CreateDevice");
-        memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
-    } else { // D3D12CreateDevice is not hooked
-        if (FAILED(d3d12_create_device(nullptr, feature_level, IID_PPV_ARGS(&device)))) {
-            spdlog::error("Failed to create D3D12 Dummy device");
-            return false;
+        if (device == nullptr) {
+            if (fallback_device != nullptr &&
+                !uevr::renderdoc_capture::env_truthy_w(L"UEVR_RENDERDOC_REQUIRE_WRAPPED_DUMMY")) {
+                spdlog::warn("[RenderDoc] continuing with an unwrapped dummy device after short retry; "
+                             "the live game objects must still prove wrapped before capture is considered 1:1");
+                device = fallback_device.Detach();
+            } else {
+                spdlog::error("[RenderDoc] failed to create a RenderDoc-wrapped D3D12 dummy device hr=0x{:08x}",
+                              static_cast<uint32_t>(last_hr));
+                return false;
+            }
+        }
+    } else {
+        // Get the original on-disk bytes of the D3D12CreateDevice export
+        const auto original_bytes = utility::get_original_bytes(d3d12_create_device);
+
+        // Temporarily unhook D3D12CreateDevice
+        // it allows compatibility with ReShade and other overlays that hook it
+        // this is just a dummy device anyways, we don't want the other overlays to be able to use it
+        if (original_bytes) {
+            spdlog::info("D3D12CreateDevice appears to be hooked, temporarily unhooking");
+
+            std::vector<uint8_t> hooked_bytes(original_bytes->size());
+            memcpy(hooked_bytes.data(), d3d12_create_device, original_bytes->size());
+
+            ProtectionOverride protection_override{ d3d12_create_device, original_bytes->size(), PAGE_EXECUTE_READWRITE };
+            memcpy(d3d12_create_device, original_bytes->data(), original_bytes->size());
+
+            if (FAILED(d3d12_create_device(nullptr, feature_level, IID_PPV_ARGS(&device)))) {
+                spdlog::error("Failed to create D3D12 Dummy device");
+                memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
+                return false;
+            }
+
+            spdlog::info("Restoring hooked bytes for D3D12CreateDevice");
+            memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
+        } else { // D3D12CreateDevice is not hooked
+            if (FAILED(d3d12_create_device(nullptr, feature_level, IID_PPV_ARGS(&device)))) {
+                spdlog::error("Failed to create D3D12 Dummy device");
+                return false;
+            }
         }
     }
 
     spdlog::info("Dummy device: {:x}", (uintptr_t)device);
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::UevrDummyD3D12Device,
+        device,
+        "D3D12Hook::hook dummy D3D12CreateDevice");
+    if (renderdoc_embedded_mode) {
+        spdlog::info("[RenderDoc] dummy device vtable module: {}",
+                     uevr::renderdoc_capture::com_object_vtable_module(device));
+    }
 
     // Manually get CreateDXGIFactory export because the user may be running Windows 7
     const auto dxgi_module = LoadLibraryA("dxgi.dll");
@@ -2394,6 +2490,10 @@ bool D3D12Hook::hook() {
         spdlog::error("Failed to create D3D12 Dummy DXGI Factory");
         return false;
     }
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::UevrDummyDXGIFactory,
+        factory,
+        "D3D12Hook::hook dummy CreateDXGIFactory");
 
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -2408,6 +2508,10 @@ bool D3D12Hook::hook() {
         spdlog::error("Failed to create D3D12 Dummy Command Queue");
         return false;
     }
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::UevrDummyD3D12CommandQueue,
+        command_queue,
+        "D3D12Hook::hook dummy CreateCommandQueue");
 
     if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&command_allocator)))) {
         spdlog::error("Failed to create D3D12 Dummy Command Allocator");
@@ -2418,6 +2522,10 @@ bool D3D12Hook::hook() {
         spdlog::error("Failed to create D3D12 Dummy Graphics Command List");
         return false;
     }
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::UevrDummyD3D12CommandList,
+        command_list,
+        "D3D12Hook::hook dummy CreateCommandList");
 
     spdlog::info("Creating dummy swapchain");
 
@@ -2518,6 +2626,10 @@ bool D3D12Hook::hook() {
         spdlog::error("Failed to retrieve D3D12 DXGI SwapChain");
         return false;
     }
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::UevrDummyDXGISwapChain,
+        swap_chain,
+        "D3D12Hook::hook dummy swapchain");
 
     if (!m_skip_dummy_swapchain_type_info_probe) {
         try {
@@ -2681,6 +2793,8 @@ bool D3D12Hook::hook() {
 
         auto& present_fn = (*(void***)target_swapchain)[8]; // Present
         auto& present1_fn = (*(void***)target_swapchain)[22]; // Present1
+        renderdoc_check_hook_original(&present_fn, 8, reinterpret_cast<void*>(&D3D12Hook::present), "D3D12Hook::Present hook");
+        renderdoc_check_hook_original(&present1_fn, 22, reinterpret_cast<void*>(&D3D12Hook::present1), "D3D12Hook::Present1 hook");
         m_present_hook = std::make_unique<PointerHook>(&present_fn, (void*)&D3D12Hook::present);
         m_present1_hook = std::make_unique<PointerHook>(&present1_fn, (void*)&D3D12Hook::present1);
 
@@ -4062,11 +4176,29 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
 
     d3d12->m_inside_present = true;
     d3d12->m_swap_chain = swap_chain;
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::PresentDXGISwapChain,
+        swap_chain,
+        present1 ? "D3D12Hook::Present1 game swapchain" : "D3D12Hook::Present game swapchain");
+    if (swap_chain != nullptr) {
+        Microsoft::WRL::ComPtr<IDXGIFactory> parent_factory{};
+        if (SUCCEEDED(swap_chain->GetParent(IID_PPV_ARGS(&parent_factory)))) {
+            uevr::renderdoc_capture::note_object(
+                uevr::renderdoc_capture::ObjectKind::ObservedDXGIFactory,
+                parent_factory.Get(),
+                "IDXGISwapChain::GetParent from game Present");
+        }
+    }
     g_sn2_d3d12_present_frame_index.fetch_add(1, std::memory_order_relaxed);
 
     swap_chain->GetDevice(IID_PPV_ARGS(&d3d12->m_device));
 
     if (d3d12->m_device != nullptr) {
+        uevr::renderdoc_capture::note_object(
+            uevr::renderdoc_capture::ObjectKind::PresentD3D12Device,
+            d3d12->m_device,
+            "IDXGISwapChain::GetDevice from game Present");
+
         // 2026-05-18 SN2 SkyAtmosFix: install CreateCommittedResource hook EARLY
         // (right when we get the device) so we catch the cb0 backing buffer at
         // creation time. The Map vtable hook installs lazily via fog_path_a path,
@@ -4082,6 +4214,10 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
         } else {
             d3d12->m_command_queue = *(ID3D12CommandQueue**)((uintptr_t)swap_chain + d3d12->m_command_queue_offset);
         }
+        uevr::renderdoc_capture::note_object(
+            uevr::renderdoc_capture::ObjectKind::PresentD3D12CommandQueue,
+            d3d12->m_command_queue,
+            "D3D12Hook::Present swapchain command queue offset");
 
         // 2026-05-23 SN2 right-eye fog fix: hook the present queue's ExecuteCommandLists (vtable
         // idx 10) ONCE so scan_and_fix_fog_view_ub() can patch the secondary-eye fog view UB at
@@ -4103,6 +4239,8 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
                     qvt[10] == reinterpret_cast<void*>(&D3D12Hook::execute_command_lists));
                 if (!already_ours && qvt != nullptr &&
                     g_sn2_ecl_hooked_queue.load(std::memory_order_acquire) != qp) {
+                    renderdoc_check_hook_original(&qvt[10], 10, reinterpret_cast<void*>(&D3D12Hook::execute_command_lists),
+                                                  "D3D12Hook::ExecuteCommandLists hook");
                     // Capture the REAL original from the live vtable BEFORE activating the hook.
                     g_sn2_ecl_original.store(reinterpret_cast<Sn2EclFn>(qvt[10]), std::memory_order_release);
                     d3d12->m_command_queue_hook = std::make_unique<VtableHook>(d3d12->m_command_queue);
@@ -4366,6 +4504,19 @@ extern "C" ID3D12CommandQueue* sn2_eye_screenshot_get_command_queue() {
 }
 
 void WINAPI D3D12Hook::execute_command_lists(ID3D12CommandQueue* queue, UINT num_command_lists, ID3D12CommandList* const* lists) {
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::ExecuteD3D12CommandQueue,
+        queue,
+        "D3D12Hook::ExecuteCommandLists");
+    if (lists != nullptr) {
+        for (UINT i = 0; i < num_command_lists; ++i) {
+            uevr::renderdoc_capture::note_object(
+                uevr::renderdoc_capture::ObjectKind::ExecuteD3D12CommandList,
+                lists[i],
+                "D3D12Hook::ExecuteCommandLists");
+        }
+    }
+
     auto d3d12 = g_d3d12_hook;
     if (d3d12 != nullptr) {
         static const bool ecl_fix_enabled = []() {
@@ -4397,7 +4548,62 @@ void WINAPI D3D12Hook::execute_command_lists(ID3D12CommandQueue* queue, UINT num
     queue->ExecuteCommandLists(num_command_lists, lists);
 }
 
+namespace {
+bool renderdoc_active_pair_tracking_enabled() {
+    static const bool enabled =
+        uevr::renderdoc_capture::env_truthy_w(L"UEVR_RENDERDOC_BOOTSTRAP") ||
+        uevr::renderdoc_capture::env_truthy_w(L"UEVR_RENDERDOC_TRACK_ACTIVE_PAIR") ||
+        sn2_rd_capture::env_enabled();
+    return enabled;
+}
+
+void renderdoc_update_active_pair_on_present(IDXGISwapChain3* swap_chain) {
+    if (!renderdoc_active_pair_tracking_enabled() || !uevr::renderdoc_capture::is_api_loaded()) {
+        return;
+    }
+
+    uevr::renderdoc_capture::CapturePair pair{};
+    pair.device = (g_d3d12_hook != nullptr) ? static_cast<void*>(g_d3d12_hook->get_device()) : nullptr;
+    if (swap_chain != nullptr) {
+        DXGI_SWAP_CHAIN_DESC sc_desc{};
+        if (SUCCEEDED(swap_chain->GetDesc(&sc_desc))) {
+            pair.window = static_cast<void*>(sc_desc.OutputWindow);
+        }
+    }
+
+    if (pair.device != nullptr || pair.window != nullptr) {
+        uevr::renderdoc_capture::set_active_window(pair);
+    }
+}
+
+void sn2_renderdoc_capture_on_present(IDXGISwapChain3* swap_chain) {
+    if (!sn2_rd_capture::env_enabled()) {
+        return;
+    }
+
+    static std::atomic<bool> rd_init_attempted{false};
+    if (!rd_init_attempted.exchange(true, std::memory_order_acq_rel)) {
+        sn2_rd_capture::init();
+    }
+
+    void* rd_device = (g_d3d12_hook != nullptr) ? static_cast<void*>(g_d3d12_hook->get_device()) : nullptr;
+    void* rd_hwnd = nullptr;
+    if (swap_chain != nullptr) {
+        DXGI_SWAP_CHAIN_DESC sc_desc{};
+        if (SUCCEEDED(swap_chain->GetDesc(&sc_desc))) {
+            rd_hwnd = static_cast<void*>(sc_desc.OutputWindow);
+        }
+    }
+
+    static std::atomic<uint64_t> rd_frame{0};
+    sn2_rd_capture::on_present(rd_frame.fetch_add(1, std::memory_order_relaxed), rd_device, rd_hwnd);
+}
+} // namespace
+
 HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags) {
+    renderdoc_update_active_pair_on_present(swap_chain);
+    sn2_renderdoc_capture_on_present(swap_chain);
+
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
     sn2_draw_log_v2::on_present();
@@ -4415,27 +4621,6 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, UINT sync_interva
     }
     sn2_resource_readback::on_present();
     sn2_fix_rules::refresh_rules();
-    // 2026-05-22: Sn2RdCapture — in-process RenderDoc capture trigger.
-    // Loads renderdoc.dll on first call (lazy init), then polls trigger file
-    // each present. Touch UEVR_SN2_RD_CAPTURE_TRIGGER_FILE to capture one
-    // frame. See feedback_rd_capture_inprocess_only memory for rationale.
-    // Pass device + HWND so SetActiveWindow can latch the API pair.
-    if (sn2_rd_capture::env_enabled()) {
-        static std::atomic<bool> rd_init_attempted{false};
-        if (!rd_init_attempted.exchange(true, std::memory_order_acq_rel)) {
-            sn2_rd_capture::init();
-        }
-        void* rd_device = (g_d3d12_hook != nullptr) ? (void*)g_d3d12_hook->get_device() : nullptr;
-        void* rd_hwnd = nullptr;
-        if (swap_chain != nullptr) {
-            DXGI_SWAP_CHAIN_DESC sc_desc{};
-            if (SUCCEEDED(swap_chain->GetDesc(&sc_desc))) {
-                rd_hwnd = (void*)sc_desc.OutputWindow;
-            }
-        }
-        static std::atomic<uint64_t> rd_frame{0};
-        sn2_rd_capture::on_present(rd_frame.fetch_add(1, std::memory_order_relaxed), rd_device, rd_hwnd);
-    }
     // 2026-05-22: Sn2HeapDxbcScanner — mid-run DXBC bytecode dumper. Scans
     // the process heap for "DXBC" magic, dumps matching shader containers.
     // Trigger via touching UEVR_SN2_HEAP_SCAN_TRIGGER_FILE. Works on
@@ -4451,6 +4636,9 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, UINT sync_interva
 }
 
 HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags, DXGI_PRESENT_PARAMETERS* params) {
+    renderdoc_update_active_pair_on_present(swap_chain);
+    sn2_renderdoc_capture_on_present(swap_chain);
+
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
     sn2_draw_log_v2::on_present();
@@ -4468,27 +4656,6 @@ HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain3* swap_chain, UINT sync_interv
     }
     sn2_resource_readback::on_present();
     sn2_fix_rules::refresh_rules();
-    // 2026-05-22: Sn2RdCapture — in-process RenderDoc capture trigger.
-    // Loads renderdoc.dll on first call (lazy init), then polls trigger file
-    // each present. Touch UEVR_SN2_RD_CAPTURE_TRIGGER_FILE to capture one
-    // frame. See feedback_rd_capture_inprocess_only memory for rationale.
-    // Pass device + HWND so SetActiveWindow can latch the API pair.
-    if (sn2_rd_capture::env_enabled()) {
-        static std::atomic<bool> rd_init_attempted{false};
-        if (!rd_init_attempted.exchange(true, std::memory_order_acq_rel)) {
-            sn2_rd_capture::init();
-        }
-        void* rd_device = (g_d3d12_hook != nullptr) ? (void*)g_d3d12_hook->get_device() : nullptr;
-        void* rd_hwnd = nullptr;
-        if (swap_chain != nullptr) {
-            DXGI_SWAP_CHAIN_DESC sc_desc{};
-            if (SUCCEEDED(swap_chain->GetDesc(&sc_desc))) {
-                rd_hwnd = (void*)sc_desc.OutputWindow;
-            }
-        }
-        static std::atomic<uint64_t> rd_frame{0};
-        sn2_rd_capture::on_present(rd_frame.fetch_add(1, std::memory_order_relaxed), rd_device, rd_hwnd);
-    }
     // 2026-05-22: Sn2HeapDxbcScanner — mid-run DXBC bytecode dumper. Scans
     // the process heap for "DXBC" magic, dumps matching shader containers.
     // Trigger via touching UEVR_SN2_HEAP_SCAN_TRIGGER_FILE. Works on
@@ -4680,6 +4847,16 @@ HRESULT WINAPI D3D12Hook::create_graphics_pipeline_state(
         *pipeline_state != nullptr && riid == __uuidof(ID3D12PipelineState)) {
         pso = static_cast<ID3D12PipelineState*>(*pipeline_state);
     }
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::CreatedD3D12PipelineState,
+        pso,
+        "D3D12Hook::CreateGraphicsPipelineState result");
+    if (desc != nullptr) {
+        uevr::renderdoc_capture::note_object(
+            uevr::renderdoc_capture::ObjectKind::CreatedD3D12RootSignature,
+            desc->pRootSignature,
+            "D3D12Hook::CreateGraphicsPipelineState root signature");
+    }
 
     render::D3D12Diagnostics::get().record_pipeline_cache_event(
         "D3D12Hook::CreateGraphicsPipelineState",
@@ -4788,6 +4965,16 @@ HRESULT WINAPI D3D12Hook::create_compute_pipeline_state(
         *pipeline_state != nullptr && riid == __uuidof(ID3D12PipelineState)) {
         pso = static_cast<ID3D12PipelineState*>(*pipeline_state);
     }
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::CreatedD3D12PipelineState,
+        pso,
+        "D3D12Hook::CreateComputePipelineState result");
+    if (desc != nullptr) {
+        uevr::renderdoc_capture::note_object(
+            uevr::renderdoc_capture::ObjectKind::CreatedD3D12RootSignature,
+            desc->pRootSignature,
+            "D3D12Hook::CreateComputePipelineState root signature");
+    }
 
     render::D3D12Diagnostics::get().record_pipeline_cache_event(
         "D3D12Hook::CreateComputePipelineState",
@@ -4858,6 +5045,10 @@ HRESULT WINAPI D3D12Hook::create_command_list(
 
     const auto result = original(device, node_mask, type, command_allocator, bound_initial_state, riid, command_list);
     if (SUCCEEDED(result) && command_list != nullptr && *command_list != nullptr && d3d12 != nullptr) {
+        uevr::renderdoc_capture::note_object(
+            uevr::renderdoc_capture::ObjectKind::CreatedD3D12CommandList,
+            *command_list,
+            "D3D12Hook::CreateCommandList result");
         auto* unknown = reinterpret_cast<IUnknown*>(*command_list);
         d3d12->install_command_list_hooks_from_unknown(unknown);
 
@@ -4892,6 +5083,10 @@ HRESULT WINAPI D3D12Hook::create_command_list1(
 
     const auto result = original(device, node_mask, type, flags, riid, command_list);
     if (SUCCEEDED(result) && command_list != nullptr && *command_list != nullptr && d3d12 != nullptr) {
+        uevr::renderdoc_capture::note_object(
+            uevr::renderdoc_capture::ObjectKind::CreatedD3D12CommandList,
+            *command_list,
+            "D3D12Hook::CreateCommandList1 result");
         d3d12->install_command_list_hooks_from_unknown(reinterpret_cast<IUnknown*>(*command_list));
     }
 
@@ -5024,6 +5219,17 @@ HRESULT WINAPI D3D12Hook::pipeline_library_load_graphics_pipeline(
     }
     auto* pso = pso_holder.Get();
 
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::CreatedD3D12PipelineState,
+        pso,
+        "D3D12Hook::ID3D12PipelineLibrary::LoadGraphicsPipeline result");
+    if (desc != nullptr) {
+        uevr::renderdoc_capture::note_object(
+            uevr::renderdoc_capture::ObjectKind::CreatedD3D12RootSignature,
+            desc->pRootSignature,
+            "D3D12Hook::ID3D12PipelineLibrary::LoadGraphicsPipeline root signature");
+    }
+
     render::D3D12Diagnostics::get().record_pipeline_cache_event(
         "D3D12Hook::ID3D12PipelineLibrary::LoadGraphicsPipeline",
         "load_graphics_pipeline",
@@ -5083,6 +5289,17 @@ HRESULT WINAPI D3D12Hook::pipeline_library_load_compute_pipeline(
         unk->QueryInterface(IID_PPV_ARGS(&pso_holder));
     }
     auto* pso = pso_holder.Get();
+
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::CreatedD3D12PipelineState,
+        pso,
+        "D3D12Hook::ID3D12PipelineLibrary::LoadComputePipeline result");
+    if (desc != nullptr) {
+        uevr::renderdoc_capture::note_object(
+            uevr::renderdoc_capture::ObjectKind::CreatedD3D12RootSignature,
+            desc->pRootSignature,
+            "D3D12Hook::ID3D12PipelineLibrary::LoadComputePipeline root signature");
+    }
 
     render::D3D12Diagnostics::get().record_pipeline_cache_event(
         "D3D12Hook::ID3D12PipelineLibrary::LoadComputePipeline",
@@ -5220,6 +5437,16 @@ HRESULT WINAPI D3D12Hook::create_pipeline_state(
     if (pso == nullptr && SUCCEEDED(result) && pipeline_state != nullptr &&
         *pipeline_state != nullptr && riid == __uuidof(ID3D12PipelineState)) {
         pso = static_cast<ID3D12PipelineState*>(*pipeline_state);
+    }
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::CreatedD3D12PipelineState,
+        pso,
+        "D3D12Hook::CreatePipelineState result");
+    if (desc != nullptr) {
+        uevr::renderdoc_capture::note_object(
+            uevr::renderdoc_capture::ObjectKind::CreatedD3D12RootSignature,
+            d3d12_root_signature_from_pipeline_stream(desc),
+            "D3D12Hook::CreatePipelineState root signature");
     }
     if (did_substitute || did_strip_cached_pso) {
         SPDLOG_WARN("[D3D12-PSOStreamPatch] post-call substituted={} stripped_cached={} hr=0x{:08x} pso={:p}",
@@ -5522,6 +5749,12 @@ HRESULT WINAPI D3D12Hook::create_root_signature(
     }
 
     const auto result = original(device, node_mask, blob, blob_length_in_bytes, riid, root_signature);
+    if (SUCCEEDED(result) && root_signature != nullptr && *root_signature != nullptr) {
+        uevr::renderdoc_capture::note_object(
+            uevr::renderdoc_capture::ObjectKind::CreatedD3D12RootSignature,
+            *root_signature,
+            "D3D12Hook::CreateRootSignature result");
+    }
     if (SUCCEEDED(result) && root_signature != nullptr && *root_signature != nullptr && blob != nullptr && blob_length_in_bytes > 0) {
         Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature_iface{};
         auto* unknown = reinterpret_cast<IUnknown*>(*root_signature);
@@ -5566,6 +5799,10 @@ void WINAPI D3D12Hook::create_render_target_view(
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor
 ) {
     (void)desc;
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::ObservedD3D12Resource,
+        resource,
+        "D3D12Hook::CreateRenderTargetView resource");
     auto d3d12 = g_d3d12_hook;
     const auto slot = device != nullptr ? &(*(void***)device)[CREATE_RENDER_TARGET_VIEW_VTABLE_INDEX] : nullptr;
     auto* hook = d3d12 != nullptr ? d3d12->find_create_render_target_view_hook(slot) : nullptr;
@@ -6594,6 +6831,10 @@ namespace sn2_upload_buf_map {
 
         HRESULT hr = original(self, heap_props, heap_flags, desc, initial_state, clear, riid, ppv);
         if (SUCCEEDED(hr) && ppv && *ppv && heap_props != nullptr && desc != nullptr) {
+            uevr::renderdoc_capture::note_object(
+                uevr::renderdoc_capture::ObjectKind::CreatedD3D12Resource,
+                *ppv,
+                "D3D12Hook::CreateCommittedResource result");
             render::StereoForensics::get().record_resource_created(
                 "D3D12Hook::CreateCommittedResource",
                 reinterpret_cast<ID3D12Resource*>(*ppv),
@@ -6749,6 +6990,10 @@ namespace sn2_upload_buf_map {
 
         HRESULT hr = original(self, heap, heap_offset, desc, initial_state, clear, riid, ppv);
         if (SUCCEEDED(hr) && ppv && *ppv && heap != nullptr && desc != nullptr) {
+            uevr::renderdoc_capture::note_object(
+                uevr::renderdoc_capture::ObjectKind::CreatedD3D12Resource,
+                *ppv,
+                "D3D12Hook::CreatePlacedResource result");
             render::StereoForensics::get().record_placed_resource_created(
                 "D3D12Hook::CreatePlacedResource",
                 reinterpret_cast<ID3D12Resource*>(*ppv),
@@ -9638,6 +9883,10 @@ void WINAPI D3D12Hook::create_shader_resource_view(
     const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor
 ) {
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::ObservedD3D12Resource,
+        resource,
+        "D3D12Hook::CreateShaderResourceView resource");
     auto d3d12 = g_d3d12_hook;
     const auto slot = device != nullptr ? &(*(void***)device)[CREATE_SHADER_RESOURCE_VIEW_VTABLE_INDEX] : nullptr;
     auto* hook = d3d12 != nullptr ? d3d12->find_create_shader_resource_view_hook(slot) : nullptr;
@@ -9726,6 +9975,14 @@ void WINAPI D3D12Hook::create_unordered_access_view(
     const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor
 ) {
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::ObservedD3D12Resource,
+        resource,
+        "D3D12Hook::CreateUnorderedAccessView resource");
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::ObservedD3D12Resource,
+        counter_resource,
+        "D3D12Hook::CreateUnorderedAccessView counter resource");
     auto d3d12 = g_d3d12_hook;
     const auto slot = device != nullptr ? &(*(void***)device)[CREATE_UNORDERED_ACCESS_VIEW_VTABLE_INDEX] : nullptr;
     auto* hook = d3d12 != nullptr ? d3d12->find_create_unordered_access_view_hook(slot) : nullptr;
@@ -10046,6 +10303,10 @@ void WINAPI D3D12Hook::create_depth_stencil_view(
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor
 ) {
     (void)desc;
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::ObservedD3D12Resource,
+        resource,
+        "D3D12Hook::CreateDepthStencilView resource");
     auto d3d12 = g_d3d12_hook;
     const auto slot = device != nullptr ? &(*(void***)device)[CREATE_DEPTH_STENCIL_VIEW_VTABLE_INDEX] : nullptr;
     auto* hook = d3d12 != nullptr ? d3d12->find_create_depth_stencil_view_hook(slot) : nullptr;
@@ -15432,6 +15693,12 @@ HRESULT WINAPI D3D12Hook::create_descriptor_heap(
     }
 
     const HRESULT hr = original(device, desc, riid, heap);
+    if (SUCCEEDED(hr) && heap != nullptr && *heap != nullptr) {
+        uevr::renderdoc_capture::note_object(
+            uevr::renderdoc_capture::ObjectKind::CreatedD3D12DescriptorHeap,
+            *heap,
+            "D3D12Hook::CreateDescriptorHeap result");
+    }
     if (sn2_hooks_disabled_by_env()) {
         return hr;
     }
@@ -15550,6 +15817,10 @@ HRESULT WINAPI D3D12Hook::reset_command_list(
         bound_initial_state = shader_registry.resolve_d3d12_pipeline_state(initial_state);
         shader_registry.note_d3d12_pipeline_state_bound(initial_state, bound_initial_state);
     }
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::BoundD3D12PipelineState,
+        bound_initial_state,
+        "D3D12Hook::ResetCommandList initial state");
 
     const auto result = original(command_list, allocator, bound_initial_state);
     if (SUCCEEDED(result) && initial_state != nullptr) {
@@ -15577,6 +15848,10 @@ void WINAPI D3D12Hook::clear_state(ID3D12GraphicsCommandList* command_list, ID3D
         bound_pipeline_state = shader_registry.resolve_d3d12_pipeline_state(pipeline_state);
         shader_registry.note_d3d12_pipeline_state_bound(pipeline_state, bound_pipeline_state);
     }
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::BoundD3D12PipelineState,
+        bound_pipeline_state,
+        "D3D12Hook::ClearState pipeline state");
 
     if (original != nullptr) {
         original(command_list, bound_pipeline_state);
@@ -15615,6 +15890,10 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
 
     auto& shader_registry = render::ShaderOverrideRegistry::get();
     if (!shader_registry.should_track_d3d12_pipelines()) {
+        uevr::renderdoc_capture::note_object(
+            uevr::renderdoc_capture::ObjectKind::BoundD3D12PipelineState,
+            pipeline_state,
+            "D3D12Hook::SetPipelineState bound state");
         if (record_forensics_pso_bind) {
             render::StereoForensics::get().record_pso_bind(
                 "D3D12Hook::SetPipelineState",
@@ -15631,6 +15910,10 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
 
     auto bound_pipeline_state = shader_registry.resolve_d3d12_pipeline_state(pipeline_state);
     shader_registry.note_d3d12_pipeline_state_bound(pipeline_state, bound_pipeline_state);
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::BoundD3D12PipelineState,
+        bound_pipeline_state,
+        "D3D12Hook::SetPipelineState bound state");
     if (pipeline_state != nullptr &&
         !shader_registry.is_d3d12_pipeline_state_tracked(reinterpret_cast<uintptr_t>(pipeline_state))) {
         static std::mutex s_unknown_pso_mutex{};
@@ -15686,6 +15969,10 @@ void WINAPI D3D12Hook::set_compute_root_signature(
 
     const auto state = read_cmdlist_state(command_list);
     update_cmdlist_root_signature(command_list, false, root_signature);
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::BoundD3D12RootSignature,
+        root_signature,
+        "D3D12Hook::SetComputeRootSignature");
     record_root_bind_event(
         "D3D12Hook::SetComputeRootSignature",
         command_list,
@@ -15713,6 +16000,10 @@ void WINAPI D3D12Hook::set_graphics_root_signature(
 
     const auto state = read_cmdlist_state(command_list);
     update_cmdlist_root_signature(command_list, true, root_signature);
+    uevr::renderdoc_capture::note_object(
+        uevr::renderdoc_capture::ObjectKind::BoundD3D12RootSignature,
+        root_signature,
+        "D3D12Hook::SetGraphicsRootSignature");
     record_root_bind_event(
         "D3D12Hook::SetGraphicsRootSignature",
         command_list,
@@ -34120,6 +34411,10 @@ void WINAPI D3D12Hook::set_descriptor_heaps(
             for (UINT i = 0; i < num_descriptor_heaps; ++i) {
                 ID3D12DescriptorHeap* heap = descriptor_heaps[i];
                 if (heap == nullptr) continue;
+                uevr::renderdoc_capture::note_object(
+                    uevr::renderdoc_capture::ObjectKind::BoundD3D12DescriptorHeap,
+                    heap,
+                    "D3D12Hook::SetDescriptorHeaps bound heap");
                 D3D12_DESCRIPTOR_HEAP_DESC desc = heap->GetDesc();
                 if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
                     tls_bindless_heap.heap = heap;
