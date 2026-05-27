@@ -1,8 +1,5 @@
 #include "render/RenderDiagnosticsCAPI.hpp"
 
-#define RENDERDOC_NO_STDINT
-#include "renderdoc_app.h"
-
 #include <Windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -24,6 +21,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -37,6 +35,7 @@
 #include "render/D3D12Diagnostics.hpp"
 #include "render/FrameResourceInspector.hpp"
 #include "render/RenderAnalysisExport.hpp"
+#include "render/RenderDocCaptureService.hpp"
 #include "render/ShaderOverrideRegistry.hpp"
 #include "render/StereoForensics.hpp"
 
@@ -1964,54 +1963,77 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_select_eye(int side) {
 
 // ── RenderDoc integration ────────────────────────────────────────────
 
+namespace rdc = uevr::renderdoc_capture;
+
 namespace {
 
-std::mutex g_renderdoc_mutex{};
-RENDERDOC_API_1_7_0* g_renderdoc_api{nullptr};
-bool g_renderdoc_attempted{false};
+struct RenderDocCaptureAttempt {
+    bool ended{};
+    bool had_exact_pair{};
+    bool wildcard_fallback{};
+    const char* mode{"wildcard_no_active_pair"};
+    rdc::CapturePair pair{};
+};
 
-void try_load_renderdoc() {
-    std::lock_guard lock{g_renderdoc_mutex};
-    if (g_renderdoc_api != nullptr) return;
+RenderDocCaptureAttempt renderdoc_capture_prefer_active_pair(std::chrono::milliseconds duration) {
+    RenderDocCaptureAttempt attempt{};
+    attempt.pair = rdc::active_window();
+    attempt.had_exact_pair = attempt.pair.device != nullptr && attempt.pair.window != nullptr;
 
-    HMODULE mod = GetModuleHandleA("renderdoc.dll");
-    if (mod == nullptr) {
-        // RenderDoc can be injected after the diagnostics UI has already queried
-        // status once. Treat "module absent" as retryable instead of caching it.
-        return;
-    }
-    if (g_renderdoc_attempted) return;
-    g_renderdoc_attempted = true;
+    if (attempt.had_exact_pair) {
+        attempt.mode = "exact_pair";
+        attempt.ended = rdc::capture_blocking(attempt.pair, duration);
+        if (attempt.ended) {
+            return attempt;
+        }
 
-    auto get_api = reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(mod, "RENDERDOC_GetAPI"));
-    if (get_api == nullptr) {
-        spdlog::warn("[RenderCAPI] renderdoc.dll is loaded but RENDERDOC_GetAPI is missing");
-        return;
+        attempt.wildcard_fallback = true;
+        attempt.mode = "exact_pair_failed_wildcard";
     }
-    if (get_api(eRENDERDOC_API_Version_1_7_0, reinterpret_cast<void**>(&g_renderdoc_api)) != 1 ||
-        g_renderdoc_api == nullptr) {
-        // Try older API versions in case the loaded runtime is older than our header.
-        get_api(eRENDERDOC_API_Version_1_4_0, reinterpret_cast<void**>(&g_renderdoc_api));
+
+    attempt.ended = rdc::capture_blocking({}, duration);
+    if (!attempt.had_exact_pair) {
+        attempt.mode = "wildcard_no_active_pair";
     }
-    if (g_renderdoc_api == nullptr) {
-        spdlog::warn("[RenderCAPI] renderdoc.dll loaded but GetAPI returned no compatible interface");
-        return;
-    }
-    int major{}, minor{}, patch{};
-    g_renderdoc_api->GetAPIVersion(&major, &minor, &patch);
-    spdlog::info("[RenderCAPI] RenderDoc API loaded: v{}.{}.{}", major, minor, patch);
+    return attempt;
 }
 
-RENDERDOC_API_1_7_0* rdoc() {
-    try_load_renderdoc();
-    return g_renderdoc_api;
+json renderdoc_object_snapshot_to_json(const rdc::ObjectSnapshot& snapshot) {
+    return json{
+        {"seen", snapshot.seen},
+        {"pointer", format_pointer(reinterpret_cast<uintptr_t>(snapshot.pointer))},
+        {"source", snapshot.source},
+        {"vtable_module", snapshot.vtable_module},
+        {"renderdoc_wrapped", snapshot.renderdoc_wrapped},
+        {"sequence", snapshot.sequence},
+    };
+}
+
+const rdc::ObjectOwnershipInfo* find_renderdoc_object(
+    const std::vector<rdc::ObjectOwnershipInfo>& objects,
+    rdc::ObjectKind kind
+) {
+    for (const auto& object : objects) {
+        if (object.kind == kind) {
+            return &object;
+        }
+    }
+    return nullptr;
+}
+
+bool first_renderdoc_object_wrapped(
+    const std::vector<rdc::ObjectOwnershipInfo>& objects,
+    rdc::ObjectKind kind
+) {
+    const auto* object = find_renderdoc_object(objects, kind);
+    return object != nullptr && object->first.seen && object->first.renderdoc_wrapped;
 }
 
 } // namespace
 
 extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_status_json() {
     try {
-        auto* api = rdoc();
+        auto* api = rdc::api();
         if (api == nullptr) {
             return publish(json{
                 {"loaded", false},
@@ -2022,27 +2044,74 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_status_json()
         int major{}, minor{}, patch{};
         api->GetAPIVersion(&major, &minor, &patch);
         const uint32_t num_captures = api->GetNumCaptures();
+        const auto bootstrap = rdc::status();
+        const auto active_pair = rdc::active_window();
+        const auto active_device_vtable_module = rdc::com_object_vtable_module(active_pair.device);
+        const auto object_infos = rdc::object_ownership();
+        const bool first_present_objects_wrapped =
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::PresentD3D12Device) &&
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::PresentDXGISwapChain) &&
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::PresentD3D12CommandQueue);
+        const bool first_created_command_list_wrapped =
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::CreatedD3D12CommandList) ||
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::ExecuteD3D12CommandList);
+        const bool first_dxgi_factory_wrapped =
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::DxgiFactoryCreateResult) ||
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::ObservedDXGIFactory);
+        const bool first_resource_wrapped =
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::CreatedD3D12Resource) ||
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::ObservedD3D12Resource);
+        const bool first_descriptor_heap_wrapped =
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::CreatedD3D12DescriptorHeap) ||
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::BoundD3D12DescriptorHeap);
+        const bool first_root_signature_wrapped =
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::CreatedD3D12RootSignature) ||
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::BoundD3D12RootSignature);
+        const bool first_pipeline_state_wrapped =
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::CreatedD3D12PipelineState) ||
+            first_renderdoc_object_wrapped(object_infos, rdc::ObjectKind::BoundD3D12PipelineState);
         json captures = json::array();
-        for (uint32_t i = 0; i < num_captures; ++i) {
-            uint32_t pathlen = 0;
-            uint64_t timestamp = 0;
-            if (api->GetCapture(i, nullptr, &pathlen, &timestamp) && pathlen > 0) {
-                std::string path(pathlen, '\0');
-                if (api->GetCapture(i, path.data(), nullptr, nullptr)) {
-                    // GetCapture writes a null terminator; trim it.
-                    if (!path.empty() && path.back() == '\0') path.pop_back();
-                    captures.push_back({{"index", i}, {"path", path}, {"timestamp", timestamp}});
-                }
-            }
+        for (const auto& capture : rdc::captures()) {
+            captures.push_back({
+                {"index", capture.index},
+                {"path", capture.path},
+                {"timestamp", capture.timestamp},
+            });
         }
-        const char* tmpl = api->GetCaptureFilePathTemplate();
+        json ownership = json::array();
+        for (const auto& object : object_infos) {
+            ownership.push_back({
+                {"kind", object.name},
+                {"first", renderdoc_object_snapshot_to_json(object.first)},
+                {"current", renderdoc_object_snapshot_to_json(object.current)},
+            });
+        }
         return publish(json{
             {"loaded", true},
             {"version", std::to_string(major) + "." + std::to_string(minor) + "." + std::to_string(patch)},
             {"num_captures", num_captures},
             {"is_target_control_connected", api->IsTargetControlConnected() != 0},
             {"is_frame_capturing", api->IsFrameCapturing() != 0},
-            {"capture_path_template", tmpl == nullptr ? "" : tmpl},
+            {"loaded_path", bootstrap.loaded_path},
+            {"was_preloaded", bootstrap.was_preloaded},
+            {"loaded_by_uevr", bootstrap.late_loaded},
+            {"capture_safe", bootstrap.capture_safe},
+            {"d3d12_loaded_before_bootstrap", bootstrap.d3d12_was_loaded},
+            {"dxgi_loaded_before_bootstrap", bootstrap.dxgi_was_loaded},
+            {"loaded_before_graphics_modules", bootstrap.loaded_before_graphics_modules},
+            {"capture_path_template", rdc::capture_template()},
+            {"active_device", format_pointer(reinterpret_cast<uintptr_t>(active_pair.device))},
+            {"active_device_vtable_module", active_device_vtable_module},
+            {"active_device_renderdoc_wrapped", rdc::com_object_looks_renderdoc_wrapped(active_pair.device)},
+            {"active_window", format_pointer(reinterpret_cast<uintptr_t>(active_pair.window))},
+            {"first_present_objects_renderdoc_wrapped", first_present_objects_wrapped},
+            {"first_dxgi_factory_renderdoc_wrapped", first_dxgi_factory_wrapped},
+            {"first_command_list_renderdoc_wrapped", first_created_command_list_wrapped},
+            {"first_resource_renderdoc_wrapped", first_resource_wrapped},
+            {"first_descriptor_heap_renderdoc_wrapped", first_descriptor_heap_wrapped},
+            {"first_root_signature_renderdoc_wrapped", first_root_signature_wrapped},
+            {"first_pipeline_state_renderdoc_wrapped", first_pipeline_state_wrapped},
+            {"object_ownership", std::move(ownership)},
             {"captures", std::move(captures)},
         });
     } catch (const std::exception& e) {
@@ -2052,7 +2121,7 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_status_json()
 
 extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_trigger_capture(int num_frames) {
     try {
-        auto* api = rdoc();
+        auto* api = rdc::api();
         if (api == nullptr) {
             return publish(json{
                 {"ok", false},
@@ -2061,17 +2130,19 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_trigger_captu
         }
         const uint32_t frames = num_frames <= 1 ? 1u : static_cast<uint32_t>(num_frames);
         if (frames == 1) {
-            // Late-injected RenderDoc sessions can ignore TriggerCapture() because
-            // no active window/device pair has been selected yet. Wildcard
-            // Start/EndFrameCapture captures any active graphics API pair.
-            api->StartFrameCapture(nullptr, nullptr);
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-            const auto ended = api->EndFrameCapture(nullptr, nullptr);
+            // Prefer the exact pair tracked by D3D12 Present, then retain
+            // wildcard capture as a diagnostics-only fallback.
+            const auto attempt = renderdoc_capture_prefer_active_pair(std::chrono::milliseconds(250));
             return publish(json{
-                {"ok", ended != 0},
+                {"ok", attempt.ended},
                 {"queued_frames", frames},
-                {"mode", "start_end_wildcard"},
-                {"ended", ended != 0},
+                {"mode", attempt.mode},
+                {"ended", attempt.ended},
+                {"had_exact_pair", attempt.had_exact_pair},
+                {"wildcard_fallback", attempt.wildcard_fallback},
+                {"active_device", format_pointer(reinterpret_cast<uintptr_t>(attempt.pair.device))},
+                {"active_window", format_pointer(reinterpret_cast<uintptr_t>(attempt.pair.window))},
+                {"newest_capture", rdc::newest_capture_path()},
                 {"num_captures", api->GetNumCaptures()},
             });
         } else {
@@ -2085,7 +2156,7 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_trigger_captu
 
 extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_launch_ui() {
     try {
-        auto* api = rdoc();
+        auto* api = rdc::api();
         if (api == nullptr) {
             return publish(json{{"ok", false}, {"error", "RenderDoc API not loaded"}});
         }
@@ -2103,15 +2174,14 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_set_capture_t
     const char* path_template
 ) {
     try {
-        auto* api = rdoc();
+        auto* api = rdc::api();
         if (api == nullptr) {
             return publish(json{{"ok", false}, {"error", "RenderDoc API not loaded"}});
         }
         if (path_template != nullptr && *path_template != '\0') {
-            api->SetCaptureFilePathTemplate(path_template);
+            rdc::set_capture_template(path_template);
         }
-        const char* tmpl = api->GetCaptureFilePathTemplate();
-        return publish(json{{"ok", true}, {"template", tmpl == nullptr ? "" : tmpl}});
+        return publish(json{{"ok", true}, {"template", rdc::capture_template()}});
     } catch (const std::exception& e) {
         return publish(json{{"ok", false}, {"error", e.what()}});
     }
@@ -2122,111 +2192,34 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_renderdoc_set_capture_t
 extern "C" UEVR_RENDER_CAPI UevrRenderDocBootstrapResult uevr_renderdoc_bootstrap() {
     UevrRenderDocBootstrapResult r{};
 
-    // Bail if the user explicitly disabled the bootstrap.
-    {
-        wchar_t buf[8]{};
-        if (GetEnvironmentVariableW(L"UEVR_DISABLE_RENDERDOC_BOOTSTRAP", buf,
-                                      (DWORD)std::size(buf)) > 0 && buf[0] == L'1') {
-            spdlog::info("[RenderDoc] bootstrap skipped (UEVR_DISABLE_RENDERDOC_BOOTSTRAP=1)");
-            return r;
-        }
-    }
+    const auto result = rdc::bootstrap(rdc::env_truthy_w(L"UEVR_LOAD_RENDERDOC_DLL"));
+    r.module = result.module;
+    r.was_preloaded = result.was_preloaded;
+    r.late_loaded = result.late_loaded;
+    r.api_loaded = result.api_loaded;
+    r.capture_safe = result.capture_safe;
+    r.d3d12_was_loaded = result.d3d12_was_loaded;
+    r.dxgi_was_loaded = result.dxgi_was_loaded;
+    r.api_version_major = result.api_version_major;
+    r.api_version_minor = result.api_version_minor;
+    r.api_version_patch = result.api_version_patch;
 
-    // Check if already loaded — the ONLY safe case. The user launched via
-    // `renderdoccmd capture --opt-hook-children` so renderdoc.dll is in
-    // the process before UEVR ever ran (and before D3D12CreateDevice).
-    //
-    // We deliberately do NOT LoadLibrary renderdoc.dll ourselves: late-
-    // loading RenderDoc after UEVR's D3D12Hook is installed (or after
-    // D3D12CreateDevice has run) breaks UEVR's hook scanner and crashes
-    // the game. Opt-in via UEVR_LOAD_RENDERDOC_DLL=1 if you really know
-    // what you're doing (analysis-API queries only — no live capture).
-    HMODULE mod = GetModuleHandleA("renderdoc.dll");
-    if (mod != nullptr) {
-        r.was_preloaded = true;
-        spdlog::info("[RenderDoc] preloaded by launcher: 0x{:x}",
-                     reinterpret_cast<uintptr_t>(mod));
-    } else {
-        wchar_t buf[8]{};
-        const bool opt_in_load = GetEnvironmentVariableW(L"UEVR_LOAD_RENDERDOC_DLL", buf,
-                                                          (DWORD)std::size(buf)) > 0 && buf[0] == L'1';
-        if (!opt_in_load) {
-            // Default: do nothing. UEVR's D3D12Hook needs to be the only
-            // DXGI wrapper at the bottom of the chain.
-            return r;
-        }
-        // Opt-in: try LoadLibrary as a fallback. Works for analysis-API
-        // queries (status / num_captures / launch UI) but capture itself
-        // will likely fail because D3D12 was created before our hooks
-        // could install — AND it may break UEVR's own D3D12Hook.
-        const wchar_t* search_paths[] = {
-            L"renderdoc.dll",
-            L"C:\\Program Files\\RenderDoc\\renderdoc.dll",
-            L"E:\\Github\\renderdoc\\x64\\Development\\renderdoc.dll",
-            L"E:\\Github\\renderdoc\\x64\\Release\\renderdoc.dll",
-            nullptr,
-        };
-        for (auto* p = search_paths; *p != nullptr; ++p) {
-            mod = LoadLibraryW(*p);
-            if (mod != nullptr) {
-                spdlog::warn("[RenderDoc] OPT-IN late-load from {} — "
-                             "UEVR D3D12Hook may now fail. Use only for analysis queries.",
-                             std::string{reinterpret_cast<const char*>(*p), wcslen(*p)});
-                break;
-            }
-        }
-        if (mod == nullptr) {
-            spdlog::info("[RenderDoc] UEVR_LOAD_RENDERDOC_DLL=1 set but no renderdoc.dll found");
-            return r;
-        }
-    }
-    r.module = static_cast<void*>(mod);
-
-    // Initialize the in-app API via the existing rdoc() lazy path.
-    auto* api = rdoc();
-    if (api == nullptr) {
-        spdlog::warn("[RenderDoc] DLL present but RENDERDOC_GetAPI did not return a compatible API");
+    if (!r.api_loaded) {
         return r;
     }
-    r.api_loaded = true;
-    api->GetAPIVersion(&r.api_version_major, &r.api_version_minor, &r.api_version_patch);
+
     spdlog::info("[RenderDoc] API ready: v{}.{}.{}  (preloaded={})",
                  r.api_version_major, r.api_version_minor, r.api_version_patch,
                  r.was_preloaded);
-
-    // Set a default capture template under %TEMP% if the user hasn't set one
-    // (so triggers from the watcher have a known landing place).
-    if (const char* existing = api->GetCaptureFilePathTemplate(); existing == nullptr || *existing == '\0') {
-        wchar_t temp[MAX_PATH]{};
-        if (GetTempPathW(MAX_PATH, temp) > 0) {
-            wchar_t pathw[MAX_PATH + 64]{};
-            SYSTEMTIME st{};
-            GetLocalTime(&st);
-            swprintf_s(pathw, L"%suevr_renderdoc_%04d%02d%02d_%02d%02d%02d",
-                        temp, st.wYear, st.wMonth, st.wDay,
-                        st.wHour, st.wMinute, st.wSecond);
-            // Convert wchar -> UTF-8 ASCII (paths are ASCII-safe in %TEMP%)
-            char patha[MAX_PATH + 64]{};
-            for (size_t i = 0; pathw[i] != 0 && i < std::size(patha) - 1; ++i) {
-                patha[i] = static_cast<char>(pathw[i]);
-            }
-            api->SetCaptureFilePathTemplate(patha);
-            spdlog::info("[RenderDoc] capture template set to: {}", patha);
-        }
-    }
     return r;
 }
 
 extern "C" UEVR_RENDER_CAPI bool uevr_renderdoc_is_api_loaded() {
-    return rdoc() != nullptr;
+    return rdc::is_api_loaded();
 }
 
 extern "C" UEVR_RENDER_CAPI bool uevr_renderdoc_capture_wildcard() {
-    auto* api = rdoc();
-    if (api == nullptr) return false;
-    api->StartFrameCapture(nullptr, nullptr);
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    return api->EndFrameCapture(nullptr, nullptr) != 0;
+    return renderdoc_capture_prefer_active_pair(std::chrono::milliseconds(250)).ended;
 }
 
 namespace {
@@ -2280,24 +2273,22 @@ void renderdoc_capture_watcher_loop() {
             }
         }
 
-        auto* api = rdoc();
+        auto* api = rdc::api();
         if (api == nullptr) {
             spdlog::warn("[RenderDoc] watcher: trigger received but API not loaded");
             continue;
         }
         if (!capture_template.empty()) {
-            api->SetCaptureFilePathTemplate(capture_template.c_str());
+            rdc::set_capture_template(capture_template);
             spdlog::info("[RenderDoc] watcher: capture template -> {}", capture_template);
         }
         if (frames > 1) {
             api->TriggerMultiFrameCapture(static_cast<uint32_t>(frames));
             spdlog::info("[RenderDoc] watcher: triggered {} frames", frames);
         } else {
-            // Wildcard works even when no window/device pair has been explicitly selected
-            api->StartFrameCapture(nullptr, nullptr);
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-            const bool ended = api->EndFrameCapture(nullptr, nullptr) != 0;
-            spdlog::info("[RenderDoc] watcher: wildcard capture ended={}", ended);
+            const auto attempt = renderdoc_capture_prefer_active_pair(std::chrono::milliseconds(250));
+            spdlog::info("[RenderDoc] watcher: capture mode={} ended={} newest='{}'",
+                         attempt.mode, attempt.ended, rdc::newest_capture_path());
         }
     }
 }

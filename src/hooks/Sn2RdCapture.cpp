@@ -1,20 +1,21 @@
-// Sn2RdCapture.cpp — implementation
-//
-// Minimal subset of RenderDoc's in-app API (renderdoc_app.h v1.6.0).
-// Loads renderdoc.dll from in-process, triggers captures, writes .rdc files
-// through RD's standard machinery.
+// Sn2RdCapture.cpp -- SN2-facing trigger wrapper around UEVR's shared
+// RenderDoc capture service.
 
 #include "Sn2RdCapture.hpp"
 
+#include <Windows.h>
+
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
 #include <string>
 
-#include <Windows.h>
 #include <spdlog/spdlog.h>
+
+#include "render/RenderDocCaptureService.hpp"
 
 namespace sn2_capture_sidecar {
 void emit(uint64_t seq);
@@ -22,152 +23,72 @@ bool env_enabled();
 }
 
 namespace sn2_rd_capture {
-
 namespace {
 
-// ---------------------------------------------------------------------------
-// Minimal subset of renderdoc_app.h v1.6.0 (MIT licensed).
-// We only declare what we use — full API is much larger.
-// ---------------------------------------------------------------------------
-
-typedef enum RENDERDOC_Version_ {
-    eRENDERDOC_API_Version_1_6_0 = 10600,
-} RENDERDOC_Version;
-
-typedef enum RENDERDOC_CaptureOption_ {
-    eRENDERDOC_Option_AllowVSync = 0,
-    eRENDERDOC_Option_AllowFullscreen = 1,
-    eRENDERDOC_Option_APIValidation = 2,
-    eRENDERDOC_Option_CaptureCallstacks = 3,
-    eRENDERDOC_Option_CaptureCallstacksOnlyDraws = 4,
-    eRENDERDOC_Option_DelayForDebugger = 5,
-    eRENDERDOC_Option_VerifyMapWrites = 6,
-    eRENDERDOC_Option_HookIntoChildren = 7,
-    eRENDERDOC_Option_RefAllResources = 8,
-    eRENDERDOC_Option_CaptureAllCmdLists = 10,
-    eRENDERDOC_Option_DebugOutputMute = 11,
-} RENDERDOC_CaptureOption;
-
-typedef int (*pRENDERDOC_SetCaptureOptionU32)(RENDERDOC_CaptureOption opt, uint32_t val);
-typedef void (*pRENDERDOC_SetCaptureFilePathTemplate)(const char* pathtemplate);
-typedef const char* (*pRENDERDOC_GetCaptureFilePathTemplate)();
-typedef void (*pRENDERDOC_TriggerCapture)();
-typedef uint32_t (*pRENDERDOC_GetNumCaptures)();
-typedef uint32_t (*pRENDERDOC_GetCapture)(uint32_t idx, char* logfile,
-                                          uint32_t* pathlength, uint64_t* timestamp);
-typedef int (*pRENDERDOC_IsTargetControlConnected)();
-typedef void (*pRENDERDOC_StartFrameCapture)(void* device, void* wndHandle);
-typedef uint32_t (*pRENDERDOC_EndFrameCapture)(void* device, void* wndHandle);
-
-// Late-injected RD needs SetActiveWindow(device, hwnd) before it can latch
-// the API pair. For D3D12 the "device" pointer is ID3D12Device*.
-typedef void (*pRENDERDOC_SetActiveWindow)(void* device, void* hwnd);
-
-// Minimal API struct — same offsets as official renderdoc_app.h. Only fields
-// we use are non-null after RENDERDOC_GetAPI. Others are present so offset
-// matches RD's layout.
-struct RENDERDOC_API_1_6_0 {
-    void* GetAPIVersion;
-    pRENDERDOC_SetCaptureOptionU32 SetCaptureOptionU32;
-    void* SetCaptureOptionF32;
-    void* GetCaptureOptionU32;
-    void* GetCaptureOptionF32;
-    void* SetFocusToggleKeys;
-    void* SetCaptureKeys;
-    void* GetOverlayBits;
-    void* MaskOverlayBits;
-    void* RemoveHooks_LEGACY;
-    void* UnloadCrashHandler;
-    pRENDERDOC_SetCaptureFilePathTemplate SetCaptureFilePathTemplate;
-    pRENDERDOC_GetCaptureFilePathTemplate GetCaptureFilePathTemplate;
-    pRENDERDOC_GetNumCaptures GetNumCaptures;
-    pRENDERDOC_GetCapture GetCapture;
-    pRENDERDOC_TriggerCapture TriggerCapture;
-    pRENDERDOC_IsTargetControlConnected IsTargetControlConnected;
-    void* LaunchReplayUI;
-    pRENDERDOC_SetActiveWindow SetActiveWindow;
-    pRENDERDOC_StartFrameCapture StartFrameCapture;
-    void* IsFrameCapturing;
-    pRENDERDOC_EndFrameCapture EndFrameCapture;
-    void* TriggerMultiFrameCapture;
-    void* SetCaptureFileComments;
-    void* DiscardFrameCapture;
-    void* ShowReplayUI;
-    void* SetCaptureTitle;
-};
-
-typedef int (*pRENDERDOC_GetAPI)(RENDERDOC_Version version, void** outAPIPointers);
-
-// ---------------------------------------------------------------------------
-
-std::string env_str(const char* name) {
-    char buf[2048]{};
-    const auto len = GetEnvironmentVariableA(name, buf, sizeof(buf));
-    if (len == 0 || len >= sizeof(buf)) return {};
-    return std::string{buf, len};
-}
+namespace rdc = uevr::renderdoc_capture;
 
 struct State {
     std::mutex mu;
-    bool init_attempted = false;
-    bool loaded = false;
-    HMODULE dll = nullptr;
-    RENDERDOC_API_1_6_0* api = nullptr;
+    bool init_attempted{};
+    bool loaded{};
     std::atomic<bool> trigger_pending{false};
-    // Wildcard-capture state machine. Late-injected RD ignores TriggerCapture()
-    // because no window/device pair has been auto-selected. We instead call
-    // StartFrameCapture(NULL, NULL) on one Present and EndFrameCapture on the
-    // next — that wildcard-captures whichever active graphics API pair
-    // happens to be live.
     std::atomic<bool> end_capture_pending{false};
     std::atomic<uint64_t> capture_count_{0};
+    rdc::CapturePair pending_pair{};
     std::string last_path;
 };
 
-State& state() { static State s; return s; }
-
-// Probe common RD install paths.
-HMODULE probe_renderdoc_dll() {
-    // Honor explicit env override
-    const auto explicit_path = env_str("UEVR_SN2_RD_CAPTURE_DLL");
-    if (!explicit_path.empty()) {
-        HMODULE h = LoadLibraryA(explicit_path.c_str());
-        if (h != nullptr) return h;
-        SPDLOG_WARN("[SN2-RdCapture] LoadLibrary('{}') failed (err={})",
-                    explicit_path, GetLastError());
-    }
-    // If already loaded in the process, GetModuleHandle returns it.
-    if (HMODULE h = GetModuleHandleA("renderdoc.dll")) return h;
-    // Try common install paths.
-    const char* candidates[] = {
-        R"(C:\Program Files\RenderDoc\renderdoc.dll)",
-        R"(C:\Program Files (x86)\RenderDoc\renderdoc.dll)",
-        R"(E:\Github\renderdoc\x64\Development\renderdoc.dll)",
-        R"(E:\Github\renderdoc\x64\Release\renderdoc.dll)",
-        "renderdoc.dll",  // PATH search
-    };
-    for (const char* p : candidates) {
-        if (HMODULE h = LoadLibraryA(p)) {
-            SPDLOG_WARN("[SN2-RdCapture] loaded renderdoc.dll from '{}'", p);
-            return h;
-        }
-    }
-    return nullptr;
+State& state() {
+    static State s;
+    return s;
 }
 
-}  // namespace
+bool env_flag(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
+uint64_t env_u64(const char* name) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return 0;
+    char* end = nullptr;
+    const unsigned long long n = std::strtoull(v, &end, 0);
+    if (end == v) return 0;
+    return static_cast<uint64_t>(n);
+}
+
+bool late_load_allowed() {
+    return env_flag("UEVR_SN2_RD_CAPTURE_LOAD_DLL") ||
+           env_flag("UEVR_LOAD_RENDERDOC_DLL") ||
+           !rdc::env_string_a("UEVR_SN2_RD_CAPTURE_DLL").empty() ||
+           !rdc::env_string_a("UEVR_RENDERDOC_DLL").empty();
+}
+
+rdc::CapturePair normalise_pair(void* d3d12_device, void* hwnd) {
+    if (d3d12_device == nullptr || hwnd == nullptr) {
+        return {};
+    }
+    return {d3d12_device, hwnd};
+}
+
+std::string pair_string(rdc::CapturePair pair) {
+    char buf[96]{};
+    std::snprintf(buf, sizeof(buf), "device=0x%llx hwnd=0x%llx",
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pair.device)),
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pair.window)));
+    return buf;
+}
+
+} // namespace
 
 bool env_enabled() {
-    static const bool e = []() {
-        const char* v = std::getenv("UEVR_SN2_RD_CAPTURE");
-        return v && v[0] && v[0] != '0';
-    }();
+    static const bool e = env_flag("UEVR_SN2_RD_CAPTURE");
     return e;
 }
 
 const std::string& trigger_file_path() {
     static const std::string s = []() -> std::string {
-        const auto v = env_str("UEVR_SN2_RD_CAPTURE_TRIGGER_FILE");
+        const auto v = rdc::env_string_a("UEVR_SN2_RD_CAPTURE_TRIGGER_FILE");
         return v.empty() ? std::string{"C:\\tmp\\rd_capture.txt"} : v;
     }();
     return s;
@@ -175,30 +96,16 @@ const std::string& trigger_file_path() {
 
 const std::string& output_template() {
     static const std::string s = []() -> std::string {
-        const auto v = env_str("UEVR_SN2_RD_CAPTURE_OUT_TEMPLATE");
+        const auto v = rdc::env_string_a("UEVR_SN2_RD_CAPTURE_OUT_TEMPLATE");
         return v.empty() ? std::string{"C:\\tmp\\uevr_captures\\sn2"} : v;
     }();
     return s;
 }
 
 bool also_emit_sidecar() {
-    static const bool b = []() {
-        const char* v = std::getenv("UEVR_SN2_RD_CAPTURE_ALSO_EMIT_SIDECAR");
-        return v && v[0] && v[0] != '0';
-    }();
+    static const bool b = env_flag("UEVR_SN2_RD_CAPTURE_ALSO_EMIT_SIDECAR");
     return b;
 }
-
-namespace {
-uint64_t env_u64(const char* name) {
-    const char* v = std::getenv(name);
-    if (v == nullptr || v[0] == '\0') return 0;
-    char* end = nullptr;
-    const unsigned long long n = std::strtoull(v, &end, 0);  // base 0: hex/dec
-    if (end == v) return 0;
-    return static_cast<uint64_t>(n);
-}
-}  // namespace
 
 uint64_t autocapture_frame() {
     static const uint64_t f = env_u64("UEVR_SN2_RDC_AUTOCAPTURE");
@@ -212,55 +119,38 @@ uint64_t autocapture_every() {
 
 bool init() {
     if (!env_enabled()) return false;
+
     auto& s = state();
     std::scoped_lock _{s.mu};
     if (s.init_attempted) return s.loaded;
     s.init_attempted = true;
 
-    s.dll = probe_renderdoc_dll();
-    if (s.dll == nullptr) {
-        SPDLOG_WARN("[SN2-RdCapture] renderdoc.dll not found. Install RenderDoc "
-                    "or set UEVR_SN2_RD_CAPTURE_DLL=<path>");
+    const bool allow_late = late_load_allowed();
+    auto result = rdc::bootstrap(allow_late);
+    if (!result.api_loaded) {
+        SPDLOG_WARN("[SN2-RdCapture] RenderDoc API unavailable. Preload renderdoc.dll before "
+                    "D3D12 creation, or set UEVR_SN2_RD_CAPTURE_LOAD_DLL=1 for degraded late-load.");
         return false;
     }
-    auto get_api = reinterpret_cast<pRENDERDOC_GetAPI>(
-        GetProcAddress(s.dll, "RENDERDOC_GetAPI"));
-    if (get_api == nullptr) {
-        SPDLOG_WARN("[SN2-RdCapture] renderdoc.dll missing RENDERDOC_GetAPI export");
-        return false;
-    }
-    void* api_ptr = nullptr;
-    int ok = get_api(eRENDERDOC_API_Version_1_6_0, &api_ptr);
-    if (ok != 1 || api_ptr == nullptr) {
-        SPDLOG_WARN("[SN2-RdCapture] RENDERDOC_GetAPI(1.6.0) returned {} api={}",
-                    ok, api_ptr);
-        return false;
-    }
-    s.api = static_cast<RENDERDOC_API_1_6_0*>(api_ptr);
 
-    // Ensure output dir exists.
+    if (!result.capture_safe) {
+        SPDLOG_WARN("[SN2-RdCapture] RenderDoc capture safety is degraded from '{}' "
+                    "(d3d12_loaded_before_bootstrap={} dxgi_loaded_before_bootstrap={}). "
+                    ".rdc capture may be incomplete.",
+                    result.loaded_path, result.d3d12_was_loaded, result.dxgi_was_loaded);
+    }
+
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::path out{output_template()};
     fs::create_directories(out.parent_path(), ec);
 
-    // Configure capture options.
-    if (s.api->SetCaptureFilePathTemplate) {
-        s.api->SetCaptureFilePathTemplate(output_template().c_str());
-    }
-    if (s.api->SetCaptureOptionU32) {
-        // Capture all command lists (important for UEVR's multi-CL workflows)
-        s.api->SetCaptureOptionU32(eRENDERDOC_Option_CaptureAllCmdLists, 1);
-        // Mute D3D12 debug spam to log
-        s.api->SetCaptureOptionU32(eRENDERDOC_Option_DebugOutputMute, 1);
-    }
+    rdc::set_capture_template(output_template());
+    rdc::configure_default_options();
 
     s.loaded = true;
-    SPDLOG_WARN("[SN2-RdCapture] initialized. dll=0x{:x} api=0x{:x}",
-                reinterpret_cast<uintptr_t>(s.dll),
-                reinterpret_cast<uintptr_t>(s.api));
-    SPDLOG_WARN("[SN2-RdCapture] output template: '{}'", output_template());
-    SPDLOG_WARN("[SN2-RdCapture] trigger file:    '{}'", trigger_file_path());
+    SPDLOG_WARN("[SN2-RdCapture] initialized. output template='{}' trigger='{}'",
+                output_template(), trigger_file_path());
     return true;
 }
 
@@ -276,37 +166,26 @@ void request_capture_next_frame() {
 
 void on_present(uint64_t frame_count, void* d3d12_device, void* hwnd) {
     if (!env_enabled()) return;
+
     auto& s = state();
     if (!s.loaded) {
-        // Lazy init — Present is the first reliable place we know graphics is alive.
         if (!s.init_attempted) {
             init();
         }
         if (!s.loaded) return;
     }
 
-    // Tell RD which (queue, window) pair is active. Required for late-injected
-    // sessions where RD didn't auto-detect the API pair at device-create time.
-    // Cheap to call every frame — RD only does work when the pair changes.
-    if (d3d12_device != nullptr && hwnd != nullptr && s.api && s.api->SetActiveWindow) {
-        s.api->SetActiveWindow(d3d12_device, hwnd);
-    }
+    const rdc::CapturePair pair = normalise_pair(d3d12_device, hwnd);
+    rdc::set_active_window(pair);
 
-    // Poll trigger file every 30 frames (~0.5s @ 60fps).
     if ((frame_count % 30) == 0) {
         DWORD attrs = GetFileAttributesA(trigger_file_path().c_str());
-        if (attrs != INVALID_FILE_ATTRIBUTES &&
-            !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
             s.trigger_pending.store(true, std::memory_order_release);
             DeleteFileA(trigger_file_path().c_str());
         }
     }
 
-    // Automated trigger: UEVR_SN2_RDC_AUTOCAPTURE=N captures on internal frame N
-    // (no trigger file), and UEVR_SN2_RDC_AUTOCAPTURE_EVERY=K captures every K
-    // frames. Uses a module-internal monotonic counter so the decision is
-    // deterministic regardless of which present path forwards here (each path
-    // owns a separate frame_count).
     {
         static std::atomic<uint64_t> autocap_frame{0};
         const uint64_t af = autocap_frame.fetch_add(1, std::memory_order_relaxed);
@@ -316,20 +195,29 @@ void on_present(uint64_t frame_count, void* d3d12_device, void* hwnd) {
         if (one_shot != 0 && af == one_shot) fire = true;
         if (every != 0 && af != 0 && (af % every) == 0) fire = true;
         if (fire) {
-            SPDLOG_WARN("[SN2-RdCapture] autocapture trigger at internal frame {} "
-                        "(N={} every={})", af, one_shot, every);
+            SPDLOG_WARN("[SN2-RdCapture] autocapture trigger at internal frame {} (N={} every={})",
+                        af, one_shot, every);
             s.trigger_pending.store(true, std::memory_order_release);
         }
     }
 
-    // Phase 2: if a wildcard EndFrameCapture is pending from a prior frame,
-    // close it now. This finalizes the .rdc that StartFrameCapture armed.
     if (s.end_capture_pending.exchange(false, std::memory_order_acq_rel)) {
-        if (s.api && s.api->EndFrameCapture) {
-            const uint32_t end_ok = s.api->EndFrameCapture(nullptr, nullptr);
-            SPDLOG_WARN("[SN2-RdCapture] EndFrameCapture(NULL,NULL) -> {} at frame {}", end_ok, frame_count);
+        rdc::CapturePair pending{};
+        {
+            std::scoped_lock _{s.mu};
+            pending = s.pending_pair;
+            s.pending_pair = {};
         }
-        // Also fire sidecar / increment counter / record path.
+
+        bool ended = rdc::end_capture(pending);
+        if (!ended && pending.device != nullptr) {
+            SPDLOG_WARN("[SN2-RdCapture] EndFrameCapture({}) failed; retrying wildcard",
+                        pair_string(pending));
+            ended = rdc::end_capture({});
+        }
+        SPDLOG_WARN("[SN2-RdCapture] EndFrameCapture({}) -> {} at frame {}",
+                    pair_string(pending), ended, frame_count);
+
         if (also_emit_sidecar() && sn2_capture_sidecar::env_enabled()) {
             const auto n = s.capture_count_.fetch_add(1, std::memory_order_relaxed) + 1;
             sn2_capture_sidecar::emit(n);
@@ -337,34 +225,27 @@ void on_present(uint64_t frame_count, void* d3d12_device, void* hwnd) {
         } else {
             s.capture_count_.fetch_add(1, std::memory_order_relaxed);
         }
-        if (s.api && s.api->GetNumCaptures && s.api->GetCapture) {
-            const uint32_t num = s.api->GetNumCaptures();
-            if (num > 0) {
-                char pathbuf[1024]{};
-                uint32_t pathlen = sizeof(pathbuf);
-                uint64_t ts = 0;
-                if (s.api->GetCapture(num - 1, pathbuf, &pathlen, &ts)) {
-                    std::scoped_lock _{s.mu};
-                    s.last_path = std::string(pathbuf, pathlen ? pathlen - 1 : 0);
-                    SPDLOG_WARN("[SN2-RdCapture] capture written: {}", s.last_path);
-                }
-            }
+
+        const auto newest = rdc::newest_capture_path();
+        if (!newest.empty()) {
+            std::scoped_lock _{s.mu};
+            s.last_path = newest;
+            SPDLOG_WARN("[SN2-RdCapture] capture written: {}", s.last_path);
         }
     }
 
-    // Phase 1: if a new capture was triggered, arm wildcard StartFrameCapture
-    // (works for late-injected RD where TriggerCapture is a no-op). Also fire
-    // TriggerCapture as a belt-and-suspenders fallback for sessions where
-    // RD did latch a window/device pair.
     if (s.trigger_pending.exchange(false, std::memory_order_acq_rel)) {
-        SPDLOG_WARN("[SN2-RdCapture] arming capture at frame {} (Start + Trigger)", frame_count);
-        if (s.api && s.api->StartFrameCapture) {
-            s.api->StartFrameCapture(nullptr, nullptr);
+        SPDLOG_WARN("[SN2-RdCapture] arming capture at frame {} ({})",
+                    frame_count, pair_string(pair));
+        if (rdc::start_capture(pair)) {
+            {
+                std::scoped_lock _{s.mu};
+                s.pending_pair = pair;
+            }
+            s.end_capture_pending.store(true, std::memory_order_release);
+        } else {
+            SPDLOG_WARN("[SN2-RdCapture] StartFrameCapture failed");
         }
-        if (s.api && s.api->TriggerCapture) {
-            s.api->TriggerCapture();
-        }
-        s.end_capture_pending.store(true, std::memory_order_release);
     }
 }
 
@@ -373,9 +254,11 @@ uint64_t capture_count() {
 }
 
 const std::string& last_capture_file() {
+    static thread_local std::string copy;
     auto& s = state();
     std::scoped_lock _{s.mu};
-    return s.last_path;
+    copy = s.last_path;
+    return copy;
 }
 
-}  // namespace sn2_rd_capture
+} // namespace sn2_rd_capture

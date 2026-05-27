@@ -65,6 +65,8 @@ set(SAFETYHOOK_FETCH_ZYDIS ON CACHE BOOL "" FORCE)
 message(STATUS "Using vendored safetyhook (b62c7356f3e364209a2ae14489550156d7b58b8b + UEVR patches)...")
 add_subdirectory(dependencies/vendor/safetyhook)
 
+include(cmake/RenderDocFull.cmake)
+
 include(FetchContent)
 
 message(STATUS "Fetching bddisasm (70db095765ab2066dd88dfb7bbcc42259ed167c5)...")
@@ -869,6 +871,8 @@ list(APPEND uevr_SOURCES
 	"src/render/FrameResourceInspector.cpp"
 	"src/render/RenderAnalysisExport.cpp"
 	"src/render/RenderDiagnosticsCAPI.cpp"
+	"src/render/RenderDocCaptureService.cpp"
+	"src/render/RenderDocDxgiProofHooks.cpp"
 	"src/render/ShaderCompiler.cpp"
 	"src/render/ShaderOverrideRegistry.cpp"
 	"src/render/StereoForensics.cpp"
@@ -894,23 +898,29 @@ list(APPEND uevr_SOURCES
 	"src/hooks/Sn2DescriptorLineage.hpp"
 	"src/hooks/Sn2DrawLogV2.hpp"
 	"src/hooks/Sn2DupConfigFile.hpp"
+	"src/hooks/Sn2DyeFill.hpp"
+	"src/hooks/Sn2EventLedger.hpp"
 	"src/hooks/Sn2EyePairingHook.hpp"
 	"src/hooks/Sn2EyeScreenshot.hpp"
 	"src/hooks/Sn2FixRuleEngine.hpp"
+	"src/hooks/Sn2FogRightVolRedirect.hpp"
 	"src/hooks/Sn2FrameCapture.hpp"
 	"src/hooks/Sn2FrameCppExport.hpp"
 	"src/hooks/Sn2GpuCounters.hpp"
 	"src/hooks/Sn2HeapDxbcScanner.hpp"
 	"src/hooks/Sn2LayeredDiagsHook.hpp"
+	"src/hooks/Sn2LiveMutate.hpp"
 	"src/hooks/Sn2MagicInk.hpp"
 	"src/hooks/Sn2MaterialNameHook.hpp"
 	"src/hooks/Sn2MeshDump.hpp"
 	"src/hooks/Sn2MissingPassDiffHook.hpp"
 	"src/hooks/Sn2OverlayUI.hpp"
+	"src/hooks/Sn2PerViewLightInject.hpp"
 	"src/hooks/Sn2PixelHistory.hpp"
 	"src/hooks/Sn2PsoBytecodeDumper.hpp"
 	"src/hooks/Sn2RDGPassHook.hpp"
 	"src/hooks/Sn2RdCapture.hpp"
+	"src/hooks/Sn2RenderDocTags.hpp"
 	"src/hooks/Sn2ResourceReadback.hpp"
 	"src/hooks/Sn2ResourceTimeline.hpp"
 	"src/hooks/Sn2RightCbSynth.hpp"
@@ -919,6 +929,7 @@ list(APPEND uevr_SOURCES
 	"src/hooks/Sn2StateInspector.hpp"
 	"src/hooks/Sn2UweFogComputeDupHook.hpp"
 	"src/hooks/Sn2UweFogMirrorHook.hpp"
+	"src/hooks/Sn2ViewUbDecode.hpp"
 	"src/hooks/Sn2VsmUbClampPatch.hpp"
 	"src/hooks/Sn2WaterBasepassDupHook.hpp"
 	"src/hooks/WindowsMessageHook.hpp"
@@ -961,8 +972,12 @@ list(APPEND uevr_SOURCES
 	"src/render/FrameResourceInspector.hpp"
 	"src/render/RenderAnalysisExport.hpp"
 	"src/render/RenderDiagnosticsCAPI.hpp"
+	"src/render/RenderDocCaptureService.hpp"
+	"src/render/RenderDocDxgiProofHooks.hpp"
 	"src/render/ShaderCompiler.hpp"
 	"src/render/ShaderOverrideRegistry.hpp"
+	"src/render/Sn2IssuerStack.hpp"
+	"src/render/StereoEye.hpp"
 	"src/render/StereoForensics.hpp"
 	"src/uevr-imgui/font_robotomedium.hpp"
 	"src/uevr-imgui/uevr_imconfig.hpp"
@@ -1064,6 +1079,8 @@ add_custom_command(
 add_custom_command(
     TARGET uevr POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:openvr> $<TARGET_FILE_DIR:uevr>)
+
+uevr_attach_full_renderdoc(uevr)
 
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)

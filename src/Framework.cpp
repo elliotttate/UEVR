@@ -35,6 +35,7 @@
 #include "LicenseStrings.hpp"
 #include "mods/FrameworkConfig.hpp"
 #include "render/D3D12Diagnostics.hpp"
+#include "render/RenderDocCaptureService.hpp"
 #include "render/RenderDiagnosticsCAPI.hpp"
 #include "DumperMode.hpp"
 #include "ProfilerMode.hpp"
@@ -60,6 +61,12 @@ struct PixLoadResult {
     HMODULE module{nullptr};
     bool    was_preloaded{false};
 };
+
+bool env_truthy_a(const char* name) {
+    char value[8]{};
+    return GetEnvironmentVariableA(name, value, static_cast<DWORD>(std::size(value))) > 0 &&
+           value[0] != '\0' && value[0] != '0';
+}
 
 // Mirrors pix3.h's PIXLoadLatestWinPixGpuCapturerLibrary. Gated by env var
 // UEVR_DISABLE_PIX_BOOTSTRAP=1.
@@ -604,8 +611,9 @@ Framework::Framework(HMODULE framework_module)
     // WinPixGpuCapturer.dll detours D3D12 in a way that breaks Nsight
     // Graphics' capture path, so Nsight mode short-circuits PIX bootstrap.
     // See ProfilerMode.hpp.
-    // RenderDoc integration — proactively load renderdoc.dll if present (or
-    // LoadLibrary it from standard paths) and initialize the in-app API.
+    // RenderDoc integration. The startup thread already performs the earliest
+    // optional bootstrap before Framework construction. This second pass runs
+    // after logging is configured and starts the file-trigger capture watcher.
     //
     // 2026-05-22: Gated behind UEVR_RENDERDOC_BOOTSTRAP=1 by default. The
     // unconditional bootstrap was loading renderdoc.dll into the process at
@@ -622,15 +630,18 @@ Framework::Framework(HMODULE framework_module)
         if (rd_bootstrap_enabled) {
             auto rd_result = uevr_renderdoc_bootstrap();
             if (rd_result.api_loaded) {
-                spdlog::info("[RenderDoc] integration READY: v{}.{}.{} (preloaded={})",
+                spdlog::info("[RenderDoc] integration READY: v{}.{}.{} (preloaded={} loaded_by_uevr={} capture_safe={} d3d12_loaded_before={} dxgi_loaded_before={})",
                              rd_result.api_version_major, rd_result.api_version_minor,
-                             rd_result.api_version_patch, rd_result.was_preloaded);
+                             rd_result.api_version_patch, rd_result.was_preloaded,
+                             rd_result.late_loaded, rd_result.capture_safe,
+                             rd_result.d3d12_was_loaded, rd_result.dxgi_was_loaded);
+                uevr::renderdoc_capture::refresh_hooks();
                 uevr_renderdoc_start_capture_watcher();
-                if (!rd_result.was_preloaded) {
-                    spdlog::warn("[RenderDoc] capture_safe=DEGRADED: renderdoc.dll was LoadLibrary'd "
-                                 "after D3D12CreateDevice. Status/UI queries work, but live captures "
-                                 "may be incomplete. For full capture: relaunch via "
-                                 "`renderdoccmd capture --opt-hook-children` then inject UEVR.");
+                if (!rd_result.capture_safe) {
+                    spdlog::warn("[RenderDoc] capture_safe=DEGRADED: RenderDoc was initialized after "
+                                 "graphics modules were already present. Status/UI queries work, but "
+                                 "live captures may be incomplete. For full embedded capture, load "
+                                 "UEVR/RenderDoc before the game creates D3D12/DXGI objects.");
                 }
             }
         }
@@ -726,6 +737,19 @@ Framework::Framework(HMODULE framework_module)
     /*if (!hook_d3d12()) {
         spdlog::error("Failed to hook D3D12 for initial test.");
     }*/
+
+    if (env_truthy_a("UEVR_RENDERDOC_PREHOOK_D3D12")) {
+        spdlog::info("[RenderDoc] prehooking D3D12 before launcher resumes the game main thread");
+        if (hook_d3d12()) {
+            m_last_present_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            m_last_message_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            m_last_chance_time = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            m_has_last_chance = true;
+            spdlog::info("[RenderDoc] early D3D12 prehook installed");
+        } else {
+            spdlog::warn("[RenderDoc] early D3D12 prehook failed; the launcher will still wait for UEVR startup, but first-device proof may fail");
+        }
+    }
 
     std::scoped_lock _{m_hook_monitor_mutex};
     PluginLoader::get()->early_init();
