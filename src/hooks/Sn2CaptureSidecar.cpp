@@ -70,6 +70,89 @@ nlohmann::json collect_env_vars() {
     return out;
 }
 
+// Static fog-pipeline classification, shared by the .rdc comments string and the
+// .rdc-keyed JSON manifest. Producers fill the volumetric froxel; consumers
+// sample it; the composite blends the result into scene color. These CRCs are
+// the SN2 SingleLayerWater / UWE fog chain identified across many RE sessions.
+struct CrcRole {
+    const char* crc;   // lowercase 0x… DXIL crc32
+    const char* name;  // shader name
+    const char* role;  // producer | consumer | composite
+};
+
+const CrcRole kFogCrcRoles[] = {
+    // Producers — write the integrated light-scattering / froxel volume.
+    {"0xd1d94ed1", "MaterialSetupCS",        "producer"},
+    {"0xd1f85c42", "LightScatteringCS",      "producer"},
+    {"0x3402487c", "FinalIntegrationCS",     "producer"},
+    {"0x0930dd4e", "UWEFogResolveCS",        "producer"},
+    // Consumers — sample the froxel (SingleLayerWater + underwater teal draw).
+    {"0xb9be2499", "SLW",                    "consumer"},
+    {"0xde7c3822", "SLW",                    "consumer"},
+    {"0x4a4eb78c", "SLW_VolumeOverlay-pathB","consumer"},
+    {"0x13b00f0c", "UnderwaterTealDraw",     "consumer"},
+    // Composite — blends fog into scene color.
+    {"0x4e86dc09", "Composite",              "composite"},
+};
+
+// SN2_* SetName prefixes the resource-naming agent emits, mapped to a coarse
+// role so replay python can regex-classify resources straight from the .rdc.
+struct PrefixRole {
+    const char* prefix;
+    const char* role;
+};
+
+const PrefixRole kResourceNamePrefixRoles[] = {
+    {"SN2_IntegratedLightScattering_froxel", "froxel"},
+    {"SN2_SceneColorSBS",                    "scene-color"},
+    {"SN2_Backbuffer_",                      "present"},
+    {"SN2_OpenXR_Array_Slice",               "VR-eye"},
+    {"SN2_PSO|",                             "pso"},
+};
+
+const char* kWorkingHypothesis =
+    "Right eye runs the full fog chain (producers + consumers fire for both "
+    "eyes) but reads an empty / wrong-region froxel via SV_Position screen-half "
+    "addressing (reg254 = 1/2560) — the bug is fog DATA, not a missing draw.";
+
+const char* kSuccessCriterion =
+    "Right eye shows its OWN underwater teal with its OWN parallax, stable "
+    "across frames, with no left-eye borrowing.";
+
+// Build the three classification maps shared by comments + manifest.
+nlohmann::json build_crc_role_map() {
+    nlohmann::json m = nlohmann::json::object();
+    for (const auto& e : kFogCrcRoles) {
+        m[e.crc] = {{"name", e.name}, {"role", e.role}};
+    }
+    return m;
+}
+
+nlohmann::json build_eye_map() {
+    // Froxel dims are family-shared; each eye samples its own screen-half.
+    const nlohmann::json froxel_dims = {107, 30, 48};
+    nlohmann::json m = nlohmann::json::object();
+    m["left"] = {
+        {"view_index", 0},
+        {"expected_froxel_role", "filled (own screen-half)"},
+        {"froxel_dims", froxel_dims},
+    };
+    m["right"] = {
+        {"view_index", 1},
+        {"expected_froxel_role", "filled (own screen-half) — currently empty (bug)"},
+        {"froxel_dims", froxel_dims},
+    };
+    return m;
+}
+
+nlohmann::json build_prefix_role_map() {
+    nlohmann::json m = nlohmann::json::object();
+    for (const auto& e : kResourceNamePrefixRoles) {
+        m[e.prefix] = e.role;
+    }
+    return m;
+}
+
 }  // namespace
 
 bool env_enabled() {
@@ -191,6 +274,60 @@ void emit(uint64_t seq) {
     static std::atomic<uint64_t> count{0};
     const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1;
     SPDLOG_WARN("[SN2-CaptureSidecar] #{} seq={} wrote {}", n, seq, path);
+}
+
+std::string emit_rdc_manifest(const std::string& rdc_path) {
+    if (rdc_path.empty()) return {};
+
+    nlohmann::json doc;
+    doc["schema_version"] = 1;
+    doc["kind"] = "uevr_sn2_rdc_manifest";
+    doc["emitted_at_iso8601"] = now_iso8601();
+    doc["pid"] = static_cast<uint32_t>(GetCurrentProcessId());
+    doc["rdc_path"] = rdc_path;
+
+    // (a) crc -> {name, role}
+    doc["crc_roles"] = build_crc_role_map();
+    // (b) eye -> {view_index, expected_froxel_role, froxel_dims}
+    doc["eyes"] = build_eye_map();
+    // (c) resource_name_prefix -> role
+    doc["resource_name_prefix_roles"] = build_prefix_role_map();
+
+    // Froxel / shader-register reference constants (RE-confirmed).
+    doc["froxel"] = {
+        {"dims", {107, 30, 48}},
+        {"format", "R11G11B10F"},
+        {"note", "family-shared; each eye samples its own screen-half via SV_Position"},
+    };
+    doc["shader_registers"] = {
+        {"reg148", "ViewRectMin"},
+        {"reg254", "VolumetricFogSVPosToVolumeUV (= 1/2560)"},
+        {"reg257", "grid dims"},
+    };
+
+    // Live UEVR_SN2_* env snapshot (reuses the same collector as emit()).
+    doc["env_vars"] = collect_env_vars();
+
+    // Working hypothesis + success criterion for replay tooling / humans.
+    doc["working_hypothesis"] = kWorkingHypothesis;
+    doc["success_criterion"] = kSuccessCriterion;
+
+    // Write "<rdc_path>.uevr.json" right beside the capture.
+    const std::string manifest_path = rdc_path + ".uevr.json";
+    std::error_code ec;
+    std::filesystem::create_directories(
+        std::filesystem::path{manifest_path}.parent_path(), ec);
+    std::ofstream f(manifest_path);
+    if (!f.good()) {
+        SPDLOG_WARN("[SN2-CaptureSidecar] rdc-manifest open failed: {}", manifest_path);
+        return {};
+    }
+    f << doc.dump(2);
+
+    static std::atomic<uint64_t> count{0};
+    const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    SPDLOG_WARN("[SN2-CaptureSidecar] rdc-manifest #{} wrote {}", n, manifest_path);
+    return manifest_path;
 }
 
 }  // namespace sn2_capture_sidecar

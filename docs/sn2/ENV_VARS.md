@@ -45,6 +45,7 @@ Wrapper fallback behavior:
 
 | Env Var | Type | Purpose |
 |---|---|---|
+| `UEVR_SN2_DESKTOP_MIRROR_SBS` | bool | SN2 diagnostic spectator mode. When OpenXR native stereo is active, keep the desktop window showing the full SBS source instead of UEVR's normal single-eye spectator mirror. Canonical SN2 launchers default this to `1`; use `-NoDesktopSbsMirror` to disable. |
 | `UEVR_SN2_BINDING_ANALYZER_JSON` | path | Output path for binding analyzer |
 | `UEVR_SN2_CB_DUMP_DIR` | path | Output dir for CB dumps |
 | `UEVR_SN2_CB_DUMP_PSOS` | csv | PS CRCs to dump |
@@ -146,6 +147,48 @@ real right-eye fog validation.
 | Env Var | Type | Purpose |
 |---|---|---|
 | `UEVR_SN2_MATERIAL_HOOK` | bool | Install `FBasePassMeshProcessor::AddMeshBatch` hook at RVA 0x2644A70 |
+| `UEVR_SN2_ADDMESH_TRACE` | bool | Install/use the `FBasePassMeshProcessor::AddMeshBatch` hook as a targeted trace for the `0x13B00F0C` mesh shape before `TryAddMeshBatch` |
+| `UEVR_SN2_ADDMESH_TRACE_MAX` | int | Maximum `SN2-AddMesh` rows when not target-shape-only (default 512) |
+| `UEVR_SN2_ADDMESH_TRACE_TARGET_SHAPE_ONLY` | bool | Only log AddMesh rows whose `FMeshBatch` exposes 76608 indices or 25536 primitives; defaults to `1` |
+| `UEVR_SN2_ADDMESH_TRACE_STACK` | bool | For target-shape `SN2-AddMesh` rows, also log a capped CPU stack with game-exe RVAs so the upstream mesh submission path can be resolved offline |
+| `UEVR_SN2_ADDMESH_TRACE_STACK_MAX` | int | Maximum `SN2-AddMeshStack` rows to emit (default 32) |
+| `UEVR_SN2_ADDMESH_FORCE_RIGHT_13B` | bool | Diagnostic only: when the left view submits the `0x13B00F0C` mesh shape, log the recent secondary BasePass processor that would be used for a re-add. Direct execution is disabled unless `UEVR_SN2_ADDMESH_FORCE_RIGHT_EXECUTE_UNSAFE=1` because same-thread and cross-thread re-adds both crashed in OpenXR tests on 2026-05-28 |
+| `UEVR_SN2_ADDMESH_FORCE_RIGHT_EXECUTE_UNSAFE` | bool | Actually execute the direct `FBasePassMeshProcessor::AddMeshBatch` re-call. Unsafe by design; the 2026-05-28 same-thread run crashed at SN2 RVA `0x44d9a7b`, and the cross-thread/global run crashed at RVA `0x262c95f`. Keep off outside crash-repro diagnostics |
+| `UEVR_SN2_ADDMESH_FORCE_RIGHT_USE_GLOBAL` | bool | Diagnostic companion for `UEVR_SN2_ADDMESH_FORCE_RIGHT_13B`: allow the candidate to use the most recent secondary BasePass processor observed on any worker thread when the same-thread cache is empty. Off by default because processor lifetime is more fragile across threads |
+| `UEVR_SN2_ADDMESH_FORCE_RIGHT_MAX_AGE` | int | Maximum AddMesh call age for the cached secondary processor used by `UEVR_SN2_ADDMESH_FORCE_RIGHT_13B` (default 8192) |
+| `UEVR_SN2_ADDMESH_FORCE_RIGHT_DELAY_MS` | int | Delay before the experimental re-add force can fire; avoids UEVR's D3D12 init race (default 25000) |
+| `UEVR_SN2_ADDMESH_FORCE_RIGHT_MAX_TOTAL` | int | Total number of experimental re-add calls allowed before auto-suppressing (default 16, 0 = unlimited) |
+| `UEVR_SN2_GENDYN_TRACE` | bool | Install `GenerateDynamicMeshDrawCommands` hook at RVA 0x2A9E010 and log per-view dynamic mesh command-generation inputs; used to prove whether the target `0x13B00F0C` mesh is absent before BasePass `AddMeshBatch` or present but masked out by `FMeshPassMask` |
+| `UEVR_SN2_GENDYN_TRACE_PASS` | int | Mesh pass filter for `SN2-GenDyn` rows (default `2`, BasePass; `-1` logs all passes) |
+| `UEVR_SN2_GENDYN_TRACE_MAX` | int | Maximum non-target `SN2-GenDyn` rows to log (default 256); target-shape hits are always logged |
+| `UEVR_SN2_GENDYN_TRACE_MAX_ELEMS` | int | Maximum dynamic mesh array elements/windows to scan per command-generation call (default 512) |
+| `UEVR_SN2_GENDYN_TRACE_SCAN_BYTES_PER_ELEM` | int | `FMeshBatchAndRelevance` element stride used by the dynamic mesh scanner (default 24 / `0x18`: mesh pointer, primitive pointer, relevance flags). Keep narrow; broad scans can read neighboring eye arrays and create false positives |
+| `UEVR_SN2_TARGET_MESH_PASS` | int | Mesh pass used by legacy GenerateDynamicMeshDrawCommands duplicate diagnostics. Default `2` (BasePass). SN2's shifted pass table has `SingleLayerWaterPass=6` and `TranslucencyAfterDOF=17` |
+| `UEVR_SN2_VIEWCOMMANDS_TRACE` | bool | Install a midhook in `FVisibilityTaskData::FinishGatherDynamicMeshElements` immediately before mesh-pass setup is launched, and dump the off-`FViewInfo` `ViewCommandsPerView` payload for passes `0/2/5/6/17` |
+| `UEVR_SN2_VIEWCOMMANDS_TRACE_MAX` | int | Maximum `FinishGatherDynamicMeshElements` callbacks to dump (default 48); each callback emits primary/secondary rows for passes `0/2/5/6/17` |
+| `UEVR_SN2_MESHCMD_BRUTE_SCAN` | bool | Install/use the same pre-setup `ViewCommands` midhook and brute-scan the configured target pass' `ViewCommands.MeshCommands` entries for pointers leading to the `0x13B00F0C` target mesh shape. Used to prove the left BasePass command array contains the target mesh while the paired right BasePass array does not, even when the exact `FVisibleMeshDrawCommand` layout is still unknown |
+| `UEVR_SN2_MESHCMD_BRUTE_SCAN_MAX` | int | Maximum `SN2-MeshCmdBrute` rows to emit (default `24`) |
+| `UEVR_SN2_MESHCMD_BRUTE_SCAN_MAX_ELEMS` | int | Maximum elements per `MeshCommands` array to brute-scan (default `128`). Keep low; this intentionally probes unknown command layouts and is for short identity captures only |
+| `UEVR_SN2_MESHCMD_COPY_RIGHT_13B` | bool | Experimental diagnostic fix path: before mesh-pass setup, find the cached `0x13B00F0C` target mesh row in the primary configured pass' `ViewCommands.MeshCommands` and replace the last secondary row with that primary row when the secondary does not already contain it. Default pass is controlled by `UEVR_SN2_UNDERWATER_TARGET_MESH_PASS` (`2`, BasePass). This preserves secondary view matrices/render targets but is still a row-replacement diagnostic, not the final allocator-aware command insertion |
+| `UEVR_SN2_VIEWCOMMANDS_COPY_RIGHT_13B` | bool | Experimental fix path: when the configured underwater target pass primary `ViewCommands` contains the `0x13B00F0C` static-mesh request and secondary does not, replace one existing secondary build-request entry with that target request before mesh-pass setup. Default target pass is `2` because current AddMesh/D3D12 traces point at Translucent BasePass; use pass `6` for the shifted SN2 `SingleLayerWaterPass` if follow-up identity work proves SLW owns the final draw. Pass `17` is `TranslucencyAfterDOF` in SN2 and should only be used to reproduce older wrong-bucket diagnostics |
+| `UEVR_SN2_UNDERWATER_TARGET_MESH_PASS` | int | Mesh-pass bucket used by the `0x13B00F0C` FViewInfo/ViewCommands copy experiments. Default `2` (BasePass). SN2's shifted enum has `SingleLayerWaterPass=6` and `TranslucencyAfterDOF=17` |
+| `UEVR_SN2_ALIAS_SLW_PASS_PTR` | bool | Legacy one-line pass-pointer diagnostic. In the pre-mesh-pass setup hook, alias `ParallelMeshDrawCommandPasses[slot]` from primary to secondary. Defaults to slot `6` for SN2's shifted `SingleLayerWaterPass`; override with `UEVR_SN2_ALIAS_PMDCP_SLOT`. This is not a final parallax-safe fix |
+| `UEVR_SN2_ALIAS_PMDCP_SLOT` | int | Slot used by `UEVR_SN2_ALIAS_SLW_PASS_PTR`. Default `6`; set explicitly for old slot-5 or pass-17 diagnostics |
+| `UEVR_SN2_VIEWCOMMANDS_COPY_DELAY_MS` | int | Startup guard for `UEVR_SN2_VIEWCOMMANDS_COPY_RIGHT_13B` / `UEVR_SN2_FVIEWINFO_BUNDLE_COPY_RIGHT_13B`; copy hooks only begin after this many milliseconds from process start (default `25000`) so they do not fire during UEVR/framework initialization |
+| `UEVR_SN2_FVIEWINFO_BUNDLE_COPY_RIGHT_13B` | bool | Experimental diagnostic companion to `UEVR_SN2_VIEWCOMMANDS_COPY_RIGHT_13B`: only inside a pre-setup `ViewCommands` task whose primary configured target-pass build requests still contain the cached `0x13B00F0C` static-mesh request, set the target primitive/static mesh's secondary visibility bits, OR the target `PrimitiveViewRelevanceMap` / LOD entries, and OR the `bHasSingleLayerWaterMaterial` bit from primary to secondary. It validates the primitive index against the active primary view before writing, never clears secondary bits, deliberately does not raw-copy owned `TArray` / bit-array headers, and leaves view matrices/ViewState/View UB/PrevViewInfo untouched |
+| `UEVR_SN2_TARGET_PRIMITIVE_INDEX_OVERRIDE` | int | Diagnostic override for the `0x13B00F0C` target primitive index used by `UEVR_SN2_FVIEWINFO_BUNDLE_COPY_RIGHT_13B`. Useful while IDA is still pinning `FPrimitiveSceneInfo::PackedIndex`; current plausible runtime values include `497`, while the old heuristic could choose low incidental bit indices like `62` |
+| `UEVR_SN2_TARGET_IDENTITY_SCENE_SCAN_BYTES` | int/hex | Target-identity scan breadth for locating `FScene::Primitives` from the captured `FPrimitiveSceneInfo` candidate. Defaults to `0x8000`; only active when `UEVR_SN2_TARGET_IDENTITY_SCAN=1` |
+| `UEVR_SN2_TARGET_IDENTITY_SCENE_SCAN_MAX_ELEMS` | int | Max elements to scan in candidate scene pointer arrays while resolving the real `PackedIndex`. Defaults to `200000`; lower this only if target identity logging becomes too expensive |
+| `UEVR_SN2_STABILITY_STREAK` | int | Scene-assembly guard for `UEVR_SN2_VIEWCOMMANDS_COPY_RIGHT_13B` and `UEVR_SN2_FVIEWINFO_BUNDLE_COPY_RIGHT_13B`. The hooks re-resolve the target through live `FScene::Primitives` and wait for the same `(target_psi, PackedIndex)` for this many callbacks before mutating secondary state. Default `60`; set `0` only for controlled startup-race diagnostics |
+| `UEVR_SN2_STABILITY_QUARANTINE` | int | Optional extra guard requiring this many callbacks since the last `PackedIndex`/scene-count instability before copies can fire. Default `0` |
+| `UEVR_SN2_STABILITY_REQUIRE_SCENE_COUNT` | bool | Include `FScene::Primitives.Num` in the stability key. Defaults off because the menu scene streams small primitive-count changes while the target `PackedIndex` stays stable |
+| `UEVR_SN2_FVIEWINFO_INDEXED_ARRAY_SCAN` | bool | Diagnostic scanner emitted from the FViewInfo bundle-copy hook. For the stable target index, scans `FViewInfo` TArray headers in `0x1B80..0x2110` and logs nonzero primary/secondary entries so missing relevance/LOD offsets can be found without another IDA pass |
+| `UEVR_SN2_FVIEWINFO_INDEXED_ARRAY_SCAN_MAX` | int | Maximum `SN2-FViewIndexedArrayScan` rows (default `64`) |
+| `UEVR_SN2_NUMVISIBLE_OFFSET_OVERRIDE` | int/hex | Diagnostic override for `FViewInfo::NumVisibleDynamicMeshElements[37]` base offset used by `UEVR_SN2_VIEWCOMMANDS_COPY_RIGHT_13B`. Leave unset by default; the RE-pinned base is `0x1D88` |
+| `UEVR_SN2_FVIEWINFO_DYNAMIC_RANGE_COPY_RIGHT_13B` | bool | Extra experimental diagnostic layer: also copy the RE-mapped `FViewInfo` dynamic mesh bookkeeping band `0x1D70..0x2070` from primary to secondary before mesh-pass setup, while deliberately stopping before `ParallelMeshDrawCommandPasses` at `0x2070`. Keep this off by default: the 2026-05-28 OpenXR run with this broad range enabled paired the draw but crashed during startup, so future work should copy only pinned scalar fields instead of the whole band |
+| `UEVR_SN2_TRYADD_TRACE` | bool | Install `FBasePassMeshProcessor::TryAddMeshBatch` entry hook at RVA 0x2687030 and log per-view primitive/material decisions |
+| `UEVR_SN2_TRYADD_TRACE_MAX` | int | Maximum `SN2-TryAdd` rows to log before suppressing non-target-shape rows (default 512) |
+| `UEVR_SN2_TRYADD_TRACE_TARGET_SHAPE_ONLY` | bool | Only log TryAdd rows whose `FMeshBatch`/first elements contain 76608 indices or 25536 primitives, matching the `0x13B00F0C` teal draw shape |
 
 ## Overlay UI
 
@@ -158,6 +201,12 @@ real right-eye fog validation.
 | Env Var | Type | Purpose |
 |---|---|---|
 | `UEVR_SN2_VSM_UB_CLAMP_PATCH` | bool | Apply 3-byte VSM UB clamp patch at RVA 0x2B50544 |
+
+## UWE ImGui diagnostics unlock
+
+| Env Var | Type | Purpose |
+|---|---|---|
+| `UEVR_SN2_FORCE_DEV_BUILD` | bool | Patch the shipping `IsDevelopmentBuild()` stub at RVA 0x12924A0 (`32 C0`→`B0 01`, mov al,1=true) so the UWE ImGui diagnostics open-by-name gate passes and diagnostic windows (Rendering/Lighting/RenderResource) can be checked open in-game. Off by default; byte-verified before patching. |
 
 ## Live-reload behavior summary
 

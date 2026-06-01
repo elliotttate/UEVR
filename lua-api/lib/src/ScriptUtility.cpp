@@ -408,7 +408,78 @@ void set_property(sol::this_state s, void* self, uevr::API::UStruct* owner_c, ue
         *(uevr::API::UClass**)((uintptr_t)self + offset) = value.as<uevr::API::UClass*>();
         return;
     case L"ArrayProperty"_fnv:
-        throw sol::error("Setting array properties is not supported (yet)");
+    {
+        // Rebuild the FScriptArray in-place from a Lua array. Supported inner
+        // types: ObjectProperty/InterfaceProperty and ClassProperty (the same
+        // element types the read path produces), so a TArray<UObject*> round-
+        // trips. Data is (re)allocated via the engine allocator (GMalloc) so UE's
+        // GC sees a normally-allocated block; object pointers stored into an
+        // FObjectProperty-inner array on a live UObject are kept referenced by
+        // UE's property-based reference collection (no manual AddReferencedObjects
+        // needed — same as UE4SS for moving existing object refs).
+        const auto inner_prop = ((uevr::API::FArrayProperty*)desc)->get_inner();
+        if (inner_prop == nullptr) {
+            throw sol::error("[set_property] ArrayProperty has no inner property");
+        }
+        const auto inner_c = inner_prop->get_class();
+        if (inner_c == nullptr) {
+            throw sol::error("[set_property] ArrayProperty inner has no class");
+        }
+        const auto inner_hash = ::utility::hash(inner_c->get_fname()->to_string());
+
+        if (!value.is<sol::table>()) {
+            throw sol::error("[set_property] ArrayProperty requires a Lua array (table)");
+        }
+        sol::table tbl = value.as<sol::table>();
+        const int32_t new_count = (int32_t)tbl.size();
+
+        switch (inner_hash) {
+        case L"InterfaceProperty"_fnv:
+        case L"ObjectProperty"_fnv:
+        case L"ClassProperty"_fnv:
+        {
+            auto& arr = *(uevr::API::TArray<uevr::API::UObject*>*)((uintptr_t)self + offset);
+            auto malloc_impl = uevr::API::FMalloc::get();
+            if (malloc_impl == nullptr) {
+                throw sol::error("[set_property] FMalloc unavailable");
+            }
+
+            if (new_count > 0) {
+                const size_t bytes = (size_t)new_count * sizeof(uevr::API::UObject*);
+                void* new_data = malloc_impl->realloc(arr.data, (uint32_t)bytes, 8);
+                if (new_data == nullptr) {
+                    throw sol::error("[set_property] array allocation failed");
+                }
+                auto** slots = (uevr::API::UObject**)new_data;
+                for (int32_t i = 0; i < new_count; ++i) {
+                    sol::object e = tbl[i + 1];
+                    if (e.is<uevr::API::UObject*>()) {
+                        slots[i] = e.as<uevr::API::UObject*>();
+                    } else if (e.is<uevr::API::UClass*>()) {
+                        slots[i] = (uevr::API::UObject*)e.as<uevr::API::UClass*>();
+                    } else if (e.get_type() == sol::type::number) {
+                        slots[i] = (uevr::API::UObject*)(uintptr_t)e.as<uint64_t>();
+                    } else if (e.get_type() == sol::type::nil) {
+                        slots[i] = nullptr;
+                    } else {
+                        throw sol::error("[set_property] array element must be a UObject/UClass, address, or nil");
+                    }
+                }
+                arr.data = (uevr::API::UObject**)new_data;
+            } else {
+                if (arr.data != nullptr) {
+                    malloc_impl->free(arr.data);
+                }
+                arr.data = nullptr;
+            }
+            arr.count = new_count;
+            arr.capacity = new_count;
+            return;
+        }
+        default:
+            throw sol::error("[set_property] Setting this ArrayProperty inner type is not supported (object/class arrays only)");
+        }
+    }
     case L"StrProperty"_fnv:
     {
         const auto arg_obj = value;

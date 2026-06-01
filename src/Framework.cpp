@@ -432,11 +432,11 @@ void Framework::hook_monitor() {
         return;
     }
 
-    // Embedded RenderDoc capture mode installs RenderDoc and the D3D12 hook
-    // before the game's main thread resumes. The normal "no Present yet"
-    // recovery path can race that startup by unhooking/re-hooking D3D12 a
-    // second time, which is exactly the fragile window this mode avoids.
-    if (capture_only_d3d12_mode() && env_flag_enabled("UEVR_RENDERDOC_BOOTSTRAP")) {
+    // Capture-only D3D12 mode intentionally skips normal framework/VR frame
+    // initialization, but the D3D12 hook itself is already installed and active.
+    // Treat that as healthy here; otherwise the "no Present yet" recovery path
+    // repeatedly unhooks/re-hooks D3D12 and destabilizes capture-only diagnostics.
+    if (capture_only_d3d12_mode()) {
         m_last_present_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         m_last_message_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         m_last_chance_time = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -444,7 +444,7 @@ void Framework::hook_monitor() {
 
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true, std::memory_order_relaxed)) {
-            spdlog::info("[CaptureOnlyD3D12] Suppressing hook-monitor D3D rehook in embedded RenderDoc capture mode.");
+            spdlog::info("[CaptureOnlyD3D12] Suppressing hook-monitor D3D rehook while capture-only mode is active.");
         }
 
         return;
@@ -1097,6 +1097,7 @@ void Framework::on_frame_d3d12() {
     m_renderer_type = RendererType::D3D12;
 
     if (capture_only_d3d12_mode()) {
+        m_last_present_time = std::chrono::steady_clock::now();
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true)) {
             spdlog::warn(
@@ -1272,6 +1273,7 @@ void Framework::on_frame_d3d12() {
 
 void Framework::on_post_present_d3d12() {
     if (capture_only_d3d12_mode()) {
+        m_last_present_time = std::chrono::steady_clock::now();
         return;
     }
 

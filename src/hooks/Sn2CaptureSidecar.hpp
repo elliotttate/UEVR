@@ -41,4 +41,18 @@ const std::string& output_dir();
 // standalone via trigger file).
 void emit(uint64_t seq);
 
+// Emit an .rdc-keyed manifest next to a completed RenderDoc capture:
+// "<rdc_path>.uevr.json". Unlike emit(), this is keyed to the capture file (not
+// a seq) and is GATED ONLY on a non-empty rdc_path (NOT on
+// UEVR_SN2_CAPTURE_SIDECAR_DIR), so replay python can always find the manifest
+// beside the .rdc. The manifest carries three static-classification maps:
+//   (a) crc -> {name, role}          (SN2 fog producer/consumer/composite CRCs)
+//   (b) eye -> {view_index, expected_froxel_role, froxel_dims}
+//   (c) resource_name_prefix -> role (the SN2_* SetName prefixes the naming
+//                                      agent emits, for regex classification)
+// plus the live UEVR_SN2_* env snapshot and the working hypothesis / success
+// criterion. CPU-only; safe to call from the RenderDoc watcher thread.
+// Returns the written manifest path, or empty on failure / empty rdc_path.
+std::string emit_rdc_manifest(const std::string& rdc_path);
+
 }  // namespace sn2_capture_sidecar

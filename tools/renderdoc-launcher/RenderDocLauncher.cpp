@@ -15,6 +15,7 @@ struct Options {
     std::wstring backend;
     std::wstring renderdoc;
     DWORD ready_timeout_ms{30000};
+    DWORD defer_backend_ms{0};
     bool wait{};
     bool inject_renderdoc_first{true};
 };
@@ -73,7 +74,8 @@ void usage() {
         << L"Usage:\n"
         << L"  UEVRRenderDocLauncher.exe --exe <game.exe> [--args \"...\"] [--cwd <dir>]\n"
         << L"      [--backend <UEVRBackend.dll>] [--renderdoc <renderdoc.dll>]\n"
-        << L"      [--ready-timeout-ms <ms>] [--backend-load-renderdoc] [--wait]\n\n"
+        << L"      [--ready-timeout-ms <ms>] [--defer-backend-ms <ms>]\n"
+        << L"      [--backend-load-renderdoc] [--wait]\n\n"
         << L"Examples:\n"
         << L"  UEVRRenderDocLauncher.exe --exe \"C:\\Games\\Game\\Game.exe\" --args \"-dx12\"\n"
         << L"  UEVRRenderDocLauncher.exe --exe \"C:\\Games\\Game.exe\" -- --dx12 -log\n";
@@ -109,6 +111,14 @@ bool parse_args(int argc, wchar_t** argv, Options& options) {
                 options.ready_timeout_ms = static_cast<DWORD>(std::stoul(value));
             } catch (...) {
                 std::wcerr << L"Invalid --ready-timeout-ms value: " << value << L"\n";
+                return false;
+            }
+        } else if (arg == L"--defer-backend-ms") {
+            const auto value = need_value(L"--defer-backend-ms");
+            try {
+                options.defer_backend_ms = static_cast<DWORD>(std::stoul(value));
+            } catch (...) {
+                std::wcerr << L"Invalid --defer-backend-ms value: " << value << L"\n";
                 return false;
             }
         } else if (arg == L"--wait") {
@@ -235,9 +245,9 @@ int wmain(int argc, wchar_t** argv) {
     SetEnvironmentVariableW(L"UEVR_RENDERDOC_TRACK_ACTIVE_PAIR", L"1");
     SetEnvironmentVariableW(L"UEVR_RENDERDOC_STRICT_ORIGINALS", L"1");
     SetEnvironmentVariableW(L"UEVR_RENDERDOC_DXGI_FACTORY_PROOF", L"0");
-    SetEnvironmentVariableW(L"UEVR_RENDERDOC_PREHOOK_D3D12", L"1");
-    SetEnvironmentVariableW(L"UEVR_RENDERDOC_LAUNCHED_SUSPENDED", L"1");
-    SetEnvironmentVariableW(L"UEVR_RENDERDOC_READY_EVENT", ready_name.c_str());
+    SetEnvironmentVariableW(L"UEVR_RENDERDOC_PREHOOK_D3D12", options.defer_backend_ms > 0 ? L"0" : L"1");
+    SetEnvironmentVariableW(L"UEVR_RENDERDOC_LAUNCHED_SUSPENDED", options.defer_backend_ms > 0 ? L"0" : L"1");
+    SetEnvironmentVariableW(L"UEVR_RENDERDOC_READY_EVENT", options.defer_backend_ms > 0 ? L"" : ready_name.c_str());
     SetEnvironmentVariableW(L"UEVR_RENDERDOC_DLL", renderdoc.wstring().c_str());
     SetEnvironmentVariableW(L"UEVR_LOAD_RENDERDOC_DLL", options.inject_renderdoc_first ? L"0" : L"1");
     SetEnvironmentVariableW(L"UEVR_DISABLE_PIX_BOOTSTRAP", L"1");
@@ -276,6 +286,45 @@ int wmain(int argc, wchar_t** argv) {
     } else {
         std::wcout << L"UEVR backend will load RenderDoc before signaling ready: "
                    << renderdoc.wstring() << L"\n";
+    }
+
+    if (options.defer_backend_ms > 0) {
+        ResumeThread(process.hThread);
+        std::wcout << L"Resumed process with RenderDoc resident only. Deferring UEVR backend injection for "
+                   << options.defer_backend_ms << L" ms.\n";
+
+        Sleep(options.defer_backend_ms);
+
+        DWORD live_exit_code{};
+        if (GetExitCodeProcess(process.hProcess, &live_exit_code) && live_exit_code != STILL_ACTIVE) {
+            std::wcerr << L"Game exited before deferred UEVR injection, exit_code=" << live_exit_code << L"\n";
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            CloseHandle(ready_event);
+            return 1;
+        }
+
+        std::wcout << L"Injecting deferred UEVR backend: " << backend.wstring() << L"\n";
+        if (!inject_dll(process.hProcess, backend, L"UEVRBackend.dll")) {
+            TerminateProcess(process.hProcess, 1);
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            CloseHandle(ready_event);
+            return 1;
+        }
+
+        std::wcout << L"Deferred UEVR backend injected. RenderDoc was resident before the game main thread ran.\n";
+
+        DWORD exit_code = 0;
+        if (options.wait) {
+            WaitForSingleObject(process.hProcess, INFINITE);
+            GetExitCodeProcess(process.hProcess, &exit_code);
+        }
+
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        CloseHandle(ready_event);
+        return static_cast<int>(exit_code);
     }
 
     std::wcout << L"Injecting UEVR backend: " << backend.wstring() << L"\n";

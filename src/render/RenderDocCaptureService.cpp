@@ -407,6 +407,33 @@ void configure_default_options() {
 
     g_api->SetCaptureOptionU32(eRENDERDOC_Option_CaptureAllCmdLists, 1);
     g_api->SetCaptureOptionU32(eRENDERDOC_Option_DebugOutputMute, 1);
+
+    // Keep all resources (including transient/aliased ones that RDG recycles
+    // per-frame) alive inside the capture so that froxel/scene-color buffers
+    // are inspectable. Without this flag, RenderDoc may drop references to
+    // transient D3D12 resources before EndFrameCapture and they appear as
+    // empty or garbage in the replay — which is exactly what causes SN2's
+    // fog volumes to read as garbage in a capture.
+    g_api->SetCaptureOptionU32(eRENDERDOC_Option_RefAllResources, 1);
+
+    // #16 Defensive soft memory limit (MBs). With RefAllResources keeping every
+    // live resource in the capture, the in-memory footprint can balloon; a soft
+    // limit asks RenderDoc to spill above this to disk instead of risking OOM.
+    // 800MB sits inside the header's suggested 200-1000MB range. Unconditional.
+    g_api->SetCaptureOptionU32(eRENDERDOC_Option_SoftMemoryLimit, 800);
+
+    // #15 CPU callstack capture for API events. Heavy on both perf and capture
+    // size, so only enabled when the readable-capture opt-in env is set/"1".
+    // CaptureCallstacksOnlyActions restricts the (still costly) callstacks to
+    // actions/draws only, which is the useful subset for tracing producers.
+    {
+        const std::string readable = env_string_a("UEVR_SN2_CAPTURE_READABLE");
+        if (!readable.empty() && readable != "0") {
+            g_api->SetCaptureOptionU32(eRENDERDOC_Option_CaptureCallstacks, 1);
+            g_api->SetCaptureOptionU32(eRENDERDOC_Option_CaptureCallstacksOnlyActions, 1);
+            spdlog::info("[RenderDoc] readable-capture opt-in: CaptureCallstacks(OnlyActions) enabled");
+        }
+    }
 }
 
 void set_default_capture_template_if_empty() {
@@ -435,6 +462,40 @@ void set_default_capture_template_if_empty() {
     WideCharToMultiByte(CP_UTF8, 0, pathw, -1, patha, static_cast<int>(std::size(patha)), nullptr, nullptr);
     g_api->SetCaptureFilePathTemplate(patha);
     spdlog::info("[RenderDoc] capture template set to: {}", patha);
+}
+
+void write_capture_file_comments(const std::wstring& rdc_path, const std::string& comments) {
+    std::lock_guard lock{g_mutex};
+    if (g_api == nullptr || g_api->SetCaptureFileComments == nullptr) {
+        spdlog::debug("[RenderDoc] write_capture_file_comments skipped (API/SetCaptureFileComments unavailable)");
+        return;
+    }
+
+    // SetCaptureFileComments takes a UTF-8 filePath; pass nullptr (most-recent
+    // capture) only when the caller gave no path. RenderDoc treats "" the same.
+    std::string path_utf8{};
+    if (!rdc_path.empty()) {
+        const int needed = WideCharToMultiByte(CP_UTF8, 0, rdc_path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (needed > 0) {
+            path_utf8.resize(static_cast<size_t>(needed));
+            WideCharToMultiByte(CP_UTF8, 0, rdc_path.c_str(), -1, path_utf8.data(), needed, nullptr, nullptr);
+            if (!path_utf8.empty() && path_utf8.back() == '\0') {
+                path_utf8.pop_back();
+            }
+        }
+    }
+
+    g_api->SetCaptureFileComments(path_utf8.empty() ? nullptr : path_utf8.c_str(), comments.c_str());
+}
+
+void set_capture_title(const std::string& title) {
+    std::lock_guard lock{g_mutex};
+    if (g_api == nullptr || g_api->SetCaptureTitle == nullptr) {
+        spdlog::debug("[RenderDoc] set_capture_title skipped (API/SetCaptureTitle unavailable)");
+        return;
+    }
+
+    g_api->SetCaptureTitle(title.c_str());
 }
 
 void set_capture_template(const std::string& path_template) {

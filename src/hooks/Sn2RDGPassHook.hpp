@@ -58,9 +58,13 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <atomic>
+#include <windows.h>
 #include <spdlog/spdlog.h>
 
 namespace sn2_rdg_pass_hook {
@@ -201,6 +205,45 @@ inline void on_dispatch(uintptr_t pso_ptr) {
         SPDLOG_WARN(
             "[SN2-RDGPSO] first_sighting pso=0x{:x} pass_name=\"{}\"",
             pso_ptr, s_tls_current_rdg_pass_name);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass-name RECONSTRUCTION (shipping strips RDG_EVENT_NAME strings).
+// SetupParameterPass runs synchronously on the render thread, so a stack
+// backtrace here reliably names the render PHASE that issued AddPass
+// (ComputeVolumetricFog / RenderSingleLayerWater / RenderFog ...) — which we
+// HAVE symbolized in ida_combined / sn2_render_function_dictionary. Emit the
+// in-module frame RVAs once per unique call path; offline-map RVA -> function.
+// ---------------------------------------------------------------------------
+inline uintptr_t main_module_base() {
+    static const uintptr_t b = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    return b;
+}
+inline std::mutex& stack_seen_mu() { static std::mutex m; return m; }
+inline std::unordered_set<uint64_t>& stack_seen() { static std::unordered_set<uint64_t> s; return s; }
+
+inline void on_setup_stack(uintptr_t pass_ptr) {
+    if (!env_enabled() || pass_ptr == 0) return;
+    void* frames[24];
+    const USHORT n = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
+    if (n == 0) return;
+    const uintptr_t base = main_module_base();
+    uint64_t sig = 1469598103934665603ull;          // FNV-1a over in-module RVAs (dedup call paths)
+    std::string rvas;
+    for (USHORT i = 0; i < n; ++i) {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(frames[i]);
+        if (a < base || a - base > 0x10000000) continue;          // only the game image
+        const uint64_t rva = static_cast<uint64_t>(a - base);
+        sig = (sig ^ rva) * 1099511628211ull;
+        if (rvas.size() < 360) { char b[20]; std::snprintf(b, sizeof(b), "0x%llx,", (unsigned long long)rva); rvas += b; }
+    }
+    bool first;
+    { std::scoped_lock _{stack_seen_mu()}; first = stack_seen().insert(sig).second; }
+    if (first) {
+        static std::atomic<uint32_t> c{0};
+        if (c.fetch_add(1, std::memory_order_relaxed) < setup_log_max())
+            SPDLOG_INFO("[SN2-RDGStack] sig=0x{:x} frames={}", sig, rvas);
     }
 }
 

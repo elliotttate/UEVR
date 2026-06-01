@@ -22,6 +22,9 @@
 #include "render/D3D12Diagnostics.hpp"
 #include "render/ShaderCompiler.hpp"
 #include "utility/String.hpp"
+// Fallback PS-CRC resolver for stream-form (UE5.6 CreatePipelineState) PSOs that
+// are not present in m_d3d12_graphics_pso_records — used by hunter_should_skip_draw_per_eye.
+#include "hooks/Sn2PsoBytecodeDumper.hpp"
 
 using json = nlohmann::json;
 
@@ -303,6 +306,46 @@ const std::unordered_set<std::string>& shader_hunter_suppression_blocklist() {
     }();
 
     return blocklist;
+}
+
+// Env-driven GLOBAL suppress set — the headless equivalent of the Shader Hunter
+// overlay's "Suppress active". Any PS/VS/CS hash (16-hex FNV) or PS CRC32 (8-hex)
+// listed in UEVR_SHADER_HUNTER_SUPPRESS is dropped for BOTH eyes at bind time,
+// via the same hunter_should_suppress_locked path the overlay uses — no UI, no
+// eye_bucket dependency (which the per-eye SKIP_*_ONLY knobs can't satisfy at
+// SetPipelineState, where the eye isn't yet known).
+const std::unordered_set<std::string>& shader_hunter_global_suppress_set() {
+    static const std::unordered_set<std::string> values = [] {
+        std::unordered_set<std::string> out{};
+        char raw[2048]{};
+        const DWORD len = GetEnvironmentVariableA(
+            "UEVR_SHADER_HUNTER_SUPPRESS",
+            raw,
+            static_cast<DWORD>(sizeof(raw)));
+        if (len == 0) {
+            return out;
+        }
+        std::string token{};
+        const std::string_view text{raw, std::min<DWORD>(len, static_cast<DWORD>(sizeof(raw) - 1))};
+        auto flush = [&] {
+            if (token.empty()) return;
+            auto normalized = normalize_hash(token);
+            if (!normalized.empty()) {
+                out.insert(std::move(normalized));
+            }
+            token.clear();
+        };
+        for (char c : text) {
+            if (c == ',' || c == ';' || std::isspace(static_cast<unsigned char>(c)) != 0) {
+                flush();
+            } else {
+                token.push_back(c);
+            }
+        }
+        flush();
+        return out;
+    }();
+    return values;
 }
 
 std::string default_profile(render::ShaderOverrideRegistry::Backend backend, render::ShaderOverrideRegistry::Stage stage) {
@@ -1247,11 +1290,22 @@ bool ShaderOverrideRegistry::should_track_d3d11_shaders() const {
 }
 
 bool ShaderOverrideRegistry::should_track_d3d12_pipelines() const {
+    // When a headless per-eye skip is configured (UEVR_SHADER_HUNTER_SKIP_{LEFT,RIGHT}_ONLY),
+    // enable full pipeline tracking so the bind-time collection records + hash-extracts the
+    // actually-bound PSO each frame — exactly what active hunting does. Without this the
+    // record only holds PSOs that were created AFTER recording started, so PSOs created during
+    // early scene load (e.g. the SkyAtmosphere pass) never resolve at draw-time and the skip
+    // can't match them. Cached once (env is read-only at runtime).
+    static const bool skip_configured =
+        GetEnvironmentVariableA("UEVR_SHADER_HUNTER_SKIP_RIGHT_ONLY", nullptr, 0) > 0 ||
+        GetEnvironmentVariableA("UEVR_SHADER_HUNTER_SKIP_LEFT_ONLY", nullptr, 0) > 0 ||
+        GetEnvironmentVariableA("UEVR_SHADER_HUNTER_SUPPRESS", nullptr, 0) > 0;
     return m_has_active_d3d12_overrides.load(std::memory_order_relaxed) ||
         m_inspector_tracking_enabled.load(std::memory_order_relaxed) ||
         m_hunter_active.load(std::memory_order_relaxed) ||
         m_hunter_hide_marked.load(std::memory_order_relaxed) ||
-        m_capture_next_d3d12_change_hot_path.load(std::memory_order_relaxed);
+        m_capture_next_d3d12_change_hot_path.load(std::memory_order_relaxed) ||
+        skip_configured;
 }
 
 bool ShaderOverrideRegistry::should_record_d3d12_pipeline_creations() const {
@@ -2079,6 +2133,21 @@ void ShaderOverrideRegistry::register_d3d12_pipeline_state_stream_creation(
         ? crc32_ieee(record.owned_stream.mesh_shader.data(), record.owned_stream.mesh_shader.size()) : 0;
     record.last_seen_frame = m_frame;
 
+    // [SN2-ComputeRec] Unconditional: log EVERY distinct stream-form COMPUTE PSO recorded,
+    // so we can tell whether the fog-resolve 0x0930dd4e is created-after-hook (recorded here)
+    // or never (precached before the hook). Capped at first 300 distinct crcs.
+    if (record.first_seen_frame == 0 && record.compute_crc32 != 0 &&
+        env_flag_enabled("UEVR_SN2_LOG_COMPUTE_REC")) {
+        static std::atomic<uint64_t> rec_n{0};
+        const auto rn = rec_n.fetch_add(1, std::memory_order_relaxed);
+        const bool is_resolve = (record.compute_crc32 == 0x0930dd4eu);
+        if (rn < 4000 || is_resolve) {
+            spdlog::warn("[SN2-ComputeRec] stream COMPUTE PSO #{} cs_crc32=0x{:08x} cs_size={}{}",
+                rn + 1, record.compute_crc32, record.owned_stream.compute_shader.size(),
+                is_resolve ? "  <== RESOLVE 0930dd4e!" : "");
+        }
+    }
+
     if (record.first_seen_frame == 0) {
         ++m_d3d12_stream_pso_creations_this_frame;
         record.first_seen_frame = m_frame;
@@ -2152,9 +2221,17 @@ ID3D12PipelineState* ShaderOverrideRegistry::resolve_d3d12_pipeline_state(ID3D12
     if (record.override_active && record.override_pipeline_state != nullptr) {
         if (!record.logged_substitution) {
             record.logged_substitution = true;
-            spdlog::info("[ShaderOverrideRegistry] >>> SUBSTITUTED pso=0x{:x} vs_hash={} ps_hash={} gs_hash={} vs_override={} ps_override={} gs_override={}",
-                record.pipeline_state_pointer, record.vertex_hash, record.pixel_hash, record.geometry_hash,
-                record.vertex_override_name, record.pixel_override_name, record.geometry_override_name);
+            const bool compute_only =
+                !record.compute_hash.empty() &&
+                record.vertex_hash.empty() &&
+                record.pixel_hash.empty() &&
+                record.geometry_hash.empty() &&
+                record.amplification_hash.empty() &&
+                record.mesh_hash.empty();
+            spdlog::info("[ShaderOverrideRegistry] >>> SUBSTITUTED stage={} pso=0x{:x} vs_hash={} ps_hash={} gs_hash={} cs_hash={} cs_crc32=0x{:08x} vs_override={} ps_override={} gs_override={} cs_override={}",
+                compute_only ? "compute" : "graphics",
+                record.pipeline_state_pointer, record.vertex_hash, record.pixel_hash, record.geometry_hash, record.compute_hash, record.compute_crc32,
+                record.vertex_override_name, record.pixel_override_name, record.geometry_override_name, record.compute_override_name);
         }
         return record.override_pipeline_state.Get();
     }
@@ -2431,6 +2508,12 @@ void ShaderOverrideRegistry::scan_override_directories() {
     std::unordered_map<std::string, std::filesystem::path> discovered_entries{};
     std::unordered_map<std::string, std::filesystem::path> discovered_bind_overrides{};
 
+    // Snapshot the override revision so we can detect whether this scan added /
+    // updated / removed any override (each such change bumps m_override_revision
+    // in scan_single_directory). If it did, we retroactively re-run the per-PSO
+    // matcher below for already-tracked PSOs.
+    const uint64_t revision_before_scan = m_override_revision;
+
     const auto global_dir = global_override_dir();
     const auto profile_dir = profile_override_dir();
     spdlog::info("[ShaderOverrideRegistry] scan tick: global={} profile={} overrides_before={}",
@@ -2454,6 +2537,39 @@ void ShaderOverrideRegistry::scan_override_directories() {
         m_overrides.size(),
         m_has_active_d3d12_overrides.load(std::memory_order_relaxed),
         m_has_active_d3d11_overrides.load(std::memory_order_relaxed));
+
+    // === Retroactive re-substitution ===
+    // The per-PSO matcher (update_d3d12_override_pipeline_state) normally runs
+    // only at PSO *creation*. But an override can become available AFTER the PSO
+    // it targets was already created — e.g. a manifest dropped in while the game
+    // is running, or (the SN2 case) a precached/early PSO whose creation lost the
+    // race against the first 30s override scan. Those records are tracked (they
+    // carry owned_stream/owned_desc + the per-stage CRCs) but were last evaluated
+    // at an older revision, so they never picked up the new override. When this
+    // scan changed the override set, re-run the matcher across every tracked
+    // D3D12 PSO record; the applied_override_revision guard inside makes records
+    // already at the current revision a cheap early-out, so only the stale ones
+    // actually rebuild a replacement PSO.
+    if (m_override_revision != revision_before_scan && m_runtime_overrides_enabled.load(std::memory_order_relaxed)) {
+        size_t reevaluated = 0;
+        size_t now_active = 0;
+        for (auto& [_, record] : m_d3d12_graphics_pso_records) {
+            if (record.applied_override_revision == m_override_revision) {
+                continue;
+            }
+            const bool was_active = record.override_active;
+            update_d3d12_override_pipeline_state(record);
+            ++reevaluated;
+            if (record.override_active && !was_active) {
+                ++now_active;
+            }
+        }
+        if (reevaluated > 0) {
+            spdlog::info("[ShaderOverrideRegistry] retroactive re-substitution: re-evaluated {} stale PSO record(s), {} newly overridden (override set changed: rev {} -> {})",
+                reevaluated, now_active, revision_before_scan, m_override_revision);
+        }
+    }
+
     if (verbose_override_scan_log_enabled()) {
         for (const auto& [k, e] : m_overrides) {
             spdlog::info("[ShaderOverrideRegistry]   override key={} hash={} compiled={} bytes={} status={} err={}",
@@ -3377,6 +3493,36 @@ bool ShaderOverrideRegistry::compile_entry(OverrideEntry& entry, std::string& er
 
     if (entry.backend == Backend::D3D12 && request.preferred_backend == ShaderCompilerBackend::Auto) {
         request.preferred_backend = ShaderCompilerBackend::Dxc;
+    }
+
+    // #13: Embed RenderDoc-friendly debug info on shaders WE author (HLSL-source
+    // overrides only). This path is unreachable for dxil_text_patch / container /
+    // transform / bytecode overrides — each of those returns earlier above — so
+    // patched copies of shipped DXIL never receive these flags and their bytecode
+    // is unaffected. Gate behind manifest "debug_info": true OR UEVR_SN2_SHADER_DEBUG=1.
+    bool embed_shader_debug = env_truthy("UEVR_SN2_SHADER_DEBUG");
+    if (!embed_shader_debug && !entry.manifest_path.empty()) {
+        std::error_code manifest_ec{};
+        if (std::filesystem::exists(entry.manifest_path, manifest_ec)) {
+            try {
+                std::ifstream manifest_stream{entry.manifest_path};
+                if (manifest_stream.good()) {
+                    const auto manifest = json::parse(manifest_stream, nullptr, false);
+                    if (!manifest.is_discarded()) {
+                        embed_shader_debug = manifest.value("debug_info", false);
+                    }
+                }
+            } catch (...) {
+                // Manifest already parsed successfully during scan; a read failure
+                // here just leaves debug info off.
+            }
+        }
+    }
+
+    if (embed_shader_debug) {
+        request.debug_info = true;
+        request.strip_debug = false;
+        request.strip_reflection = false;
     }
 
     entry.compiler = compiler_to_string(request.preferred_backend);
@@ -4792,6 +4938,23 @@ bool ShaderOverrideRegistry::hunter_should_suppress_locked(const D3D12GraphicsPs
     if (m_hunter_runtime_blocklist.count(record.pixel_hash) > 0) return false;
     if (!record.vertex_hash.empty() && m_hunter_runtime_blocklist.count(record.vertex_hash) > 0) return false;
     if (!record.compute_hash.empty() && m_hunter_runtime_blocklist.count(record.compute_hash) > 0) return false;
+    // === Env-driven GLOBAL suppress (headless "Suppress active") ===
+    // Ungated: no overlay, no hunting_active, no eye_bucket. Matches PS/VS/CS
+    // hash or PS CRC32. This is what reproduces the user's manual hunter
+    // suppression of e.g. bb7b1616d81d6bb3 / 1f958d46 (SkyAtmosphere over-draw).
+    {
+        const auto& global_suppress = shader_hunter_global_suppress_set();
+        if (!global_suppress.empty()) {
+            if (!record.pixel_hash.empty() && global_suppress.count(record.pixel_hash) > 0) return true;
+            if (!record.vertex_hash.empty() && global_suppress.count(record.vertex_hash) > 0) return true;
+            if (!record.compute_hash.empty() && global_suppress.count(record.compute_hash) > 0) return true;
+            if (record.pixel_crc32 != 0) {
+                char crc_str[16]{};
+                std::snprintf(crc_str, sizeof(crc_str), "%08x", record.pixel_crc32);
+                if (global_suppress.count(std::string{crc_str}) > 0) return true;
+            }
+        }
+    }
     const bool suppress_active = m_hunter_suppression_enabled.load(std::memory_order_relaxed);
     const bool hunting_active = m_hunter_active.load(std::memory_order_relaxed);
     const bool hide_marked = m_hunter_hide_marked.load(std::memory_order_relaxed);
@@ -6132,9 +6295,11 @@ void ShaderOverrideRegistry::hunter_record_set_pipeline_state_with_eye(void* com
         seed_per_eye_skip_from_env(m_hunter_skip_left_only, m_hunter_skip_right_only);
     }
     const bool has_per_eye = !clean_diag && (!m_hunter_skip_left_only.empty() || !m_hunter_skip_right_only.empty());
+    const bool has_global_suppress = !clean_diag && !shader_hunter_global_suppress_set().empty();
     if (!m_hunter_active.load(std::memory_order_relaxed) &&
             !m_hunter_hide_marked.load(std::memory_order_relaxed) &&
-            !has_per_eye) {
+            !has_per_eye &&
+            !has_global_suppress) {
         // Clear any stale skip flag for this CL so we don't skip after a
         // previous bound suppression.
         std::scoped_lock _{m_hunter_skip_mutex};
@@ -6153,7 +6318,19 @@ void ShaderOverrideRegistry::hunter_record_set_pipeline_state_with_eye(void* com
         std::scoped_lock _{m_mutex};
         auto it = m_d3d12_graphics_pso_records.find(reinterpret_cast<uintptr_t>(original_pso));
         if (it != m_d3d12_graphics_pso_records.end()) {
-            const auto& record = it->second;
+            auto& record = it->second;
+            // Backfill the stream-form PS CRC. UE5.6 stream-form PSOs get a pixel_hash
+            // recorded but NOT a pixel_crc32 (only the bytecode dumper resolves the CRC).
+            // Without this, CRC-keyed global suppress (UEVR_SHADER_HUNTER_SUPPRESS) and
+            // per-eye skip silently miss every stream PSO — e.g. the water chain
+            // 0x4e86dc09/0xb9be2499/etc. which we only know by CRC. Cached once.
+            if (record.pixel_crc32 == 0 && !record.pixel_hash.empty()) {
+                const uint32_t fb = sn2_pso_bytecode_dumper::ps_crc_for_pso(
+                    reinterpret_cast<ID3D12PipelineState*>(original_pso));
+                if (fb != 0 && fb != sn2_pso_bytecode_dumper::NOPS_CRC) {
+                    record.pixel_crc32 = fb;
+                }
+            }
             is_compute = !record.compute_hash.empty() && record.pixel_hash.empty() && record.mesh_hash.empty();
             is_graphics = !record.pixel_hash.empty() || !record.mesh_hash.empty();
             hunter_record_bind_locked(record);
@@ -6261,19 +6438,59 @@ bool ShaderOverrideRegistry::hunter_should_skip_draw_per_eye(uintptr_t pso_point
     // Cheap fast-path when nothing is configured per-eye.
     if (m_hunter_skip_left_only.empty() && m_hunter_skip_right_only.empty()) return false;
     if (eye_bucket != 1 && eye_bucket != 2) return false;
-    std::scoped_lock _{m_mutex};
-    auto it = m_d3d12_graphics_pso_records.find(pso_pointer);
-    if (it == m_d3d12_graphics_pso_records.end()) return false;
-    const auto& rec = it->second;
-    // Match PS hash for graphics PSOs OR compute hash for compute PSOs.
-    const auto& which_hash = !rec.pixel_hash.empty() ? rec.pixel_hash : rec.compute_hash;
-    const uint32_t which_crc = !rec.pixel_hash.empty() ? rec.pixel_crc32 : rec.compute_crc32;
+    // Resolve this draw's PS/CS identity. Copy out of the record map under the
+    // lock so it can be released before the separately-locked dumper fallback.
+    std::string which_hash;
+    uint32_t which_crc = 0;
+    {
+        std::scoped_lock _{m_mutex};
+        auto it = m_d3d12_graphics_pso_records.find(pso_pointer);
+        if (it != m_d3d12_graphics_pso_records.end()) {
+            const auto& rec = it->second;
+            const bool is_pixel = !rec.pixel_hash.empty();
+            which_hash = is_pixel ? rec.pixel_hash : rec.compute_hash;
+            which_crc  = is_pixel ? rec.pixel_crc32 : rec.compute_crc32;
+        }
+    }
+    // Stream-form PSOs (UE5.6 ID3D12Device2::CreatePipelineState) are NOT in
+    // m_d3d12_graphics_pso_records, so the lookup above misses them entirely
+    // (e.g. the SkyAtmosphere ApplyLowerHemisphereColorPS, ps_crc 0x1F958D46).
+    // Fall back to the bytecode-dumper's stream-aware PS-CRC resolver so per-eye
+    // skip can match stream PSOs by CRC. NOPS_CRC = "seen but no pixel shader".
+    if (which_hash.empty() && which_crc == 0) {
+        const uint32_t fb = sn2_pso_bytecode_dumper::ps_crc_for_pso(
+            reinterpret_cast<ID3D12PipelineState*>(pso_pointer));
+        if (fb != 0 && fb != sn2_pso_bytecode_dumper::NOPS_CRC) {
+            which_crc = fb;
+        }
+    }
+    // DIAG: log the first N right-eye (eye2) draws' resolved identity so we can see
+    // whether the sky draw resolves to 0x1f958d46 at draw-time (PSO-pointer check).
+    if (eye_bucket == 2) {
+        static std::atomic<uint64_t> dn{0};
+        const auto d = dn.fetch_add(1, std::memory_order_relaxed);
+        if (d < 60) {
+            char dk[16]{}; std::snprintf(dk, sizeof(dk), "%08x", which_crc);
+            spdlog::warn("[SN2-SkipDiag] eye2 draw #{} which_hash={} which_crc=0x{}",
+                d + 1, which_hash.empty() ? "(none)" : which_hash.c_str(), dk);
+        }
+    }
     if (which_hash.empty() && which_crc == 0) return false;
     char crc_str[16]{};
     std::snprintf(crc_str, sizeof(crc_str), "%08x", which_crc);
     const std::string crc_key = crc_str;
+    std::scoped_lock _{m_mutex};
     const auto& set = (eye_bucket == 1) ? m_hunter_skip_left_only : m_hunter_skip_right_only;
-    return set.count(which_hash) > 0 || set.count(crc_key) > 0;
+    const bool skip = (!which_hash.empty() && set.count(which_hash) > 0) || set.count(crc_key) > 0;
+    if (skip) {
+        static std::atomic<uint64_t> skip_log{0};
+        const auto n = skip_log.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8 || (n % 1000) == 0) {
+            spdlog::warn("[SN2-SkipPerEye] skipped draw eye_bucket={} hash={} crc=0x{} (n={})",
+                eye_bucket, which_hash.empty() ? "(stream)" : which_hash, crc_key, n + 1);
+        }
+    }
+    return skip;
 }
 
 bool ShaderOverrideRegistry::hunter_should_skip_draw(void* command_list) const {

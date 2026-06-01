@@ -84,6 +84,17 @@ bool refresh_hooks();
 
 void configure_default_options();
 void set_default_capture_template_if_empty();
+
+// Writes RenderDoc capture-file comments INTO an existing .rdc on disk.
+// rdc_path is converted to UTF-8 and forwarded to the in-proc API's
+// SetCaptureFileComments(filePath, comments). No-op (logged at debug) if the
+// API or the function pointer is unavailable.
+void write_capture_file_comments(const std::wstring& rdc_path, const std::string& comments);
+
+// Sets the in-progress capture's title via the API's SetCaptureTitle. Only
+// valid between StartFrameCapture/EndFrameCapture. Logged no-op if the API or
+// the function pointer is unavailable in the loaded RenderDoc version.
+void set_capture_title(const std::string& title);
 void set_capture_template(const std::string& path_template);
 std::string capture_template();
 std::vector<CaptureInfo> captures();

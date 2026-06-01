@@ -33,6 +33,8 @@
 
 #include "d3d12/DirectXTK.hpp"
 
+#include "../../hooks/Sn2DebugResources.hpp"
+
 #include "D3D12Component.hpp"
 
 //#define AFR_DEPTH_TEMP_DISABLED
@@ -467,6 +469,1004 @@ namespace sn2_color_transfer {
     }
 } // namespace sn2_color_transfer
 
+// 2026-05-28 SN2: depth-aware right-eye fog blend.
+// Reads slice 0 (left, contains teal fog) and slice 1 (right, missing fog) of an
+// already-populated OpenXR native-stereo-array texture, plus UE's SceneDepthZ (an
+// SBS depth with left[0..w/2] and right[w/2..w] halves). For each pixel in slice 1,
+// if the right pixel's depth is at the far plane (= sky / volumetric-fog region),
+// replace with slice 0's color. Otherwise keep slice 1 (preserves right-eye
+// foreground parallax). This is the parallax-correct version of MIRROR_FULL.
+//
+// Env switches:
+//   UEVR_SN2_RIGHT_EYE_DEPTH_BLEND       = 1  enable
+//   UEVR_SN2_RIGHT_EYE_DEPTH_THRESHOLD  = 0.9999  (reversed-Z) far-plane cutoff
+//   UEVR_SN2_RIGHT_EYE_DEPTH_SOFTNESS   = 0.0005  smoothstep half-width
+//   UEVR_SN2_RIGHT_EYE_DEPTH_REVERSED_Z = 1   (UE5 default is reversed-Z)
+namespace sn2_depth_blend {
+    template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
+    static bool env_on() {
+        static const bool v = []() {
+            char b[8]{}; const auto n = GetEnvironmentVariableA("UEVR_SN2_RIGHT_EYE_DEPTH_BLEND", b, sizeof(b));
+            return n != 0 && n < sizeof(b) && b[0] && b[0] != '0';
+        }();
+        return v;
+    }
+    static float depth_threshold() {
+        static const float v = []() {
+            char b[32]{}; const auto n = GetEnvironmentVariableA("UEVR_SN2_RIGHT_EYE_DEPTH_THRESHOLD", b, sizeof(b));
+            return (n != 0 && n < sizeof(b)) ? (float)atof(b) : 0.0005f; // reversed-Z far ≈ 0
+        }();
+        return v;
+    }
+    static float depth_softness() {
+        static const float v = []() {
+            char b[32]{}; const auto n = GetEnvironmentVariableA("UEVR_SN2_RIGHT_EYE_DEPTH_SOFTNESS", b, sizeof(b));
+            return (n != 0 && n < sizeof(b)) ? (float)atof(b) : 0.0001f;
+        }();
+        return v;
+    }
+    static uint32_t reversed_z() {
+        static const uint32_t v = []() {
+            char b[8]{}; const auto n = GetEnvironmentVariableA("UEVR_SN2_RIGHT_EYE_DEPTH_REVERSED_Z", b, sizeof(b));
+            return (n != 0 && n < sizeof(b) && b[0] != '0') ? 1u : 1u; // UE5 default = reversed
+        }();
+        return v;
+    }
+
+    static bool g_attempted = false;
+    static bool g_ok = false;
+    static ComPtr<ID3D12RootSignature> g_rs{};
+    static ComPtr<ID3D12PipelineState> g_pso{};
+    static ComPtr<ID3D12DescriptorHeap> g_heap{};
+    static ComPtr<ID3D12Resource> g_cb{};
+    static uint8_t* g_cb_ptr = nullptr;
+    static UINT g_inc = 0;
+    // Intermediate one-eye UNORM UAV texture. The OpenXR native-stereo-array swapchain
+    // is _SRGB with no UNORDERED_ACCESS usage, so we cannot UAV-write it directly (the
+    // old code did -> device-remove on submit). The CS writes here, then we copy this
+    // into array slice 1 (copy is valid on the swapchain).
+    static ComPtr<ID3D12Resource> g_intermediate{};
+    static UINT g_inter_w = 0;
+    static UINT g_inter_h = 0;
+
+    static bool ensure_init(ID3D12Device* device) {
+        if (g_attempted) return g_ok;
+        g_attempted = true;
+        render::ShaderCompileRequest req{};
+        char path[512]{};
+        const auto n = GetEnvironmentVariableA("UEVR_SN2_DEPTH_BLEND_SHADER", path, sizeof(path));
+        req.source_path = (n != 0 && n < sizeof(path))
+            ? std::filesystem::path(path)
+            : std::filesystem::path(L"E:/Github/Subnautica 2/moddingkit/shaders/sn2_right_eye_depth_blend.hlsl");
+        req.entry_point = "main";
+        req.profile = "cs_6_0";
+        req.warnings_as_errors = false;
+        const auto res = render::compile_shader_file(req);
+        if (!res.succeeded || res.bytecode.empty()) {
+            SPDLOG_ERROR("[SN2-DepthBlend] shader compile FAILED: {}", res.error);
+            return false;
+        }
+        D3D12_DESCRIPTOR_RANGE ranges[2]{};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; // t0,t1
+        ranges[0].NumDescriptors = 2; ranges[0].BaseShaderRegister = 0; ranges[0].RegisterSpace = 0;
+        ranges[0].OffsetInDescriptorsFromTableStart = 0;
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; // u0
+        ranges[1].NumDescriptors = 1; ranges[1].BaseShaderRegister = 0; ranges[1].RegisterSpace = 0;
+        ranges[1].OffsetInDescriptorsFromTableStart = 2;
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor.ShaderRegister = 0; params[0].Descriptor.RegisterSpace = 0;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable.NumDescriptorRanges = 2;
+        params[1].DescriptorTable.pDescriptorRanges = ranges;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2; rsd.pParameters = params; rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        ComPtr<ID3DBlob> sig{}, err{};
+        if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
+            SPDLOG_ERROR("[SN2-DepthBlend] root sig serialize failed"); return false;
+        }
+        if (FAILED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_rs)))) {
+            SPDLOG_ERROR("[SN2-DepthBlend] CreateRootSignature failed"); return false;
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = g_rs.Get();
+        pd.CS.pShaderBytecode = res.bytecode.data(); pd.CS.BytecodeLength = res.bytecode.size();
+        if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_pso)))) {
+            SPDLOG_ERROR("[SN2-DepthBlend] CreateComputePipelineState failed"); return false;
+        }
+        // Round-robin descriptor slots across frames to avoid GPU-in-flight races.
+        // 30 slots = 10 frames × 3 descriptors per dispatch.
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 30;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_heap)))) {
+            SPDLOG_ERROR("[SN2-DepthBlend] CreateDescriptorHeap failed"); return false;
+        }
+        g_inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_HEAP_PROPERTIES up{}; up.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC cbd{};
+        cbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; cbd.Width = 256; cbd.Height = 1;
+        cbd.DepthOrArraySize = 1; cbd.MipLevels = 1; cbd.Format = DXGI_FORMAT_UNKNOWN;
+        cbd.SampleDesc.Count = 1; cbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &cbd,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cb)))) {
+            SPDLOG_ERROR("[SN2-DepthBlend] CB create failed"); return false;
+        }
+        D3D12_RANGE rr{0, 0};
+        if (FAILED(g_cb->Map(0, &rr, reinterpret_cast<void**>(&g_cb_ptr)))) {
+            SPDLOG_ERROR("[SN2-DepthBlend] CB map failed"); return false;
+        }
+        g_ok = true;
+        SPDLOG_WARN("[SN2-DepthBlend] initialized OK (thresh={} soft={} revZ={})",
+            depth_threshold(), depth_softness(), reversed_z());
+        return true;
+    }
+
+    // Run the depth blend pass. Caller passes a recording command list that already
+    // has both slices populated. We add SRV-for-array-color, SRV-for-depth, and
+    // UAV-for-array-color(slice 1 only) descriptors into our heap, set the compute
+    // PSO, and dispatch.
+    static void run(ID3D12GraphicsCommandList* cl,
+                    ID3D12Resource* stereo_array_color, D3D12_RESOURCE_STATES color_state_in,
+                    ID3D12Resource* sbs_depth,           D3D12_RESOURCE_STATES depth_state_in,
+                    UINT slice_w, UINT slice_h, UINT backbuffer_w)
+    {
+        if (!env_on() || cl == nullptr || stereo_array_color == nullptr) return;
+        // Depth is OPTIONAL — luma-only heuristic works without it.
+        auto* device = g_framework->get_d3d12_hook()->get_device();
+        if (device == nullptr) return;
+        if (!ensure_init(device)) return;
+        if (slice_w == 0 || slice_h == 0) return;
+
+        // Pack CB.
+        struct CB {
+            uint32_t dim_x, dim_y;
+            float    depth_far_threshold;
+            float    blend_softness;
+            uint32_t backbuffer_w;
+            uint32_t reversed_z;
+            uint32_t luma_only;
+            uint32_t _pad0;
+        } cb{ slice_w, slice_h, depth_threshold(), depth_softness(), backbuffer_w, reversed_z(),
+              (sbs_depth == nullptr) ? 1u : 0u, 0 };
+        memcpy(g_cb_ptr, &cb, sizeof(cb));
+
+        // Descriptor writes. Heap layout per group: [color SRV][depth SRV][color UAV].
+        // Round-robin across frames to avoid GPU-in-flight races on descriptor reuse.
+        static std::atomic<UINT> s_group_idx{0};
+        const UINT group = s_group_idx.fetch_add(1, std::memory_order_relaxed) % 10u;
+        const auto color_desc = stereo_array_color->GetDesc();
+        const D3D12_RESOURCE_DESC depth_desc = (sbs_depth != nullptr) ? sbs_depth->GetDesc() : D3D12_RESOURCE_DESC{};
+
+        // UNORM (non-sRGB) format of the swapchain's family — UAV-compatible and
+        // copy-compatible with the _SRGB swapchain slice.
+        const DXGI_FORMAT unorm_fmt =
+            (color_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+             color_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+             color_desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS)
+                ? DXGI_FORMAT_R8G8B8A8_UNORM
+                : DXGI_FORMAT_B8G8R8A8_UNORM;
+
+        // Lazy-create / resize the intermediate one-eye UNORM UAV texture.
+        if (g_intermediate == nullptr || g_inter_w != slice_w || g_inter_h != slice_h) {
+            g_intermediate.Reset();
+            D3D12_HEAP_PROPERTIES dp{}; dp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = slice_w; td.Height = slice_h;
+            td.DepthOrArraySize = 1; td.MipLevels = 1;
+            td.Format = unorm_fmt;
+            td.SampleDesc.Count = 1;
+            td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(device->CreateCommittedResource(&dp, D3D12_HEAP_FLAG_NONE, &td,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_intermediate)))) {
+                SPDLOG_ERROR("[SN2-DepthBlend] intermediate create FAILED {}x{} fmt={}",
+                    slice_w, slice_h, (int)unorm_fmt);
+                g_intermediate.Reset();
+                return;
+            }
+            g_inter_w = slice_w; g_inter_h = slice_h;
+            SPDLOG_WARN("[SN2-DepthBlend] intermediate UAV texture created {}x{} fmt={}",
+                slice_w, slice_h, (int)unorm_fmt);
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_heap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += static_cast<SIZE_T>(group) * 3u * g_inc;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_heap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += static_cast<UINT64>(group) * 3u * g_inc;
+
+        // SRV t0: Texture2DArray<float4> (entire array, both slices readable).
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = color_desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM
+                       : color_desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ? DXGI_FORMAT_B8G8R8A8_UNORM
+                       : color_desc.Format;
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.Texture2DArray.MostDetailedMip = 0;
+            sd.Texture2DArray.MipLevels = 1;
+            sd.Texture2DArray.FirstArraySlice = 0;
+            sd.Texture2DArray.ArraySize = 2;
+            sd.Texture2DArray.PlaneSlice = 0;
+            sd.Texture2DArray.ResourceMinLODClamp = 0.0f;
+            device->CreateShaderResourceView(stereo_array_color, &sd, cpu);
+            cpu.ptr += g_inc;
+        }
+        // SRV t1: Texture2D<float> depth (or null if not available — shader ignores).
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = DXGI_FORMAT_R32_FLOAT;
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.Texture2D.MostDetailedMip = 0;
+            sd.Texture2D.MipLevels = 1;
+            sd.Texture2D.PlaneSlice = 0;
+            sd.Texture2D.ResourceMinLODClamp = 0.0f;
+            if (sbs_depth != nullptr) {
+                // UE depth is typically D32_FLOAT; SRV must be R32_FLOAT.
+                sd.Format = (depth_desc.Format == DXGI_FORMAT_R32_TYPELESS ||
+                             depth_desc.Format == DXGI_FORMAT_D32_FLOAT ||
+                             depth_desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
+                            ? DXGI_FORMAT_R32_FLOAT : depth_desc.Format;
+            }
+            device->CreateShaderResourceView(sbs_depth, &sd, cpu);
+            cpu.ptr += g_inc;
+        }
+        // UAV u0: the INTERMEDIATE Texture2D (NOT the swapchain array — see HLSL note).
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.Format = unorm_fmt;
+            ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            ud.Texture2D.MipSlice = 0;
+            ud.Texture2D.PlaneSlice = 0;
+            device->CreateUnorderedAccessView(g_intermediate.Get(), nullptr, &ud, cpu);
+        }
+
+        // Pre-dispatch barriers: array (both slices) -> NON_PIXEL_SHADER_RESOURCE (SRV read),
+        // depth -> NPS, intermediate COPY_SOURCE -> UAV.
+        {
+            D3D12_RESOURCE_BARRIER pre[3]{};
+            UINT pre_n = 0;
+            if (color_state_in != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+                auto& b = pre[pre_n++]; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = stereo_array_color;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = color_state_in;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            }
+            if (sbs_depth != nullptr && depth_state_in != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+                auto& b = pre[pre_n++]; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = sbs_depth;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = depth_state_in;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            }
+            {
+                auto& b = pre[pre_n++]; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = g_intermediate.Get();
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            }
+            cl->ResourceBarrier(pre_n, pre);
+        }
+
+        ID3D12DescriptorHeap* heaps[] = { g_heap.Get() };
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetComputeRootSignature(g_rs.Get());
+        cl->SetPipelineState(g_pso.Get());
+        cl->SetComputeRootConstantBufferView(0, g_cb->GetGPUVirtualAddress());
+        cl->SetComputeRootDescriptorTable(1, gpu);
+        cl->Dispatch((slice_w + 7) / 8, (slice_h + 7) / 8, 1);
+
+        // Post-dispatch: intermediate UAV -> COPY_SOURCE; array slice 1 (subres 1) NPS -> COPY_DEST.
+        {
+            D3D12_RESOURCE_BARRIER b2[2]{};
+            b2[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b2[0].Transition.pResource = g_intermediate.Get();
+            b2[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b2[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            b2[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b2[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b2[1].Transition.pResource = stereo_array_color;
+            b2[1].Transition.Subresource = 1; // array slice 1, mip 0
+            b2[1].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            b2[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            cl->ResourceBarrier(2, b2);
+        }
+
+        // Copy intermediate (the blended right eye) -> array slice 1.
+        {
+            D3D12_TEXTURE_COPY_LOCATION dstL{};
+            dstL.pResource = stereo_array_color;
+            dstL.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dstL.SubresourceIndex = 1; // array slice 1
+            D3D12_TEXTURE_COPY_LOCATION srcL{};
+            srcL.pResource = g_intermediate.Get();
+            srcL.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            srcL.SubresourceIndex = 0;
+            cl->CopyTextureRegion(&dstL, 0, 0, 0, &srcL, nullptr);
+        }
+
+        // Restore: array slice 1 COPY_DEST -> color_state_in; array slice 0 NPS -> color_state_in;
+        // depth NPS -> depth_state_in.
+        {
+            D3D12_RESOURCE_BARRIER post[3]{};
+            UINT post_n = 0;
+            {
+                auto& b = post[post_n++]; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = stereo_array_color;
+                b.Transition.Subresource = 1;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                b.Transition.StateAfter = color_state_in;
+            }
+            if (color_state_in != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+                auto& b = post[post_n++]; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = stereo_array_color;
+                b.Transition.Subresource = 0; // slice 0 was moved to NPS; restore it
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                b.Transition.StateAfter = color_state_in;
+            }
+            if (sbs_depth != nullptr && depth_state_in != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+                auto& b = post[post_n++]; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = sbs_depth;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                b.Transition.StateAfter = depth_state_in;
+            }
+            cl->ResourceBarrier(post_n, post);
+        }
+
+        static std::atomic<uint64_t> rn{0};
+        const auto cnt = rn.fetch_add(1, std::memory_order_relaxed);
+        if (cnt < 8 || (cnt % 600) == 0) {
+            const HRESULT dr = device->GetDeviceRemovedReason();
+            SPDLOG_WARN("[SN2-DepthBlend] dispatched #{} slice={}x{} bb_w={} depth={} luma_only={} array_fmt={} device_removed=0x{:x}",
+                cnt + 1, slice_w, slice_h, backbuffer_w,
+                (sbs_depth != nullptr) ? 1 : 0, cb.luma_only, (int)color_desc.Format, (uint32_t)dr);
+        }
+    }
+} // namespace sn2_depth_blend
+
+// ===========================================================================
+// sn2_debug — RenderDoc / OpenXR capture-readability debug resources.
+//
+// Owned by agent OWNEDRES. Declared in src/hooks/Sn2DebugResources.hpp; called
+// from the D3D12 dispatch/draw hooks. EVERYTHING here is default-OFF and uses
+// ONLY UEVR-owned committed resources in their own heaps. We NEVER call
+// CopyTextureRegion / ResourceBarrier / SetDescriptorHeaps against an engine
+// resource or the engine's command list. The owned->staging readback runs on
+// our OWN CommandContext queue after a fence.
+//
+// DEVICE-REMOVAL NOTE: features #4 (watermark) and #11 (sentinel) are the only
+// device-removal-risk surfaces in the capture-readability batch. They are
+// PENDING LIVE VALIDATION. The risky part is NOT the C++ here (which only
+// touches owned resources) but the STAGED dxil_text_patch manifests that bind
+// the owned texture into a space99 UAV slot / redirect the t5 SRV. Those
+// manifests are hand-deployed for a validation run only.
+// ===========================================================================
+namespace sn2_debug {
+    template <typename T> using DComPtr = Microsoft::WRL::ComPtr<T>;
+
+    static bool env_truthy_local(const char* name) {
+        char b[16]{};
+        const auto n = GetEnvironmentVariableA(name, b, (DWORD)sizeof(b));
+        return n != 0 && n < sizeof(b) && b[0] && b[0] != '0';
+    }
+
+    // ---- feature gates ----------------------------------------------------
+    bool fog_fill_watermark_enabled() {
+        static const bool v = env_truthy_local("UEVR_SN2_FOG_FILL_WATERMARK");
+        return v;
+    }
+    bool sentinel_froxel_enabled() {
+        static const bool v = env_truthy_local("UEVR_SN2_SENTINEL_FROXEL");
+        return v;
+    }
+
+    static bool verbose_log() {
+        static const bool v = env_truthy_local("UEVR_SN2_DEBUG_RES_LOG");
+        return v;
+    }
+
+    // Producer CS CRCs we watermark (UWEFogResolveCS + LightScattering family).
+    static bool is_producer_crc(uint32_t cs_crc) {
+        return cs_crc == 0x0930dd4eu  // UWEFogResolveCS (store-x redirect target)
+            || cs_crc == 0xd1f85c42u  // LightScatteringCS variant
+            || cs_crc == 0x3402487cu; // FinalIntegration / froxel-fill variant
+    }
+
+    // Froxel grid X-by-Y the watermark maps. SBS family froxel is ~107 wide
+    // (each eye fills ~53). 30 rows is enough to make the L/R-empty split legible.
+    static constexpr UINT kWmWidth  = 107;
+    static constexpr UINT kWmHeight = 30;
+    // Sentinel test froxel (matches the family froxel dimensions ~107x30x48).
+    static constexpr UINT kSentinelW = 107;
+    static constexpr UINT kSentinelH = 30;
+    static constexpr UINT kSentinelD = 48;
+
+    struct State {
+        std::mutex mutex{};
+        bool attempted_watermark = false;
+        bool attempted_sentinel  = false;
+
+        // #4 watermark: owned RWTexture2D<uint> (R32_UINT) + own readback buffer.
+        DComPtr<ID3D12Resource> wm_tex{};       // DEFAULT heap, UAV-capable.
+        DComPtr<ID3D12Resource> wm_readback{};  // READBACK heap, CPU-mappable.
+        UINT64 wm_readback_total = 0;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT wm_footprint{};
+        UINT wm_rows = 0;
+        UINT64 wm_row_size = 0;
+
+        // #11 sentinel: owned Texture3D (R11G11B10F) filled once with X-gradient.
+        DComPtr<ID3D12Resource> sentinel_tex{};
+        bool sentinel_filled = false;
+
+        // Our OWN command context (own queue + fence) for owned->own copies.
+        // NEVER used against an engine resource or the engine command list.
+        d3d12::CommandContext cmds{};
+        bool cmds_ready = false;
+
+        std::atomic<uint64_t> wm_seq{0};
+        std::atomic<uint64_t> consumer_seq{0};
+    };
+
+    static State& state() {
+        static State s{};
+        return s;
+    }
+
+    static ID3D12Device* resolve_device(ID3D12Device* dev) {
+        if (dev != nullptr) {
+            return dev;
+        }
+        if (g_framework != nullptr && g_framework->get_d3d12_hook() != nullptr) {
+            return g_framework->get_d3d12_hook()->get_device();
+        }
+        return nullptr;
+    }
+
+    static bool ensure_cmds(State& s) {
+        if (s.cmds_ready) {
+            return true;
+        }
+        if (!s.cmds.setup(L"SN2 Debug Resources (owned copy queue)")) {
+            SPDLOG_WARN("[SN2-DebugRes] failed to set up owned command context");
+            return false;
+        }
+        s.cmds_ready = true;
+        return true;
+    }
+
+    // ---- #4 watermark resource creation -----------------------------------
+    static void ensure_watermark(ID3D12Device* device, State& s) {
+        if (s.attempted_watermark) {
+            return;
+        }
+        s.attempted_watermark = true;
+
+        // Owned RWTexture2D<uint> in our OWN default heap (UAV-capable).
+        D3D12_HEAP_PROPERTIES dp{}; dp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = kWmWidth; td.Height = kWmHeight;
+        td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R32_UINT;
+        td.SampleDesc.Count = 1;
+        td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(device->CreateCommittedResource(&dp, D3D12_HEAP_FLAG_NONE, &td,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&s.wm_tex)))) {
+            SPDLOG_WARN("[SN2-DebugRes] watermark tex create FAILED {}x{}", kWmWidth, kWmHeight);
+            s.wm_tex.Reset();
+            return;
+        }
+        s.wm_tex->SetName(L"SN2_Debug_FogFillWatermark_R32UINT");
+
+        // Own readback buffer sized from the texture footprint.
+        device->GetCopyableFootprints(&td, 0, 1, 0, &s.wm_footprint, &s.wm_rows,
+            &s.wm_row_size, &s.wm_readback_total);
+
+        D3D12_HEAP_PROPERTIES rp{}; rp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = s.wm_readback_total; bd.Height = 1;
+        bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &bd,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&s.wm_readback)))) {
+            SPDLOG_WARN("[SN2-DebugRes] watermark readback create FAILED size={}", s.wm_readback_total);
+            s.wm_readback.Reset();
+            return;
+        }
+        s.wm_readback->SetName(L"SN2_Debug_FogFillWatermark_Readback");
+
+        SPDLOG_WARN("[SN2-DebugRes] #4 watermark resources created {}x{} R32_UINT readback={}B "
+                    "(bind owned tex into space99 UAV via staged manifest wm_producer_store_0930dd4e.json)",
+            kWmWidth, kWmHeight, s.wm_readback_total);
+    }
+
+    // ---- #11 sentinel resource creation + one-time gradient fill ----------
+    static void ensure_sentinel(ID3D12Device* device, State& s) {
+        if (s.attempted_sentinel) {
+            return;
+        }
+        s.attempted_sentinel = true;
+
+        // Owned Texture3D in our OWN default heap. We fill it via an UPLOAD
+        // staging buffer + CopyTextureRegion on our OWN queue while idle —
+        // both src and dst are UEVR-owned, so this never touches engine state.
+        D3D12_HEAP_PROPERTIES dp{}; dp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        td.Width = kSentinelW; td.Height = kSentinelH; td.DepthOrArraySize = kSentinelD;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+        td.SampleDesc.Count = 1;
+        td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        td.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (FAILED(device->CreateCommittedResource(&dp, D3D12_HEAP_FLAG_NONE, &td,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&s.sentinel_tex)))) {
+            SPDLOG_WARN("[SN2-DebugRes] sentinel tex create FAILED {}x{}x{}",
+                kSentinelW, kSentinelH, kSentinelD);
+            s.sentinel_tex.Reset();
+            return;
+        }
+        s.sentinel_tex->SetName(L"SN2_Debug_SentinelFroxel_R11G11B10F");
+
+        // Build an X-gradient in R11G11B10F packed format for every slice.
+        // Pack: R(11) | G(11)<<11 | B(10)<<22. Floats are positive [0,1] so we
+        // use the simple unsigned-normalized-ish encode that RenderDoc decodes
+        // back to a visible gradient (exact float bits not load-bearing — we
+        // just need a smooth ramp the consumer A/B oracle can read).
+        const auto pack_r11g11b10 = [](float r, float g, float b) -> uint32_t {
+            auto to_u = [](float v, int bits, int mant) -> uint32_t {
+                // crude float->packed: clamp [0,1], scale to mantissa range,
+                // place at exponent 15 (1.x). Good enough for a visible ramp.
+                v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+                const uint32_t maxm = (1u << mant) - 1u;
+                const uint32_t m = (uint32_t)(v * (float)maxm + 0.5f);
+                (void)bits;
+                return m; // store in mantissa; exponent left 0 => denorm ramp
+            };
+            const uint32_t rr = to_u(r, 11, 6) & 0x7ffu;
+            const uint32_t gg = to_u(g, 11, 6) & 0x7ffu;
+            const uint32_t bb = to_u(b, 10, 5) & 0x3ffu;
+            return rr | (gg << 11) | (bb << 22);
+        };
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT rows = 0; UINT64 row_size = 0; UINT64 total = 0;
+        device->GetCopyableFootprints(&td, 0, 1, 0, &fp, &rows, &row_size, &total);
+
+        D3D12_HEAP_PROPERTIES up{}; up.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC ub{};
+        ub.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        ub.Width = total; ub.Height = 1; ub.DepthOrArraySize = 1; ub.MipLevels = 1;
+        ub.Format = DXGI_FORMAT_UNKNOWN; ub.SampleDesc.Count = 1;
+        ub.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        DComPtr<ID3D12Resource> upload{};
+        if (FAILED(device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &ub,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload)))) {
+            SPDLOG_WARN("[SN2-DebugRes] sentinel upload buffer create FAILED size={}", total);
+            return;
+        }
+        upload->SetName(L"SN2_Debug_SentinelFroxel_Upload");
+
+        uint8_t* mapped = nullptr;
+        D3D12_RANGE rr{0, 0};
+        if (FAILED(upload->Map(0, &rr, reinterpret_cast<void**>(&mapped))) || mapped == nullptr) {
+            SPDLOG_WARN("[SN2-DebugRes] sentinel upload map FAILED");
+            return;
+        }
+        const UINT row_pitch = fp.Footprint.RowPitch;
+        const UINT slice_pitch = row_pitch * kSentinelH;
+        for (UINT z = 0; z < kSentinelD; ++z) {
+            for (UINT y = 0; y < kSentinelH; ++y) {
+                auto* dst = reinterpret_cast<uint32_t*>(mapped + fp.Offset
+                    + (size_t)z * slice_pitch + (size_t)y * row_pitch);
+                for (UINT x = 0; x < kSentinelW; ++x) {
+                    const float gx = (float)x / (float)(kSentinelW - 1); // 0..1 across X
+                    // Green dominant ramp = clearly directional + teal-ish to
+                    // resemble the fog so it reads naturally in the consumer.
+                    dst[x] = pack_r11g11b10(gx * 0.25f, gx, gx * 0.6f);
+                }
+            }
+        }
+        D3D12_RANGE wr{0, total};
+        upload->Unmap(0, &wr);
+
+        if (!ensure_cmds(s)) {
+            return;
+        }
+        s.cmds.wait(INFINITE);
+        auto* cl = s.cmds.cmd_list.Get();
+        if (cl == nullptr) {
+            return;
+        }
+
+        // owned upload -> owned sentinel, both UEVR-owned, our queue.
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = upload.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = fp;
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = s.sentinel_tex.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+        // Transition owned sentinel to a shader-readable state for the consumer
+        // SRV redirect. This barrier is on OUR owned resource, OUR command list.
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = s.sentinel_tex.Get();
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = ENGINE_SRC_COLOR;
+        cl->ResourceBarrier(1, &b);
+
+        s.cmds.has_commands = true;
+        s.cmds.execute();
+        s.cmds.wait(INFINITE);
+        s.sentinel_filled = true;
+
+        SPDLOG_WARN("[SN2-DebugRes] #11 sentinel froxel created+filled {}x{}x{} R11G11B10F "
+                    "(redirect t5 SRV to it via staged sentinel_t5_<crc>.json)",
+            kSentinelW, kSentinelH, kSentinelD);
+    }
+
+    void ensure_resources(ID3D12Device* dev) {
+        if (!fog_fill_watermark_enabled() && !sentinel_froxel_enabled()) {
+            return;
+        }
+        auto* device = resolve_device(dev);
+        if (device == nullptr) {
+            return;
+        }
+        auto& s = state();
+        std::scoped_lock lock{s.mutex};
+        if (fog_fill_watermark_enabled()) {
+            ensure_watermark(device, s);
+        }
+        if (sentinel_froxel_enabled()) {
+            ensure_sentinel(device, s);
+        }
+    }
+
+    // ---- #4 readback after the producer dispatch --------------------------
+    // We DO NOT touch the engine command list `cl`. The staged dxil_text_patch
+    // redirected the producer's existing store into the space99 UAV bound to our
+    // owned wm_tex, so by the time the engine submits, wm_tex holds the fill
+    // coords. We copy owned wm_tex -> owned readback on OUR queue, after a fence,
+    // and (occasionally) dump the CPU map. This never serializes the engine.
+    static void copy_watermark_readback(State& s, ID3D12Device* device) {
+        if (s.wm_tex == nullptr || s.wm_readback == nullptr) {
+            return;
+        }
+        if (!ensure_cmds(s)) {
+            return;
+        }
+        s.cmds.wait(INFINITE);
+        auto* cl = s.cmds.cmd_list.Get();
+        if (cl == nullptr) {
+            return;
+        }
+
+        // owned wm_tex UAV -> COPY_SOURCE (our resource, our list).
+        D3D12_RESOURCE_BARRIER toSrc{};
+        toSrc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toSrc.Transition.pResource = s.wm_tex.Get();
+        toSrc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toSrc.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        toSrc.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        cl->ResourceBarrier(1, &toSrc);
+
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = s.wm_readback.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = s.wm_footprint;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = s.wm_tex.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+        // restore owned wm_tex to UAV for the next frame's producer store.
+        D3D12_RESOURCE_BARRIER back = toSrc;
+        back.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        back.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        cl->ResourceBarrier(1, &back);
+
+        s.cmds.has_commands = true;
+        s.cmds.execute();
+        s.cmds.wait(INFINITE);
+
+        // Decode + log the literal fill map (low 16 bits = DTid.x, top 8 = eye).
+        uint8_t* mapped = nullptr;
+        D3D12_RANGE rr{0, (SIZE_T)s.wm_readback_total};
+        if (FAILED(s.wm_readback->Map(0, &rr, reinterpret_cast<void**>(&mapped))) || mapped == nullptr) {
+            return;
+        }
+        // Sample one representative row (middle) to summarize L/R coverage.
+        // High byte of each cell = eyeID stamped by the shader, using the UEVR
+        // eye-bucket convention 1=LEFT, 2=RIGHT, 0=unknown/unset. A cell value of
+        // 0 means that froxel column was never filled (empty), so left/right and
+        // empty are all distinguishable.
+        const UINT y = kWmHeight / 2;
+        const auto* row = reinterpret_cast<const uint32_t*>(mapped + s.wm_footprint.Offset
+            + (size_t)y * s.wm_footprint.Footprint.RowPitch);
+        UINT left_filled = 0, right_filled = 0;
+        UINT stamped_left = 0, stamped_right = 0, stamped_unknown = 0;
+        const UINT half = kWmWidth / 2;
+        for (UINT x = 0; x < kWmWidth; ++x) {
+            const uint32_t v = row[x];
+            if (v != 0) {
+                const uint32_t eye_id = (v >> 24) & 0xFFu; // 1=L,2=R,0=unknown
+                if (eye_id == 1u) ++stamped_left;
+                else if (eye_id == 2u) ++stamped_right;
+                else ++stamped_unknown;
+                if (x < half) ++left_filled; else ++right_filled;
+            }
+        }
+        D3D12_RANGE wr{0, 0};
+        s.wm_readback->Unmap(0, &wr);
+
+        SPDLOG_WARN("[SN2-DebugRes] #4 watermark map row{} cells_left[0..{}]filled={} cells_right[{}..{}]filled={} "
+                    "stamped(eye1=L={} eye2=R={} unknown={}) "
+                    "(expect one half filled, other empty => producer fill split)",
+            y, half, left_filled, half, kWmWidth, right_filled,
+            stamped_left, stamped_right, stamped_unknown);
+        (void)device;
+    }
+
+    void on_producer_dispatch(ID3D12GraphicsCommandList* cl, uint32_t cs_crc, int eye) {
+        if (!fog_fill_watermark_enabled() || !is_producer_crc(cs_crc)) {
+            return;
+        }
+        auto* device = resolve_device(nullptr);
+        if (device == nullptr) {
+            return;
+        }
+        auto& s = state();
+        std::scoped_lock lock{s.mutex};
+        ensure_watermark(device, s);
+        if (s.wm_tex == nullptr) {
+            return;
+        }
+        // Throttle the owned->own readback (do not do it every dispatch; it has
+        // its own fence wait). Once per ~120 producer dispatches is plenty for a
+        // capture-time diagnostic.
+        const auto seq = s.wm_seq.fetch_add(1, std::memory_order_relaxed);
+        if ((seq % 120) == 0) {
+            copy_watermark_readback(s, device);
+        }
+        if (verbose_log() && seq < 8) {
+            SPDLOG_WARN("[SN2-DebugRes] #4 producer dispatch crc=0x{:08x} eye={} seq={} "
+                        "(staged manifest must redirect store into space99 UAV=owned wm_tex)",
+                cs_crc, eye, seq);
+        }
+        (void)cl;
+    }
+
+    void on_consumer_draw(ID3D12GraphicsCommandList* cl, uint32_t ps_crc, int eye) {
+        if (!sentinel_froxel_enabled()) {
+            return;
+        }
+        // Lightweight marker only — the actual t5 SRV redirect to the owned
+        // sentinel lives in the staged consumer manifests. We never touch `cl`
+        // or any engine resource here.
+        const auto seq = state().consumer_seq.fetch_add(1, std::memory_order_relaxed);
+        if (verbose_log() && seq < 16) {
+            SPDLOG_WARN("[SN2-DebugRes] #11 consumer draw crc=0x{:08x} eye={} seq={} "
+                        "(t5 SRV should be redirected to owned sentinel by staged manifest)",
+                ps_crc, eye, seq);
+        }
+        (void)cl;
+    }
+
+    // =========================================================================
+    // Feature #15 — Cave-region last-writer recorder
+    // =========================================================================
+    // Pure CPU observer. No GPU resources, no engine mutations.
+    // Gated by UEVR_SN2_RDOC_TAGS (same master flag as features #10–#14).
+    //
+    // Cave-region rect is specified in per-eye-half pixel coordinates
+    // (each eye half is 1280 wide in SN2's 2560-wide SBS target).
+    // Env var UEVR_SN2_CAVE_REGION="x0,y0,x1,y1" overrides the default.
+    // The default [320,100,960,460] brackets the upper-center region of a
+    // 1280×720 half-frame, covering the cave opening in the main-menu vista
+    // as confirmed from the sn2_rd_uevr_20260525_141356_frame652.rdc capture.
+    // =========================================================================
+
+    bool cave_writer_enabled() {
+        static const bool v = env_truthy_local("UEVR_SN2_RDOC_TAGS");
+        return v;
+    }
+
+    // Cave rect in per-eye-half coordinates (pixels within one 1280-wide half).
+    struct CaveRect { long x0, y0, x1, y1; };
+
+    static CaveRect cave_rect_per_eye() {
+        static const CaveRect v = []() -> CaveRect {
+            char buf[64]{};
+            const DWORD n = GetEnvironmentVariableA("UEVR_SN2_CAVE_REGION", buf, sizeof(buf));
+            if (n == 0 || n >= sizeof(buf)) {
+                return {320, 100, 960, 460}; // default: upper-centre of a 1280x720 half
+            }
+            // Parse "x0,y0,x1,y1" — accept spaces around commas.
+            long vals[4] = {320, 100, 960, 460};
+            char* p = buf;
+            for (int i = 0; i < 4 && p != nullptr && *p != '\0'; ++i) {
+                while (*p == ' ') ++p;
+                char* end = nullptr;
+                vals[i] = std::strtol(p, &end, 10);
+                if (end == p) break; // parse error — keep defaults
+                p = end;
+                while (*p == ',' || *p == ' ') ++p;
+            }
+            return {vals[0], vals[1], vals[2], vals[3]};
+        }();
+        return v;
+    }
+
+    // One record per DISTINCT (by ps_crc) draw covering a cave region. We now record
+    // ALL covering draws for the LEFT region [0,1280] and the RIGHT region [1280,2560]
+    // independently, with membership decided purely by WHERE the scissor draws (not by
+    // the eye_bucket label) — so a full-screen [0,2560] pass lands in both lists while a
+    // per-eye scene draw lands in only its own. The set difference (L-only vs R-only
+    // CRCs) is the teal-vs-sky divergence we're hunting.
+    struct CaveDrawRec {
+        uint32_t ps_crc     = 0;
+        int      eye_bucket = 0;
+        uint64_t rtv_handle = 0;
+        long     sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0; // full-SBS scissor coords
+        uint64_t draw_seq   = 0;
+    };
+
+    static constexpr size_t kCaveMaxRecs = 48;
+
+    struct CaveWriterState {
+        std::mutex mutex{};
+        std::vector<CaveDrawRec> left{};   // distinct draws covering the LEFT cave rect
+        std::vector<CaveDrawRec> right{};  // distinct draws covering the RIGHT cave rect
+        std::atomic<uint64_t> frame_seq{0};
+    };
+
+    static CaveWriterState& cave_state() {
+        static CaveWriterState s{};
+        return s;
+    }
+
+    // Returns true if two LTRB rectangles overlap (strictly).
+    static inline bool rects_intersect(long ax0, long ay0, long ax1, long ay1,
+                                       long bx0, long by0, long bx1, long by1) {
+        return ax0 < bx1 && ax1 > bx0 && ay0 < by1 && ay1 > by0;
+    }
+
+    // Append a distinct (by ps_crc) covering draw into a region list (capped).
+    static void cave_push(std::vector<CaveDrawRec>& list, int eye_bucket, uint64_t rtv,
+                          const Sn2Rect& sc, uint32_t ps_crc, uint64_t seq) {
+        for (const auto& r : list) { if (r.ps_crc == ps_crc) return; } // distinct CRCs only
+        if (list.size() >= kCaveMaxRecs) return;
+        CaveDrawRec rec;
+        rec.ps_crc = ps_crc; rec.eye_bucket = eye_bucket; rec.rtv_handle = rtv;
+        rec.sx0 = sc.left; rec.sy0 = sc.top; rec.sx1 = sc.right; rec.sy1 = sc.bottom;
+        rec.draw_seq = seq;
+        list.push_back(rec);
+    }
+
+    void on_draw_observed(
+        ID3D12GraphicsCommandList* cl,
+        int       eye_bucket,
+        bool      has_scissor,
+        Sn2Rect   scissor,
+        uint64_t  rtv_handle,
+        uint32_t  ps_crc,
+        uint64_t  draw_seq)
+    {
+        if (!cave_writer_enabled() || !has_scissor) {
+            return;
+        }
+        // LEFT cave rect lives in [0,1280); RIGHT is the same rect shifted +1280.
+        // Membership is by WHERE the scissor draws (NOT eye_bucket), so a full-screen
+        // [0,2560] pass lands in both lists and per-eye scene draws land in only one.
+        const CaveRect per_eye = cave_rect_per_eye();
+        const bool covers_left = rects_intersect(
+            scissor.left, scissor.top, scissor.right, scissor.bottom,
+            per_eye.x0,          per_eye.y0, per_eye.x1,          per_eye.y1);
+        const bool covers_right = rects_intersect(
+            scissor.left, scissor.top, scissor.right, scissor.bottom,
+            per_eye.x0 + 1280L,  per_eye.y0, per_eye.x1 + 1280L,  per_eye.y1);
+        if (!covers_left && !covers_right) {
+            return;
+        }
+        {
+            auto& cs = cave_state();
+            std::scoped_lock lock{cs.mutex};
+            if (covers_left)  cave_push(cs.left,  eye_bucket, rtv_handle, scissor, ps_crc, draw_seq);
+            if (covers_right) cave_push(cs.right, eye_bucket, rtv_handle, scissor, ps_crc, draw_seq);
+        }
+
+        // Inline PIX SetMarker so the covering draw is greppable in the RenderDoc
+        // capture too (metadata-only; same safety profile as sn2_rdoc_tags::mark()).
+        if (cl != nullptr) {
+            char text[96];
+            std::snprintf(text, sizeof(text),
+                "CAVE_REGION_WRITER region=%s%s eb=%d ps=0x%08x rtv=0x%llx seq=%llu",
+                covers_left ? "L" : "", covers_right ? "R" : "",
+                eye_bucket, ps_crc,
+                static_cast<unsigned long long>(rtv_handle),
+                static_cast<unsigned long long>(draw_seq));
+            constexpr UINT PIX_EVENT_ANSI_VERSION = 1;
+            UINT text_bytes = 1; // at minimum null terminator
+            for (const char* p = text; *p; ++p) ++text_bytes;
+            cl->SetMarker(PIX_EVENT_ANSI_VERSION, text, text_bytes);
+        }
+    }
+
+    void flush_cave_writers() {
+        if (!cave_writer_enabled()) {
+            return;
+        }
+        auto& cs = cave_state();
+        const uint64_t frame = cs.frame_seq.fetch_add(1, std::memory_order_relaxed);
+        std::vector<CaveDrawRec> left_snap, right_snap;
+        {
+            std::scoped_lock lock{cs.mutex};
+            left_snap  = cs.left;
+            right_snap = cs.right;
+            cs.left.clear();
+            cs.right.clear();
+        }
+
+        // The menu is static, so throttle the full dump to keep the log lean:
+        // every frame for the first few, then once every ~180 frames.
+        const bool do_log = (frame < 3) || ((frame % 180) == 0);
+        if (!do_log) {
+            return;
+        }
+
+        const auto log_list = [&](const std::vector<CaveDrawRec>& recs, const char* tag) {
+            if (recs.empty()) {
+                SPDLOG_WARN("[SN2-CaveWriter] frame={} region={} NONE", frame, tag);
+                return;
+            }
+            for (size_t i = 0; i < recs.size(); ++i) {
+                const auto& r = recs[i];
+                SPDLOG_WARN("[SN2-CaveWriter] frame={} region={} idx={} ps=0x{:08x} eb={} "
+                            "rtv=0x{:016x} scissor=[{},{},{},{}] seq={}",
+                            frame, tag, i, r.ps_crc, r.eye_bucket, r.rtv_handle,
+                            r.sx0, r.sy0, r.sx1, r.sy1, r.draw_seq);
+            }
+        };
+        log_list(left_snap,  "L");
+        log_list(right_snap, "R");
+
+        // Set difference: CRCs covering one region but not the other = the divergence
+        // (e.g. the teal water/fog draw on the left vs the sky draw on the right).
+        const auto in_list = [](const std::vector<CaveDrawRec>& v, uint32_t crc) {
+            for (const auto& r : v) { if (r.ps_crc == crc) return true; }
+            return false;
+        };
+        std::string lonly, ronly;
+        char tmp[16];
+        for (const auto& r : left_snap) {
+            if (!in_list(right_snap, r.ps_crc)) { std::snprintf(tmp, sizeof(tmp), "0x%08x ", r.ps_crc); lonly += tmp; }
+        }
+        for (const auto& r : right_snap) {
+            if (!in_list(left_snap, r.ps_crc)) { std::snprintf(tmp, sizeof(tmp), "0x%08x ", r.ps_crc); ronly += tmp; }
+        }
+        SPDLOG_WARN("[SN2-CaveWriter] frame={} DIVERGENCE L_only=[{}] R_only=[{}]",
+                    frame, lonly, ronly);
+    }
+
+} // namespace sn2_debug
+
 namespace vrmod {
 namespace {
 constexpr auto FRAME_TIMING_LOG_INTERVAL = std::chrono::seconds(5);
@@ -487,6 +1487,32 @@ bool sn2_env_truthy(const char* name) {
 bool frame_profiler_log_enabled() {
     static const bool enabled = sn2_env_truthy("UEVR_D3D12_FRAME_PROFILER_LOG");
     return enabled;
+}
+
+// Feature #10 (agent OWNEDRES): give the OpenXR native-stereo-array texture and
+// the native (SBS) source resource descriptive RenderDoc-legible names so a
+// capture can tell slice0=left / slice1=right apart and identify the source.
+// SetName is SAFE (no device removal). Idempotent: each distinct resource is
+// named once. We only name UEVR/OpenXR-side resources here; DXGI swapchain
+// back-buffers belong to another agent and are intentionally skipped.
+inline void sn2_name_native_stereo_resources(ID3D12Resource* array_tex, ID3D12Resource* native_source) {
+    static std::unordered_set<ID3D12Resource*> s_named{};
+    static std::mutex s_mutex{};
+    std::scoped_lock lock{s_mutex};
+
+    if (array_tex != nullptr && s_named.insert(array_tex).second) {
+        // The array texture carries both eye slices: slice0=left, slice1=right.
+        // D3D12 SetName is per-resource (not per-subresource), so encode both.
+        array_tex->SetName(L"SN2_OpenXR_Array_Slice0_LeftEye__Slice1_RightEye");
+    }
+
+    if (native_source != nullptr && s_named.insert(native_source).second) {
+        const auto d = native_source->GetDesc();
+        wchar_t name[128]{};
+        swprintf_s(name, L"SN2_NativeStereoSource_%llux%u_fmt%u",
+            (unsigned long long)d.Width, (unsigned)d.Height, (unsigned)d.Format);
+        native_source->SetName(name);
+    }
 }
 
 enum SwapchainRecreateReason : uint32_t {
@@ -2411,6 +3437,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
                         dump_native_stereo_backbuffer_once(backbuffer.Get(), left_src_box, right_src_box, scene_source_state);
 
+                        // #10: name the native SBS source for both split + array paths
+                        // (the array texture itself is named inside the array-submit lambda).
+                        sn2_name_native_stereo_resources(nullptr, backbuffer.Get());
+
                         if (use_native_split_submit) {
                             SPDLOG_INFO_ONCE("[NativeStereoDebug] Split submit using native per-eye OpenXR swapchains");
                             // SN2 fog hack: check env var to mirror left half to right eye.
@@ -2440,17 +3470,51 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                                     value, (DWORD)std::size(value));
                                 return len > 0 && value[0] != L'\0' && value[0] != L'0';
                             }();
+                            // 2026-05-27 FULL mirror variant: copy ENTIRE left half to slice 1
+                            // (right eye) instead of just the top sky region. Eliminates the
+                            // mid-screen seam at the cost of zero right-eye parallax. Proof-of-
+                            // mechanism for the SN2 right-eye-fog work — slice 1 then matches
+                            // slice 0 fully so the OpenXR submit shows teal everywhere on right.
+                            static const bool mirror_full_left = []() {
+                                wchar_t value[16]{};
+                                const auto len = GetEnvironmentVariableW(
+                                    L"UEVR_SUBNAUTICA2_MIRROR_LEFT_TO_RIGHT_EYE_FULL",
+                                    value, (DWORD)std::size(value));
+                                return len > 0 && value[0] != L'\0' && value[0] != L'0';
+                            }();
                             // Compute top-half source box from left half of backbuffer.
                             D3D12_BOX left_top_src_box = left_src_box;
                             left_top_src_box.bottom = left_src_box.top + (left_src_box.bottom - left_src_box.top) / 2;
-                            SPDLOG_INFO_ONCE("[NativeStereoDebug] Mirror flag (sky-only top half): {}, left_top box={}-{} {}-{}",
-                                mirror_top_half,
+                            SPDLOG_INFO_ONCE("[NativeStereoDebug] Mirror flag (sky-only top half): {} full: {}, left_top box={}-{} {}-{}",
+                                mirror_top_half, mirror_full_left,
                                 left_top_src_box.left, left_top_src_box.right,
                                 left_top_src_box.top, left_top_src_box.bottom);
+                            // Capture scene depth into the lambda so the depth-blend compute can sample it.
+                            ComPtr<ID3D12Resource> lambda_scene_depth = scene_depth_tex;
+                            // The depth-blend needs depth even when UEVR depth-submit is OFF (scene_depth_tex
+                            // is only populated when is_depth_enabled()). Fetch SceneDepthZ directly for the
+                            // blend (read-only) so the DEPTH heuristic (far-plane = distant fog) works — the
+                            // luma-only fallback cannot catch the right eye's DARK distant region.
+                            if (lambda_scene_depth == nullptr && sn2_depth_blend::env_on()) {
+                                auto& rt_pool_db = vr->get_render_target_pool_hook();
+                                if (rt_pool_db != nullptr) {
+                                    lambda_scene_depth = rt_pool_db->get_texture<ID3D12Resource>(L"SceneDepthZ");
+                                }
+                            }
+                            const UINT lambda_slice_w = static_cast<UINT>(left_src_box.right - left_src_box.left);
+                            const UINT lambda_slice_h = static_cast<UINT>(left_src_box.bottom - left_src_box.top);
+                            const UINT lambda_bb_w   = static_cast<UINT>(m_backbuffer_size[0]);
                             m_openxr.copy(
                                 native_stereo_array_swapchain,
                                 nullptr,
-                                [backbuffer, left_src_box, right_src_box, left_top_src_box, scene_source_state, mirror = mirror_top_half](d3d12::CommandContext& commands, ID3D12Resource* dst) mutable {
+                                [backbuffer, left_src_box, right_src_box, left_top_src_box, scene_source_state,
+                                 mirror = mirror_top_half, mirror_full = mirror_full_left,
+                                 scene_depth = lambda_scene_depth,
+                                 slice_w = lambda_slice_w, slice_h = lambda_slice_h, bb_w = lambda_bb_w]
+                                (d3d12::CommandContext& commands, ID3D12Resource* dst) mutable {
+                                    // #10: name the OpenXR array texture (slice0=left/slice1=right)
+                                    // and the native SBS source for RenderDoc/OpenXR legibility.
+                                    sn2_name_native_stereo_resources(dst, backbuffer.Get());
                                     sn2_openxr_array_diag::clear_source_box_if_enabled(
                                         commands,
                                         backbuffer.Get(),
@@ -2464,25 +3528,45 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                                         0,
                                         scene_source_state,
                                         D3D12_RESOURCE_STATE_RENDER_TARGET);
-                                    // Slice 1 (right eye): full right half first (preserves right-eye parallax everywhere)
-                                    commands.copy_region_to_subresource(
-                                        backbuffer.Get(),
-                                        dst,
-                                        &right_src_box,
-                                        1,
-                                        scene_source_state,
-                                        D3D12_RESOURCE_STATE_RENDER_TARGET);
-                                    // Then overlay top half from left eye (the sky region with teal fog)
-                                    // ONLY if mirror flag is set.
-                                    if (mirror) {
+                                    // Slice 1 (right eye): default is right half of SBS (right-eye parallax).
+                                    // With UEVR_SUBNAUTICA2_MIRROR_LEFT_TO_RIGHT_EYE_FULL=1: skip right_src_box
+                                    // entirely and copy LEFT half — both eyes show identical left render.
+                                    if (mirror_full) {
                                         commands.copy_region_to_subresource(
                                             backbuffer.Get(),
                                             dst,
-                                            &left_top_src_box,
+                                            &left_src_box,
                                             1,
                                             scene_source_state,
                                             D3D12_RESOURCE_STATE_RENDER_TARGET);
+                                    } else {
+                                        commands.copy_region_to_subresource(
+                                            backbuffer.Get(),
+                                            dst,
+                                            &right_src_box,
+                                            1,
+                                            scene_source_state,
+                                            D3D12_RESOURCE_STATE_RENDER_TARGET);
+                                        // Then overlay top half from left eye (the sky region with teal fog)
+                                        // ONLY if (top-only) mirror flag is set.
+                                        if (mirror) {
+                                            commands.copy_region_to_subresource(
+                                                backbuffer.Get(),
+                                                dst,
+                                                &left_top_src_box,
+                                                1,
+                                                scene_source_state,
+                                                D3D12_RESOURCE_STATE_RENDER_TARGET);
+                                        }
                                     }
+                                    // 2026-05-28 SN2 depth-aware right-eye fog blend (parallax-correct
+                                    // version of MIRROR_FULL). Gated by UEVR_SN2_RIGHT_EYE_DEPTH_BLEND.
+                                    // Depth is optional (luma-only heuristic kicks in if null).
+                                    sn2_depth_blend::run(
+                                        commands.cmd_list.Get(),
+                                        dst,                 D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                        scene_depth.Get(),   ENGINE_SRC_DEPTH,
+                                        slice_w, slice_h, bb_w);
                                     sn2_openxr_array_diag::clear_slice_if_enabled(commands, dst);
                                 },
                                 std::nullopt,
@@ -3255,8 +4339,23 @@ void D3D12Component::draw_spectator_view(ID3D12GraphicsCommandList* command_list
     // only show one half of the double wide texture (right side)
     RECT source_rect{};
 
+    const bool force_sbs_desktop_mirror =
+        vr->is_native_stereo_fix_enabled() &&
+        sn2_openxr_array_diag::env_on("UEVR_SN2_DESKTOP_MIRROR_SBS");
+
+    // Show the full SBS source for SN2 diagnostics when requested. Normally
+    // UEVR mirrors a single eye to the desktop once OpenXR/native-stereo is
+    // active, which hides desktop-only fixes from the visible game window.
+    if (force_sbs_desktop_mirror) {
+        source_rect.left = 0;
+        source_rect.top = 0;
+        source_rect.right = m_backbuffer_size[0];
+        source_rect.bottom = m_backbuffer_size[1];
+        SPDLOG_INFO_ONCE(
+            "[SN2-DesktopMirror] UEVR_SN2_DESKTOP_MIRROR_SBS=1: desktop spectator shows full SBS source while OpenXR native stereo is active");
+    }
     // Show left side when using AFR or native stereo fix
-    if (vr->is_using_afr() || vr->is_native_stereo_fix_enabled()) {
+    else if (vr->is_using_afr() || vr->is_native_stereo_fix_enabled()) {
         source_rect.left = 0;
         source_rect.top = 0;
         source_rect.right = m_backbuffer_size[0] / 2;
@@ -3268,17 +4367,21 @@ void D3D12Component::draw_spectator_view(ID3D12GraphicsCommandList* command_list
         source_rect.bottom = m_backbuffer_size[1];
     }
 
-    // Correct left/top/right/bottom to match the aspect ratio of the game
-    if (eye_aspect_ratio > aspect_ratio) {
-        const auto new_width = eye_height * aspect_ratio;
-        const auto new_centerw = new_width / 2.0f;
-        source_rect.left = (LONG)(original_centerw - new_centerw);
-        source_rect.right = (LONG)(original_centerw + new_centerw);
-    } else {
-        const auto new_height = eye_width / aspect_ratio;
-        const auto new_centerh = new_height / 2.0f;
-        source_rect.top = (LONG)(original_centerh - new_centerh);
-        source_rect.bottom = (LONG)(original_centerh + new_centerh);
+    // Correct left/top/right/bottom to match the aspect ratio of the game.
+    // The SBS diagnostic mirror intentionally uses the whole source texture and
+    // should not be cropped as if it were a single eye.
+    if (!force_sbs_desktop_mirror) {
+        if (eye_aspect_ratio > aspect_ratio) {
+            const auto new_width = eye_height * aspect_ratio;
+            const auto new_centerw = new_width / 2.0f;
+            source_rect.left = (LONG)(original_centerw - new_centerw);
+            source_rect.right = (LONG)(original_centerw + new_centerw);
+        } else {
+            const auto new_height = eye_width / aspect_ratio;
+            const auto new_centerh = new_height / 2.0f;
+            source_rect.top = (LONG)(original_centerh - new_centerh);
+            source_rect.bottom = (LONG)(original_centerh + new_centerh);
+        }
     }
 
     // Set descriptor heaps

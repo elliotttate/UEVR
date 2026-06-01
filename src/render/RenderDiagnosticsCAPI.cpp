@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstring>
@@ -29,6 +30,7 @@
 #include "Framework.hpp"
 #include "hooks/D3D12Hook.hpp"
 #include "hooks/Sn2CaptureSidecar.hpp"
+#include "hooks/Sn2RuntimeState.hpp"
 #include "mods/RenderInspector.hpp"
 #include "mods/VR.hpp"
 #include "mods/vr/CVarManager.hpp"
@@ -240,6 +242,31 @@ json root_hash_array_to_json(const Array& values) {
         result.push_back({
             {"slot", i},
             {"hash", format_pointer(static_cast<uintptr_t>(values[i]))},
+        });
+    }
+    return result;
+}
+
+json draw13_cbv_probe_to_json(const std::array<sn2_runtime_state::Draw13BCbvProbe, sn2_runtime_state::kDraw13BCbvRootCount>& values) {
+    json result = json::array();
+    for (size_t i = 0; i < values.size(); ++i) {
+        const auto& p = values[i];
+        if (p.gpu_va == 0 && !p.mapped) {
+            continue;
+        }
+
+        result.push_back({
+            {"root", i},
+            {"gpu_va", format_pointer(static_cast<uintptr_t>(p.gpu_va))},
+            {"mapped", p.mapped},
+            {"bytes", p.bytes},
+            {"hash", format_pointer(static_cast<uintptr_t>(p.hash))},
+            {"reg204_w", p.has_reg204_w ? json(p.reg204_w) : json(nullptr)},
+            {"cb321x", p.has_cb321x ? json(p.cb321x) : json(nullptr)},
+            {"cb321x_bit32", p.has_cb321x ? json((p.cb321x & 32u) != 0u) : json(nullptr)},
+            {"first_640_float_off", p.first_640_float_off},
+            {"first_720_float_off", p.first_720_float_off},
+            {"first_1280_float_off", p.first_1280_float_off},
         });
     }
     return result;
@@ -2235,6 +2262,69 @@ bool renderdoc_watcher_emit_sn2_sidecar() {
            rdc::env_truthy_w(L"UEVR_RENDERDOC_EMIT_SN2_SIDECAR");
 }
 
+// UEVR_SN2_CAPTURE_READABLE (default OFF):
+// Before each watcher-triggered capture, disable RDG transient aliasing and
+// UWE async-compute fog so that froxel/volumetric resources are kept alive and
+// readable inside the .rdc file.  The three cvars are:
+//   r.RDG.TransientAllocator       0  — disable per-frame transient heap recycling
+//   r.RDG.TransientAllocator.Buffers 0 — also disable buffer aliasing
+//   r.UWEFog.AsyncCompute          0  — push fog CS onto the graphics queue so
+//                                       it appears synchronously in the capture
+//   r.RDG.ImmediateMode            1  — execute RDG passes immediately so each
+//                                       dispatch/draw maps 1:1 to a capture event
+//                                       instead of being reordered/culled by the
+//                                       RDG graph (huge readability win)
+//
+// Thread-safety note: this function is called from the background watcher
+// thread (NOT the game/render thread).  set_cvar_data_int() writes an int
+// directly into the TConsoleVariableData<int> object; that is a racy direct
+// write but matches the pattern used elsewhere in UEVR (see
+// FFakeStereoRenderingHook.cpp set_cvar_to_zero) and is the only viable path
+// from a detached background thread.  set_cvar_int() would dispatch via
+// GameThreadWorker and only take effect one tick later — too late if the
+// capture is triggered on the very next frame.  If the game reads the cvar on
+// the same cycle as the write from this thread there is a benign data race on
+// a 32-bit int; the render thread will pick up the value within at most one
+// frame after the watcher fires.
+//
+// A two-frame settle gap (2 × 16 ms ≈ 32 ms) is inserted after the writes so
+// the render pipeline flushes out in-flight aliased allocations before the
+// capture window opens.
+void renderdoc_watcher_apply_capture_readable_cvars() {
+    if (!rdc::env_truthy_w(L"UEVR_SN2_CAPTURE_READABLE")) {
+        return;
+    }
+
+    // 2026-05-29 CRASH FIX: the live cvar-set previously done here is REMOVED.
+    // It called sdk::set_cvar_data_int() from THIS background watcher thread,
+    // which forces the SDK to resolve IConsoleVariable's vtable via fault-based
+    // instruction emulation off the game thread. On this build that resolution
+    // (a) reliably FAILS for r.RDG.TransientAllocator / r.RDG.ImmediateMode
+    // (CVar.cpp logs "Failed to resolve ... address"), and (b) destabilises the
+    // process so that a subsequent genuine fault inside renderdoc.dll becomes
+    // unrecoverable — the game crashes a few seconds AFTER each capture
+    // (c0000005 in renderdoc.dll; RIP is not the XRSystem null-deref pattern, so
+    // the FFakeStereoRenderingHook vectored handler returns CONTINUE_SEARCH and
+    // the process dies). See log lines around the "settling 40 ms" message.
+    //
+    // The readable-capture cvars are already applied SAFELY at launch, on the
+    // game thread, via the launcher's
+    //   -ExecCmds="r.RDG.TransientAllocator 0,r.RDG.TransientAllocator.Buffers 0,
+    //              r.UWEFog.AsyncCompute 0"
+    // and transient/aliased resources additionally survive into the capture via
+    // eRENDERDOC_Option_RefAllResources, which RenderDocCaptureService::
+    // configure_default_options() sets unconditionally. So the live set is
+    // redundant; we only log here and rely on the launch-time setup.
+    //
+    // (If a future build needs to toggle these cvars live, dispatch via
+    // sdk::set_cvar_int() / GameThreadWorker — NEVER set_cvar_data_int() from a
+    // detached thread.)
+    spdlog::info("[RenderDoc] watcher: UEVR_SN2_CAPTURE_READABLE=1 — readable-capture "
+                 "cvars are applied at launch (-ExecCmds) + RefAllResources; skipping "
+                 "the background-thread cvar-set (it failed to resolve and crashed "
+                 "renderdoc.dll post-capture).");
+}
+
 bool renderdoc_watcher_notify_sn2_capture() {
     return rdc::env_truthy_w(L"UEVR_SN2_CAPTURE_TRUTH") ||
            rdc::env_truthy_w(L"UEVR_SN2_TARGET_STATE_DUMP") ||
@@ -2253,6 +2343,74 @@ uint64_t renderdoc_watcher_sn2_prearm_ms() {
         return end != raw.c_str() ? static_cast<uint64_t>(value) : 0ull;
     }();
     return ms;
+}
+
+// Assemble the human-readable comments baked into the .rdc via
+// SetCaptureFileComments. Mirrors the static-classification maps that the
+// .rdc-keyed JSON manifest carries, but as plain text so it is legible inside
+// the RenderDoc UI's capture-comments pane without any external tooling.
+std::string build_capture_comments(uint64_t seq, const std::string& rdc_path) {
+    std::ostringstream c;
+    c << "UEVR / Subnautica 2 right-eye fog capture\n";
+    c << "seq=" << seq << "\n";
+    if (!rdc_path.empty()) {
+        c << "rdc=" << rdc_path << "\n";
+    }
+    c << "\n";
+
+    c << "FOG CHAIN CRC -> ROLE\n";
+    c << "  producers (fill froxel volume):\n";
+    c << "    0xd1d94ed1 MaterialSetupCS\n";
+    c << "    0xd1f85c42 LightScatteringCS\n";
+    c << "    0x3402487c FinalIntegrationCS\n";
+    c << "    0x0930dd4e UWEFogResolveCS\n";
+    c << "  consumers (sample froxel):\n";
+    c << "    0xb9be2499 SLW\n";
+    c << "    0xde7c3822 SLW\n";
+    c << "    0x4a4eb78c SLW_VolumeOverlay-pathB\n";
+    c << "    0x13b00f0c UnderwaterTealDraw\n";
+    c << "  composite:\n";
+    c << "    0x4e86dc09 Composite\n";
+    c << "\n";
+
+    c << "FROXEL: dims [107,30,48] R11G11B10F (family-shared; each eye samples\n";
+    c << "  its own screen-half via SV_Position)\n";
+    c << "REGISTERS: reg148=ViewRectMin  reg254=VolumetricFogSVPosToVolumeUV(=1/2560)\n";
+    c << "  reg257=grid dims\n";
+    c << "\n";
+
+    // Active UEVR_SN2_* / UEVR_SUBNAUTICA2_* env vars (only the ones that are set).
+    c << "ACTIVE ENV:\n";
+    {
+        bool any = false;
+        if (LPCH env = GetEnvironmentStringsA()) {
+            for (char* p = env; *p; p += std::strlen(p) + 1) {
+                const std::string entry{p};
+                const auto eq = entry.find('=');
+                if (eq == std::string::npos) {
+                    continue;
+                }
+                const auto name = entry.substr(0, eq);
+                if (name.rfind("UEVR_SN2_", 0) == 0 ||
+                    name.rfind("UEVR_SUBNAUTICA2_", 0) == 0 ||
+                    name == "UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS") {
+                    c << "  " << entry << "\n";
+                    any = true;
+                }
+            }
+            FreeEnvironmentStringsA(env);
+        }
+        if (!any) {
+            c << "  (none set)\n";
+        }
+    }
+    c << "\n";
+
+    c << "HYPOTHESIS: right eye runs the full fog chain but reads an empty /\n";
+    c << "  wrong-region froxel (reg254 SV_Position screen-half) -> bug is fog DATA.\n";
+    c << "SUCCESS: right eye shows its OWN teal, its OWN parallax, stable, no\n";
+    c << "  left-eye borrowing.\n";
+    return c.str();
 }
 
 void renderdoc_capture_watcher_loop() {
@@ -2321,6 +2479,18 @@ void renderdoc_capture_watcher_loop() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(prearm_ms));
             }
         }
+        // Must happen after the SN2 prearm delay (so the render thread is already
+        // draining) but before StartFrameCapture / TriggerMultiFrameCapture.
+        renderdoc_watcher_apply_capture_readable_cvars();
+
+        // (#1) Title the in-progress capture BEFORE EndFrameCapture — RenderDoc
+        // applies SetCaptureTitle to whichever capture is currently open. The
+        // human-readable comments are baked into the .rdc AFTER the file exists
+        // on disk (below). Remember the prior newest path so we can detect the
+        // freshly written capture for the wildcard (frames==1) path.
+        const std::string prior_newest = rdc::newest_capture_path();
+        rdc::set_capture_title("SN2 right-eye fog seq=" + std::to_string(sn2_seq));
+
         if (frames > 1) {
             api->TriggerMultiFrameCapture(static_cast<uint32_t>(frames));
             spdlog::info("[RenderDoc] watcher: triggered {} frames", frames);
@@ -2329,6 +2499,33 @@ void renderdoc_capture_watcher_loop() {
             spdlog::info("[RenderDoc] watcher: capture mode={} ended={} newest='{}'",
                          attempt.mode, attempt.ended, rdc::newest_capture_path());
         }
+
+        // (#1 + #2) Once the .rdc exists, bake the ground-truth comments into it
+        // and drop the .rdc-keyed manifest sidecar beside it. For the wildcard
+        // path the file is written synchronously by capture_blocking; for the
+        // multi-frame path it may lag, so only act once a NEW newest path shows.
+        const std::string newest = rdc::newest_capture_path();
+        if (!newest.empty() && newest != prior_newest) {
+            // newest_capture_path() is UTF-8; widen properly for the wstring API.
+            std::wstring newest_w;
+            const int wneeded = MultiByteToWideChar(CP_UTF8, 0, newest.c_str(), -1, nullptr, 0);
+            if (wneeded > 0) {
+                newest_w.resize(static_cast<size_t>(wneeded));
+                MultiByteToWideChar(CP_UTF8, 0, newest.c_str(), -1, newest_w.data(), wneeded);
+                if (!newest_w.empty() && newest_w.back() == L'\0') {
+                    newest_w.pop_back();
+                }
+            }
+            rdc::write_capture_file_comments(newest_w, build_capture_comments(sn2_seq, newest));
+            const auto manifest = sn2_capture_sidecar::emit_rdc_manifest(newest);
+            spdlog::info("[RenderDoc] watcher: baked comments + manifest='{}' into '{}'",
+                         manifest, newest);
+        } else {
+            spdlog::info("[RenderDoc] watcher: no NEW capture path detected "
+                         "(newest='{}' prior='{}') — skipping comments/manifest",
+                         newest, prior_newest);
+        }
+
         if (notify_sn2 && renderdoc_watcher_emit_sn2_sidecar() && sn2_capture_sidecar::env_enabled()) {
             sn2_capture_sidecar::emit(sn2_seq);
             spdlog::info("[RenderDoc] watcher: emitted SN2 sidecar seq={}", sn2_seq);
@@ -3078,6 +3275,30 @@ json sn2_env_snapshot_json() {
         "UEVR_SN2_PSO3069_CAPTURE_NEXT",
         "UEVR_SN2_PSO3069_CAPTURE_MARK_FILE",
         "UEVR_SN2_BASEPASS_SNAPSHOT",
+        "UEVR_SN2_13B_DRAW_PROBE",
+        "UEVR_SN2_13B_DRAW_PROBE_STACK",
+        "UEVR_SN2_13B_DRAW_PROBE_MAX_PER_EYE",
+        "UEVR_SN2_ADDMESH_TRACE",
+        "UEVR_SN2_ADDMESH_TRACE_MAX",
+        "UEVR_SN2_ADDMESH_TRACE_STACK",
+        "UEVR_SN2_ADDMESH_TRACE_STACK_MAX",
+        "UEVR_SN2_ADDMESH_TRACE_TARGET_SHAPE_ONLY",
+        "UEVR_SN2_PASS_ID_PROBE",
+        "UEVR_SN2_PASS_ID_PROBE_MAX",
+        "UEVR_SN2_TARGET_IDENTITY_SCAN",
+        "UEVR_SN2_TARGET_IDENTITY_SCAN_MAX",
+        "UEVR_SN2_TRYADD_TRACE",
+        "UEVR_SN2_TRYADD_TRACE_TARGET_SHAPE_ONLY",
+        "UEVR_SN2_TRYADD_TRACE_MAX",
+        "UEVR_SN2_SUBMITDRAW_TRACE",
+        "UEVR_SN2_SUBMITDRAW_TRACE_STACK",
+        "UEVR_SN2_SUBMITDRAW_TRACE_MAX",
+        "UEVR_SN2_VIEWCOMMANDS_TRACE",
+        "UEVR_SN2_VIEWCOMMANDS_TRACE_MAX",
+        "UEVR_SN2_GENDYN_TRACE",
+        "UEVR_SN2_RDG_PASS_HOOK",
+        "UEVR_SN2_RDOC_TAGS",
+        "UEVR_SN2_RDOC_TAGS_TARGET_ONLY",
         "UEVR_SN2_TAIL_SRV_REPAIR",
         "UEVR_SN2_TAIL_SRV_REPAIR_TARGET_CRC",
         "UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_PER_VIEW_HOOK",
@@ -3125,6 +3346,14 @@ json sn2_env_snapshot_json() {
         }
         if (string_in_list(name, {
                 "UEVR_SN2_FOG_SRV_REDIRECT_SLOTS",
+                "UEVR_SN2_13B_DRAW_PROBE_MAX_PER_EYE",
+                "UEVR_SN2_ADDMESH_TRACE_MAX",
+                "UEVR_SN2_ADDMESH_TRACE_STACK_MAX",
+                "UEVR_SN2_PASS_ID_PROBE_MAX",
+                "UEVR_SN2_TARGET_IDENTITY_SCAN_MAX",
+                "UEVR_SN2_TRYADD_TRACE_MAX",
+                "UEVR_SN2_SUBMITDRAW_TRACE_MAX",
+                "UEVR_SN2_VIEWCOMMANDS_TRACE_MAX",
                 "UEVR_SN2_TAIL_SRV_REPAIR_TARGET_CRC",
                 "UEVR_SN2_PSO3069_CAPTURE_MARK_FILE",
                 "UEVR_SUBNAUTICA2_FOG_SWAP_SRC_HANDLE",
@@ -3141,6 +3370,21 @@ json sn2_env_snapshot_json() {
                 "UEVR_ENABLE_D3D12_GPU_TIMESTAMPS",
                 "UEVR_SN2_PSO3069_CAPTURE_NEXT",
                 "UEVR_SN2_BASEPASS_SNAPSHOT",
+                "UEVR_SN2_13B_DRAW_PROBE",
+                "UEVR_SN2_13B_DRAW_PROBE_STACK",
+                "UEVR_SN2_ADDMESH_TRACE",
+                "UEVR_SN2_ADDMESH_TRACE_STACK",
+                "UEVR_SN2_ADDMESH_TRACE_TARGET_SHAPE_ONLY",
+                "UEVR_SN2_PASS_ID_PROBE",
+                "UEVR_SN2_TARGET_IDENTITY_SCAN",
+                "UEVR_SN2_TRYADD_TRACE",
+                "UEVR_SN2_TRYADD_TRACE_TARGET_SHAPE_ONLY",
+                "UEVR_SN2_SUBMITDRAW_TRACE",
+                "UEVR_SN2_SUBMITDRAW_TRACE_STACK",
+                "UEVR_SN2_VIEWCOMMANDS_TRACE",
+                "UEVR_SN2_GENDYN_TRACE",
+                "UEVR_SN2_RDG_PASS_HOOK",
+                "UEVR_SN2_RDOC_TAGS",
                 "UEVR_SUBNAUTICA2_ENABLE_VOLUMETRIC_FOG_PER_VIEW_HOOK",
                 "UEVR_SUBNAUTICA2_FOG_ALIAS_THUNK_DIAG",
                 "UEVR_SUBNAUTICA2_LIGHT_AFFECTS_VIEW_DIAG",
@@ -3177,6 +3421,20 @@ json sn2_env_snapshot_json() {
 
 extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_sn2_state_json() {
     try {
+        sn2_runtime_state::Draw13BLast last_draw13{};
+        sn2_runtime_state::AddMeshLast last_addmesh{};
+        sn2_runtime_state::ViewCommandsLast last_viewcommands{};
+        sn2_runtime_state::SubmitDrawLast last_submitdraw{};
+        sn2_runtime_state::RhiDrawLast last_rhi_draw{};
+        {
+            std::scoped_lock lock{sn2_runtime_state::state_mutex};
+            last_draw13 = sn2_runtime_state::last_draw13;
+            last_addmesh = sn2_runtime_state::last_addmesh;
+            last_viewcommands = sn2_runtime_state::last_viewcommands;
+            last_submitdraw = sn2_runtime_state::last_submitdraw;
+            last_rhi_draw = sn2_runtime_state::last_rhi_draw;
+        }
+
         json result{
             {"available", true},
             {"framework_ready", g_framework != nullptr && g_framework->is_ready()},
@@ -3199,6 +3457,205 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_sn2_state_json() {
                 {"bindless_slot_view0", sn2_bindless_slot_map::count_by_view(0)},
                 {"bindless_slot_view1", sn2_bindless_slot_map::count_by_view(1)},
                 {"bindless_slot_unknown", sn2_bindless_slot_map::count_by_view(-1)},
+            }},
+            {"underwater_13b", {
+                {"draw_probe_samples", {
+                    {"seen_total", sn2_runtime_state::draw13_seen_total.load(std::memory_order_relaxed)},
+                    {"seen_left", sn2_runtime_state::draw13_seen_left.load(std::memory_order_relaxed)},
+                    {"seen_right", sn2_runtime_state::draw13_seen_right.load(std::memory_order_relaxed)},
+                    {"seen_unknown", sn2_runtime_state::draw13_seen_unknown.load(std::memory_order_relaxed)},
+                    {"total", sn2_runtime_state::draw13_total.load(std::memory_order_relaxed)},
+                    {"left", sn2_runtime_state::draw13_left.load(std::memory_order_relaxed)},
+                    {"right", sn2_runtime_state::draw13_right.load(std::memory_order_relaxed)},
+                    {"unknown", sn2_runtime_state::draw13_unknown.load(std::memory_order_relaxed)},
+                    {"last", {
+                        {"seq", last_draw13.seq},
+                        {"eye_seq", last_draw13.eye_seq},
+                        {"eye", last_draw13.eye == 1 ? "left" : (last_draw13.eye == 2 ? "right" : "unknown")},
+                        {"pso", format_pointer(static_cast<uintptr_t>(last_draw13.pso))},
+                        {"effective_pso", format_pointer(static_cast<uintptr_t>(last_draw13.effective_pso))},
+                        {"vs_crc", format_crc32(last_draw13.vs_crc)},
+                        {"ps_crc", "0x13B00F0C"},
+                        {"gs_crc", format_crc32(last_draw13.gs_crc)},
+                        {"index_count", last_draw13.index_count},
+                        {"instance_count", last_draw13.instance_count},
+                        {"start_index", last_draw13.start_index},
+                        {"base_vertex", last_draw13.base_vertex},
+                        {"start_instance", last_draw13.start_instance},
+                        {"topology", last_draw13.topology},
+                        {"viewport", {
+                            {"x", last_draw13.viewport_x},
+                            {"y", last_draw13.viewport_y},
+                            {"w", last_draw13.viewport_w},
+                            {"h", last_draw13.viewport_h},
+                        }},
+                        {"scissor", {
+                            {"left", last_draw13.scissor_l},
+                            {"top", last_draw13.scissor_t},
+                            {"right", last_draw13.scissor_r},
+                            {"bottom", last_draw13.scissor_b},
+                        }},
+                        {"rt0_resource", format_pointer(static_cast<uintptr_t>(last_draw13.rt0_resource))},
+                        {"rt0_desc", {
+                            {"width", last_draw13.rt0_width},
+                            {"height", last_draw13.rt0_height},
+                            {"depth", last_draw13.rt0_depth},
+                            {"format", last_draw13.rt0_format},
+                        }},
+                        {"ib", {
+                            {"gpu_va", format_pointer(static_cast<uintptr_t>(last_draw13.ib_va))},
+                            {"size", last_draw13.ib_size},
+                            {"format", last_draw13.ib_format},
+                        }},
+                        {"vb0", {
+                            {"gpu_va", format_pointer(static_cast<uintptr_t>(last_draw13.vb0_va))},
+                            {"size", last_draw13.vb0_size},
+                            {"stride", last_draw13.vb0_stride},
+                        }},
+                        {"root_signature", format_pointer(static_cast<uintptr_t>(last_draw13.root_signature))},
+                        {"root_cbv", {
+                            {"4", format_pointer(static_cast<uintptr_t>(last_draw13.cb4))},
+                            {"5", format_pointer(static_cast<uintptr_t>(last_draw13.cb5))},
+                            {"6", format_pointer(static_cast<uintptr_t>(last_draw13.cb6))},
+                            {"7", format_pointer(static_cast<uintptr_t>(last_draw13.cb7))},
+                        }},
+                        {"root_table", {
+                            {"0", format_pointer(static_cast<uintptr_t>(last_draw13.table0))},
+                            {"1", format_pointer(static_cast<uintptr_t>(last_draw13.table1))},
+                            {"2", format_pointer(static_cast<uintptr_t>(last_draw13.table2))},
+                            {"3", format_pointer(static_cast<uintptr_t>(last_draw13.table3))},
+                        }},
+                        {"cbv_probe", draw13_cbv_probe_to_json(last_draw13.cbv_probe)},
+                        {"rdg_pass", format_pointer(static_cast<uintptr_t>(last_draw13.rdg_pass))},
+                        {"submit_draw", {
+                            {"cmd", format_pointer(static_cast<uintptr_t>(last_draw13.submit_cmd))},
+                            {"scene_args", format_pointer(static_cast<uintptr_t>(last_draw13.submit_scene_args))},
+                            {"rhi", format_pointer(static_cast<uintptr_t>(last_draw13.submit_rhi))},
+                            {"instance_factor", last_draw13.submit_instance_factor},
+                            {"primitive_id_offset", last_draw13.submit_primitive_id_offset},
+                            {"indirect_args_byte_offset", last_draw13.submit_indirect_args_byte_offset},
+                            {"batched_primitive_slot", last_draw13.submit_batched_primitive_slot},
+                            {"primitive_ids_buffer", format_pointer(static_cast<uintptr_t>(last_draw13.submit_primitive_ids_buffer))},
+                            {"indirect_args_buffer", format_pointer(static_cast<uintptr_t>(last_draw13.submit_indirect_args_buffer))},
+                            {"cmd_index_buffer", format_pointer(static_cast<uintptr_t>(last_draw13.submit_cmd_index_buffer))},
+                            {"cmd_cached_pipeline_id", format_pointer(static_cast<uintptr_t>(last_draw13.submit_cmd_cached_pipeline_id))},
+                            {"cmd_first_index", last_draw13.submit_cmd_first_index},
+                            {"cmd_num_primitives", last_draw13.submit_cmd_num_primitives},
+                            {"cmd_num_instances", last_draw13.submit_cmd_num_instances},
+                            {"cmd_primitive_id_stream_index", last_draw13.submit_cmd_primitive_id_stream_index},
+                        }},
+                        {"rhi_draw_command", {
+                            {"cmd", format_pointer(static_cast<uintptr_t>(last_draw13.rhi_cmd))},
+                            {"cmd_list", format_pointer(static_cast<uintptr_t>(last_draw13.rhi_cmd_list))},
+                            {"payload_offset", last_draw13.rhi_payload_offset},
+                            {"index_buffer", format_pointer(static_cast<uintptr_t>(last_draw13.rhi_index_buffer))},
+                            {"base_vertex", last_draw13.rhi_base_vertex},
+                            {"first_instance", last_draw13.rhi_first_instance},
+                            {"num_vertices", last_draw13.rhi_num_vertices},
+                            {"start_index", last_draw13.rhi_start_index},
+                            {"num_primitives", last_draw13.rhi_num_primitives},
+                            {"num_instances", last_draw13.rhi_num_instances},
+                        }},
+                        {"src", last_draw13.src},
+                        {"stack", last_draw13.stack},
+                    }},
+                }},
+                {"submitdraw_target_shape", {
+                    {"total", sn2_runtime_state::submitdraw_target_total.load(std::memory_order_relaxed)},
+                    {"last", {
+                        {"seq", last_submitdraw.seq},
+                        {"cmd", format_pointer(static_cast<uintptr_t>(last_submitdraw.cmd))},
+                        {"scene_args", format_pointer(static_cast<uintptr_t>(last_submitdraw.scene_args))},
+                        {"rhi", format_pointer(static_cast<uintptr_t>(last_submitdraw.rhi))},
+                        {"instance_factor", last_submitdraw.instance_factor},
+                        {"first_index", last_submitdraw.first_index},
+                        {"num_primitives", last_submitdraw.num_primitives},
+                        {"num_instances", last_submitdraw.num_instances},
+                        {"index_buffer", format_pointer(static_cast<uintptr_t>(last_submitdraw.index_buffer))},
+                        {"cached_pipeline_id", format_pointer(static_cast<uintptr_t>(last_submitdraw.cached_pipeline_id))},
+                        {"primitive_id_stream_index", last_submitdraw.primitive_id_stream_index},
+                        {"primitive_id_offset", last_submitdraw.primitive_id_offset},
+                        {"indirect_args_byte_offset", last_submitdraw.indirect_args_byte_offset},
+                        {"batched_primitive_slot", last_submitdraw.batched_primitive_slot},
+                        {"primitive_ids_buffer", format_pointer(static_cast<uintptr_t>(last_submitdraw.primitive_ids_buffer))},
+                        {"indirect_args_buffer", format_pointer(static_cast<uintptr_t>(last_submitdraw.indirect_args_buffer))},
+                        {"stack", last_submitdraw.stack},
+                    }},
+                }},
+                {"rhi_command_draw_indexed_primitive", {
+                    {"total", sn2_runtime_state::rhi_draw_target_total.load(std::memory_order_relaxed)},
+                    {"last", {
+                        {"seq", last_rhi_draw.seq},
+                        {"cmd", format_pointer(static_cast<uintptr_t>(last_rhi_draw.cmd))},
+                        {"cmd_list", format_pointer(static_cast<uintptr_t>(last_rhi_draw.cmd_list))},
+                        {"payload_offset", last_rhi_draw.payload_offset},
+                        {"index_buffer", format_pointer(static_cast<uintptr_t>(last_rhi_draw.index_buffer))},
+                        {"base_vertex", last_rhi_draw.base_vertex},
+                        {"first_instance", last_rhi_draw.first_instance},
+                        {"num_vertices", last_rhi_draw.num_vertices},
+                        {"start_index", last_rhi_draw.start_index},
+                        {"num_primitives", last_rhi_draw.num_primitives},
+                        {"num_instances", last_rhi_draw.num_instances},
+                        {"stack", last_rhi_draw.stack},
+                    }},
+                }},
+                {"addmesh_shape_hits", {
+                    {"basepass", {
+                        {"total", sn2_runtime_state::addmesh_basepass_total.load(std::memory_order_relaxed)},
+                        {"left", sn2_runtime_state::addmesh_basepass_left.load(std::memory_order_relaxed)},
+                        {"right", sn2_runtime_state::addmesh_basepass_right.load(std::memory_order_relaxed)},
+                        {"unknown", sn2_runtime_state::addmesh_basepass_unknown.load(std::memory_order_relaxed)},
+                    }},
+                    {"slw", {
+                        {"total", sn2_runtime_state::addmesh_slw_total.load(std::memory_order_relaxed)},
+                        {"left", sn2_runtime_state::addmesh_slw_left.load(std::memory_order_relaxed)},
+                        {"right", sn2_runtime_state::addmesh_slw_right.load(std::memory_order_relaxed)},
+                        {"unknown", sn2_runtime_state::addmesh_slw_unknown.load(std::memory_order_relaxed)},
+                    }},
+                    {"last", {
+                        {"seq", last_addmesh.seq},
+                        {"processor", last_addmesh.processor_kind == 1 ? "BasePass" : (last_addmesh.processor_kind == 2 ? "SLW" : "unknown")},
+                        {"stereo_pass", last_addmesh.stereo_pass},
+                        {"mesh_pass", last_addmesh.mesh_pass},
+                        {"processor_ptr", format_pointer(static_cast<uintptr_t>(last_addmesh.processor))},
+                        {"view", format_pointer(static_cast<uintptr_t>(last_addmesh.view))},
+                        {"mesh", format_pointer(static_cast<uintptr_t>(last_addmesh.mesh))},
+                        {"primitive", format_pointer(static_cast<uintptr_t>(last_addmesh.primitive))},
+                        {"material_proxy", format_pointer(static_cast<uintptr_t>(last_addmesh.material_proxy))},
+                        {"primitive_vft_rva", format_pointer(static_cast<uintptr_t>(last_addmesh.primitive_vtable_rva))},
+                        {"material_vft_rva", format_pointer(static_cast<uintptr_t>(last_addmesh.material_vtable_rva))},
+                        {"static_mesh_id", last_addmesh.static_mesh_id},
+                        {"batch_element_mask", format_pointer(static_cast<uintptr_t>(last_addmesh.batch_element_mask))},
+                        {"direct_hit", {
+                            {"value", last_addmesh.direct_hit_value},
+                            {"offset", last_addmesh.direct_hit_offset},
+                        }},
+                        {"element_hit", {
+                            {"value", last_addmesh.element_hit_value},
+                            {"offset", last_addmesh.element_hit_offset},
+                        }},
+                    }},
+                }},
+                {"viewcommands_probe", {
+                    {"rows", sn2_runtime_state::viewcommands_total.load(std::memory_order_relaxed)},
+                    {"shape_hits", sn2_runtime_state::viewcommands_shape_hits.load(std::memory_order_relaxed)},
+                    {"last", {
+                        {"seq", last_viewcommands.seq},
+                        {"view_slot", last_viewcommands.view_slot},
+                        {"stereo_pass", last_viewcommands.stereo_pass},
+                        {"mesh_pass", last_viewcommands.mesh_pass},
+                        {"view", format_pointer(static_cast<uintptr_t>(last_viewcommands.view))},
+                        {"view_commands", format_pointer(static_cast<uintptr_t>(last_viewcommands.view_commands))},
+                        {"mesh_commands_count", last_viewcommands.mesh_commands_count},
+                        {"build_request_count", last_viewcommands.build_request_count},
+                        {"mesh_shape_hit", last_viewcommands.mesh_shape_hit},
+                        {"mesh_hits", last_viewcommands.mesh_hits},
+                        {"mesh_draw_command", format_pointer(static_cast<uintptr_t>(last_viewcommands.mesh_draw_command))},
+                        {"max_num_primitives", last_viewcommands.max_num_primitives},
+                        {"max_elem", last_viewcommands.max_elem},
+                        {"max_cmd", format_pointer(static_cast<uintptr_t>(last_viewcommands.max_cmd))},
+                    }},
+                }},
             }},
         };
 

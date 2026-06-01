@@ -68,6 +68,49 @@ inline constexpr uint64_t SUBNAUTICA2_UMATERIAL_GETRENDERPROXY_PUREVIRT_STUB_RVA
 // MaterialRenderProxy*).
 inline constexpr uint64_t SUBNAUTICA2_FBASEPASS_ADDMESHBATCH_RVA = 0x2644A70;
 
+// FBasePassMeshProcessor::TryAddMeshBatch — the per-material/per-primitive
+// decision point that decides whether a mesh batch proceeds into a base-pass
+// draw command and which material path is viable. This is the old 0x13B00F0C
+// divergence site (branch around RVA 0x2687131), but we hook the function entry
+// only, with a hard row cap, to avoid the unstable mid-function hot-path hooks.
+inline constexpr uint64_t SUBNAUTICA2_FBASEPASS_TRYADDMESHBATCH_RVA = 0x2687030;
+
+// FRDGBuilder::Execute — central RDG dispatch. Hook target for Path C
+// (reading FRDGPass names that survived shipping's WITH_PROFILEGPU=0 strip).
+// FRDGPass.Name (FRDGEventName) lives at pass+0x10; its EventFormat const wchar_t*
+// at +0x00 within the FRDGEventName is the original literal passed to
+// RDG_EVENT_NAME(...). Even when PIX macros are stripped, the format-string
+// pointer is preserved (used for RDG validation / fence naming / crash dumps).
+// FRDGBuilder.Passes (TArray<FRDGPass*>) at +0x1B8 — iterate to enumerate all
+// passes about to run, log/tag pass names.
+inline constexpr uint64_t SUBNAUTICA2_FRDGBUILDER_EXECUTE_RVA = 0x3295800;
+
+// FSingleLayerWaterPassMeshProcessor::AddMeshBatch — the SLW pass equivalent
+// of FBasePassMeshProcessor::AddMeshBatch. Both share the virtual signature
+// (FMeshBatch&, uint64 BatchElementMask, FPrimitiveSceneProxy*, int32 StaticMeshId).
+// Hook to settle "which pass owns 0x13B00F0C" — when a target-shape mesh
+// reaches THIS processor, the mesh ends up in EMeshPass::SingleLayerWaterPass=5;
+// when it reaches FBasePassMeshProcessor::AddMeshBatch, it ends up in
+// EMeshPass::BasePass=2. Either firing for the target shape identifies the
+// authoritative pass. (Per binfold sym
+// `?AddMeshBatch@FSingleLayerWaterPassMeshProcessor@@UEAAXAEIBUFMeshBatch@@_KPEIBVFPrimitiveSceneProxy@@H@Z`)
+inline constexpr uint64_t SUBNAUTICA2_FSLW_ADDMESHBATCH_RVA = 0x2EAF2F0;
+
+// GenerateDynamicMeshDrawCommands — dynamic mesh command generation for a view/pass.
+// The 0x13B00F0C teal draw now appears to be missing from the secondary view
+// before FBasePassMeshProcessor::AddMeshBatch. This hook lets us inspect the
+// per-view dynamic mesh array at the command-generation boundary without trying
+// to re-enter AddMeshBatch out of order.
+inline constexpr uint64_t SUBNAUTICA2_GENERATE_DYNAMIC_MESH_DRAW_COMMANDS_RVA = 0x2A9E010;
+
+// FVisibilityTaskData::FinishGatherDynamicMeshElements — midhook at the point
+// immediately before SetupMeshPasses is launched. At this instruction rbp is
+// the FVisibilityTaskData* (`movzx r8d, byte ptr [rbp+22A4h]`, build 112084).
+// This is the safest place to inspect the off-FViewInfo ViewCommandsPerView
+// payload after CVV/relevance has completed but before mesh pass setup consumes
+// it.
+inline constexpr uint64_t SUBNAUTICA2_FINISH_GATHER_VIEWCOMMANDS_PRE_SETUP_RVA = 0x2DF8671;
+
 // FMaterialResource::GetFriendlyName(FString*) — returns the material name.
 // Call this on the material the proxy resolves to (proxy->GetMaterial(level)
 // → FMaterialResource* → GetFriendlyName).

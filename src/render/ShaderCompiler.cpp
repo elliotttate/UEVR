@@ -846,6 +846,13 @@ render::ShaderCompileResult compile_with_dxc(const render::ShaderCompileRequest&
 
     if (request.debug_info) {
         push_arg(L"-Zi");
+        // Embed the debug info (source, line tables, named bindings) directly in
+        // the DXIL container instead of emitting a side PDB. RenderDoc then gets
+        // source-level stepping + named entrypoint/bindings for shaders we author,
+        // with no PDB-path lookup. Only meaningful when debug isn't stripped.
+        if (!request.strip_debug) {
+            push_arg(L"-Qembed_debug");
+        }
     }
 
     if (request.strip_reflection) {
