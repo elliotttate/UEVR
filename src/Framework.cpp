@@ -433,10 +433,10 @@ void Framework::hook_monitor() {
     }
 
     // Capture-only D3D12 mode intentionally skips normal framework/VR frame
-    // initialization, but the D3D12 hook itself is already installed and active.
-    // Treat that as healthy here; otherwise the "no Present yet" recovery path
-    // repeatedly unhooks/re-hooks D3D12 and destabilizes capture-only diagnostics.
-    if (capture_only_d3d12_mode()) {
+    // initialization after the D3D12 hook is installed. Treat that hooked state as
+    // healthy; before then, the monitor must still perform the initial D3D12 hook
+    // or shader overrides/RenderDoc sidecar diagnostics never activate.
+    if (capture_only_d3d12_mode() && m_valid && m_is_d3d12 && m_d3d12_hook != nullptr) {
         m_last_present_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         m_last_message_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         m_last_chance_time = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -640,8 +640,16 @@ Framework::Framework(HMODULE framework_module)
     spdlog::set_default_logger(m_logger);
     // UE 5.7 startup can legitimately emit thousands of info-level discovery logs.
     // Flushing every info line to disk turns that into visible hitching and input lag.
-    // Keep immediate flushing for actual errors only.
-    spdlog::flush_on(spdlog::level::err);
+    // Keep immediate flushing for actual errors only unless an explicit diagnostics
+    // run needs live log evidence while the game remains open.
+    if (capture_only_d3d12_mode() ||
+        env_flag_enabled("UEVR_LOG_FLUSH_INFO") ||
+        env_flag_enabled("UEVR_SHADER_OVERRIDE_VERBOSE_SCAN_LOG")) {
+        m_logger->flush_on(spdlog::level::info);
+        spdlog::flush_on(spdlog::level::info);
+    } else {
+        spdlog::flush_on(spdlog::level::err);
+    }
     spdlog::info("UnrealVR entry");
 
     // Profiler integration is one-of-N: PIX OR Nsight, not both. PIX's

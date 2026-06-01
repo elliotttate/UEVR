@@ -670,6 +670,29 @@ static void sn2_log_water_candidate_draw(
     UINT c,
     INT d,
     UINT e);
+static void sn2_log_streak_candidate_draw(
+    const CommandListCorrelationState& state,
+    const char* draw_kind,
+    UINT a,
+    UINT b,
+    UINT c,
+    INT d,
+    UINT e);
+struct Sn2LocalRtViewportScope {
+    ID3D12GraphicsCommandList* command_list = nullptr;
+    D3D12_VIEWPORT original_viewport{};
+    D3D12_RECT original_scissor{};
+    bool had_scissor = false;
+    bool active = false;
+
+    void restore();
+};
+static bool sn2_try_begin_local_rt_viewport_fix(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    uint32_t ps_crc,
+    const char* draw_kind,
+    Sn2LocalRtViewportScope& scope);
 static bool sn2_should_skip_water_chain_draw(
     const CommandListCorrelationState& state,
     const char* draw_kind);
@@ -882,6 +905,41 @@ bool sn2_water_candidate_log_enabled() {
 int sn2_water_candidate_log_max_rows() {
     static const int rows = std::max(0, env_int_a("UEVR_SN2_WATER_CANDIDATE_LOG_MAX_ROWS", 400));
     return rows;
+}
+
+bool sn2_streak_candidate_log_enabled() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_STREAK_CANDIDATE_LOG");
+    return enabled;
+}
+
+int sn2_streak_candidate_log_max_rows() {
+    static const int rows = std::max(0, env_int_a("UEVR_SN2_STREAK_CANDIDATE_LOG_MAX_ROWS", 160));
+    return rows;
+}
+
+bool sn2_local_rt_viewport_fix_enabled() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_LOCAL_RT_VIEWPORT_FIX");
+    return enabled;
+}
+
+bool sn2_local_rt_viewport_fix_dry_run() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_LOCAL_RT_VIEWPORT_FIX_DRY_RUN");
+    return enabled;
+}
+
+int sn2_local_rt_viewport_fix_log_max_rows() {
+    static const int rows = std::max(0, env_int_a("UEVR_SN2_LOCAL_RT_VIEWPORT_FIX_LOG_MAX_ROWS", 80));
+    return rows;
+}
+
+bool sn2_pso_allowed_by_env(const char* env_name, uint32_t ps_crc, bool default_all);
+
+bool sn2_local_rt_viewport_fix_pso_allowed(uint32_t ps_crc) {
+    const char* raw = std::getenv("UEVR_SN2_LOCAL_RT_VIEWPORT_FIX_PS_CRCS");
+    if (raw == nullptr || raw[0] == '\0') {
+        return ps_crc == 0x944801B4u;
+    }
+    return sn2_pso_allowed_by_env("UEVR_SN2_LOCAL_RT_VIEWPORT_FIX_PS_CRCS", ps_crc, false);
 }
 
 bool sn2_zero_dispatch_log_enabled() {
@@ -27269,6 +27327,14 @@ void WINAPI D3D12Hook::draw_instanced(
         start_vertex_location,
         0,
         start_instance_location);
+    sn2_log_streak_candidate_draw(
+        s,
+        "DrawInstanced",
+        vertex_count_per_instance,
+        instance_count,
+        start_vertex_location,
+        0,
+        start_instance_location);
     sn2_capture_pass_rtv(command_list, s);
     // Keep BeginEvent/EndEvent balanced across the draw-skip early-returns below:
     // a skipped draw produces no GPU event to bracket, so close any opened RDoc
@@ -27427,9 +27493,17 @@ void WINAPI D3D12Hook::draw_instanced(
         if (!sn2_underwater_deferred::after_draw() && deferred_indexed_original != nullptr) {
             sn2_underwater_deferred::try_replay(command_list, s, deferred_indexed_original);
         }
+        Sn2LocalRtViewportScope local_rt_viewport_scope{};
+        sn2_try_begin_local_rt_viewport_fix(
+            command_list,
+            s,
+            forensics_ps_crc,
+            "DrawInstanced",
+            local_rt_viewport_scope);
         const auto timing = gpu_timestamp_timing::begin(command_list, "draw", s);
         original(command_list, vertex_count_per_instance, instance_count, start_vertex_location, start_instance_location);
         gpu_timestamp_timing::end(command_list, timing);
+        local_rt_viewport_scope.restore();
         if (sn2_underwater_deferred::after_draw() && deferred_indexed_original != nullptr) {
             sn2_underwater_deferred::try_replay(command_list, s, deferred_indexed_original);
         }
@@ -28155,6 +28229,14 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         start_index_location,
         base_vertex_location,
         start_instance_location);
+    sn2_log_streak_candidate_draw(
+        s2,
+        "DrawIndexedInstanced",
+        index_count_per_instance,
+        instance_count,
+        start_index_location,
+        base_vertex_location,
+        start_instance_location);
     sn2_capture_pass_rtv(command_list, s2);
     // Balance BeginEvent/EndEvent across the draw-skip early-returns below (see
     // the matching logic in DrawInstanced). Only side-effect-free precomputed
@@ -28724,11 +28806,21 @@ void WINAPI D3D12Hook::draw_indexed_instanced(
         if (!sn2_underwater_deferred::after_draw()) {
             sn2_underwater_deferred::try_replay(command_list, s2, original);
         }
+        Sn2LocalRtViewportScope local_rt_viewport_scope{};
+        if (!sn2_live_mutate_skip_draw) {
+            sn2_try_begin_local_rt_viewport_fix(
+                command_list,
+                s2,
+                forensics_ps_crc,
+                "DrawIndexedInstanced",
+                local_rt_viewport_scope);
+        }
         const auto timing = gpu_timestamp_timing::begin(command_list, "draw_indexed", s2);
         if (!sn2_live_mutate_skip_draw) {
             original(command_list, index_count_per_instance, instance_count, start_index_location, base_vertex_location, start_instance_location);
         }
         gpu_timestamp_timing::end(command_list, timing);
+        local_rt_viewport_scope.restore();
         if (sn2_underwater_deferred::after_draw()) {
             sn2_underwater_deferred::try_replay(command_list, s2, original);
         }
@@ -35311,6 +35403,348 @@ static std::string sn2_pso3069_semantic_slot_token(
 
 static uintptr_t sn2_rtv_resource_ptr(uint64_t cpu_handle) {
     return reinterpret_cast<uintptr_t>(sn2_rt_snapshot::lookup_rtv(cpu_handle));
+}
+
+void Sn2LocalRtViewportScope::restore() {
+    if (!active || command_list == nullptr) {
+        active = false;
+        return;
+    }
+
+    command_list->RSSetViewports(1, &original_viewport);
+    if (had_scissor) {
+        command_list->RSSetScissorRects(1, &original_scissor);
+    }
+    active = false;
+}
+
+static bool sn2_try_begin_local_rt_viewport_fix(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListCorrelationState& state,
+    uint32_t ps_crc,
+    const char* draw_kind,
+    Sn2LocalRtViewportScope& scope)
+{
+    if (!sn2_local_rt_viewport_fix_enabled() ||
+        command_list == nullptr ||
+        state.current_pso == nullptr ||
+        !state.has_viewport ||
+        state.viewport_count != 1 ||
+        (state.has_scissor && state.scissor_count != 1) ||
+        ps_crc == 0 ||
+        !sn2_local_rt_viewport_fix_pso_allowed(ps_crc)) {
+        return false;
+    }
+
+    const int view_id = cmdlist_view_id(state);
+    const bool right_eye =
+        view_id == 1 ||
+        state.last_viewport_bucket == StereoTraceBucket::Right;
+    if (!right_eye || state.last_rtv_count == 0 || state.last_rtv_handles[0] == 0) {
+        return false;
+    }
+
+    ID3D12Resource* rt0 = sn2_rt_snapshot::lookup_rtv(state.last_rtv_handles[0]);
+    if (rt0 == nullptr) {
+        return false;
+    }
+
+    const auto desc = rt0->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width == 0 || desc.Height == 0) {
+        return false;
+    }
+
+    const double rt_w = static_cast<double>(desc.Width);
+    const double vp_x = static_cast<double>(state.viewport0.TopLeftX);
+    const double vp_w = static_cast<double>(state.viewport0.Width);
+    constexpr double kEyeOffsetTolerance = 1.0;
+    if (vp_w <= 0.0 ||
+        vp_x < (rt_w - kEyeOffsetTolerance) ||
+        vp_x > (rt_w + kEyeOffsetTolerance) ||
+        vp_w > (rt_w + kEyeOffsetTolerance)) {
+        return false;
+    }
+
+    D3D12_VIEWPORT fixed_vp = state.viewport0;
+    const double original_vp_x = static_cast<double>(fixed_vp.TopLeftX);
+    fixed_vp.TopLeftX = 0.0f;
+    fixed_vp.Width = static_cast<float>(std::max(0.0, std::min(vp_w, rt_w)));
+
+    D3D12_RECT fixed_scissor = state.scissor0;
+    const bool had_scissor = state.has_scissor;
+    if (had_scissor) {
+        const LONG shift = static_cast<LONG>(original_vp_x + (original_vp_x >= 0.0 ? 0.5 : -0.5));
+        const LONG long_max = (std::numeric_limits<LONG>::max)();
+        const LONG rt_width = static_cast<LONG>(std::min<uint64_t>(desc.Width, static_cast<uint64_t>(long_max)));
+        const LONG rt_height = static_cast<LONG>(std::min<uint64_t>(static_cast<uint64_t>(desc.Height), static_cast<uint64_t>(long_max)));
+        const bool scissor_needs_shift =
+            static_cast<double>(state.scissor0.left) >= (static_cast<double>(shift) - kEyeOffsetTolerance) ||
+            static_cast<double>(state.scissor0.right) > (rt_w + kEyeOffsetTolerance);
+        const int64_t scissor_shift = scissor_needs_shift ? static_cast<int64_t>(shift) : 0;
+        const int64_t scissor_left = static_cast<int64_t>(state.scissor0.left) - scissor_shift;
+        const int64_t scissor_right = static_cast<int64_t>(state.scissor0.right) - scissor_shift;
+        const int64_t scissor_top = static_cast<int64_t>(state.scissor0.top);
+        const int64_t scissor_bottom = static_cast<int64_t>(state.scissor0.bottom);
+        fixed_scissor.left = static_cast<LONG>(
+            std::max<int64_t>(0, std::min<int64_t>(static_cast<int64_t>(rt_width), scissor_left)));
+        fixed_scissor.right = std::max<LONG>(
+            fixed_scissor.left,
+            static_cast<LONG>(
+                std::min<int64_t>(static_cast<int64_t>(rt_width), scissor_right)));
+        fixed_scissor.top = static_cast<LONG>(
+            std::max<int64_t>(0, std::min<int64_t>(static_cast<int64_t>(rt_height), scissor_top)));
+        fixed_scissor.bottom = std::max<LONG>(
+            fixed_scissor.top,
+            static_cast<LONG>(
+                std::min<int64_t>(static_cast<int64_t>(rt_height), scissor_bottom)));
+    }
+
+    static std::atomic<uint64_t> s_seen{0};
+    static std::atomic<uint64_t> s_applied{0};
+    const auto seen = s_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool dry_run = sn2_local_rt_viewport_fix_dry_run();
+    const auto applied = dry_run ? s_applied.load(std::memory_order_relaxed)
+                                 : s_applied.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int max_rows = sn2_local_rt_viewport_fix_log_max_rows();
+    if (max_rows > 0 && seen <= static_cast<uint64_t>(max_rows)) {
+        SPDLOG_WARN(
+            "[SN2-LocalRTViewportFix] {} #{} apply={} applied={} kind={} eye={} view_id={} "
+            "ps=0x{:08x} rt0=0x{:x}/res0x{:x}/fmt{}/{}x{} "
+            "vp ({:.1f},{:.1f},{:.1f},{:.1f})->({:.1f},{:.1f},{:.1f},{:.1f}) "
+            "scissor ({},{},{},{})->({},{},{},{})",
+            dry_run ? "DRY" : "FIX",
+            seen,
+            dry_run ? 0 : 1,
+            applied,
+            draw_kind,
+            sn2_eye_name(view_id, state.last_viewport_bucket),
+            view_id,
+            ps_crc,
+            state.last_rtv_handles[0],
+            reinterpret_cast<uintptr_t>(rt0),
+            static_cast<int>(desc.Format),
+            static_cast<uint64_t>(desc.Width),
+            static_cast<uint32_t>(desc.Height),
+            state.viewport0.TopLeftX,
+            state.viewport0.TopLeftY,
+            state.viewport0.Width,
+            state.viewport0.Height,
+            fixed_vp.TopLeftX,
+            fixed_vp.TopLeftY,
+            fixed_vp.Width,
+            fixed_vp.Height,
+            state.scissor0.left,
+            state.scissor0.top,
+            state.scissor0.right,
+            state.scissor0.bottom,
+            fixed_scissor.left,
+            fixed_scissor.top,
+            fixed_scissor.right,
+            fixed_scissor.bottom);
+    }
+
+    if (dry_run) {
+        return false;
+    }
+
+    scope.command_list = command_list;
+    scope.original_viewport = state.viewport0;
+    scope.original_scissor = state.scissor0;
+    scope.had_scissor = had_scissor;
+    scope.active = true;
+
+    command_list->RSSetViewports(1, &fixed_vp);
+    if (had_scissor) {
+        command_list->RSSetScissorRects(1, &fixed_scissor);
+    }
+    return true;
+}
+
+static void sn2_log_streak_candidate_draw(
+    const CommandListCorrelationState& state,
+    const char* draw_kind,
+    UINT a,
+    UINT b,
+    UINT c,
+    INT d,
+    UINT e)
+{
+    if (!sn2_streak_candidate_log_enabled() || state.current_pso == nullptr || !state.has_viewport) {
+        return;
+    }
+
+    const uintptr_t pso = reinterpret_cast<uintptr_t>(state.current_pso);
+    auto& registry = render::ShaderOverrideRegistry::get();
+    const uint32_t ps_crc = registry.d3d12_pso_pixel_crc32(pso);
+    if (!sn2_pso_allowed_by_env("UEVR_SN2_STREAK_CANDIDATE_PSOS", ps_crc, false)) {
+        return;
+    }
+
+    static std::atomic<uint64_t> s_rows{0};
+    const auto row = s_rows.fetch_add(1, std::memory_order_relaxed);
+    const int max_rows = sn2_streak_candidate_log_max_rows();
+    if (max_rows <= 0 || row >= static_cast<uint64_t>(max_rows)) {
+        return;
+    }
+
+    const int view_id = cmdlist_view_id(state);
+    auto [ps_hash, vs_hash] = registry.snapshot_pso_hashes_for(pso);
+    const auto& rtvs = state.last_rtv_handles;
+
+    auto rtv_desc = [](uint64_t handle) {
+        struct Desc {
+            uintptr_t res{};
+            int fmt{};
+            int dim{};
+            uint64_t w{};
+            uint32_t h{};
+            uint16_t d{};
+        } out{};
+        if (auto* res = sn2_rt_snapshot::lookup_rtv(handle); res != nullptr) {
+            const auto rd = res->GetDesc();
+            out.res = reinterpret_cast<uintptr_t>(res);
+            out.fmt = static_cast<int>(rd.Format);
+            out.dim = static_cast<int>(rd.Dimension);
+            out.w = static_cast<uint64_t>(rd.Width);
+            out.h = rd.Height;
+            out.d = rd.DepthOrArraySize;
+        }
+        return out;
+    };
+
+    const auto rt0 = rtv_desc(rtvs[0]);
+    const auto rt1 = rtv_desc(rtvs[1]);
+
+    auto slot_token = [](UINT root, UINT slot, const Sn2Pso3069SlotInfo& s) {
+        return fmt::format(
+            "r{}s{} res=0x{:x} kind={} fmt={} dim={} size={}x{}x{} hash=0x{:016x} match={}",
+            root,
+            slot,
+            reinterpret_cast<uintptr_t>(s.resource),
+            s.kind,
+            static_cast<int>(s.format),
+            static_cast<int>(s.dimension),
+            s.width,
+            s.height,
+            s.depth_or_array,
+            s.desc_hash,
+            s.descriptor_match);
+    };
+
+    const uint64_t root0 = sn2_graphics_root_table_gpu(state, 0);
+    const uint64_t root2 = sn2_graphics_root_table_gpu(state, 2);
+    const auto r0s0 = sn2_resolve_pso3069_slot(root0, 0);
+    const auto r0s1 = sn2_resolve_pso3069_slot(root0, 1);
+    const auto r0s2 = sn2_resolve_pso3069_slot(root0, 2);
+    const auto r0s3 = sn2_resolve_pso3069_slot(root0, 3);
+    const auto r0s4 = sn2_resolve_pso3069_slot(root0, 4);
+    const auto r0s5 = sn2_resolve_pso3069_slot(root0, 5);
+    const auto r2s0 = sn2_resolve_pso3069_slot(root2, 0);
+    const auto r2s1 = sn2_resolve_pso3069_slot(root2, 1);
+    const auto r2s2 = sn2_resolve_pso3069_slot(root2, 2);
+
+    auto read_row = [](uint64_t gpu_va, uint32_t row_idx, float (&f)[4], uint32_t (&u)[4]) {
+        const size_t offset = static_cast<size_t>(row_idx) * 16u;
+        uint8_t* cpu = sn2_upload_buf_map::gpu_va_to_cpu(gpu_va, offset + 16u);
+        if (cpu == nullptr) {
+            return false;
+        }
+        std::memcpy(f, cpu + offset, sizeof(float) * 4);
+        std::memcpy(u, cpu + offset, sizeof(uint32_t) * 4);
+        return true;
+    };
+
+    auto format_row = [&](UINT root, uint32_t row_idx) {
+        if (root >= state.last_graphics_root_cbv.size()) {
+            return fmt::format("cb{}[{}]=out_of_range", root, row_idx);
+        }
+        const uint64_t va = state.last_graphics_root_cbv[root];
+        if (va == 0) {
+            return fmt::format("cb{}[{}]=none", root, row_idx);
+        }
+        float f[4]{};
+        uint32_t u[4]{};
+        if (!read_row(va, row_idx, f, u)) {
+            return fmt::format("cb{}[{}]=unmapped va=0x{:x}", root, row_idx, va);
+        }
+        return fmt::format(
+            "cb{}[{}] u=({},{},{},{}) f=({:.7g},{:.7g},{:.7g},{:.7g})",
+            root,
+            row_idx,
+            u[0], u[1], u[2], u[3],
+            f[0], f[1], f[2], f[3]);
+    };
+
+    std::string cb_rows;
+    if (ps_crc == 0x944801B4u) {
+        // 0x944801B4 uses CB0 rows 1/2/15/16 for rect->UV sampling. In this
+        // root signature CB0 has historically appeared at graphics root 2.
+        for (uint32_t row_idx : {0u, 1u, 2u, 15u, 16u}) {
+            if (!cb_rows.empty()) cb_rows += " | ";
+            cb_rows += format_row(2, row_idx);
+        }
+    } else {
+        for (UINT root : {4u, 5u, 6u, 7u, 8u, 2u}) {
+            if (root >= state.last_graphics_root_cbv.size() || state.last_graphics_root_cbv[root] == 0) {
+                continue;
+            }
+            if (!cb_rows.empty()) cb_rows += " | ";
+            cb_rows += format_row(root, 0);
+        }
+    }
+    if (cb_rows.empty()) {
+        cb_rows = "none";
+    }
+
+    SPDLOG_WARN(
+        "[SN2-StreakCandidate] row={} kind={} eye={} view_id={} bucket={} pso={:p} "
+        "ps_crc=0x{:08x} ps_hash={} vs_hash={} root_sig=0x{:x} "
+        "vp=({:.1f},{:.1f},{:.1f},{:.1f}) scissor=({},{},{},{}) "
+        "mrt_count={} rtv0=0x{:x}/res0x{:x}/fmt{}/dim{}/{}x{}x{} "
+        "rtv1=0x{:x}/res0x{:x}/fmt{}/dim{}/{}x{}x{} "
+        "root0=0x{:x} root2=0x{:x} cbv2=0x{:x} cbv4=0x{:x} cbv5=0x{:x} cbv6=0x{:x} cbv7=0x{:x} cbv8=0x{:x} "
+        "{} | {} | {} | {} | {} | {} | {} | {} | {} "
+        "cbrows=[{}] args=({}, {}, {}, {}, {})",
+        row + 1,
+        draw_kind,
+        sn2_eye_name(view_id, state.last_viewport_bucket),
+        view_id,
+        static_cast<int>(state.last_viewport_bucket),
+        state.current_pso,
+        ps_crc,
+        ps_hash.empty() ? "(none)" : ps_hash,
+        vs_hash.empty() ? "(none)" : vs_hash,
+        state.last_graphics_root_signature,
+        state.viewport_top_left_x,
+        state.viewport_top_left_y,
+        state.viewport_width,
+        state.viewport_height,
+        state.scissor0.left,
+        state.scissor0.top,
+        state.scissor0.right,
+        state.scissor0.bottom,
+        static_cast<unsigned>(state.last_rtv_count),
+        rtvs[0], rt0.res, rt0.fmt, rt0.dim, rt0.w, rt0.h, rt0.d,
+        rtvs[1], rt1.res, rt1.fmt, rt1.dim, rt1.w, rt1.h, rt1.d,
+        root0,
+        root2,
+        state.last_graphics_root_cbv[2],
+        state.last_graphics_root_cbv[4],
+        state.last_graphics_root_cbv[5],
+        state.last_graphics_root_cbv[6],
+        state.last_graphics_root_cbv[7],
+        state.last_graphics_root_cbv[8],
+        slot_token(0, 0, r0s0),
+        slot_token(0, 1, r0s1),
+        slot_token(0, 2, r0s2),
+        slot_token(0, 3, r0s3),
+        slot_token(0, 4, r0s4),
+        slot_token(0, 5, r0s5),
+        slot_token(2, 0, r2s0),
+        slot_token(2, 1, r2s1),
+        slot_token(2, 2, r2s2),
+        cb_rows,
+        a, b, c, d, e);
 }
 
 static void sn2_log_render_name_pso3069(

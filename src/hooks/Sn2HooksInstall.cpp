@@ -468,6 +468,22 @@ static int sn2_viewcommands_copy_delay_ms() {
     return ms;
 }
 
+static bool sn2_viewcommands_copy_debug_enabled() {
+    static const bool e = []() {
+        const char* v = std::getenv("UEVR_SN2_VIEWCOMMANDS_COPY_DEBUG");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return e;
+}
+
+static int sn2_viewcommands_copy_debug_max() {
+    static const int rows = []() {
+        const int v = sn2_env_int("UEVR_SN2_VIEWCOMMANDS_COPY_DEBUG_MAX", 128);
+        return v < 0 ? 0 : v;
+    }();
+    return rows;
+}
+
 static int sn2_stability_streak_required() {
     static const int frames = []() {
         const int v = sn2_env_int("UEVR_SN2_STABILITY_STREAK", 60);
@@ -1437,6 +1453,58 @@ struct Sn2MeshCommandsShapeLookup {
     uint32_t max_elem{0xffffffffu};
     uintptr_t max_cmd{0};
 };
+
+static void sn2_log_viewcommands_copy_debug(
+    const char* path,
+    uint64_t seq,
+    const char* reason,
+    int32_t pass,
+    uintptr_t cached_target_static,
+    uintptr_t target_static,
+    const Sn2TArrayHeader& primary_req,
+    const Sn2PointerArrayLookup& primary_hit,
+    const Sn2TArrayHeader& secondary_req,
+    const Sn2PointerArrayLookup& secondary_hit)
+{
+    if (!sn2_viewcommands_copy_debug_enabled()) {
+        return;
+    }
+    static std::atomic<uint64_t> rows{0};
+    const auto n = rows.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > static_cast<uint64_t>(sn2_viewcommands_copy_debug_max())) {
+        return;
+    }
+
+    SPDLOG_WARN(
+        "[SN2-ViewCommandsCopyDebug] #{} path={} trace#{} reason={} pass={}({}) "
+        "cached_target_static=0x{:x} target_static=0x{:x} "
+        "primary_req[data=0x{:x} count={} cap={} valid={}] primary_hit[found={} elem={} hits={} value=0x{:x}] "
+        "secondary_req[data=0x{:x} count={} cap={} valid={}] secondary_hit[found={} elem={} hits={} value=0x{:x}]",
+        n,
+        path ? path : "?",
+        seq,
+        reason ? reason : "?",
+        pass,
+        sn2_mesh_pass_name(pass),
+        cached_target_static,
+        target_static,
+        primary_req.data,
+        primary_req.count,
+        primary_req.capacity,
+        primary_req.valid ? 1 : 0,
+        primary_hit.found ? 1 : 0,
+        primary_hit.elem,
+        primary_hit.hits,
+        primary_hit.value,
+        secondary_req.data,
+        secondary_req.count,
+        secondary_req.capacity,
+        secondary_req.valid ? 1 : 0,
+        secondary_hit.found ? 1 : 0,
+        secondary_hit.elem,
+        secondary_hit.hits,
+        secondary_hit.value);
+}
 
 static Sn2PointerArrayLookup sn2_find_pointer_array_element_limited(
     const Sn2TArrayHeader& array,
@@ -4689,6 +4757,17 @@ static void sn2_maybe_copy_fviewinfo_bundle_right_13b(uint64_t seq,
     }
     const auto secondary_hit = sn2_find_pointer_array_element(secondary_req, target_static);
     if (!primary_hit.found || secondary_hit.found) {
+        sn2_log_viewcommands_copy_debug(
+            "FViewBundle",
+            seq,
+            !primary_hit.found ? "primary_missing_target" : "secondary_already_has_target",
+            pass,
+            cached_target_static,
+            target_static,
+            primary_req,
+            primary_hit,
+            secondary_req,
+            secondary_hit);
         return;
     }
 
@@ -4700,6 +4779,20 @@ static void sn2_maybe_copy_fviewinfo_bundle_right_13b(uint64_t seq,
 
     const auto stable_index = sn2_resolve_stable_target_primitive_index(seq);
     if (!stable_index.stable) {
+        if (sn2_viewcommands_copy_debug_enabled()) {
+            Sn2PointerArrayLookup empty_secondary_hit{};
+            sn2_log_viewcommands_copy_debug(
+                "FViewBundle",
+                seq,
+                "primitive_index_not_stable",
+                pass,
+                cached_target_static,
+                target_static,
+                primary_req,
+                primary_hit,
+                secondary_req,
+                empty_secondary_hit);
+        }
         return;
     }
     Sn2PrimitiveIndexChoice primitive_choice =
@@ -4976,6 +5069,17 @@ static void sn2_maybe_copy_viewcommands_right_13b(uint64_t seq,
     }
     const auto secondary_hit = sn2_find_pointer_array_element(secondary_req, target_static);
     if (!primary_hit.found || secondary_hit.found) {
+        sn2_log_viewcommands_copy_debug(
+            "ViewCommands",
+            seq,
+            !primary_hit.found ? "primary_missing_target" : "secondary_already_has_target",
+            pass,
+            cached_target_static,
+            target_static,
+            primary_req,
+            primary_hit,
+            secondary_req,
+            secondary_hit);
         return;
     }
 
@@ -4987,6 +5091,20 @@ static void sn2_maybe_copy_viewcommands_right_13b(uint64_t seq,
 
     const auto stable_index = sn2_resolve_stable_target_primitive_index(seq);
     if (!stable_index.stable) {
+        if (sn2_viewcommands_copy_debug_enabled()) {
+            Sn2PointerArrayLookup empty_secondary_hit{};
+            sn2_log_viewcommands_copy_debug(
+                "ViewCommands",
+                seq,
+                "primitive_index_not_stable",
+                pass,
+                cached_target_static,
+                target_static,
+                primary_req,
+                primary_hit,
+                secondary_req,
+                empty_secondary_hit);
+        }
         return;
     }
 
