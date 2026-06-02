@@ -270,6 +270,60 @@ bool shader_hunter_compute_suppression_enabled() {
     return env_flag_enabled("UEVR_SHADER_HUNTER_ALLOW_COMPUTE_SUPPRESS", false);
 }
 
+bool shader_hunter_pixel_only_mode() {
+    static const bool enabled =
+        env_flag_enabled("UEVR_SHADER_HUNTER_PIXEL_ONLY", false) ||
+        env_flag_enabled("UEVR_SHADER_HUNTER_PERF_MODE", false);
+    return enabled;
+}
+
+bool shader_hunter_collect_compute_events_enabled() {
+    static const bool enabled =
+        !shader_hunter_pixel_only_mode() &&
+        !env_flag_enabled("UEVR_SHADER_HUNTER_DISABLE_COMPUTE", false) &&
+        !env_flag_enabled("UEVR_SHADER_HUNTER_SKIP_COMPUTE", false) &&
+        env_flag_enabled("UEVR_SHADER_HUNTER_COLLECT_COMPUTE", true);
+    return enabled;
+}
+
+bool shader_hunter_collect_indirect_events_enabled() {
+    static const bool enabled =
+        !env_flag_enabled("UEVR_SHADER_HUNTER_SKIP_INDIRECT", false) &&
+        !env_flag_enabled("UEVR_SHADER_HUNTER_SKIP_INDIRECT_COLLECTION", false) &&
+        env_flag_enabled("UEVR_SHADER_HUNTER_COLLECT_INDIRECT", true);
+    return enabled;
+}
+
+bool shader_hunter_disable_compute_dispatch_hook_enabled() {
+    static const bool enabled = env_flag_enabled("UEVR_SHADER_HUNTER_DISABLE_COMPUTE", false);
+    return enabled;
+}
+
+bool shader_hunter_freeze_after_window_enabled() {
+    static const bool enabled = env_flag_enabled("UEVR_SHADER_HUNTER_FREEZE_AFTER_WINDOW", false);
+    return enabled;
+}
+
+bool shader_hunter_stats_log_enabled() {
+    static const bool enabled = env_flag_enabled("UEVR_SHADER_HUNTER_STATS_LOG", true);
+    return enabled;
+}
+
+int shader_hunter_env_frame_window() {
+    static const int frames = []() {
+        char value[32]{};
+        const DWORD len = GetEnvironmentVariableA("UEVR_SHADER_HUNTER_FRAME_WINDOW", value, sizeof(value));
+        if (len == 0 || len >= sizeof(value)) {
+            return -1;
+        }
+
+        char* end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        return end != value ? static_cast<int>(std::max<long>(0, parsed)) : -1;
+    }();
+    return frames;
+}
+
 const std::unordered_set<std::string>& shader_hunter_suppression_blocklist() {
     static const std::unordered_set<std::string> blocklist = [] {
         std::unordered_set<std::string> values{};
@@ -1235,7 +1289,9 @@ void ShaderOverrideRegistry::on_present(Framework&) {
                 e.rtv_divergence_seen, e.desc_divergence_seen);
         }
     }
-    if (m_hunter_active.load(std::memory_order_relaxed) && (m_frame % 120) == 0) {
+    if (m_hunter_active.load(std::memory_order_relaxed) &&
+            shader_hunter_stats_log_enabled() &&
+            (m_frame % 120) == 0) {
         const auto setpso = g_hunter_setpso_calls.exchange(0, std::memory_order_relaxed);
         const auto setpso_skip = g_hunter_setpso_skip_true.exchange(0, std::memory_order_relaxed);
         const auto draws = g_hunter_draw_hits.exchange(0, std::memory_order_relaxed);
@@ -4752,17 +4808,18 @@ void ShaderOverrideRegistry::hunter_ensure_discard_compiled_locked() {
 void ShaderOverrideRegistry::hunter_record_bind_locked(const D3D12GraphicsPsoRecord& record) {
     if (!m_hunter_active.load(std::memory_order_relaxed)) return;
     const bool compute_only = record.pixel_hash.empty() && !record.compute_hash.empty();
+    if (compute_only && !shader_hunter_collect_compute_events_enabled()) return;
     const auto& hunted_hash = compute_only ? record.compute_hash : record.pixel_hash;
     if (hunted_hash.empty()) return;
 
     const bool window_expired = m_hunter_frame_window > 0 &&
         m_frame >= m_hunter_window_start_frame + static_cast<uint64_t>(m_hunter_frame_window);
-    if (window_expired && !m_hunter_window_stopped) {
-        m_hunter_window_stopped = true;
+    if (window_expired && !m_hunter_window_stopped.load(std::memory_order_relaxed)) {
+        m_hunter_window_stopped.store(true, std::memory_order_relaxed);
         spdlog::info("[ShaderHunter] frame window expired ({} frames). Collection paused; {} hashes captured.",
             m_hunter_frame_window, m_hunter_collected.size());
     }
-    const bool collection_paused = m_hunter_window_stopped || window_expired;
+    const bool collection_paused = m_hunter_window_stopped.load(std::memory_order_relaxed) || window_expired;
 
     auto it = m_hunter_collected.find(hunted_hash);
     if (it == m_hunter_collected.end()) {
@@ -4838,9 +4895,15 @@ void ShaderOverrideRegistry::hunter_record_bind_locked(const D3D12GraphicsPsoRec
     }
 }
 
-void ShaderOverrideRegistry::hunter_record_draw_event(uintptr_t pso_pointer, int eye_bucket, bool compute, bool indexed) {
+void ShaderOverrideRegistry::hunter_record_draw_event(uintptr_t pso_pointer, int eye_bucket, bool compute, bool indexed, bool indirect) {
     if (!m_hunter_active.load(std::memory_order_relaxed)) return;
     if (pso_pointer == 0) return;
+    if (compute && !shader_hunter_collect_compute_events_enabled()) return;
+    if (indirect && !shader_hunter_collect_indirect_events_enabled()) return;
+    if (shader_hunter_freeze_after_window_enabled() &&
+            m_hunter_window_stopped.load(std::memory_order_relaxed)) {
+        return;
+    }
     if (eye_bucket < 0 || eye_bucket > 4) eye_bucket = 0;
 
     std::scoped_lock _{m_mutex};
@@ -4849,6 +4912,7 @@ void ShaderOverrideRegistry::hunter_record_draw_event(uintptr_t pso_pointer, int
 
     const auto& record = rec_it->second;
     const bool compute_only = compute || (record.pixel_hash.empty() && !record.compute_hash.empty());
+    if (compute_only && !shader_hunter_collect_compute_events_enabled()) return;
     const std::string& hunted_hash = compute_only ? record.compute_hash : record.pixel_hash;
     if (hunted_hash.empty()) return;
 
@@ -5117,6 +5181,10 @@ void ShaderOverrideRegistry::hunter_rebuild_stage_active_locked(HunterStage stag
 
 void ShaderOverrideRegistry::hunter_start() {
     std::scoped_lock _{m_mutex};
+    const int env_frame_window = shader_hunter_env_frame_window();
+    if (env_frame_window >= 0) {
+        m_hunter_frame_window = env_frame_window;
+    }
     m_hunter_active = true;
     m_hunter_collected.clear();
     m_hunter_collected_vs.clear();
@@ -5131,13 +5199,17 @@ void ShaderOverrideRegistry::hunter_start() {
     m_hunter_active_index_cs = -1;
     m_hunter_active_hash_cs.clear();
     m_hunter_window_start_frame = m_frame;
-    m_hunter_window_stopped = false;
+    m_hunter_window_stopped.store(false, std::memory_order_relaxed);
     {
         std::scoped_lock skip_lock{m_hunter_skip_mutex};
         m_hunter_skip_by_cmdlist.clear();
     }
     push_event("Shader Hunter: started");
-    spdlog::info("[ShaderHunter] started (frame_window={})", m_hunter_frame_window);
+    spdlog::info("[ShaderHunter] started (frame_window={} collect_compute={} collect_indirect={} freeze_after_window={})",
+        m_hunter_frame_window,
+        shader_hunter_collect_compute_events_enabled() ? 1 : 0,
+        shader_hunter_collect_indirect_events_enabled() ? 1 : 0,
+        shader_hunter_freeze_after_window_enabled() ? 1 : 0);
 }
 
 void ShaderOverrideRegistry::hunter_stop() {
@@ -5175,7 +5247,7 @@ void ShaderOverrideRegistry::hunter_clear_collected() {
     m_hunter_active_hash_cs.clear();
     // Reset frame window so a fresh collection starts from now.
     m_hunter_window_start_frame = m_frame;
-    m_hunter_window_stopped = false;
+    m_hunter_window_stopped.store(false, std::memory_order_relaxed);
     {
         std::scoped_lock skip_lock{m_hunter_skip_mutex};
         m_hunter_skip_by_cmdlist.clear();
@@ -5191,7 +5263,7 @@ void ShaderOverrideRegistry::hunter_set_frame_window(int frames) {
     m_hunter_frame_window = frames < 0 ? 0 : frames;
     // Reset the start point so a newly-set window starts counting from now.
     m_hunter_window_start_frame = m_frame;
-    m_hunter_window_stopped = false;
+    m_hunter_window_stopped.store(false, std::memory_order_relaxed);
 }
 
 void ShaderOverrideRegistry::hunter_set_recent_frame_age(int frames) {
@@ -5849,7 +5921,7 @@ size_t ShaderOverrideRegistry::hunter_trim_collected(bool scene_only, bool live_
     hunter_rebuild_stage_active_locked(HunterStage::Vertex);
     hunter_rebuild_stage_active_locked(HunterStage::Compute);
     // Also auto-pause collection so the trimmed list stays stable.
-    m_hunter_window_stopped = true;
+    m_hunter_window_stopped.store(true, std::memory_order_relaxed);
     const size_t after = kept_main + kept_vs + kept_cs;
     spdlog::info("[ShaderHunter] trim_collected: {} -> {} (main={} vs={} cs={} scene_only={} live_only={})",
         before, after, kept_main, kept_vs, kept_cs, scene_only ? 1 : 0, live_only ? 1 : 0);
@@ -5952,7 +6024,7 @@ size_t ShaderOverrideRegistry::hunter_trim_to_top_hits(size_t keep_count) {
     hunter_rebuild_active_locked();
     hunter_rebuild_stage_active_locked(HunterStage::Vertex);
     hunter_rebuild_stage_active_locked(HunterStage::Compute);
-    m_hunter_window_stopped = true;
+    m_hunter_window_stopped.store(true, std::memory_order_relaxed);
     const size_t after = kept_main + kept_vs + kept_cs;
     spdlog::info("[ShaderHunter] trim_to_top_hits: {} -> {} (main={} vs={} cs={})",
         before, after, kept_main, kept_vs, kept_cs);
@@ -6111,8 +6183,8 @@ ShaderOverrideRegistry::HunterStateView ShaderOverrideRegistry::hunter_state() c
     v.frame_window = m_hunter_frame_window;
     v.recent_frame_age = m_hunter_recent_frame_age;
     v.min_scene_ps_size = HUNTER_MIN_SCENE_PS_SIZE;
-    v.window_stopped = m_hunter_window_stopped;
-    if (m_hunter_frame_window > 0 && !m_hunter_window_stopped) {
+    v.window_stopped = m_hunter_window_stopped.load(std::memory_order_relaxed);
+    if (m_hunter_frame_window > 0 && !v.window_stopped) {
         const uint64_t end_frame = m_hunter_window_start_frame +
             static_cast<uint64_t>(m_hunter_frame_window);
         v.window_frames_left = (end_frame > m_frame) ? (end_frame - m_frame) : 0;
@@ -6513,6 +6585,18 @@ bool ShaderOverrideRegistry::hunter_should_skip_compute(void* command_list) cons
     return it != m_hunter_skip_by_cmdlist.end() && it->second.compute;
 }
 
+bool ShaderOverrideRegistry::hunter_collect_compute_events() const {
+    return shader_hunter_collect_compute_events_enabled();
+}
+
+bool ShaderOverrideRegistry::hunter_collect_indirect_events() const {
+    return shader_hunter_collect_indirect_events_enabled();
+}
+
+bool ShaderOverrideRegistry::hunter_disable_compute_dispatch_hook() const {
+    return shader_hunter_disable_compute_dispatch_hook_enabled();
+}
+
 void ShaderOverrideRegistry::hunter_clear_command_list(void* command_list) {
     std::scoped_lock _{m_hunter_skip_mutex};
     m_hunter_skip_by_cmdlist.erase(command_list);
@@ -6757,7 +6841,7 @@ bool ShaderOverrideRegistry::hunter_export_scene_list_json(std::filesystem::path
     doc["active"] = m_hunter_active.load(std::memory_order_relaxed);
     doc["recent_frame_age"] = m_hunter_recent_frame_age;
     doc["frame_window"] = m_hunter_frame_window;
-    doc["window_stopped"] = m_hunter_window_stopped;
+    doc["window_stopped"] = m_hunter_window_stopped.load(std::memory_order_relaxed);
     doc["min_scene_bytecode_size"] = HUNTER_MIN_SCENE_PS_SIZE;
     doc["entry_count"] = rows.size();
     doc["entries"] = json::array();

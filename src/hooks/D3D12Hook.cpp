@@ -787,6 +787,18 @@ double env_double_a(const char* name, double fallback) {
     return end != value ? parsed : fallback;
 }
 
+bool shader_hunter_skip_dispatch_hook_install() {
+    static const bool skip = env_flag_enabled_a("UEVR_SHADER_HUNTER_DISABLE_COMPUTE");
+    return skip;
+}
+
+bool shader_hunter_skip_execute_indirect_hook_install() {
+    static const bool skip =
+        env_flag_enabled_a("UEVR_SHADER_HUNTER_SKIP_INDIRECT_HOOK") ||
+        env_flag_enabled_a("UEVR_SHADER_HUNTER_DISABLE_INDIRECT_HOOK");
+    return skip;
+}
+
 uint32_t sn2_d3d12_root_table_log_max() {
     // Default quiet. The root-table summaries are useful while bringing up an
     // eye-attribution probe, but they run forever in live sessions if left on.
@@ -3588,14 +3600,16 @@ void D3D12Hook::install_command_list_hooks(ID3D12GraphicsCommandList* command_li
             m_command_list_diagnostic_slots
         );
 
-        add_unique_pointer_hook(
-            iface,
-            DISPATCH_VTABLE_INDEX,
-            reinterpret_cast<void*>(&D3D12Hook::dispatch),
-            m_command_list_diagnostic_hooks,
-            m_command_list_diagnostic_hook_lookup,
-            m_command_list_diagnostic_slots
-        );
+        if (!shader_hunter_skip_dispatch_hook_install()) {
+            add_unique_pointer_hook(
+                iface,
+                DISPATCH_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::dispatch),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+        }
 
         add_unique_pointer_hook(
             iface,
@@ -3642,14 +3656,16 @@ void D3D12Hook::install_command_list_hooks(ID3D12GraphicsCommandList* command_li
             m_command_list_diagnostic_slots
         );
 
-        add_unique_pointer_hook(
-            iface,
-            EXECUTE_INDIRECT_VTABLE_INDEX,
-            reinterpret_cast<void*>(&D3D12Hook::execute_indirect),
-            m_command_list_diagnostic_hooks,
-            m_command_list_diagnostic_hook_lookup,
-            m_command_list_diagnostic_slots
-        );
+        if (!shader_hunter_skip_execute_indirect_hook_install()) {
+            add_unique_pointer_hook(
+                iface,
+                EXECUTE_INDIRECT_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::execute_indirect),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+        }
 
         add_unique_pointer_hook(
             iface,
@@ -12270,8 +12286,10 @@ inline void record_draw_event_from_state(
     const bool forensics_enabled = forensics.is_enabled();
     const bool forensics_capturing = forensics.is_capturing_this_frame();
     const bool lightweight_producer_tracking = forensics.should_track_lightweight_producers();
+    auto& diagnostics = render::D3D12Diagnostics::get();
     const bool diagnostics_recording =
-        render::D3D12Diagnostics::get().is_enabled() &&
+        diagnostics.is_enabled() &&
+        !diagnostics.is_lightweight() &&
         (!forensics_enabled || forensics_capturing || stereo_forensics_keep_hook_detail_on_skipped_frames());
     if (!diagnostics_recording && !forensics_capturing && !lightweight_producer_tracking) {
         return;
@@ -29962,12 +29980,22 @@ void WINAPI D3D12Hook::dispatch(
     }
 
     auto& reg = render::ShaderOverrideRegistry::get();
-    reg.hunter_inc_dispatch_hit();
+    if (reg.hunter_disable_compute_dispatch_hook()) {
+        if (original != nullptr) {
+            original(command_list, thread_group_count_x, thread_group_count_y, thread_group_count_z);
+        }
+        return;
+    }
+
+    const bool hunter_collect_compute = reg.hunter_collect_compute_events();
+    if (hunter_collect_compute) {
+        reg.hunter_inc_dispatch_hit();
+    }
     // Per-eye selective skip for compute. eye_bucket from CL viewport state
     // (compute usually inherits the graphics-pass viewport set just before).
     const auto dispatch_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
     const int dispatch_eye_bucket = cmdlist_eye_bucket(dispatch_state);
-    if (dispatch_state.current_pso != nullptr) {
+    if (hunter_collect_compute && dispatch_state.current_pso != nullptr) {
         reg.hunter_record_draw_event(
             reinterpret_cast<uintptr_t>(dispatch_state.current_pso),
             dispatch_eye_bucket,
@@ -30392,19 +30420,19 @@ void WINAPI D3D12Hook::dispatch(
         0,
         original != nullptr && !upstream_skip && !per_eye_skip && !hunter_skip && !forensics_skip);
     if (upstream_skip) {
-        reg.hunter_inc_dispatch_skipped();
+        if (hunter_collect_compute) reg.hunter_inc_dispatch_skipped();
         return;
     }
     if (per_eye_skip) {
-        reg.hunter_inc_dispatch_skipped();
+        if (hunter_collect_compute) reg.hunter_inc_dispatch_skipped();
         return;
     }
     if (hunter_skip) {
-        reg.hunter_inc_dispatch_skipped();
+        if (hunter_collect_compute) reg.hunter_inc_dispatch_skipped();
         return;
     }
     if (forensics_skip) {
-        reg.hunter_inc_dispatch_skipped();
+        if (hunter_collect_compute) reg.hunter_inc_dispatch_skipped();
         return;
     }
 
@@ -31546,19 +31574,23 @@ void WINAPI D3D12Hook::execute_indirect(
     }
 
     auto& reg = render::ShaderOverrideRegistry::get();
-    reg.hunter_inc_execute_indirect_hit();
-    const auto hunter_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
-    const int hunter_eye_bucket = cmdlist_eye_bucket(hunter_state);
-    if (hunter_state.current_pso != nullptr) {
-        reg.hunter_record_draw_event(
-            reinterpret_cast<uintptr_t>(hunter_state.current_pso),
-            hunter_eye_bucket,
-            false,
-            false);
-        sn2_rdg_pass_hook::on_dispatch(reinterpret_cast<uintptr_t>(hunter_state.current_pso));
+    const bool hunter_collect_indirect = reg.hunter_collect_indirect_events();
+    if (hunter_collect_indirect) {
+        reg.hunter_inc_execute_indirect_hit();
+        const auto hunter_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
+        const int hunter_eye_bucket = cmdlist_eye_bucket(hunter_state);
+        if (hunter_state.current_pso != nullptr) {
+            reg.hunter_record_draw_event(
+                reinterpret_cast<uintptr_t>(hunter_state.current_pso),
+                hunter_eye_bucket,
+                false,
+                false,
+                true);
+            sn2_rdg_pass_hook::on_dispatch(reinterpret_cast<uintptr_t>(hunter_state.current_pso));
+        }
     }
     if (reg.hunter_should_skip_graphics(command_list)) {
-        reg.hunter_inc_execute_indirect_skipped();
+        if (hunter_collect_indirect) reg.hunter_inc_execute_indirect_skipped();
         return;
     }
 
@@ -31607,7 +31639,7 @@ void WINAPI D3D12Hook::execute_indirect(
             seq);
     }
 
-    if (command_list != nullptr && argument_buffer != nullptr) {
+    if (sn2_capture_truth::cs_census_enabled() && command_list != nullptr && argument_buffer != nullptr) {
         const auto state = read_cmdlist_state(command_list);
         void* current_pso = state.current_pso;
         uint32_t cs_crc = 0;
@@ -31774,15 +31806,19 @@ void WINAPI D3D12Hook::execute_indirect(
         }
     }
 
-    if (command_list != nullptr) {
+    if (hunter_collect_indirect && command_list != nullptr) {
         apply_per_eye_pso_variant(command_list, read_cmdlist_state(command_list));
     }
 
     if (original != nullptr) {
-        const auto indirect_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
-        const auto timing = gpu_timestamp_timing::begin(command_list, "execute_indirect", indirect_state);
-        original(command_list, command_signature, max_command_count, effective_arg_buffer, effective_arg_offset, count_buffer, count_buffer_offset);
-        gpu_timestamp_timing::end(command_list, timing);
+        if (gpu_timestamp_timing::enabled()) {
+            const auto indirect_state = command_list != nullptr ? read_cmdlist_state(command_list) : g_cmdlist_state_empty;
+            const auto timing = gpu_timestamp_timing::begin(command_list, "execute_indirect", indirect_state);
+            original(command_list, command_signature, max_command_count, effective_arg_buffer, effective_arg_offset, count_buffer, count_buffer_offset);
+            gpu_timestamp_timing::end(command_list, timing);
+        } else {
+            original(command_list, command_signature, max_command_count, effective_arg_buffer, effective_arg_offset, count_buffer, count_buffer_offset);
+        }
     }
 }
 

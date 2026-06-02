@@ -368,10 +368,13 @@ public:
     // Extended variant: caller passes the current eye bucket (0 Unknown, 1
     // Left, 2 Right, 3 Full, 4 Multi) so per-eye-selective skip can fire.
     void hunter_record_set_pipeline_state_with_eye(void* command_list, void* original_pso, int eye_bucket);
-    void hunter_record_draw_event(uintptr_t pso_pointer, int eye_bucket, bool compute, bool indexed);
+    void hunter_record_draw_event(uintptr_t pso_pointer, int eye_bucket, bool compute, bool indexed, bool indirect = false);
     void hunter_clear_command_list(void* command_list);
     bool hunter_should_skip_graphics(void* command_list) const;
     bool hunter_should_skip_compute(void* command_list) const;
+    bool hunter_collect_compute_events() const;
+    bool hunter_collect_indirect_events() const;
+    bool hunter_disable_compute_dispatch_hook() const;
     // Increment self-test counters from the Draw* hooks so the periodic
     // stats log can show whether those hooks are even reaching us.
     void hunter_inc_draw_hit();
@@ -828,7 +831,7 @@ private:
     int m_hunter_frame_window{0};            // 0 = unlimited; otherwise auto-pause after N frames
     int m_hunter_recent_frame_age{30};
     uint64_t m_hunter_window_start_frame{0};
-    bool m_hunter_window_stopped{false};     // true when frame-window auto-paused collection
+    std::atomic_bool m_hunter_window_stopped{false}; // true when frame-window auto-paused collection
     struct HunterCommandListSkipState {
         bool graphics{};
         bool compute{};
