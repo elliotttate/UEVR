@@ -9,6 +9,7 @@
 #include <ShlObj.h>
 
 #include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/null_sink.h>
 
 #include <imgui.h>
 #include "uevr-imgui/font_robotomedium.hpp"
@@ -60,6 +61,25 @@ bool env_flag_enabled(const char* name) {
 
     std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
     return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+}
+
+bool release_no_logging_enabled() {
+    static const bool enabled =
+        env_flag_enabled("UEVR_RELEASE_NO_LOGGING") ||
+        env_flag_enabled("UEVR_NO_LOGGING");
+    return enabled;
+}
+
+std::shared_ptr<spdlog::logger> make_framework_logger() {
+    if (release_no_logging_enabled()) {
+        auto logger = std::make_shared<spdlog::logger>(
+            "UnrealVR",
+            std::make_shared<spdlog::sinks::null_sink_mt>());
+        logger->set_level(spdlog::level::off);
+        return logger;
+    }
+
+    return spdlog::basic_logger_mt("UnrealVR", (Framework::get_persistent_dir() / "log.txt").string(), true);
 }
 
 bool capture_only_d3d12_mode() {
@@ -632,23 +652,30 @@ void Framework::command_thread() {
 Framework::Framework(HMODULE framework_module)
     : m_framework_module{framework_module}
     , m_game_module{GetModuleHandle(0)},
-    m_logger{spdlog::basic_logger_mt("UnrealVR", (get_persistent_dir() / "log.txt").string(), true)},
+    m_logger{make_framework_logger()},
     m_vr{std::make_shared<VR>()}
 {
     std::scoped_lock __{m_constructor_mutex};
 
     spdlog::set_default_logger(m_logger);
-    // UE 5.7 startup can legitimately emit thousands of info-level discovery logs.
-    // Flushing every info line to disk turns that into visible hitching and input lag.
-    // Keep immediate flushing for actual errors only unless an explicit diagnostics
-    // run needs live log evidence while the game remains open.
-    if (capture_only_d3d12_mode() ||
-        env_flag_enabled("UEVR_LOG_FLUSH_INFO") ||
-        env_flag_enabled("UEVR_SHADER_OVERRIDE_VERBOSE_SCAN_LOG")) {
-        m_logger->flush_on(spdlog::level::info);
-        spdlog::flush_on(spdlog::level::info);
+    if (release_no_logging_enabled()) {
+        m_logger->set_level(spdlog::level::off);
+        spdlog::set_level(spdlog::level::off);
+        m_logger->flush_on(spdlog::level::off);
+        spdlog::flush_on(spdlog::level::off);
     } else {
-        spdlog::flush_on(spdlog::level::err);
+        // UE 5.7 startup can legitimately emit thousands of info-level discovery logs.
+        // Flushing every info line to disk turns that into visible hitching and input lag.
+        // Keep immediate flushing for actual errors only unless an explicit diagnostics
+        // run needs live log evidence while the game remains open.
+        if (capture_only_d3d12_mode() ||
+            env_flag_enabled("UEVR_LOG_FLUSH_INFO") ||
+            env_flag_enabled("UEVR_SHADER_OVERRIDE_VERBOSE_SCAN_LOG")) {
+            m_logger->flush_on(spdlog::level::info);
+            spdlog::flush_on(spdlog::level::info);
+        } else {
+            spdlog::flush_on(spdlog::level::err);
+        }
     }
     spdlog::info("UnrealVR entry");
 
