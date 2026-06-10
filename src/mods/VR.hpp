@@ -1330,7 +1330,10 @@ private:
     const ModSlider::Ptr m_dibr_popout_limit{ ModSlider::create(generate_name("DIBR_PopoutLimit"), 0.0f, 1.0f, 1.0f) };
     const ModCombo::Ptr m_dibr_edge_fill_mode{ ModCombo::create(generate_name("DIBR_EdgeFillMode"), s_dibr_edge_fill_names, 2) };
     const ModSlider::Ptr m_dibr_disocclusion_strength{ ModSlider::create(generate_name("DIBR_DisocclusionGuard"), 0.0f, 1.0f, 0.6f) };
-    const ModSlider::Ptr m_dibr_edge_guard_strength{ ModSlider::create(generate_name("DIBR_EdgeGuard"), 0.0f, 1.0f, 0.0f) };
+    // Default ON: ramps disparity to zero at the screen edges so the
+    // synthesized eye never exposes a no-source-data band there (Depth3D
+    // ships its equivalent "Edge Reduction" at 0.5 too); validated in-game.
+    const ModSlider::Ptr m_dibr_edge_guard_strength{ ModSlider::create(generate_name("DIBR_EdgeGuard"), 0.0f, 1.0f, 0.5f) };
     const ModSlider::Ptr m_dibr_foreground_protect{ ModSlider::create(generate_name("DIBR_ForegroundProtect"), 0.0f, 1.0f, 0.5f) };
     const ModSlider::Ptr m_dibr_range_smoothing{ ModSlider::create(generate_name("DIBR_RangeSmoothing"), 0.0f, 1.0f, 0.35f) };
     const ModInt32::Ptr m_dibr_raymarch_steps{ ModSliderInt32::create(generate_name("DIBR_RaymarchSteps"), 8, 128, 32) };

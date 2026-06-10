@@ -381,6 +381,39 @@ behavior from §2 payoff 1.
 
 ---
 
+### Phase 6 progress (2026-06-10) — YORO occlusion search + artifact defaults
+
+Driven by SN2 main-menu artifacts in the synthesized eye (torn/ghosted in-scene logo
+text, smeared right screen edge), diagnosed live via param A/B (divergence scaling,
+kernel switch) plus deep-dives of E:\Github\Depth3D and E:\Github\YORO-VR:
+
+- **Root cause of tearing:** the yoro kernel was a naive single-tap backward warp
+  (`uv - shift(depth_at_destination)`) with no occlusion search — cheaper than even
+  SuperDepth3D's cheapest view mode (which always runs a parallax search + binary
+  refinement). Thin features and depth-less translucents tore at every depth edge.
+- **Fix: ported the raymarch kernel's parallax search into dibr_yoro.hlsl**
+  (`YoroSearchUv` + `YoroSearchDepth` + `SampleSynthStereoColor`): the synthesized
+  eye walks the depth field along the disparity ray (raymarch_steps, foveation
+  supported), with the raymarch disocclusion guard blending revealed regions back
+  to the unwarped center color. The reference eye remains a pristine passthrough.
+  The disocclusion/raymarch params are therefore now LIVE in yoro (UI group renamed
+  "Synthesis Quality"). Cbuffer layout unchanged (243 fields / 972 bytes verified
+  via offline DXC compile).
+- **Edge band fix:** `edge_guard_strength` (screen-edge disparity ramp) default
+  0 -> 0.5, validated in-game; Depth3D ships its equivalent at 0.5 by default too.
+- **Resolution-scaled divergence:** the UI value is now interpreted as pixels at a
+  1920-wide eye and scaled by actual eye width (Depth3D clamps per-resolution for
+  the same reason); env override stays absolute.
+- Remaining ideas from the Depth3D/YORO-VR reports (not yet ported): Depth3D's
+  3-iteration binary post-search refinement + sharp-gap seek (:6373-6448), its
+  always-on per-axis depth min-filter pre-pass (DepthSmoothPS :6123), AXAA on the
+  warped output, YORO-VR's biased scanline gap interpolation for edge fill, and
+  overscan (render the single view with ~1.15x FOV and crop) to truly eliminate
+  the screen-edge blind spot.
+- Inherent limit (both references agree): translucents/UI baked into the scene do
+  not write depth and can only be mitigated (search + disocclusion guard), not
+  fully fixed, without engine-side layer separation.
+
 ## 6b. Phase 6 — Depth3D / SuperDepth3D-derived enhancements
 
 `E:\Github\Depth3D` (BlueSkyDefender's SuperDepth3D — the methodology the inverse-warp

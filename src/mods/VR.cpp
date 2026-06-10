@@ -6964,7 +6964,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 m_dibr_convergence->value() = 0.5f;
                 m_dibr_popout_limit->value() = 1.0f;
                 m_dibr_disocclusion_strength->value() = 0.6f;
-                m_dibr_edge_guard_strength->value() = 0.2f;
+                m_dibr_edge_guard_strength->value() = 0.5f;
             }
             ImGui::SameLine();
             if (ImGui::Button("Pop-out")) {
@@ -6972,7 +6972,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 m_dibr_convergence->value() = 0.65f;
                 m_dibr_popout_limit->value() = 1.0f;
                 m_dibr_disocclusion_strength->value() = 0.5f;
-                m_dibr_edge_guard_strength->value() = 0.0f;
+                m_dibr_edge_guard_strength->value() = 0.3f;
             }
 
             m_dibr_divergence->draw("Divergence (stereo strength)");
@@ -6989,10 +6989,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             m_dibr_edge_fill_mode->draw("Edge Fill");
             m_dibr_edge_guard_strength->draw("Screen Edge Guard");
 
-            // These constants are only referenced by the raymarch kernel
-            // (verified via shader reflection) - vrmod implemented its
-            // advanced depth conditioning in that variant only.
-            if (ImGui::TreeNode("Raymarch Quality")) {
+            // The YORO kernels now share the raymarch kernel's parallax
+            // search and disocclusion guard, so these tune both; only the
+            // remaining depth-conditioning constants are raymarch-specific.
+            if (ImGui::TreeNode("Synthesis Quality")) {
                 m_dibr_raymarch_steps->draw("Steps");
                 m_dibr_foveation_strength->draw("Foveation");
                 m_dibr_depth_gain->draw("Depth Gain");

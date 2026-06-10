@@ -4923,9 +4923,14 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     stage_source(cmd_list, source_x);
 
     // 2) Parameters: vrmod defaults -> persisted UI settings -> env overrides.
+    // The UI divergence is tuned in pixels at a 1920-wide eye (the Depth3D /
+    // vrmod convention); scale by the actual eye width so the ANGULAR
+    // disparity stays constant across render resolutions. The env override
+    // stays absolute for scripted reproducibility.
+    const float divergence_scale = static_cast<float>(eye_width) / 1920.0f;
     DIBRStereoParams params{};
     params.mode_param0 = yoro_reference_eye;
-    params.divergence = env.divergence.value_or(vr->m_dibr_divergence->value());
+    params.divergence = env.divergence.value_or(vr->m_dibr_divergence->value() * divergence_scale);
     params.convergence = env.convergence.value_or(vr->m_dibr_convergence->value());
     params.zpd_balance = vr->m_dibr_zpd_balance->value();
     params.reverse_depth = env.reverse_depth.value_or(vr->m_dibr_reverse_depth->value() ? 1.0f : 0.0f);
