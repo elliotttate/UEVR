@@ -10,6 +10,10 @@
 Texture2D<float4> g_colorTex : register(t0);
 Texture2D<float>  g_depthTex : register(t1);
 RWTexture2D<float4> g_sbsOut : register(u0);
+// Scatter pipeline intermediates (see dibr_scatter_*.hlsl); only read when
+// scatter_compose > 0.5.
+RWTexture2D<uint> g_scatterKey : register(u1);
+RWTexture2D<float4> g_scatterColor : register(u2);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
 
@@ -260,6 +264,7 @@ cbuffer StereoParams : register(b0) {
     float reproj_enabled;
     float4x4 reproj_source_to_left;
     float4x4 reproj_source_to_right;
+    float scatter_compose;
 };
 
 float EffectiveConvergence()
@@ -2237,9 +2242,21 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float4 outLeft = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftRefColor, centerColor))));
         outLeft = ApplyAlignmentMarker(uv, leftRefUV, outLeft);
 
-        float2 rightSearchUV = YoroSearchUv(uv, -1.0f, searchDepth, boundaryScale, 1.0f);
-        float2 rightUV = ApplyOutputEyeAlignment(rightSearchUV + rightInterlaceOffset, -1.0f);
-        float4 rightColor = SampleSynthStereoColor(rightUV, uv, centerColor, searchDepth);
+        float2 rightUV = uv;
+        float4 rightColor;
+        if (scatter_compose > 0.5f) {
+            // R2: the scatter pipeline already produced an occlusion-correct,
+            // hole-filled synthesized eye; fetch it, blending toward the
+            // unwarped center near the screen edges (the synthesized eye's
+            // outer band has no source data - same role as the gather path's
+            // ScreenEdgeGuard disparity squeeze).
+            float edgeKeep = ScreenEdgeGuard(uv, searchDepth);
+            rightColor = float4(lerp(centerColor.rgb, g_scatterColor[uint2(x, y)].rgb, edgeKeep), centerColor.a);
+        } else {
+            float2 rightSearchUV = YoroSearchUv(uv, -1.0f, searchDepth, boundaryScale, 1.0f);
+            rightUV = ApplyOutputEyeAlignment(rightSearchUV + rightInterlaceOffset, -1.0f);
+            rightColor = SampleSynthStereoColor(rightUV, uv, centerColor, searchDepth);
+        }
         float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightColor, centerColor))));
         outRight = ApplyAlignmentMarker(uv, rightUV, outRight);
         if (floor(output_layout_mode + 0.5f) == 2.0f) {
@@ -2255,9 +2272,16 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         }
     } else {
         // Right reference: synthesize left at full disparity, pristine right.
-        float2 leftSearchUV = YoroSearchUv(uv, 1.0f, searchDepth, boundaryScale, 1.0f);
-        float2 leftUV = ApplyOutputEyeAlignment(leftSearchUV + leftInterlaceOffset, 1.0f);
-        float4 leftColor = SampleSynthStereoColor(leftUV, uv, centerColor, searchDepth);
+        float2 leftUV = uv;
+        float4 leftColor;
+        if (scatter_compose > 0.5f) {
+            float edgeKeep = ScreenEdgeGuard(uv, searchDepth);
+            leftColor = float4(lerp(centerColor.rgb, g_scatterColor[uint2(x, y)].rgb, edgeKeep), centerColor.a);
+        } else {
+            float2 leftSearchUV = YoroSearchUv(uv, 1.0f, searchDepth, boundaryScale, 1.0f);
+            leftUV = ApplyOutputEyeAlignment(leftSearchUV + leftInterlaceOffset, 1.0f);
+            leftColor = SampleSynthStereoColor(leftUV, uv, centerColor, searchDepth);
+        }
         float4 outLeft = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftColor, centerColor))));
         outLeft = ApplyAlignmentMarker(uv, leftUV, outLeft);
 

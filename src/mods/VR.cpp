@@ -2056,6 +2056,9 @@ int32_t VR::get_dibr_requested_mode() const {
         if (m == "yoro_left" || m == "synth_left") {
             return 2;
         }
+        if (m == "scatter" || m == "yoro_scatter") {
+            return 5;
+        }
         return 1; // yoro / synth_right / unrecognized
     }();
 
@@ -2066,10 +2069,12 @@ int32_t VR::get_dibr_requested_mode() const {
     const auto ui_mode = m_dibr_mode->value();
 
     // The "Synthetic Stereo (DIBR)" rendering method engages DIBR even with
-    // the panel combo on Off; default to YORO synth-right (the recommended
-    // kernel). The panel combo still selects the kernel when not Off.
+    // the panel combo on Off; default to the scatter pipeline (occlusion
+    // correct by construction; falls back to the gather kernel when the
+    // reprojection matrices are unavailable). The panel combo still selects
+    // the kernel when not Off.
     if (ui_mode == 0 && m_rendering_method->value() == RenderingMethod::SYNTHETIC_DIBR) {
-        return 1;
+        return 5;
     }
 
     return ui_mode;

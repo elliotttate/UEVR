@@ -4593,6 +4593,9 @@ const Config& get() {
             c.mode = DIBRSynthesis::Mode::InverseWarp;
         } else if (mode == "raymarch") {
             c.mode = DIBRSynthesis::Mode::Raymarch;
+        } else if (mode == "scatter" || mode == "yoro_scatter") {
+            c.mode = DIBRSynthesis::Mode::YoroScatter;
+            c.yoro_reference_eye = 0.0f;
         } else {
             SPDLOG_WARN("[DIBR] unrecognized UEVR_DIBR value '{}', defaulting to yoro (synthesize right eye)", mode);
         }
@@ -4838,6 +4841,10 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         case 4:
             mode = DIBRSynthesis::Mode::Raymarch;
             break;
+        case 5: // YORO scatter (R2 redesign)
+            mode = DIBRSynthesis::Mode::YoroScatter;
+            yoro_reference_eye = 0.0f;
+            break;
         default:
             fill_right_half_mono(false); // engine may still be mid-transition out of single-view
             return; // Off
@@ -5005,7 +5012,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         return (v != nullptr && v[0] == '-') ? -1.0f : 1.0f;
     }();
 
-    if (mode == DIBRSynthesis::Mode::Yoro && !reproj_disabled) {
+    if ((mode == DIBRSynthesis::Mode::Yoro || mode == DIBRSynthesis::Mode::YoroScatter) && !reproj_disabled) {
         const auto proj_l = vr->get_projection_matrix(VRRuntime::Eye::LEFT);
         const auto proj_r = vr->get_projection_matrix(VRRuntime::Eye::RIGHT);
         const auto off_l = glm::vec3{vr->get_eye_offset(VRRuntime::Eye::LEFT)};

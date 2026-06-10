@@ -161,10 +161,10 @@ bool validate_cbuffer_layout(const std::vector<uint8_t>& bytecode, const char* n
         // Field count + the last field's offset pin the layout exactly and are
         // backend-independent (FXC reports the cbuffer size padded to 16 bytes,
         // DXC's DXIL reflection may not - so total size is only sanity-ranged).
-        // 244 scalars (incl. reproj_enabled) + two float4x4, which reflection
-        // counts as ONE variable each.
-        constexpr uint32_t expected_fields = 244u + 2u;
-        constexpr uint32_t expected_last_offset = offsetof(DIBRStereoParams, reproj_source_to_right);
+        // 245 scalars (incl. reproj_enabled + scatter_compose) + two float4x4,
+        // which reflection counts as ONE variable each.
+        constexpr uint32_t expected_fields = 245u + 2u;
+        constexpr uint32_t expected_last_offset = offsetof(DIBRStereoParams, scatter_compose);
         constexpr uint32_t expected_size_min = sizeof(DIBRStereoParams);
         constexpr uint32_t expected_size_max = (sizeof(DIBRStereoParams) + 15u) & ~15u;
 
@@ -281,7 +281,7 @@ bool DIBRSynthesis::create_root_signature(ID3D12Device* device, DeviceObjects& o
     ranges[0].BaseShaderRegister = 0;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 1;
+    ranges[1].NumDescriptors = 3; // u0 output, u1 scatter key, u2 scatter color
     ranges[1].BaseShaderRegister = 0;
     ranges[1].OffsetInDescriptorsFromTableStart = 2;
 
@@ -341,6 +341,10 @@ bool DIBRSynthesis::create_psos(ID3D12Device* device, DeviceObjects& objs) {
         {"dibr_inverse.hlsl", &dibr_shaders::dibr_inverse_source, &objs.pso_inverse},
         {"dibr_yoro.hlsl", &dibr_shaders::dibr_yoro_source, &objs.pso_yoro},
         {"dibr_raymarch.hlsl", &dibr_shaders::dibr_raymarch_source, &objs.pso_raymarch},
+        {"dibr_scatter_clear.hlsl", &dibr_shaders::dibr_scatter_clear_source, &objs.pso_scatter_clear},
+        {"dibr_scatter_depth.hlsl", &dibr_shaders::dibr_scatter_depth_source, &objs.pso_scatter_depth},
+        {"dibr_scatter_color.hlsl", &dibr_shaders::dibr_scatter_color_source, &objs.pso_scatter_color},
+        {"dibr_scatter_fill.hlsl", &dibr_shaders::dibr_scatter_fill_source, &objs.pso_scatter_fill},
     };
 
     for (const auto& k : kernels) {
@@ -448,6 +452,49 @@ void DIBRSynthesis::set_output_format(DXGI_FORMAT format) {
     m_output_height = 0;
 }
 
+bool DIBRSynthesis::ensure_scatter(ID3D12Device* device, uint32_t width, uint32_t height) {
+    if (m_scatter_key != nullptr && m_scatter_width == width && m_scatter_height == height) {
+        return true;
+    }
+
+    m_scatter_key.Reset();
+    m_scatter_color.Reset();
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    desc.Format = DXGI_FORMAT_R32_UINT;
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_scatter_key)))) {
+        SPDLOG_ERROR_ONCE("[DIBR] failed to create {}x{} scatter key texture", width, height);
+        return false;
+    }
+    m_scatter_key->SetName(L"DIBR Scatter Key");
+
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_scatter_color)))) {
+        SPDLOG_ERROR_ONCE("[DIBR] failed to create {}x{} scatter color texture", width, height);
+        m_scatter_key.Reset();
+        return false;
+    }
+    m_scatter_color->SetName(L"DIBR Scatter Color");
+
+    m_scatter_width = width;
+    m_scatter_height = height;
+    SPDLOG_INFO("[DIBR] scatter buffers {}x{}", width, height);
+    return true;
+}
+
 ID3D12Resource* DIBRSynthesis::synthesize(
     ID3D12Device* device,
     ID3D12GraphicsCommandList* cmd_list,
@@ -458,6 +505,12 @@ ID3D12Resource* DIBRSynthesis::synthesize(
 {
     if (!ensure(device) || cmd_list == nullptr || color == nullptr || depth == nullptr) {
         return nullptr;
+    }
+
+    // Scatter requires the true-matrix reprojection inputs; without them it
+    // degrades to the plain gather kernel.
+    if (mode == Mode::YoroScatter && params.reproj_enabled < 0.5f) {
+        mode = Mode::Yoro;
     }
 
     ID3D12PipelineState* pso = nullptr;
@@ -471,6 +524,16 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     case Mode::Raymarch:
         pso = m_objs.pso_raymarch.Get();
         break;
+    case Mode::YoroScatter:
+        // Final compose runs through the yoro kernel with scatter_compose set.
+        pso = m_objs.pso_yoro.Get();
+        if (m_objs.pso_scatter_clear == nullptr || m_objs.pso_scatter_depth == nullptr ||
+            m_objs.pso_scatter_color == nullptr || m_objs.pso_scatter_fill == nullptr) {
+            pso = nullptr;
+        } else {
+            params.scatter_compose = 1.0f;
+        }
+        break;
     }
     if (pso == nullptr) {
         return nullptr;
@@ -481,6 +544,10 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     params.source_width = static_cast<uint32_t>(color_desc.Width);
     params.source_height = color_desc.Height;
     params.frame_index = m_frame_index;
+
+    if (!ensure_scatter(device, params.source_width, params.source_height)) {
+        return nullptr;
+    }
 
     uint32_t out_w{}, out_h{};
     packed_output_dimensions(params, out_w, out_h);
@@ -514,6 +581,16 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     device->CreateUnorderedAccessView(m_output.Get(), nullptr, &uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 2 * m_objs.descriptor_stride});
 
+    D3D12_UNORDERED_ACCESS_VIEW_DESC key_uav{};
+    key_uav.Format = DXGI_FORMAT_R32_UINT;
+    key_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(m_scatter_key.Get(), nullptr, &key_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 3 * m_objs.descriptor_stride});
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC scol_uav{};
+    scol_uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    scol_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(m_scatter_color.Get(), nullptr, &scol_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 4 * m_objs.descriptor_stride});
+
     // Read-combo states that already include NON_PIXEL_SHADER_RESOURCE (e.g.
     // UEVR's ENGINE_SRC_COLOR / ENGINE_SRC_DEPTH) are readable by compute
     // as-is; narrowing them would just be barrier churn.
@@ -534,14 +611,45 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     ID3D12DescriptorHeap* heaps[] = {m_objs.heap.Get()};
     cmd_list->SetDescriptorHeaps(1, heaps);
     cmd_list->SetComputeRootSignature(m_objs.root_sig.Get());
-    cmd_list->SetPipelineState(pso);
 
     const auto gpu_base = m_objs.heap->GetGPUDescriptorHandleForHeapStart();
     cmd_list->SetComputeRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{gpu_base.ptr + slot_offset});
     cmd_list->SetComputeRootConstantBufferView(1, m_objs.cbuffer->GetGPUVirtualAddress() + static_cast<uint64_t>(slot) * kCbSlotSize);
 
+    const uint32_t gx = (params.source_width + 15) / 16;
+    const uint32_t gy = (params.source_height + 15) / 16;
+
+    if (mode == Mode::YoroScatter) {
+        const auto uav_barrier = [cmd_list](ID3D12Resource* r) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            b.UAV.pResource = r;
+            cmd_list->ResourceBarrier(1, &b);
+        };
+
+        // clear -> depth scatter (nearest wins) -> color resolve -> hole fill.
+        cmd_list->SetPipelineState(m_objs.pso_scatter_clear.Get());
+        cmd_list->Dispatch(gx, gy, 1);
+        uav_barrier(m_scatter_key.Get());
+        uav_barrier(m_scatter_color.Get());
+
+        cmd_list->SetPipelineState(m_objs.pso_scatter_depth.Get());
+        cmd_list->Dispatch(gx, gy, 1);
+        uav_barrier(m_scatter_key.Get());
+
+        cmd_list->SetPipelineState(m_objs.pso_scatter_color.Get());
+        cmd_list->Dispatch(gx, gy, 1);
+        uav_barrier(m_scatter_color.Get());
+
+        cmd_list->SetPipelineState(m_objs.pso_scatter_fill.Get());
+        cmd_list->Dispatch(gx, gy, 1);
+        uav_barrier(m_scatter_color.Get());
+    }
+
+    cmd_list->SetPipelineState(pso);
+
     // One thread per SOURCE pixel; each thread writes both eyes' output pixels.
-    cmd_list->Dispatch((params.source_width + 15) / 16, (params.source_height + 15) / 16, 1);
+    cmd_list->Dispatch(gx, gy, 1);
 
     transition(cmd_list, m_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     if (depth_needs_transition) {
@@ -566,6 +674,10 @@ void DIBRSynthesis::reset() {
     m_output.Reset();
     m_output_width = 0;
     m_output_height = 0;
+    m_scatter_key.Reset();
+    m_scatter_color.Reset();
+    m_scatter_width = 0;
+    m_scatter_height = 0;
     m_ring_index = 0;
     m_state.store(State::NotStarted, std::memory_order_release);
 }

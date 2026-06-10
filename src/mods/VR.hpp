@@ -1332,6 +1332,7 @@ private:
         "YORO (synthesize left eye)",
         "Inverse Warp (synthesize both)",
         "Raymarch (synthesize both)",
+        "YORO Scatter (occlusion-exact)",
     };
     static const inline std::vector<std::string> s_dibr_edge_fill_names{
         "Mirror",

@@ -256,6 +256,7 @@ cbuffer StereoParams : register(b0) {
     float reproj_enabled;
     float4x4 reproj_source_to_left;
     float4x4 reproj_source_to_right;
+    float scatter_compose;
 };
 
 float EffectiveConvergence()

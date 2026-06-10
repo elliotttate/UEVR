@@ -476,6 +476,36 @@ Verified full-res left-vs-right: rock/seafloor/coral detail now matches the pris
 eye; the floating logo's glyph shimmer (thin far geometry at full disparity) remains
 the known limitation.
 
+### R1/R2 redesign (2026-06-10) — true matrices + forward scatter
+
+Major rebuild of the synthesis core (the gather/divergence model inherited from
+vrmod kept producing heuristic-fill artifacts):
+
+- **R1 — true-matrix reprojection**: the kernels map source->target through the
+  exact clip-to-clip matrix (P_dst * T_ipd * P_src^-1) built from the runtime's
+  real per-eye projections and the IPD in UE units. Raw reversed-Z device depth
+  feeds a homogeneous unproject directly; the linearize-near/far guesses and the
+  convergence model are no longer part of geometric correctness. Divergence
+  slider = stereo strength (30 = 100% true IPD). UEVR_DIBR_REPROJ=0 reverts,
+  UEVR_DIBR_REPROJ_SIGN flips conventions. (Found+fixed along the way: the
+  cbuffer ring slot size was hardcoded 1024 and overran when the struct grew -
+  kCbSlotSize now derives from sizeof.)
+- **R2 — forward scatter + explicit hole fill** (UEVR_DIBR=scatter / panel
+  "YORO Scatter" / the dropdown DIBR method's default): four new kernels
+  (dibr_scatter_clear/depth/color/fill). Depth scatter with InterlockedMax
+  (reversed-Z bits: nearest wins) + 2-px splat; color resolve by key match;
+  hole fill extends the BACKGROUND side of the nearest valid scanline
+  neighbors (YORO-paper doctrine); the yoro kernel composes the result
+  (scatter_compose cbuffer flag) with a ScreenEdgeGuard-driven blend to
+  unwarped color at the screen-edge blind band. Root signature grew to
+  t0-t1/u0-u2 (5 descriptors per ring slot).
+  RESULT: occlusion correct by construction - the menu logo (which defeated
+  every gather variant) renders essentially perfect, thin features (crab,
+  fish, plant fronds) coherent at stressed poses, no repeated-edge stamps.
+  Remaining: R3 temporal hole fill (history reprojection) for residual
+  motion shimmer in revealed bands; translucents still inherit background
+  depth (engine-layer capture would be the real fix).
+
 ### Rendering Method dropdown integration + Mono baseline (2026-06-10)
 
 - `RenderingMethod` gained two entries: **Synthetic Stereo (DIBR)** (3) — engages

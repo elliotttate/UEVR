@@ -281,9 +281,13 @@ struct DIBRStereoParams {
     float reproj_enabled{0.0f};
     float reproj_source_to_left[16]{};
     float reproj_source_to_right[16]{};
+    // When > 0.5 the YORO kernel composes the synthesized eye from the
+    // scatter pipeline's filled buffer (u2) instead of running its gather
+    // search - see the dibr_scatter_* kernels.
+    float scatter_compose{0.0f};
 };
 
-static_assert(sizeof(DIBRStereoParams) == 244 * 4 + 2 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + reproj flag + two float4x4)");
+static_assert(sizeof(DIBRStereoParams) == 245 * 4 + 2 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + reproj flag + two float4x4 + scatter flag)");
 static_assert(offsetof(DIBRStereoParams, reproj_source_to_left) % 16 == 0, "reprojection matrices must be 16-byte aligned to match HLSL cbuffer packing");
 
 // DIBR stereo synthesis: a single compute dispatch that turns one rendered
@@ -307,6 +311,10 @@ public:
         InverseWarp = 0,
         Yoro = 1,
         Raymarch = 2,
+        // R2 redesign: forward scatter (occlusion correct by construction)
+        // + explicit hole fill, composed by the yoro kernel. Requires the
+        // true-matrix reprojection inputs (params.reproj_*).
+        YoroScatter = 3,
     };
 
     DIBRSynthesis() = default;
@@ -383,6 +391,10 @@ private:
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_inverse{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_yoro{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_raymarch{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_clear{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_depth{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_color{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_fill{};
         Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap{};
         uint32_t descriptor_stride{0};
         Microsoft::WRL::ComPtr<ID3D12Resource> cbuffer{};
@@ -394,6 +406,7 @@ private:
     static bool create_psos(ID3D12Device* device, DeviceObjects& objs);
     static bool create_rings(ID3D12Device* device, DeviceObjects& objs);
     bool ensure_output(ID3D12Device* device, uint32_t width, uint32_t height);
+    bool ensure_scatter(ID3D12Device* device, uint32_t width, uint32_t height);
     void join_worker();
 
     static DXGI_FORMAT color_srv_format(DXGI_FORMAT f);
@@ -406,7 +419,7 @@ private:
     // descriptor triplets rotate through a ring sized well past UEVR's frame
     // queue depth.
     static constexpr uint32_t kRing = 8;
-    static constexpr uint32_t kDescriptorsPerSlot = 3; // t0 color, t1 depth, u0 output
+    static constexpr uint32_t kDescriptorsPerSlot = 5; // t0 color, t1 depth, u0 output, u1 scatter key, u2 scatter color
     // Derived, not hardcoded: a fixed value overran the upload buffer when the
     // struct grew (the reprojection matrices pushed it past the old 1024).
     static constexpr uint32_t kCbSlotSize = (sizeof(DIBRStereoParams) + 255u) & ~255u;
@@ -424,6 +437,12 @@ private:
     uint32_t m_output_width{0};
     uint32_t m_output_height{0};
     DXGI_FORMAT m_output_format{DXGI_FORMAT_R8G8B8A8_UNORM};
+
+    // Scatter pipeline intermediates (kept in UNORDERED_ACCESS; eye-sized).
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_scatter_key{};
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_scatter_color{};
+    uint32_t m_scatter_width{0};
+    uint32_t m_scatter_height{0};
 
     uint32_t m_ring_index{0};
     uint32_t m_frame_index{0};
