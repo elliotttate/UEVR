@@ -1993,7 +1993,7 @@ inline std::string dibr_inverse_source() {
     return out;
 }
 
-// dibr_yoro.hlsl (84584 bytes, 8 chunks)
+// dibr_yoro.hlsl (86654 bytes, 8 chunks)
 inline const char* const g_dibr_yoro_chunks[] = {
 R"DIBR(// dibr_yoro.hlsl — YORO / Meta-style asymmetric inverse-warp DIBR
 //
@@ -3941,6 +3941,7 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
     int steps = YoroSearchSteps(uv, requestedSteps);
     float direction = (targetShift >= 0.0f) ? 1.0f : -1.0f;
     float2 bestUv = saturate(directUv);
+    float bestT = 1.0f;
     float bestError = 1000000.0f;
     float previousDepth = centerDepth;
 
@@ -3961,6 +3962,7 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
         if (error < bestError) {
             bestError = error;
             bestUv = probeUv;
+            bestT = t;
         }
 
         // Early out after crossing a sharp foreground/background boundary.
@@ -3971,8 +3973,43 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
         previousDepth = probeDepth;
     }
 
+    // SuperDepth3D-style post-search refinement: probe midpoints around the
+    // best coarse hit and keep the lower-error side, giving sub-step
+    // precision so the final sample is a single coherent location.
+    float tLo = max(bestT - 1.0f / (float)steps, 0.0f);
+    float tHi = min(bestT + 1.0f / (float)steps, 1.0f);
+    [unroll]
+    for (int r = 0; r < 3; ++r) {
+        float tA = lerp(tLo, tHi, 0.25f);
+        float tB = lerp(tLo, tHi, 0.75f);
+        float2 uvA = saturate(uv + StereoShift(direction * absTarget * tA));
+        float2 uvB = saturate(uv + StereoShift(direction * absTarget * tB));
+        float eA = abs(abs(YoroSynthShiftBase(uvA, YoroSearchDepth(uvA), eyeSign) * boundaryScale * shiftScale) - absTarget * tA);
+        float eB = abs(abs(YoroSynthShiftBase(uvB, YoroSearchDepth(uvB), eyeSign) * boundaryScale * shiftScale) - absTarget * tB);
+        if (eA <= eB) {
+            if (eA < bestError) {
+                bestError = eA;
+                bestUv = uvA;
+            }
+            tHi = 0.5f * (tLo + tHi);
+        } else {
+            if (eB < bestError) {
+                bestError = eB;
+                bestUv = uvB;
+            }
+            tLo = 0.5f * (tLo + tHi);
+        }
+    }
+
+    // Snap, don't smear: lerping between two far-apart sample positions
+    // averages unrelated texels (it blurred the whole synthesized eye).
+    // Blend only when the candidates are within ~a texel of each other.
     float confidence = saturate(1.0f - bestError * max((float)srcWidth, 1.0f) / max(abs(divergence), 1.0f));
-    return lerp(directUv, bestUv, confidence);
+    float candidateDist = length((bestUv - directUv) * float2((float)srcWidth, (float)srcHeight));
+    if (candidateDist <= 1.5f) {
+        return lerp(directUv, bestUv, confidence);
+    }
+    return (confidence >= 0.25f) ? bestUv : directUv;
 }
 
 // Edge-fill behavior of SampleStereoColor plus the raymarch kernel's
@@ -3989,7 +4026,12 @@ float4 SampleSynthStereoColor(float2 sampleUv, float2 centerUv, float4 centerCol
     }
 
     float sampleDepth = YoroSearchDepth(sampleUv);
-    float depthDelta = abs(sampleDepth - centerDepth) * max(disocclusion_depth_weight, 0.0f);
+    // SIGNED test: only a sample meaningfully NEARER than the output pixel's
+    // own depth is a disocclusion error (foreground smeared into a revealed
+    // region). The previous absolute-difference test fired on ordinary depth
+    // variation across slanted surfaces, blending unwarped color over most of
+    // the image - a global double exposure that read as a blurry eye.
+    float depthDelta = (centerDepth - sampleDepth) * max(disocclusion_depth_weight, 0.0f);
     float threshold = max(disocclusion_threshold, 0.0f);
     float feather = max(disocclusion_feather, 0.0001f);
     float guardMask = smoothstep(threshold, threshold + feather, depthDelta) * saturate(disocclusion_strength);
@@ -4080,7 +4122,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float2 rightSearchUV = YoroSearchUv(uv, -1.0f, searchDepth, boundaryScale, 1.0f);
         float2 rightUV = ApplyOutputEyeAlignment(rightSearchUV + rightInterlaceOffset, -1.0f);
         float4 rightColor = SampleSynthStereoColor(rightUV, uv, centerColor, searchDepth);
-        float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightColor, centerColor))));
+)DIBR",
+R"DIBR(        float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightColor, centerColor))));
         outRight = ApplyAlignmentMarker(uv, rightUV, outRight);
         if (floor(output_layout_mode + 0.5f) == 2.0f) {
             float4 outLeftReduced = outLeft;
@@ -4105,8 +4148,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float4 rightRefColor = SampleFilteredOutputColor(rightRefUV);
         float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightRefColor, centerColor))));
         outRight = ApplyAlignmentMarker(uv, rightRefUV, outRight);
-)DIBR",
-R"DIBR(        if (floor(output_layout_mode + 0.5f) == 2.0f) {
+        if (floor(output_layout_mode + 0.5f) == 2.0f) {
             float2 leftReducedSearchUV = YoroSearchUv(uv, 1.0f, searchDepth, boundaryScale, 0.33333334f);
             float2 leftReducedUV = ApplyOutputEyeAlignment(leftReducedSearchUV + leftInterlaceOffset, 1.0f);
             float4 leftReducedColor = SampleSynthStereoColor(leftReducedUV, uv, centerColor, searchDepth);

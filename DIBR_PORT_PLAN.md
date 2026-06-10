@@ -457,6 +457,25 @@ Fixes:
 - run_dibr_synthesis logs every depth-target switch (pointer + extent + format)
   so future depth-shaped distortion is diagnosable from the log alone.
 
+### Synthesized-eye sharpness (2026-06-10) — guard blur + search smear
+
+After the depth fixes the synthesized eye was uniformly BLURRY vs the pristine eye.
+Live A/B (DisocclusionGuard 0.6 -> 0 via MCP) proved the disocclusion guard was the
+main cause: its |sampleDepth - centerDepth| test fired on ordinary depth variation
+across slanted surfaces, blending up to 60% unwarped center color over most of the
+image - a global double exposure. Fixes (yoro kernel):
+- Guard test is now SIGNED (centerDepth - sampleDepth): only a sample meaningfully
+  NEARER than the output pixel (true foreground bleed into a revealed region)
+  triggers the blend.
+- Search snap-don't-smear: the final lerp(directUv, bestUv, confidence) averaged two
+  far-apart sample positions (unrelated texels); now it blends only when the
+  candidates are within ~1.5 texels, otherwise picks one outright.
+- SuperDepth3D-style 3-round post-search refinement around the best coarse hit
+  (sub-step precision -> higher-quality single sample; Phase 6 item 2, done for yoro).
+Verified full-res left-vs-right: rock/seafloor/coral detail now matches the pristine
+eye; the floating logo's glyph shimmer (thin far geometry at full disparity) remains
+the known limitation.
+
 ### Rendering Method dropdown integration + Mono baseline (2026-06-10)
 
 - `RenderingMethod` gained two entries: **Synthetic Stereo (DIBR)** (3) — engages
