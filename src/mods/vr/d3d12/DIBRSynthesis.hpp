@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -268,9 +269,22 @@ struct DIBRStereoParams {
     float output_alignment_marker_thickness{0.002f};
     float stereo_axis_mode{0.0f};
     uint32_t frame_index{0};
+
+    // --- True-matrix reprojection (appended; offsets above are load-bearing) ---
+    // When > 0.5 the synthesized-eye search maps source->target through the
+    // exact clip-to-clip matrices below (built from the runtime's real
+    // per-eye projections + IPD) instead of the screen-space divergence
+    // model. The matrices are glm::mat4 memcpy'd column-major; the HLSL side
+    // declares default (column_major) float4x4, so mul(M, v) computes M*v.
+    // 243 scalars end at byte 972; the flag brings it to 976 (16-aligned), so
+    // the float4x4 fields start exactly where HLSL packs them - no padding.
+    float reproj_enabled{0.0f};
+    float reproj_source_to_left[16]{};
+    float reproj_source_to_right[16]{};
 };
 
-static_assert(sizeof(DIBRStereoParams) == 243 * 4, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars)");
+static_assert(sizeof(DIBRStereoParams) == 244 * 4 + 2 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + reproj flag + two float4x4)");
+static_assert(offsetof(DIBRStereoParams, reproj_source_to_left) % 16 == 0, "reprojection matrices must be 16-byte aligned to match HLSL cbuffer packing");
 
 // DIBR stereo synthesis: a single compute dispatch that turns one rendered
 // color frame + scene depth into a packed stereo pair. Ported from
@@ -393,7 +407,9 @@ private:
     // queue depth.
     static constexpr uint32_t kRing = 8;
     static constexpr uint32_t kDescriptorsPerSlot = 3; // t0 color, t1 depth, u0 output
-    static constexpr uint32_t kCbSlotSize = 1024;      // sizeof(DIBRStereoParams) aligned up to 256
+    // Derived, not hardcoded: a fixed value overran the upload buffer when the
+    // struct grew (the reprojection matrices pushed it past the old 1024).
+    static constexpr uint32_t kCbSlotSize = (sizeof(DIBRStereoParams) + 255u) & ~255u;
 
     std::atomic<State> m_state{State::NotStarted};
     std::thread m_worker{};

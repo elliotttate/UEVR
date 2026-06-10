@@ -257,6 +257,9 @@ cbuffer StereoParams : register(b0) {
     float output_alignment_marker_thickness;
     float stereo_axis_mode;
     uint  frame_index;
+    float reproj_enabled;
+    float4x4 reproj_source_to_left;
+    float4x4 reproj_source_to_right;
 };
 
 float EffectiveConvergence()
@@ -1952,8 +1955,114 @@ int YoroSearchSteps(float2 uv, float requestedSteps)
     return (int)clamp(round(steps), 4.0f, (float)YORO_MAX_SEARCH_STEPS);
 }
 
+// ---- True-matrix reprojection (R1 redesign) ----
+
+float SampleRawDeviceDepth(float2 uv)
+{
+    return SampleDepthTexture(TransformDepthUv(saturate(uv)));
+}
+
+// Map a SOURCE-eye pixel + raw device depth (reversed-Z, as stored) to the
+// synthesized TARGET eye's uv through the exact clip->clip matrix. The
+// homogeneous unproject trick makes (ndc, deviceZ, 1) valid input for the
+// combined P_dst * T * P_src^-1 matrix regardless of w.
+float2 ReprojectSourceUv(float2 srcUv, float rawDepth, float eyeSign)
+{
+    float2 ndc = float2(srcUv.x * 2.0f - 1.0f, 1.0f - srcUv.y * 2.0f);
+    float4 clip = float4(ndc, rawDepth, 1.0f);
+    float4 t = (eyeSign > 0.0f) ? mul(reproj_source_to_left, clip) : mul(reproj_source_to_right, clip);
+    float w = (abs(t.w) > 1e-6f) ? t.w : 1e-6f;
+    float2 tNdc = t.xy / w;
+    return float2(tNdc.x * 0.5f + 0.5f, 0.5f - tNdc.y * 0.5f);
+}
+
+// First-crossing search in exact-reprojection space: find the source pixel
+// whose projection lands on this output pixel. Disparity is monotonic in
+// depth, so candidate source offsets span the shifts implied by the nearest
+// (device 1, reversed-Z) and farthest (device 0) depths; marching from the
+// near-implied end keeps nearest-surface-wins occlusion.
+float2 YoroMatrixSearchUv(float2 uv, float eyeSign)
+{
+    float fwdNear = ReprojectSourceUv(uv, 1.0f, eyeSign).x - uv.x;
+    float fwdFar = ReprojectSourceUv(uv, 0.0f, eyeSign).x - uv.x;
+
+    // A source pixel at uv.x + s with forward shift fwd(depth) lands at
+    // uv.x + s + fwd; landing on this pixel needs s = -fwd(depth).
+    float sNearEnd = -fwdNear;
+    float sFarEnd = -fwdFar;
+
+    float spanPx = abs(sNearEnd - sFarEnd) * (float)srcWidth;
+    if (spanPx <= 0.25f) {
+        return float2(uv.x + sFarEnd, uv.y);
+    }
+
+    float requestedSteps = (raymarch_steps > 0.0f) ? raymarch_steps : 32.0f;
+    int steps = YoroSearchSteps(uv, min(requestedSteps, max(spanPx, 8.0f)));
+
+    float prevS = 0.0f;
+    float prevF = 0.0f;
+    bool havePrev = false;
+    float hitS = sFarEnd;
+
+    [loop]
+    for (int i = 0; i <= YORO_MAX_SEARCH_STEPS; ++i) {
+        if (i > steps) {
+            break;
+        }
+
+        float t = (float)i / (float)steps;
+        float s = lerp(sNearEnd, sFarEnd, t);
+        float2 probeUv = float2(uv.x + s, uv.y);
+        float f = ReprojectSourceUv(probeUv, SampleRawDeviceDepth(probeUv), eyeSign).x - uv.x;
+
+        if (havePrev && (f <= 0.0f) != (prevF <= 0.0f)) {
+            // Bisect the bracket for sub-step precision.
+            float lo = prevS;
+            float hi = s;
+            float fLo = prevF;
+            [loop]
+            for (int r = 0; r < 4; ++r) {
+                float mid = 0.5f * (lo + hi);
+                float2 midUv = float2(uv.x + mid, uv.y);
+                float fMid = ReprojectSourceUv(midUv, SampleRawDeviceDepth(midUv), eyeSign).x - uv.x;
+                if ((fMid <= 0.0f) == (fLo <= 0.0f)) {
+                    lo = mid;
+                    fLo = fMid;
+                } else {
+                    hi = mid;
+                }
+            }
+            hitS = 0.5f * (lo + hi);
+            break;
+        }
+
+        havePrev = true;
+        prevS = s;
+        prevF = f;
+    }
+
+    float2 srcUv = float2(uv.x + hitS, uv.y);
+
+    // One vertical correction pass: asymmetric frusta produce a small y
+    // disparity; line the found sample up on y as well.
+    float dHit = SampleRawDeviceDepth(srcUv);
+    float2 proj = ReprojectSourceUv(srcUv, dHit, eyeSign);
+    srcUv.y += (uv.y - proj.y);
+    return srcUv;
+}
+
 float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryScale, float shiftScale)
 {
+    if (reproj_enabled > 0.5f) {
+        float2 srcUv = YoroMatrixSearchUv(uv, eyeSign);
+        // Screen-edge guard, gradient guards and the reduced-disparity layout
+        // compress the found offset toward the far-plane alignment.
+        float guard = ScreenEdgeGuard(uv, centerDepth) * boundaryScale * shiftScale;
+        float sFar = -(ReprojectSourceUv(uv, 0.0f, eyeSign).x - uv.x);
+        srcUv.x = uv.x + sFar + (srcUv.x - uv.x - sFar) * guard;
+        return srcUv;
+    }
+
     float targetShift = YoroSynthShiftBase(uv, centerDepth, eyeSign) * boundaryScale * shiftScale;
     float absTarget = abs(targetShift);
     float2 directUv = uv + StereoShift(targetShift);

@@ -255,6 +255,9 @@ cbuffer StereoParams : register(b0) {
     float output_alignment_marker_thickness;
     float stereo_axis_mode;
     uint  frame_index;
+    float reproj_enabled;
+    float4x4 reproj_source_to_left;
+    float4x4 reproj_source_to_right;
 };
 
 static const int MAX_STEPS = 48;

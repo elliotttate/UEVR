@@ -9,6 +9,8 @@
 #include <array>
 #include <cmath>
 #include <DirectXMath.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -4986,6 +4988,53 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     params.raymarch_steps = env.raymarch_steps.value_or(static_cast<float>(vr->m_dibr_raymarch_steps->value()));
     params.raymarch_foveation_strength = vr->m_dibr_foveation_strength->value();
     params.debug_view_mode = env.debug_view.value_or(static_cast<float>(vr->m_dibr_debug_view->value()));
+
+    // --- True-matrix reprojection (R1 redesign) ---
+    // Exact clip(source eye) -> clip(target eye) built from the runtime's
+    // real per-eye projections and the IPD expressed in UE units, replacing
+    // the screen-space divergence model in the YORO kernel. The divergence
+    // slider becomes stereo strength: 30 = 100% of the true IPD.
+    // UEVR_DIBR_REPROJ=0 falls back to the legacy model; UEVR_DIBR_REPROJ_SIGN
+    // flips the eye-separation sign if a title's view convention differs.
+    static const bool reproj_disabled = []() {
+        const char* v = std::getenv("UEVR_DIBR_REPROJ");
+        return v != nullptr && v[0] == '0';
+    }();
+    static const float reproj_sign = []() {
+        const char* v = std::getenv("UEVR_DIBR_REPROJ_SIGN");
+        return (v != nullptr && v[0] == '-') ? -1.0f : 1.0f;
+    }();
+
+    if (mode == DIBRSynthesis::Mode::Yoro && !reproj_disabled) {
+        const auto proj_l = vr->get_projection_matrix(VRRuntime::Eye::LEFT);
+        const auto proj_r = vr->get_projection_matrix(VRRuntime::Eye::RIGHT);
+        const auto off_l = glm::vec3{vr->get_eye_offset(VRRuntime::Eye::LEFT)};
+        const auto off_r = glm::vec3{vr->get_eye_offset(VRRuntime::Eye::RIGHT)};
+
+        const float strength = env.divergence.has_value()
+            ? (*env.divergence / 30.0f)
+            : (vr->m_dibr_divergence->value() / 30.0f);
+        const float ipd_ue = glm::length(off_r - off_l) * vr->get_world_to_meters() * strength * reproj_sign;
+
+        if (ipd_ue != 0.0f) {
+            const bool ref_left = yoro_reference_eye < 0.5f;
+            const auto& proj_src = ref_left ? proj_l : proj_r;
+            const auto& proj_dst = ref_left ? proj_r : proj_l;
+            // The target eye sits at +/-IPD along view-space X relative to the
+            // source eye; world points shift the opposite way in its view.
+            const float dx = ref_left ? -ipd_ue : ipd_ue;
+            const glm::mat4 t = glm::translate(glm::mat4{1.0f}, glm::vec3{dx, 0.0f, 0.0f});
+            const glm::mat4 m = proj_dst * t * glm::inverse(proj_src);
+            const glm::mat4 ident{1.0f};
+
+            std::memcpy(params.reproj_source_to_right, ref_left ? &m[0][0] : &ident[0][0], sizeof(params.reproj_source_to_right));
+            std::memcpy(params.reproj_source_to_left, ref_left ? &ident[0][0] : &m[0][0], sizeof(params.reproj_source_to_left));
+            params.reproj_enabled = 1.0f;
+
+            SPDLOG_INFO_ONCE("[DIBR] true-matrix reprojection active (ipd_ue={:.3f}, strength={:.2f}, sign={})",
+                ipd_ue, strength, reproj_sign);
+        }
+    }
 
     // SceneDepthZ can cover the full double-wide render while the source is a
     // single eye; map output UVs onto the half of the depth texture that the
