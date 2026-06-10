@@ -29,9 +29,13 @@ void record_dsv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor
 // one mutex-guarded map probe; unknown descriptors are ignored.
 void record_dsv_bind(D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
 
-// Best LIVE candidate for the (width, height) backbuffer extent; falls back
-// to stale candidates only when no live one qualifies. Returns nullptr when
-// nothing matches (caller should skip synthesis for the frame). Also advances
-// the per-present liveness window - call once per presented frame.
-Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t width, uint32_t height);
+// Best LIVE candidate for the backbuffer: accepts BOTH double-wide
+// (full_width x height, two packed views) and single-eye (eye_width x height)
+// shaped depth targets - in single-view rendering UE allocates SceneDepthZ at
+// the lone view's extent, so an aspect filter against the double-wide target
+// alone rejects the real depth. Falls back to stale candidates only when no
+// live one qualifies. Returns nullptr when nothing matches (caller should
+// skip synthesis for the frame). Also advances the per-present liveness
+// window - call once per presented frame.
+Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, uint32_t eye_width, uint32_t height);
 } // namespace dibr_depth_tracker

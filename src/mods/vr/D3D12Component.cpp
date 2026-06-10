@@ -4891,7 +4891,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     // in every title - SN2's UE5 build defeats its signature scan). UE's scene
     // depth always matches the swapchain extent, double-wide included.
     if (depth == nullptr) {
-        depth = dibr_depth_tracker::select_scene_depth(static_cast<uint32_t>(bb_desc.Width), eye_height);
+        depth = dibr_depth_tracker::select_scene_depth(static_cast<uint32_t>(bb_desc.Width), eye_width, eye_height);
         if (depth != nullptr) {
             SPDLOG_INFO_ONCE("[DIBR] using DSV-discovered scene depth (render-target pool unavailable)");
         }
@@ -4901,6 +4901,18 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         SPDLOG_WARNING_EVERY_N_SEC(5, "[DIBR] no scene depth available; skipping synthesis this frame");
         fill_right_half_mono(false);
         return;
+    }
+
+    // Selection diagnostics: a depth-target switch is the prime suspect for
+    // any sudden depth-shaped distortion, so make every switch visible.
+    {
+        static ID3D12Resource* s_last_depth{nullptr};
+        if (depth.Get() != s_last_depth) {
+            s_last_depth = depth.Get();
+            const auto dd = depth->GetDesc();
+            SPDLOG_INFO("[DIBR] depth target -> 0x{:x} {}x{} fmt {}",
+                reinterpret_cast<uintptr_t>(depth.Get()), dd.Width, dd.Height, static_cast<int>(dd.Format));
+        }
     }
 
     const auto output_format = dibr_config::uav_store_format_for(device, bb_desc.Format);

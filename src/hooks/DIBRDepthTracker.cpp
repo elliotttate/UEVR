@@ -19,6 +19,12 @@ struct Candidate {
     uint64_t sequence{};
     // Present-window of the last DSV bind (OMSetRenderTargets/BeginRenderPass).
     uint64_t last_bind_present{};
+    // Global monotonic order of the last bind. UE renders scene captures /
+    // auxiliary views BEFORE the main view, so among live candidates the one
+    // bound LATEST in the frame is the main view's scene depth - this is what
+    // separates it from a fixed-camera capture depth that is also bound every
+    // frame (which made the warp sample a depth that never tracked the HMD).
+    uint64_t last_bind_order{};
 };
 
 std::mutex g_mtx{};
@@ -30,6 +36,8 @@ uint64_t g_sequence{0};
 // Incremented once per presented frame (in select_scene_depth); binds recorded
 // during a frame are tagged with the current value.
 std::atomic<uint64_t> g_present_seq{1};
+// Monotonic counter across every DSV bind (frame-order discriminator).
+std::atomic<uint64_t> g_bind_order{1};
 
 // Bounded: depth targets are created rarely (a handful per resolution), so a
 // small cap with oldest-first eviction covers resizes without growing.
@@ -128,13 +136,14 @@ void record_dsv_bind(D3D12_CPU_DESCRIPTOR_HANDLE descriptor) {
     for (auto& c : g_candidates) {
         if (c.resource.Get() == it->second) {
             c.last_bind_present = present;
+            c.last_bind_order = g_bind_order.fetch_add(1, std::memory_order_relaxed);
             return;
         }
     }
 }
 
-Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t width, uint32_t height) {
-    if (width == 0 || height == 0) {
+Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, uint32_t eye_width, uint32_t height) {
+    if (full_width == 0 || eye_width == 0 || height == 0) {
         return nullptr;
     }
 
@@ -148,21 +157,29 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t width, uint32
     // LIVE candidates first - a stale-but-perfectly-shaped candidate (e.g. a
     // frozen loading-screen depth) must always lose to one the game actually
     // bound this frame. Then exact extent, area, depth format tier, recency.
-    const float target_aspect = static_cast<float>(width) / static_cast<float>(height);
+    const float full_aspect = static_cast<float>(full_width) / static_cast<float>(height);
+    const float eye_aspect = static_cast<float>(eye_width) / static_cast<float>(height);
+
+    // A candidate qualifies in either shape family: double-wide (both views
+    // packed) or single-eye (single-view rendering allocates SceneDepthZ at
+    // the lone view's extent). Dynamic res shrinks within a family.
+    const auto shape_ok = [&](const Candidate& c) {
+        const float aspect = static_cast<float>(c.width) / static_cast<float>(c.height);
+        const bool full_shape = std::fabs(aspect - full_aspect) <= full_aspect * 0.02f &&
+                                c.width <= full_width && c.width * 2 >= full_width;
+        const bool eye_shape = std::fabs(aspect - eye_aspect) <= eye_aspect * 0.02f &&
+                               c.width <= eye_width && c.width * 2 >= eye_width;
+        return full_shape || eye_shape;
+    };
+
     const Candidate* best = nullptr;
     bool best_exact = false;
     bool best_live = false;
 
     for (const auto& c : g_candidates) {
-        const bool exact = c.width == width && c.height == height;
-        if (!exact) {
-            const float aspect = static_cast<float>(c.width) / static_cast<float>(c.height);
-            if (std::fabs(aspect - target_aspect) > target_aspect * 0.02f) {
-                continue;
-            }
-            if (c.width > width || c.width * 2 < width) {
-                continue; // larger than output or below half-res: not the scene depth
-            }
+        const bool exact = (c.width == full_width || c.width == eye_width) && c.height == height;
+        if (!exact && !shape_ok(c)) {
+            continue;
         }
 
         const bool live = c.last_bind_present + 2 > present;
@@ -179,6 +196,18 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t width, uint32
                 best = &c;
                 best_exact = exact;
                 best_live = true;
+            }
+            continue;
+        }
+
+        // Among live candidates, the LATEST-bound one is the main view's
+        // scene depth: UE renders scene captures / auxiliary views first and
+        // the main view (with its late translucency/post passes) last. A
+        // fixed-camera capture depth is live too but always binds earlier.
+        if (live && c.last_bind_order != best->last_bind_order) {
+            if (c.last_bind_order > best->last_bind_order) {
+                best = &c;
+                best_exact = exact;
             }
             continue;
         }

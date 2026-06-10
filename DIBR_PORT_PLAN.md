@@ -433,6 +433,30 @@ live, smooth scene depth (and the menu logo turns out to write real depth).
 Also ported the raymarch `popout_limit` near-disparity clamp into YoroSynthShiftBase
 so the Pop-out Limit slider works in YORO and tames close-geometry warp.
 
+### Depth liveness, part 2 (2026-06-10) — the depth that never moved
+
+User observation that nailed it: with the heatmap up, **the depth map did not move
+when the camera moved** — pose sweeps via the simulator confirmed pixel-identical
+depth at ±25° yaw. Root cause UNDER the liveness fix: in single-view rendering UE
+allocates SceneDepthZ at the LONE VIEW's extent (1280x720), and select_scene_depth
+filtered by the double-wide aspect (2560x720) — the real, live, HMD-tracked depth
+was rejected on aspect EVERY frame, and selection fell back to the frozen
+loading-screen-era depth (which approximates the menu's default view well enough
+that static-pose verification looked correct - the earlier "logo writes depth"
+reading was actually the frozen buffer).
+
+Fixes:
+- select_scene_depth now accepts BOTH shape families: double-wide
+  (full_width x height) and single-eye (eye_width x height), dynamic-res scaled
+  within each. With this, SN2 selects live 1280x720 R32G8X24 targets that track
+  the HMD (verified by pose-swept heatmaps).
+- Among live candidates, prefer the LATEST-bound one each frame (monotonic bind
+  counter): UE renders scene captures / aux views before the main view, so the
+  main scene depth always binds last. Also handles RDG ping-ponging SceneDepthZ
+  between pooled physical textures across frames.
+- run_dibr_synthesis logs every depth-target switch (pointer + extent + format)
+  so future depth-shaped distortion is diagnosable from the log alone.
+
 ### Rendering Method dropdown integration + Mono baseline (2026-06-10)
 
 - `RenderingMethod` gained two entries: **Synthetic Stereo (DIBR)** (3) — engages
