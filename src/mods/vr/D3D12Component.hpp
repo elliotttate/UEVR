@@ -20,6 +20,7 @@
 #include <../../directxtk12-src/Inc/DescriptorHeap.h>
 
 #include "d3d12/CommandContext.hpp"
+#include "d3d12/DIBRSynthesis.hpp"
 #include "d3d12/TextureContext.hpp"
 
 class VR;
@@ -49,6 +50,8 @@ public:
 
     auto& openxr() { return m_openxr; }
     auto& get_openvr_ui_tex() { return m_openvr.ui_tex; }
+    auto& get_dibr_synthesis() { return m_dibr; }
+    const auto& get_dibr_synthesis() const { return m_dibr; }
 
     // External-consumer hooks for the render-diagnostics FFI.
     // Eye target descriptor: the texture that holds the requested eye's pixels,
@@ -227,6 +230,21 @@ private:
     std::vector<std::unique_ptr<d3d12::TextureContext>> m_backbuffer_textures{};
     bool m_skip_spectator_view_for_volatile_external_rt{};
     ShfSceneMode m_shf_scene_mode{ShfSceneMode::Unknown};
+
+    // DIBR synthetic stereo (see DIBR_PORT_PLAN.md). Rewrites the SBS
+    // backbuffer in place with depth-synthesized stereo right before the
+    // per-eye copies; env-gated via UEVR_DIBR until the UI lands (Phase 3).
+    void run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D12_RESOURCE_STATES scene_source_state, ID3D12Resource* scene_depth);
+    DIBRSynthesis m_dibr{};
+    d3d12::CommandContext m_dibr_commands{};
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_dibr_source{};
+    uint32_t m_dibr_source_width{};
+    uint32_t m_dibr_source_height{};
+    DXGI_FORMAT m_dibr_source_format{DXGI_FORMAT_UNKNOWN};
+    // Frames the right-half mono fill stays armed after single-view mode
+    // turns off, covering backbuffers still in flight that were rendered
+    // with one view (see run_dibr_synthesis).
+    uint32_t m_dibr_single_view_cooldown{};
 
     std::unique_ptr<DirectX::DX12::GraphicsMemory> m_graphics_memory{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_backbuffer_batch{};

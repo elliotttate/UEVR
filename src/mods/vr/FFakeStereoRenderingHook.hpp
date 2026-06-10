@@ -545,6 +545,15 @@ public:
         return m_last_pre_rotation_double;
     }
 
+    // Whether we can actually make the engine render a single view: either the
+    // GetDesiredNumberOfViews vtable hook is installed, or the view-extension
+    // BeginRenderViewFamily fallback (which force-sets the view count) is. Used
+    // to gate DIBR single-view mode so it never claims to drop the second eye
+    // when the engine would keep rendering it anyway.
+    bool has_view_count_control() const {
+        return m_get_desired_number_of_views_hook != nullptr || m_has_view_extensions_installed;
+    }
+
     // Do not call these directly
     static void setup_viewpoint(ISceneViewExtension* extension, void* player_controller, void* view_info);
     static void localplayer_setup_viewpoint(void* localplayer, void* view_info, void* pass);

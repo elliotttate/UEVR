@@ -1,0 +1,1982 @@
+// dibr_yoro.hlsl — YORO / Meta-style asymmetric inverse-warp DIBR
+//
+// One eye is a pristine passthrough copy of the captured frame; the other
+// eye carries the FULL inter-eye disparity (2× the per-eye offset used by
+// symmetric DIBR). Same total stereo separation as dibr_inverse.hlsl, but
+// artifact distribution favours a sharp reference eye (marginally cheaper too).
+//
+// reference_eye: mode_param0, where 0.0 = left reference and 1.0 = right reference.
+
+Texture2D<float4> g_colorTex : register(t0);
+Texture2D<float>  g_depthTex : register(t1);
+RWTexture2D<float4> g_sbsOut : register(u0);
+SamplerState g_linearSampler : register(s0);
+SamplerState g_pointSampler : register(s1);
+
+cbuffer StereoParams : register(b0) {
+    float divergence;
+    float convergence;
+    uint  srcWidth;
+    uint  srcHeight;
+    float edge_compression;
+    float reverse_depth;
+    float depth_floor;
+    float depth_ceiling;
+    float depth_gain;
+    float depth_curve;
+    float depth_range_boost_strength;
+    float depth_range_boost_center;
+    float depth_range_boost_width;
+    float depth_range_boost_scale;
+    float perspective_shift;
+    float zpd_balance;
+    float popout_limit;
+    float edge_fill;
+    float edge_fill_mode;
+    float range_smoothing;
+    float foreground_protect;
+    float raymarch_steps;
+    float mode_param0;
+    float near_field_strength;
+    float near_field_start;
+    float near_field_end;
+    float near_field_target;
+    float auto_depth_strength;
+    float auto_depth_radius;
+    float auto_depth_min_range;
+    float auto_depth_contrast;
+    float disocclusion_strength;
+    float disocclusion_threshold;
+    float disocclusion_feather;
+    float disocclusion_depth_weight;
+    float edge_guard_strength;
+    float edge_guard_width;
+    float edge_guard_shape;
+    float edge_guard_near_depth;
+    float depth_uv_scale_x;
+    float depth_uv_scale_y;
+    float depth_uv_offset_x;
+    float depth_uv_offset_y;
+    float depth_uv_anchor;
+    float depth_uv_flip_x;
+    float depth_uv_flip_y;
+    float depth_value_flip;
+    float depth_linearize_strength;
+    float depth_linearize_near;
+    float depth_linearize_far;
+    float depth_linearize_mode;
+    float convergence_boundary_strength;
+    float convergence_boundary_threshold;
+    float convergence_boundary_feather;
+    float convergence_boundary_scale;
+    float depth_artifact_guard_strength;
+    float depth_artifact_guard_threshold;
+    float depth_artifact_guard_feather;
+    float depth_artifact_guard_scale;
+    float depth_edge_mask_strength;
+    float depth_edge_mask_radius;
+    float depth_edge_mask_threshold;
+    float depth_edge_mask_feather;
+    float depth_expand_strength;
+    float depth_expand_radius;
+    float depth_expand_edge_threshold;
+    float depth_expand_near_bias;
+    float letterbox_mask_strength;
+    float letterbox_mask_x;
+    float letterbox_mask_y;
+    float letterbox_mask_feather;
+    float letterbox_auto_strength;
+    float letterbox_auto_mode;
+    float letterbox_auto_max_x;
+    float letterbox_auto_max_y;
+    float letterbox_auto_threshold;
+    float letterbox_auto_feather;
+    float depth_reconstruct_strength;
+    float depth_reconstruct_radius;
+    float depth_reconstruct_edge_threshold;
+    float depth_reconstruct_near_bias;
+    float region_mask_strength;
+    float region_mask_left;
+    float region_mask_top;
+    float region_mask_right;
+    float region_mask_bottom;
+    float region_mask_target_depth;
+    float region_mask_feather;
+    float region_mask_depth_gate;
+    float weapon_mask_strength;
+    float weapon_mask_left;
+    float weapon_mask_top;
+    float weapon_mask_right;
+    float weapon_mask_bottom;
+    float weapon_mask_target_depth;
+    float weapon_mask_feather;
+    float weapon_mask_depth_gate;
+    float weapon_auto_mask_strength;
+    float weapon_auto_mask_y_start;
+    float weapon_auto_mask_near;
+    float weapon_auto_mask_far;
+    float weapon_auto_mask_target_depth;
+    float weapon_auto_mask_feather;
+    float weapon_boundary_strength;
+    float weapon_boundary_y_start;
+    float weapon_boundary_near;
+    float weapon_boundary_far;
+    float weapon_boundary_scale;
+    float weapon_boundary_feather;
+    float focus_reduction_strength;
+    float focus_reduction_mode;
+    float focus_reduction_world_scale;
+    float focus_reduction_weapon_scale;
+    float focus_reduction_eye_selection;
+    float output_matte_strength;
+    float output_matte_left;
+    float output_matte_top;
+    float output_matte_right;
+    float output_matte_bottom;
+    float output_matte_feather;
+    float output_matte_mode;
+    float output_matte_gray;
+    float cursor_overlay_strength;
+    float cursor_overlay_type;
+    float cursor_overlay_x;
+    float cursor_overlay_y;
+    float cursor_overlay_size;
+    float cursor_overlay_thickness;
+    float cursor_overlay_feather;
+    float cursor_overlay_depth;
+    float cursor_overlay_color_mode;
+    float cursor_overlay_lock_to_center;
+    float depth_sample_mode;
+    float depth_dither_strength;
+    float depth_dither_bits;
+    float raymarch_foveation_strength;
+    float raymarch_foveation_radius;
+    float raymarch_foveation_min_steps;
+    float raymarch_foveation_curve;
+    float debug_view_mode;
+    float debug_view_scale;
+    float debug_view_near;
+    float debug_view_far;
+    float ui_alpha_mask_strength;
+    float ui_alpha_mask_threshold;
+    float ui_alpha_mask_feather;
+    float ui_alpha_mask_target_depth;
+    float ui_auto_mask_strength;
+    float ui_auto_mask_mode;
+    float ui_auto_mask_threshold;
+    float ui_auto_mask_feather;
+    float ui_auto_mask_target_depth;
+    float shape_mask_strength;
+    float shape_mask_mode;
+    float shape_mask_left;
+    float shape_mask_top;
+    float shape_mask_right;
+    float shape_mask_bottom;
+    float shape_mask_target_depth;
+    float shape_mask_feather;
+    float shape_mask_depth_gate;
+    float shape_mask_invert;
+    float shape_mask_edge_width;
+    float comfort_nose_strength;
+    float comfort_nose_width;
+    float comfort_nose_height;
+    float comfort_nose_y;
+    float comfort_nose_feather;
+    float comfort_nose_curve;
+    float comfort_nose_mode;
+    float comfort_nose_color_r;
+    float comfort_nose_color_g;
+    float comfort_nose_color_b;
+    float image_filter_sharpen_strength;
+    float image_filter_radius;
+    float image_filter_sharpen_limit;
+    float image_filter_aa_strength;
+    float image_filter_aa_threshold;
+    float image_filter_aa_feather;
+    float image_filter_alpha_passthrough;
+    float image_filter_deband_strength;
+    float image_filter_deband_radius;
+    float image_filter_deband_threshold;
+    float image_filter_deband_grain;
+    float output_eye_swap;
+    float output_saturation;
+    float output_vignette_strength;
+    float output_vignette_radius;
+    float output_vignette_feather;
+    float output_hmd_vignette;
+    float output_geometry_barrel;
+    float output_geometry_radial_k2;
+    float output_geometry_radial_k3;
+    float output_geometry_poly_strength;
+    float output_geometry_poly_k1_r;
+    float output_geometry_poly_k1_g;
+    float output_geometry_poly_k1_b;
+    float output_geometry_poly_k2_r;
+    float output_geometry_poly_k2_g;
+    float output_geometry_poly_k2_b;
+    float output_geometry_zoom;
+    float output_geometry_fov;
+    float output_geometry_scale_x;
+    float output_geometry_scale_y;
+    float output_geometry_offset_x;
+    float output_geometry_offset_y;
+    float output_geometry_left_offset_x;
+    float output_geometry_left_offset_y;
+    float output_geometry_right_offset_x;
+    float output_geometry_right_offset_y;
+    float output_geometry_left_rotation_deg;
+    float output_geometry_right_rotation_deg;
+    float output_geometry_keystone_tilt;
+    float output_geometry_tie_right_alignment;
+    float output_geometry_ipd_offset;
+    float output_geometry_lens_dependent_ipd;
+    float output_geometry_axis_swap;
+    float output_headset_profile;
+    float output_composition_mode;
+    float output_layout_mode;
+    float output_anaglyph_saturation;
+    float output_anaglyph_contrast;
+    float output_anaglyph_mode;
+    float output_anaglyph_left_contrast;
+    float output_anaglyph_right_contrast;
+    float filter_emulator_focus;
+    float filter_emulator_max_depth;
+    float filter_emulator_near_reduction;
+    float filter_emulator_auto_focus;
+    float filter_emulator_reduce_r;
+    float filter_emulator_reduce_g;
+    float filter_emulator_reduce_b;
+    float output_interlace_swap;
+    float output_interlace_blend;
+    float output_interlace_scale_mode;
+    float output_interlace_sample_offset;
+    float output_distortion_grid;
+    float output_frame_marker_mode;
+    float output_frame_marker_thickness;
+    float output_alignment_marker_mode;
+    float output_alignment_marker_thickness;
+    float stereo_axis_mode;
+    uint  frame_index;
+};
+
+float EffectiveConvergence()
+{
+    return lerp(convergence, 0.5f, saturate(zpd_balance));
+}
+
+float StereoDepthDelta(float depth)
+{
+    return depth - EffectiveConvergence();
+}
+
+float FilterEmulatorMask()
+{
+    float compositionMode = floor(output_composition_mode + 0.5f);
+    float anaglyphMode = floor(output_anaglyph_mode + 0.5f);
+    return (anaglyphMode >= 4.5f && compositionMode >= 2.5f && compositionMode < 5.5f) ? 1.0f : 0.0f;
+}
+
+float FilterEmulatorFocusScale(float depth)
+{
+    if (FilterEmulatorMask() <= 0.0f) {
+        return 1.0f;
+    }
+
+    float focusValue = clamp(filter_emulator_focus, 0.0f, 1.5f);
+    float scale = max(0.0f, lerp(0.25f, 0.75f, 1.0f - focusValue));
+    if (filter_emulator_auto_focus > 0.5f) {
+        float focusDistance = abs(depth - EffectiveConvergence());
+        scale *= lerp(0.75f, 1.0f, saturate(smoothstep(0.0f, 0.13f, focusDistance)));
+    }
+    return scale;
+}
+
+float ApplyFilterEmulatorDepthControls(float depth)
+{
+    if (FilterEmulatorMask() <= 0.0f) {
+        return depth;
+    }
+
+    float adjusted = depth;
+    float farMask = saturate(adjusted * 0.5f);
+    adjusted = lerp(adjusted, min(adjusted, saturate(filter_emulator_max_depth)), farMask);
+
+    float focus = EffectiveConvergence();
+    float nearMask = saturate((focus - adjusted) / max(focus, 0.0001f));
+    adjusted = lerp(adjusted, lerp(adjusted, focus, 0.25f), nearMask * saturate(filter_emulator_near_reduction));
+    return saturate(adjusted);
+}
+
+float2 TransformDepthUv(float2 uv)
+{
+    float2 scale = max(float2(depth_uv_scale_x, depth_uv_scale_y), float2(0.0001f, 0.0001f));
+    float2 offset = float2(depth_uv_offset_x, depth_uv_offset_y);
+    float anchor = floor(depth_uv_anchor + 0.5f);
+    float2 mapped = (anchor < 0.5f)
+        ? (uv - 0.5f) / scale + 0.5f
+        : ((anchor < 1.5f) ? uv / scale : 1.0f - ((1.0f - uv) / scale));
+    mapped += offset;
+    if (depth_uv_flip_x > 0.5f) {
+        mapped.x = 1.0f - mapped.x;
+    }
+    if (depth_uv_flip_y > 0.5f) {
+        mapped.y = 1.0f - mapped.y;
+    }
+    return saturate(mapped);
+}
+
+float SampleDepthTexture(float2 uv)
+{
+    float mode = floor(depth_sample_mode + 0.5f);
+    return (mode >= 1.0f)
+        ? g_depthTex.SampleLevel(g_pointSampler, uv, 0)
+        : g_depthTex.SampleLevel(g_linearSampler, uv, 0);
+}
+
+float LetterboxAutoMask(float2 uv)
+{
+    float strength = saturate(letterbox_auto_strength);
+    if (strength <= 0.0f) {
+        return 0.0f;
+    }
+
+    float mode = floor(letterbox_auto_mode + 0.5f);
+    float feather = max(letterbox_auto_feather, 0.0001f);
+    float xExtent = saturate(letterbox_auto_max_x);
+    float yExtent = saturate(letterbox_auto_max_y);
+    float xMask = (mode < 0.5f || mode >= 1.5f)
+        ? 1.0f - smoothstep(max(xExtent - feather, 0.0f), xExtent, min(uv.x, 1.0f - uv.x))
+        : 0.0f;
+    float yMask = (mode < 1.5f)
+        ? 1.0f - smoothstep(max(yExtent - feather, 0.0f), yExtent, min(uv.y, 1.0f - uv.y))
+        : 0.0f;
+    float3 color = g_colorTex.SampleLevel(g_linearSampler, saturate(uv), 0).rgb;
+    float luma = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+    float threshold = saturate(letterbox_auto_threshold);
+    float darkMask = 1.0f - smoothstep(threshold, min(threshold + feather, 1.0f), luma);
+    return saturate(max(xMask, yMask) * darkMask * strength);
+}
+
+float LetterboxMask(float2 uv)
+{
+    float feather = max(letterbox_mask_feather, 0.0001f);
+    float xMask = (letterbox_mask_x > 0.0f)
+        ? 1.0f - smoothstep(max(letterbox_mask_x - feather, 0.0f), letterbox_mask_x, min(uv.x, 1.0f - uv.x))
+        : 0.0f;
+    float yMask = (letterbox_mask_y > 0.0f)
+        ? 1.0f - smoothstep(max(letterbox_mask_y - feather, 0.0f), letterbox_mask_y, min(uv.y, 1.0f - uv.y))
+        : 0.0f;
+    float manualMask = max(xMask, yMask) * saturate(letterbox_mask_strength);
+    return saturate(max(manualMask, LetterboxAutoMask(uv)));
+}
+
+float ApplyLetterboxDepthMask(float2 uv, float depth)
+{
+    return lerp(depth, EffectiveConvergence(), LetterboxMask(uv));
+}
+
+float RegionDepthMask(float2 uv, float depth)
+{
+    float strength = saturate(region_mask_strength);
+    if (strength <= 0.0f) {
+        return 0.0f;
+    }
+
+    float left = saturate(region_mask_left);
+    float top = saturate(region_mask_top);
+    float right = saturate(region_mask_right);
+    float bottom = saturate(region_mask_bottom);
+    if (right <= left || bottom <= top) {
+        return 0.0f;
+    }
+
+    float feather = max(region_mask_feather, 0.0001f);
+    float xMask = smoothstep(left, min(left + feather, right), uv.x)
+        * (1.0f - smoothstep(max(right - feather, left), right, uv.x));
+    float yMask = smoothstep(top, min(top + feather, bottom), uv.y)
+        * (1.0f - smoothstep(max(bottom - feather, top), bottom, uv.y));
+    float gate = saturate(region_mask_depth_gate);
+    float depthMask = (gate < 1.0f)
+        ? 1.0f - smoothstep(gate, min(gate + feather, 1.0f), depth)
+        : 1.0f;
+    return saturate(xMask * yMask * depthMask * strength);
+}
+
+float ApplyRegionDepthMask(float2 uv, float depth)
+{
+    return lerp(depth, saturate(region_mask_target_depth), RegionDepthMask(uv, depth));
+}
+
+float WeaponDepthMask(float2 uv, float depth)
+{
+    float strength = saturate(weapon_mask_strength);
+    if (strength <= 0.0f) {
+        return 0.0f;
+    }
+
+    float left = saturate(weapon_mask_left);
+    float top = saturate(weapon_mask_top);
+    float right = saturate(weapon_mask_right);
+    float bottom = saturate(weapon_mask_bottom);
+    if (right <= left || bottom <= top) {
+        return 0.0f;
+    }
+
+    float feather = max(weapon_mask_feather, 0.0001f);
+    float xMask = smoothstep(left, min(left + feather, right), uv.x)
+        * (1.0f - smoothstep(max(right - feather, left), right, uv.x));
+    float yMask = smoothstep(top, min(top + feather, bottom), uv.y)
+        * (1.0f - smoothstep(max(bottom - feather, top), bottom, uv.y));
+    float gate = saturate(weapon_mask_depth_gate);
+    float depthMask = (gate < 1.0f)
+        ? 1.0f - smoothstep(gate, min(gate + feather, 1.0f), depth)
+        : 1.0f;
+    return saturate(xMask * yMask * depthMask * strength);
+}
+
+float AutoWeaponDepthMask(float2 uv, float depth)
+{
+    float strength = saturate(weapon_auto_mask_strength);
+    if (strength <= 0.0f) {
+        return 0.0f;
+    }
+
+    float feather = max(weapon_auto_mask_feather, 0.0001f);
+    float yStart = min(saturate(weapon_auto_mask_y_start), 0.9999f);
+    float yMask = smoothstep(yStart, min(yStart + feather, 1.0f), uv.y);
+    float nearDepth = min(saturate(weapon_auto_mask_near), 0.9999f);
+    float farDepth = min(max(saturate(weapon_auto_mask_far), nearDepth + 0.0001f), 1.0f);
+    float depthMask = 1.0f - smoothstep(nearDepth, farDepth, depth);
+    return saturate(yMask * depthMask * strength);
+}
+
+float WeaponBoundaryScale(float2 uv, float depth)
+{
+    float strength = saturate(weapon_boundary_strength);
+    if (strength <= 0.0f) {
+        return 1.0f;
+    }
+
+    float feather = max(weapon_boundary_feather, 0.0001f);
+    float yStart = min(saturate(weapon_boundary_y_start), 0.9999f);
+    float yMask = smoothstep(yStart, min(yStart + feather, 1.0f), uv.y);
+    float nearDepth = min(saturate(weapon_boundary_near), 0.9999f);
+    float farDepth = min(max(saturate(weapon_boundary_far), nearDepth + 0.0001f), 1.0f);
+    float depthMask = 1.0f - smoothstep(nearDepth, farDepth, depth);
+    float mask = saturate(yMask * depthMask * strength);
+    return lerp(1.0f, saturate(weapon_boundary_scale), mask);
+}
+
+float AutoWeaponFocusMask(float2 uv, float depth)
+{
+    float feather = max(weapon_auto_mask_feather, 0.0001f);
+    float yStart = min(saturate(weapon_auto_mask_y_start), 0.9999f);
+    float yMask = smoothstep(yStart, min(yStart + feather, 1.0f), uv.y);
+    float nearDepth = min(saturate(weapon_auto_mask_near), 0.9999f);
+    float farDepth = min(max(saturate(weapon_auto_mask_far), nearDepth + 0.0001f), 1.0f);
+    float depthMask = 1.0f - smoothstep(nearDepth, farDepth, depth);
+    return saturate(yMask * depthMask);
+}
+
+float FocusReductionWeaponMask(float2 uv, float depth)
+{
+    return saturate(max(WeaponDepthMask(uv, depth), AutoWeaponFocusMask(uv, depth)));
+}
+
+float FocusReductionBaseScale(float2 uv, float depth)
+{
+    float strength = saturate(focus_reduction_strength);
+    if (strength <= 0.0f) {
+        return 1.0f;
+    }
+
+    float mode = floor(focus_reduction_mode + 0.5f);
+    float weaponMask = FocusReductionWeaponMask(uv, depth);
+    float worldScale = saturate(focus_reduction_world_scale);
+    float weaponScale = saturate(focus_reduction_weapon_scale);
+    float targetScale = lerp(worldScale, weaponScale, weaponMask);
+    if (mode < 0.5f) {
+        targetScale = lerp(worldScale, 1.0f, weaponMask);
+    } else if (mode < 1.5f) {
+        targetScale = lerp(1.0f, weaponScale, weaponMask);
+    }
+    return lerp(1.0f, targetScale, strength);
+}
+
+float FocusReductionEyeGate(float eyeSign)
+{
+    float selection = floor(focus_reduction_eye_selection + 0.5f);
+    if (selection < 0.5f) {
+        return 1.0f;
+    }
+    if (selection < 1.5f) {
+        return (eyeSign < 0.0f) ? 1.0f : 0.0f;
+    }
+    return (eyeSign > 0.0f) ? 1.0f : 0.0f;
+}
+
+float FocusReductionScale(float2 uv, float depth, float eyeSign)
+{
+    return lerp(1.0f, FocusReductionBaseScale(uv, depth), FocusReductionEyeGate(eyeSign));
+}
+
+float ApplyWeaponDepthMask(float2 uv, float depth)
+{
+    float manualMask = WeaponDepthMask(uv, depth);
+    float autoMask = AutoWeaponDepthMask(uv, depth);
+    float maskedDepth = lerp(depth, saturate(weapon_mask_target_depth), manualMask);
+    return lerp(maskedDepth, saturate(weapon_auto_mask_target_depth), autoMask);
+}
+
+float RectShapeMask(float2 uv, float left, float top, float right, float bottom, float feather)
+{
+    float xMask = smoothstep(left, min(left + feather, right), uv.x)
+        * (1.0f - smoothstep(max(right - feather, left), right, uv.x));
+    float yMask = smoothstep(top, min(top + feather, bottom), uv.y)
+        * (1.0f - smoothstep(max(bottom - feather, top), bottom, uv.y));
+    return saturate(xMask * yMask);
+}
+
+float ShapeDepthMask(float2 uv, float depth)
+{
+    float strength = saturate(shape_mask_strength);
+    float mode = floor(shape_mask_mode + 0.5f);
+    if (strength <= 0.0f || mode < 0.5f) {
+        return 0.0f;
+    }
+
+    float left = saturate(shape_mask_left);
+    float top = saturate(shape_mask_top);
+    float right = saturate(shape_mask_right);
+    float bottom = saturate(shape_mask_bottom);
+    if (right <= left || bottom <= top) {
+        return 0.0f;
+    }
+
+    float feather = max(shape_mask_feather, 0.0001f);
+    float2 center = float2((left + right) * 0.5f, (top + bottom) * 0.5f);
+    float2 halfSize = max(float2((right - left) * 0.5f, (bottom - top) * 0.5f), float2(0.0001f, 0.0001f));
+    float rectMask = RectShapeMask(uv, left, top, right, bottom, feather);
+    float2 ellipseD = (uv - center) / halfSize;
+    float ellipseRadius = length(ellipseD);
+    float featherNorm = feather / max(min(halfSize.x, halfSize.y), 0.0001f);
+    float ellipseMask = 1.0f - smoothstep(max(1.0f - featherNorm, 0.0f), 1.0f, ellipseRadius);
+    float edgeWidth = max(shape_mask_edge_width, 0.0f);
+    float rectDistance = min(min(uv.x - left, right - uv.x), min(uv.y - top, bottom - uv.y));
+    float rectEdge = rectMask * (1.0f - smoothstep(edgeWidth, edgeWidth + feather, rectDistance));
+    float ellipseDistance = max((1.0f - ellipseRadius) * min(halfSize.x, halfSize.y), 0.0f);
+    float ellipseEdge = saturate(ellipseMask) * (1.0f - smoothstep(edgeWidth, edgeWidth + feather, ellipseDistance));
+
+    float shape = (mode < 1.5f) ? rectMask
+        : ((mode < 2.5f) ? ellipseMask
+        : ((mode < 3.5f) ? rectEdge : ellipseEdge));
+    shape = lerp(shape, 1.0f - shape, step(0.5f, shape_mask_invert));
+
+    float gate = saturate(shape_mask_depth_gate);
+    float depthMask = (gate < 1.0f)
+        ? 1.0f - smoothstep(gate, min(gate + feather, 1.0f), depth)
+        : 1.0f;
+    return saturate(shape * depthMask * strength);
+}
+
+float ApplyShapeDepthMask(float2 uv, float depth)
+{
+    return lerp(depth, saturate(shape_mask_target_depth), ShapeDepthMask(uv, depth));
+}
+
+float OutputMatteMask(float2 uv)
+{
+    float strength = saturate(output_matte_strength);
+    if (strength <= 0.0f) {
+        return 0.0f;
+    }
+
+    float left = saturate(output_matte_left);
+    float top = saturate(output_matte_top);
+    float right = saturate(output_matte_right);
+    float bottom = saturate(output_matte_bottom);
+    if (right <= left || bottom <= top) {
+        return 0.0f;
+    }
+
+    float feather = max(output_matte_feather, 0.0001f);
+    float xMask = smoothstep(left, min(left + feather, right), uv.x)
+        * (1.0f - smoothstep(max(right - feather, left), right, uv.x));
+    float yMask = smoothstep(top, min(top + feather, bottom), uv.y)
+        * (1.0f - smoothstep(max(bottom - feather, top), bottom, uv.y));
+    return saturate(xMask * yMask * strength);
+}
+
+float4 ApplyOutputMatte(float2 uv, float4 stereoColor, float4 centerColor)
+{
+    float mask = OutputMatteMask(uv);
+    if (mask <= 0.0f) {
+        return stereoColor;
+    }
+
+    float mode = floor(output_matte_mode + 0.5f);
+    float gray = saturate(output_matte_gray);
+    float4 target = centerColor;
+    if (mode >= 0.5f && mode < 1.5f) {
+        target = float4(0.0f, 0.0f, 0.0f, stereoColor.a);
+    } else if (mode >= 1.5f && mode < 2.5f) {
+        target = float4(1.0f, 1.0f, 1.0f, stereoColor.a);
+    } else if (mode >= 2.5f) {
+        target = float4(gray, gray, gray, stereoColor.a);
+    }
+    return lerp(stereoColor, target, mask);
+}
+
+float3 CursorOverlayColor()
+{
+    float mode = floor(cursor_overlay_color_mode + 0.5f);
+    if (mode < 0.5f) return float3(1.0f, 1.0f, 1.0f);
+    if (mode < 1.5f) return float3(0.0f, 0.0f, 0.0f);
+    if (mode < 2.5f) return float3(1.0f, 0.0f, 0.0f);
+    if (mode < 3.5f) return float3(0.0f, 1.0f, 0.0f);
+    if (mode < 4.5f) return float3(0.0f, 0.25f, 1.0f);
+    if (mode < 5.5f) return float3(0.0f, 1.0f, 1.0f);
+    if (mode < 6.5f) return float3(1.0f, 0.0f, 1.0f);
+    return float3(1.0f, 1.0f, 0.0f);
+}
+
+float CursorSegmentMask(float2 p, float2 a, float2 b, float thickness, float feather)
+{
+    float2 pa = p - a;
+    float2 ba = b - a;
+    float h = saturate(dot(pa, ba) / max(dot(ba, ba), 0.000001f));
+    float dist = length(pa - ba * h);
+    return 1.0f - smoothstep(thickness, thickness + feather, dist);
+}
+
+float CursorOverlayMask(float2 uv, float eyeSign)
+{
+    float strength = saturate(cursor_overlay_strength);
+    float type = floor(cursor_overlay_type + 0.5f);
+    if (strength <= 0.0f || type < 0.5f) {
+        return 0.0f;
+    }
+
+    float centerX = lerp(saturate(cursor_overlay_x), 0.5f, step(0.5f, cursor_overlay_lock_to_center));
+    float2 center = float2(centerX, saturate(cursor_overlay_y));
+    float cursorShift = divergence * StereoDepthDelta(saturate(cursor_overlay_depth)) / (float)srcWidth;
+    center.x -= eyeSign * cursorShift;
+
+    float2 d = uv - center;
+    d.x *= (float)srcWidth / max((float)srcHeight, 1.0f);
+    float size = max(cursor_overlay_size, 0.0001f);
+    float thickness = max(cursor_overlay_thickness, 0.0001f);
+    float feather = max(cursor_overlay_feather, 0.00001f);
+    float lenD = length(d);
+    float crossX = (1.0f - smoothstep(thickness, thickness + feather, abs(d.y)))
+        * (1.0f - smoothstep(size, size + feather, abs(d.x)));
+    float crossY = (1.0f - smoothstep(thickness, thickness + feather, abs(d.x)))
+        * (1.0f - smoothstep(size, size + feather, abs(d.y)));
+    float cross = saturate(max(crossX, crossY));
+    float ring = 1.0f - smoothstep(thickness, thickness + feather, abs(lenD - size * 0.65f));
+    float diamond = 1.0f - smoothstep(size, size + feather, abs(d.x) + abs(d.y));
+    float dot = 1.0f - smoothstep(size * 0.45f, size * 0.45f + feather, lenD);
+    float pointer = max(
+        CursorSegmentMask(d, float2(-size * 0.55f, -size * 0.55f), float2(size * 0.38f, size * 0.02f), thickness, feather),
+        CursorSegmentMask(d, float2(-size * 0.55f, -size * 0.55f), float2(-size * 0.05f, size * 0.48f), thickness, feather));
+    pointer = max(pointer, CursorSegmentMask(d, float2(size * 0.02f, size * 0.20f), float2(size * 0.32f, size * 0.52f), thickness, feather));
+
+    float mask = (type < 1.5f) ? max(ring, cross * 0.75f)
+        : ((type < 2.5f) ? diamond
+        : ((type < 3.5f) ? dot
+        : ((type < 4.5f) ? cross : pointer)));
+    return saturate(mask * strength);
+}
+
+float4 ApplyCursorOverlay(float2 uv, float eyeSign, float4 color)
+{
+    float mask = CursorOverlayMask(uv, eyeSign);
+    if (mask <= 0.0f) {
+        return color;
+    }
+    return float4(lerp(color.rgb, CursorOverlayColor(), mask), color.a);
+}
+
+float ComfortNoseMask(float2 uv, float eyeSign)
+{
+    float strength = saturate(comfort_nose_strength);
+    if (strength <= 0.0f) {
+        return 0.0f;
+    }
+
+    float side = (eyeSign > 0.0f) ? (1.0f - uv.x) : uv.x;
+    float width = max(comfort_nose_width, 0.0001f);
+    float height = max(comfort_nose_height, 0.0001f);
+    float yCenter = saturate(comfort_nose_y);
+    float feather = max(comfort_nose_feather, 0.0001f);
+    float curve = max(comfort_nose_curve, 0.1f);
+    float x = side / width;
+    float y = abs(uv.y - yCenter) / height;
+    float shape = pow(max(x, 0.0f), curve) + y * y;
+    return saturate((1.0f - smoothstep(max(1.0f - feather, 0.0f), 1.0f, shape)) * strength);
+}
+
+float4 ApplyComfortNose(float2 uv, float eyeSign, float4 color)
+{
+    float mask = ComfortNoseMask(uv, eyeSign);
+    if (mask <= 0.0f) {
+        return color;
+    }
+    float mode = floor(comfort_nose_mode + 0.5f);
+    float3 target = float3(0.0f, 0.0f, 0.0f);
+    if (mode >= 0.5f) {
+        float3 noseColor = saturate(float3(comfort_nose_color_r, comfort_nose_color_g, comfort_nose_color_b));
+        target = noseColor;
+        if (mode >= 1.5f) {
+            float luma = dot(color.rgb, float3(0.2126f, 0.7152f, 0.0722f));
+            target = (mode < 2.5f) ? (noseColor * luma) : (noseColor * color.rgb);
+        }
+    }
+    return float4(lerp(color.rgb, target, mask), color.a);
+}
+
+float ImageFilterLuma(float3 color)
+{
+    return dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+float ImageFilterNoise(float2 uv)
+{
+    float2 p = uv * float2((float)srcWidth, (float)srcHeight);
+    return frac(52.9829189f * frac(dot(p, float2(0.06711056f, 0.00583715f))));
+}
+
+float4 ApplyImageFilter(float2 sampleUv, float4 color)
+{
+    float sharpenStrength = max(image_filter_sharpen_strength, 0.0f);
+    float aaStrength = saturate(image_filter_aa_strength);
+    float debandStrength = saturate(image_filter_deband_strength);
+    float debandGrain = max(image_filter_deband_grain, 0.0f);
+    if (sharpenStrength <= 0.0f && aaStrength <= 0.0f && debandStrength <= 0.0f && debandGrain <= 0.0f) {
+        return color;
+    }
+
+    float2 uv = saturate(sampleUv);
+    float4 filtered = color;
+
+    if (debandStrength > 0.0f || debandGrain > 0.0f) {
+        float debandRadius = max(image_filter_deband_radius, 0.0f);
+        float2 debandTexel = float2(1.0f / max((float)srcWidth, 1.0f), 1.0f / max((float)srcHeight, 1.0f)) * debandRadius;
+        float4 dl = g_colorTex.SampleLevel(g_linearSampler, saturate(uv - float2(debandTexel.x, 0.0f)), 0);
+        float4 dr = g_colorTex.SampleLevel(g_linearSampler, saturate(uv + float2(debandTexel.x, 0.0f)), 0);
+        float4 du = g_colorTex.SampleLevel(g_linearSampler, saturate(uv - float2(0.0f, debandTexel.y)), 0);
+        float4 dd = g_colorTex.SampleLevel(g_linearSampler, saturate(uv + float2(0.0f, debandTexel.y)), 0);
+        float4 debandAverage = (dl + dr + du + dd + filtered * 4.0f) / 8.0f;
+        float debandGradient = max(abs(ImageFilterLuma(dr.rgb) - ImageFilterLuma(dl.rgb)),
+                                   abs(ImageFilterLuma(dd.rgb) - ImageFilterLuma(du.rgb)));
+        float threshold = max(image_filter_deband_threshold, 0.0f);
+        float flatMask = 1.0f - smoothstep(threshold, threshold * 2.0f + 0.0001f, debandGradient);
+        filtered.rgb = saturate(lerp(filtered.rgb, debandAverage.rgb, debandStrength * flatMask));
+        if (debandGrain > 0.0f) {
+            float grain = (ImageFilterNoise(uv) - 0.5f) * (debandGrain / 255.0f) * flatMask;
+            filtered.rgb = saturate(filtered.rgb + grain);
+        }
+    }
+
+    float radius = max(image_filter_radius, 0.0f);
+    float2 texel = float2(1.0f / max((float)srcWidth, 1.0f), 1.0f / max((float)srcHeight, 1.0f)) * radius;
+    float4 left = g_colorTex.SampleLevel(g_linearSampler, saturate(uv - float2(texel.x, 0.0f)), 0);
+    float4 right = g_colorTex.SampleLevel(g_linearSampler, saturate(uv + float2(texel.x, 0.0f)), 0);
+    float4 up = g_colorTex.SampleLevel(g_linearSampler, saturate(uv - float2(0.0f, texel.y)), 0);
+    float4 down = g_colorTex.SampleLevel(g_linearSampler, saturate(uv + float2(0.0f, texel.y)), 0);
+    float4 average = (left + right + up + down + filtered * 2.0f) / 6.0f;
+
+    float gradient = max(abs(ImageFilterLuma(right.rgb) - ImageFilterLuma(left.rgb)),
+                         abs(ImageFilterLuma(down.rgb) - ImageFilterLuma(up.rgb)));
+    float threshold = max(image_filter_aa_threshold, 0.0f);
+    float feather = max(image_filter_aa_feather, 0.0001f);
+    float edgeMask = smoothstep(threshold, threshold + feather, gradient);
+    filtered = lerp(filtered, average, aaStrength * edgeMask);
+
+    if (sharpenStrength > 0.0f) {
+        float4 blur = (left + right + up + down + filtered * 4.0f) / 8.0f;
+        float limit = max(image_filter_sharpen_limit, 0.0f);
+        float3 detail = clamp(filtered.rgb - blur.rgb, float3(-limit, -limit, -limit), float3(limit, limit, limit));
+        filtered.rgb = saturate(filtered.rgb + detail * sharpenStrength);
+    }
+
+    filtered.a = lerp(filtered.a, color.a, saturate(image_filter_alpha_passthrough));
+    return filtered;
+}
+
+float2 OutputPolynomialUv(float2 uv, float k1, float k2)
+{
+    float2 p = uv * 2.0f - 1.0f;
+    float r2 = dot(p, p);
+    float r4 = r2 * r2;
+    p *= 1.0f + k1 * r2 + k2 * r4;
+    return saturate(p * 0.5f + 0.5f);
+}
+
+float4 OutputDistortionGridColor(float2 uv)
+{
+    float2 grid = abs(frac((uv - 0.5f) * 25.0f));
+    float gridLine = (grid.x > 0.9f || grid.y > 0.9f) ? 1.0f : 0.0f;
+    return float4(gridLine, gridLine, gridLine, 1.0f);
+}
+
+float4 SampleOutputSource(float2 uv)
+{
+    if (output_distortion_grid > 0.5f) {
+        return OutputDistortionGridColor(uv);
+    }
+    return g_colorTex.SampleLevel(g_linearSampler, uv, 0);
+}
+
+float OutputHeadsetProfileMode()
+{
+    return floor(clamp(output_headset_profile, 0.0f, 3.0f) + 0.5f);
+}
+
+bool OutputHeadsetProfileEnabled()
+{
+    return OutputHeadsetProfileMode() > 0.5f;
+}
+
+float OutputHeadsetIpdOffset()
+{
+    float profile = OutputHeadsetProfileMode();
+    if (profile < 0.5f) {
+        return output_geometry_ipd_offset;
+    }
+    if (profile < 1.5f) {
+        return 0.0f;
+    }
+    if (profile < 2.5f) {
+        return 25.0f;
+    }
+    return 27.25f;
+}
+
+float2 OutputHeadsetScale()
+{
+    float profile = OutputHeadsetProfileMode();
+    if (profile < 0.5f) {
+        return max(float2(output_geometry_scale_x, output_geometry_scale_y), float2(0.0001f, 0.0001f));
+    }
+    float yScale = (profile >= 1.5f && profile < 2.5f) ? 0.925f : 1.0f;
+    return float2(1.0f, yScale);
+}
+
+float OutputHeadsetZoom()
+{
+    return OutputHeadsetProfileEnabled() ? 1.0f : max(output_geometry_zoom, 0.0001f);
+}
+
+float OutputHeadsetFov()
+{
+    return OutputHeadsetProfileEnabled() ? 0.0f : output_geometry_fov;
+}
+
+float2 OutputHeadsetPixelOffset(float eyeSign)
+{
+    if (OutputHeadsetProfileEnabled()) {
+        return float2(0.0f, 0.0f);
+    }
+    bool useLeftAlignment = eyeSign > 0.0f || output_geometry_tie_right_alignment > 0.5f;
+    return useLeftAlignment
+        ? float2(output_geometry_left_offset_x, output_geometry_left_offset_y)
+        : float2(output_geometry_right_offset_x, output_geometry_right_offset_y);
+}
+
+float OutputHeadsetRotation(float eyeSign)
+{
+    if (OutputHeadsetProfileEnabled()) {
+        return 0.0f;
+    }
+    bool useLeftAlignment = eyeSign > 0.0f || output_geometry_tie_right_alignment > 0.5f;
+    return useLeftAlignment ? output_geometry_left_rotation_deg : output_geometry_right_rotation_deg;
+}
+
+float3 OutputHeadsetPolyK1()
+{
+    if (OutputHeadsetProfileEnabled()) {
+        return float3(0.22f, 0.22f, 0.22f);
+    }
+    return float3(output_geometry_poly_k1_r, output_geometry_poly_k1_g, output_geometry_poly_k1_b);
+}
+
+float3 OutputHeadsetPolyK2()
+{
+    if (OutputHeadsetProfileEnabled()) {
+        return float3(0.24f, 0.24f, 0.24f);
+    }
+    return float3(output_geometry_poly_k2_r, output_geometry_poly_k2_g, output_geometry_poly_k2_b);
+}
+
+float4 SampleOutputColor(float2 sampleUv)
+{
+    float2 uv = saturate(sampleUv);
+    float4 baseColor = SampleOutputSource(uv);
+    float strength = saturate(output_geometry_poly_strength);
+    if (strength <= 0.0f) {
+        return baseColor;
+    }
+
+    float3 k1 = clamp(OutputHeadsetPolyK1(), -2.0f, 2.0f);
+    float3 k2 = clamp(OutputHeadsetPolyK2(), -2.0f, 2.0f);
+    float2 uvR = lerp(uv, OutputPolynomialUv(uv, k1.r, k2.r), strength);
+    float2 uvG = lerp(uv, OutputPolynomialUv(uv, k1.g, k2.g), strength);
+    float2 uvB = lerp(uv, OutputPolynomialUv(uv, k1.b, k2.b), strength);
+    float4 red = SampleOutputSource(uvR);
+    float4 green = SampleOutputSource(uvG);
+    float4 blue = SampleOutputSource(uvB);
+    return float4(red.r, green.g, blue.b, green.a);
+}
+
+float4 SampleFilteredOutputColor(float2 sampleUv)
+{
+    return ApplyImageFilter(sampleUv, SampleOutputColor(sampleUv));
+}
+
+float2 MirrorEdgeUv(float2 uv)
+{
+    return 1.0f - abs(frac(uv * 0.5f) * 2.0f - 1.0f);
+}
+
+float4 SampleStereoColor(float2 sampleUv, float2 centerUv, float4 centerColor)
+{
+    float outside = (sampleUv.x < 0.0f || sampleUv.x > 1.0f ||
+                     sampleUv.y < 0.0f || sampleUv.y > 1.0f) ? 1.0f : 0.0f;
+    float mode = floor(edge_fill_mode + 0.5f);
+    float2 edgeUv = (mode < 0.5f) ? MirrorEdgeUv(sampleUv) : saturate(sampleUv);
+    float4 edgeColor = SampleFilteredOutputColor(edgeUv);
+    if (outside >= 0.5f) {
+        float4 blackColor = float4(0.0f, 0.0f, 0.0f, centerColor.a);
+        float4 fillColor = (mode >= 0.5f && mode < 1.5f) ? blackColor : edgeColor;
+        return lerp(centerColor, fillColor, saturate(edge_fill));
+    }
+    return edgeColor;
+}
+
+float3 PrepareCompositionColor(float3 color, float eyeContrast)
+{
+    float sat = max(output_anaglyph_saturation, 0.0f);
+    float luma = ImageFilterLuma(color);
+    color = lerp(float3(luma, luma, luma), color, sat);
+    float contrast = max(output_anaglyph_contrast * eyeContrast, 0.0f);
+    return saturate((color - 0.5f) * contrast + 0.5f);
+}
+
+float3 ComposeSimpleAnaglyphColor(float3 left, float3 right, float pair)
+{
+    if (pair < 0.5f) {
+        return float3(left.r, right.g, right.b);
+    }
+    if (pair < 1.5f) {
+        return float3(right.r, left.g, right.b);
+    }
+    return float3(right.r, right.g, left.b);
+}
+
+float3 ComposeOptimizedAnaglyphColor(float3 left, float3 right, float pair)
+{
+    if (pair < 0.5f) {
+        float3 dubois;
+        dubois.r = dot(left, float3(0.437f, 0.449f, 0.164f)) + dot(right, float3(-0.062f, -0.062f, -0.024f));
+        dubois.g = dot(left, float3(-0.011f, -0.032f, -0.007f)) + dot(right, float3(0.377f, 0.761f, -0.009f));
+        dubois.b = dot(left, float3(-0.015f, -0.034f, -0.006f)) + dot(right, float3(-0.026f, -0.093f, 1.234f));
+        return saturate(dubois);
+    }
+
+    if (pair < 1.5f) {
+        float3 tuned;
+        tuned.r = dot(left, float3(-0.062f, -0.158f, -0.039f)) + dot(right, float3(0.529f, 0.705f, 0.024f));
+        tuned.g = dot(left, float3(0.284f, 0.668f, 0.143f)) + dot(right, float3(-0.016f, -0.015f, 0.065f));
+        tuned.b = dot(left, float3(-0.015f, -0.027f, 0.021f)) + dot(right, float3(0.009f, 0.075f, 0.937f));
+        return saturate(tuned);
+    }
+
+    float3 amber;
+    amber.r = dot(left, float3(0.72f, 0.21f, 0.07f)) + dot(right, float3(0.04f, 0.04f, -0.02f));
+    amber.g = dot(left, float3(0.18f, 0.72f, 0.10f)) + dot(right, float3(0.03f, 0.03f, -0.01f));
+    amber.b = dot(right, float3(0.07f, 0.18f, 0.75f)) + dot(left, float3(-0.03f, -0.03f, 0.06f));
+    return saturate(amber);
+}
+
+float3 ComposeDeghostAnaglyphColor(float3 left, float3 right, float pair)
+{
+    float3 simple = ComposeSimpleAnaglyphColor(left, right, pair);
+    float l = ImageFilterLuma(left);
+    float r = ImageFilterLuma(right);
+    float delta = l - r;
+    float3 correction;
+    if (pair < 0.5f) {
+        correction = float3(delta * 0.08f, -delta * 0.04f, -delta * 0.04f);
+    } else if (pair < 1.5f) {
+        correction = float3(-delta * 0.04f, delta * 0.08f, -delta * 0.04f);
+    } else {
+        correction = float3(-delta * 0.04f, -delta * 0.04f, delta * 0.08f);
+    }
+    return saturate(simple + correction);
+}
+
+float3 ComposeWarmCoolAnaglyphColor(float3 left, float3 right, float pair)
+{
+    pair = floor(pair + 0.5f);
+    if (pair < 0.5f) {
+        float warm = dot(left, float3(0.72f, 0.22f, 0.06f));
+        float coolG = dot(right, float3(0.08f, 0.78f, 0.14f));
+        float coolB = dot(right, float3(0.04f, 0.24f, 0.72f));
+        return saturate(float3(warm, coolG, coolB));
+    }
+    if (pair < 1.5f) {
+        float magR = dot(right, float3(0.72f, 0.22f, 0.06f));
+        float green = dot(left, float3(0.12f, 0.76f, 0.12f));
+        float magB = dot(right, float3(0.06f, 0.22f, 0.72f));
+        return saturate(float3(magR, green, magB));
+    }
+
+    float amberR = dot(right, float3(0.78f, 0.18f, 0.04f));
+    float amberG = dot(right, float3(0.22f, 0.72f, 0.06f));
+    float blue = dot(left, float3(0.06f, 0.20f, 0.74f));
+    return saturate(float3(amberR, amberG, blue));
+}
+
+float3 ApplyFilterEmulatorRgbReduction(float3 color)
+{
+    float3 balance = float3(
+        dot(color, float3(1.0f, -1.0f, -1.0f)),
+        dot(color, float3(-1.0f, 1.0f, -1.0f)),
+        dot(color, float3(-1.0f, -1.0f, 1.0f)));
+    color.r *= lerp(1.0f, lerp(1.0f, 0.5f, smoothstep(-0.250f, 0.0f, balance.r)), saturate(filter_emulator_reduce_r));
+    color.g *= lerp(1.0f, lerp(1.0f, 0.5f, smoothstep(-0.375f, 0.0f, balance.g)), saturate(filter_emulator_reduce_g));
+    color.b *= lerp(1.0f, lerp(1.0f, 0.5f, smoothstep(-0.500f, 0.0f, balance.b)), saturate(filter_emulator_reduce_b));
+    return saturate(color);
+}
+
+float3 ComposeFilterEmulatorAnaglyphColor(float3 left, float3 right, float pair)
+{
+    pair = floor(pair + 0.5f);
+    float3 color;
+    if (pair < 0.5f) {
+        color = left * float3(1.0f, 0.0f, 1.0f) + right * float3(0.0f, 1.0f, 0.0f);
+        return ApplyFilterEmulatorRgbReduction(color);
+    }
+
+    if (pair < 1.5f) {
+        color = float3(left.r, ImageFilterLuma(right), left.b);
+        return ApplyFilterEmulatorRgbReduction(color);
+    }
+
+    float leftLuma = ImageFilterLuma(left);
+    float rightLuma = ImageFilterLuma(right);
+    color = float3(left.r + 0.35f * left.b, right.g + 0.25f * right.b, 0.5f * (leftLuma + rightLuma));
+    return ApplyFilterEmulatorRgbReduction(color);
+}
+
+float3 ComposeRedBlueOptimizedAnaglyphColor(float3 left, float3 right)
+{
+    return saturate(float3(ImageFilterLuma(left), 0.0f, ImageFilterLuma(right)));
+}
+
+float3 ComposeRedGreenAnaglyphColor(float3 left, float3 right)
+{
+    return saturate(float3(left.r, right.g, 0.0f));
+}
+
+float3 ComposeMagentaCyanAnaglyphColor(float3 left, float3 right)
+{
+    float leftLuma = ImageFilterLuma(left);
+    float rightLuma = ImageFilterLuma(right);
+    return saturate(float3(left.r + left.b, right.g + right.b, 0.5f * (leftLuma + rightLuma)));
+}
+
+float3 ComposeLcdOptimizedRedCyanAnaglyphColor(float3 left, float3 right)
+{
+    float3 color;
+    color.r = dot(left, float3(0.4561f, 0.500484f, 0.176381f)) + dot(right, float3(-0.0434706f, -0.0879388f, -0.00155529f));
+    color.g = dot(left, float3(-0.400822f, -0.0378246f, -0.0157589f)) + dot(right, float3(0.378476f, 0.73364f, -0.0184503f));
+    color.b = dot(left, float3(-0.0152161f, -0.0205971f, -0.00546856f)) + dot(right, float3(-0.0721527f, -0.112961f, 1.2264f));
+    return pow(saturate(color), float3(0.625f, 1.25f, 1.0f));
+}
+
+float3 ComposeGreenMagentaTriochromeAnaglyphColor(float3 left, float3 right)
+{
+    float lOne = 0.45f;
+    float rOne = 0.8f;
+    float deghost = 0.275f;
+    float3 image;
+    float3 accum = saturate(right * float3(rOne, 1.0f - rOne, 0.0f));
+    image.r = pow(dot(accum, float3(1.0f, 1.0f, 1.0f)), 1.15f);
+    accum = saturate(left * float3((1.0f - lOne) * 0.5f, lOne, (1.0f - lOne) * 0.5f));
+    image.g = pow(dot(accum, float3(1.0f, 1.0f, 1.0f)), 1.05f);
+    accum = saturate(right * float3(0.0f, 1.0f - rOne, rOne));
+    image.b = pow(dot(accum, float3(1.0f, 1.0f, 1.0f)), 1.15f);
+
+    float3 base = image;
+    image.r = base.r + (base.r * (deghost * 0.5f)) + (base.g * (deghost * -0.25f)) + (base.b * (deghost * -0.25f));
+    image.g = base.g + (base.r * (deghost * -0.5f)) + (base.g * (deghost * 0.25f)) + (base.b * (deghost * -0.5f));
+    image.b = base.b + (base.r * (deghost * -0.25f)) + (base.g * (deghost * -0.25f)) + (base.b * (deghost * 0.5f));
+    return saturate(image);
+}
+
+float3 ComposeBlueAmberColorCodeAnaglyphColor(float3 left, float3 right)
+{
+    float lOne = 0.45f;
+    float rOne = 1.0f;
+    float deghost = 0.275f;
+    float3 image;
+    float3 accum = saturate(left * float3(rOne, 0.0f, 1.0f - rOne));
+    image.r = pow(dot(accum, float3(1.0f, 1.0f, 1.0f)), 1.05f);
+    accum = saturate(left * float3(0.0f, rOne, 1.0f - rOne));
+    image.g = pow(dot(accum, float3(1.0f, 1.0f, 1.0f)), 1.10f);
+    accum = saturate(right * float3((1.0f - lOne) * 0.5f, (1.0f - lOne) * 0.5f, lOne));
+    image.b = pow(dot(accum, float3(1.0f, 1.0f, 1.0f)), 1.0f);
+    image.b = lerp(pow(image.b, (deghost * 0.15f) + 1.0f), 1.0f - pow(abs(1.0f - image.b), (deghost * 0.15f) + 1.0f), image.b);
+
+    float3 base = image;
+    image.r = base.r + (base.r * (deghost * 1.5f)) + (base.g * (deghost * -0.75f)) + (base.b * (deghost * -0.75f));
+    image.g = base.g + (base.r * (deghost * -0.75f)) + (base.g * (deghost * 1.5f)) + (base.b * (deghost * -0.75f));
+    image.b = base.b + (base.r * (deghost * -1.5f)) + (base.g * (deghost * -1.5f)) + (base.b * (deghost * 3.0f));
+    return saturate(image);
+}
+
+float3 ComposeAnaglyphColor(float3 left, float3 right, float channelMode)
+{
+    float mode = floor(output_anaglyph_mode + 0.5f);
+    float pair = floor(channelMode + 0.5f);
+    if (mode >= 10.5f) {
+        return ComposeRedGreenAnaglyphColor(left, right);
+    }
+    if (mode >= 9.5f) {
+        return ComposeLcdOptimizedRedCyanAnaglyphColor(left, right);
+    }
+    if (mode >= 8.5f) {
+        return ComposeBlueAmberColorCodeAnaglyphColor(left, right);
+    }
+    if (mode >= 7.5f) {
+        return ComposeGreenMagentaTriochromeAnaglyphColor(left, right);
+    }
+    if (mode >= 6.5f) {
+        return ComposeMagentaCyanAnaglyphColor(left, right);
+    }
+    if (mode >= 5.5f) {
+        return ComposeRedBlueOptimizedAnaglyphColor(left, right);
+    }
+    if (mode >= 4.5f) {
+        return ComposeFilterEmulatorAnaglyphColor(left, right, pair);
+    }
+    if (mode >= 3.5f) {
+        return ComposeWarmCoolAnaglyphColor(left, right, pair);
+    }
+    if (mode >= 2.5f) {
+        return ComposeDeghostAnaglyphColor(left, right, pair);
+    }
+    if (mode >= 1.5f) {
+        return ComposeOptimizedAnaglyphColor(left, right, pair);
+    }
+
+    if (mode >= 0.5f) {
+        left = ImageFilterLuma(left).xxx;
+        right = ImageFilterLuma(right).xxx;
+    }
+    return ComposeSimpleAnaglyphColor(left, right, pair);
+}
+
+uint FrameMarkerParity()
+{
+    uint parity = frame_index & 1u;
+    if (output_interlace_swap > 0.5f) {
+        parity = 1u - parity;
+    }
+    return parity;
+}
+
+float3 FrameMarkerLineColor(uint parity, float layoutMode, bool frameAlternate)
+{
+    if (frameAlternate) {
+        return ((frame_index & 2u) == 0u)
+            ? float3(1.0f, 0.0f, 1.0f)
+            : float3(0.0f, 1.0f, 0.0f);
+    }
+    if ((layoutMode >= 0.5f && layoutMode < 1.5f) || layoutMode >= 3.0f) {
+        return (parity == 0u) ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 1.0f, 0.0f);
+    }
+    return (parity == 0u) ? float3(1.0f, 0.0f, 0.0f) : float3(0.0f, 1.0f, 1.0f);
+}
+
+float4 ApplyFrameMarker(uint outX, uint outY, uint outWidth, uint outHeight, float4 color, uint parity, float layoutMode)
+{
+    float mode = floor(output_frame_marker_mode + 0.5f);
+    if (mode < 0.5f) {
+        return color;
+    }
+
+    uint rows = max(1u, (uint)round(max(output_frame_marker_thickness, 0.0001f) * (float)outHeight));
+    rows = min(rows, outHeight);
+    uint cols = max(1u, (uint)round(max(output_frame_marker_thickness, 0.0001f) * (float)outWidth));
+    cols = min(cols, outWidth);
+
+    if (mode >= 2.5f) {
+        bool inCorner = outX < cols && outY < rows;
+        if (!inCorner) {
+            return color;
+        }
+        color.rgb = (parity == 0u) ? float3(0.0f, 0.0f, 0.0f) : float3(1.0f, 1.0f, 1.0f);
+        color.a = max(color.a, 1.0f);
+        return color;
+    }
+
+    bool bottomRows = outY >= outHeight - rows;
+    bool topBottomMiddleRows = false;
+    if (layoutMode >= 0.5f && layoutMode < 1.5f) {
+        topBottomMiddleRows = outY >= srcHeight - rows && outY < srcHeight;
+    }
+    if (!bottomRows && !topBottomMiddleRows) {
+        return color;
+    }
+
+    if (mode < 1.5f) {
+        bool frameAlternate = floor(output_composition_mode + 0.5f) >= 8.5f;
+        color.rgb = FrameMarkerLineColor(parity, layoutMode, frameAlternate);
+    } else {
+        float xNorm = ((float)outX + 0.5f) / max((float)outWidth, 1.0f);
+        bool activeSegment = (parity == 0u) ? (xNorm <= 0.25f) : (xNorm <= 0.75f);
+        color.rgb = activeSegment ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 0.0f, 0.0f);
+    }
+
+    color.a = max(color.a, 1.0f);
+    return color;
+}
+
+float AlignmentCrossMask(float2 markerUv)
+{
+    float thickness = max(output_alignment_marker_thickness, 0.0001f);
+    float feather = max(1.0f / max(min((float)srcWidth, (float)srcHeight), 1.0f), thickness * 0.5f);
+    float2 centered = abs(markerUv - float2(0.5f, 0.5f));
+    float lineDistance = min(centered.x, centered.y);
+    float inside = step(0.0f, markerUv.x) * step(markerUv.x, 1.0f) * step(0.0f, markerUv.y) * step(markerUv.y, 1.0f);
+    return (1.0f - smoothstep(thickness, thickness + feather, lineDistance)) * inside;
+}
+
+float4 ApplyAlignmentMarker(float2 outputUv, float2 sampleUv, float4 color)
+{
+    float mode = floor(output_alignment_marker_mode + 0.5f);
+    if (mode < 0.5f)
+    {
+        return color;
+    }
+
+    if (mode == 1.0f || mode >= 2.5f)
+    {
+        float imageMask = AlignmentCrossMask(sampleUv);
+        color.rgb = lerp(color.rgb, float3(1.0f, 1.0f, 0.0f), imageMask);
+        color.a = max(color.a, imageMask);
+    }
+
+    if (mode >= 1.5f)
+    {
+        float lensMask = AlignmentCrossMask(outputUv);
+        color.rgb = lerp(color.rgb, float3(0.0f, 1.0f, 0.0f), lensMask);
+        color.a = max(color.a, lensMask);
+    }
+    return color;
+}
+
+float2 InterlaceGridCoord(uint x, uint y)
+{
+    float2 nativeSize = max(float2((float)srcWidth, (float)srcHeight), float2(1.0f, 1.0f));
+    float2 uv = (float2((float)x, (float)y) + float2(0.5f, 0.5f)) / nativeSize;
+    float mode = floor(output_interlace_scale_mode + 0.5f);
+    if (mode < 0.5f) {
+        return floor(float2((float)x, (float)y));
+    }
+    if (mode < 1.5f) {
+        return floor(uv * float2(3840.0f, 2160.0f));
+    }
+    if (mode < 2.5f) {
+        return floor(uv * float2(1920.0f * 0.5f, 1080.0f * 0.5f));
+    }
+    if (mode < 3.5f) {
+        return floor(uv * float2(1921.0f * 0.5f, 1081.0f * 0.5f));
+    }
+    if (mode < 4.5f) {
+        return floor(uv * float2(1680.0f * 0.5f, 1050.0f * 0.5f));
+    }
+    if (mode < 5.5f) {
+        return floor(uv * float2(1681.0f * 0.5f, 1051.0f * 0.5f));
+    }
+    if (mode < 6.5f) {
+        return floor(uv * float2(1280.0f * 0.5f, 720.0f * 0.5f));
+    }
+    return floor(uv * float2(1281.0f * 0.5f, 721.0f * 0.5f));
+}
+
+float2 InterlaceSampleOffset(float eyeSign)
+{
+    float mode = floor(output_composition_mode + 0.5f);
+    float offset = max(output_interlace_sample_offset, 0.0f);
+    if (mode >= 5.5f && mode < 6.5f) {
+        return float2(0.0f, eyeSign * offset / max((float)srcHeight, 1.0f));
+    }
+    if (mode >= 6.5f && mode < 7.5f) {
+        return float2(eyeSign * offset / max((float)srcWidth, 1.0f), 0.0f);
+    }
+    return float2(0.0f, 0.0f);
+}
+
+float2 RotateOutputKeystonePoint(float2 value, float2 center, float angle)
+{
+    float s;
+    float c;
+    sincos(angle, s, c);
+    float2 d = value - center;
+    return float2(d.x * c - d.y * s, d.x * s + d.y * c) + center;
+}
+
+float SafeOutputKeystoneDivide(float numerator, float denominator)
+{
+    float safeDenominator = denominator;
+    if (abs(safeDenominator) < 0.00001f)
+    {
+        safeDenominator = safeDenominator < 0.0f ? -0.00001f : 0.00001f;
+    }
+    return numerator / safeDenominator;
+}
+
+float2 OutputKeystonePlane(float2 tc, float2 center, float tiltX, float tiltY)
+{
+    float2 direction = float2(tc.x, 0.0f);
+    float2 alpha0 = float2(0.0f, -1.0f);
+    float2 beta0 = direction - alpha0;
+    float2 gamma0 = RotateOutputKeystonePoint(float2(-1.0f, 0.0f), float2(center.x, 0.0f), tiltY);
+    float2 delta0 = RotateOutputKeystonePoint(float2(1.0f, 0.0f), float2(center.x, 0.0f), tiltY) - gamma0;
+    float ip = SafeOutputKeystoneDivide(
+        ((gamma0.y + 1.0f) * delta0.x) - (gamma0.x * delta0.y),
+        (delta0.x * beta0.y) - (delta0.y * beta0.x));
+    float xPlane = ip * beta0.x;
+    float yPlane = ip * tc.y;
+
+    direction = float2(yPlane, 0.0f);
+    float2 beta1 = direction - alpha0;
+    float2 gamma1 = RotateOutputKeystonePoint(float2(-1.0f, 0.0f), float2(center.y, 0.0f), tiltX);
+    float2 delta1 = RotateOutputKeystonePoint(float2(1.0f, 0.0f), float2(center.y, 0.0f), tiltX) - gamma1;
+    float v = SafeOutputKeystoneDivide(
+        ((gamma1.y + 1.0f) * delta1.x) - (gamma1.x * delta1.y),
+        (delta1.x * beta1.y) - (delta1.y * beta1.x));
+    return float2(v * xPlane, v * beta1.x);
+}
+
+float2 ApplyOutputEyeKeystone(float2 uv, float eyeSign)
+{
+    float tilt = clamp(output_geometry_keystone_tilt, -0.5f, 0.5f);
+    if (abs(tilt) < 0.00001f)
+    {
+        return uv;
+    }
+    float anchorX = tilt > 0.0f ? -eyeSign : eyeSign;
+    float signedTiltY = eyeSign > 0.0f ? tilt : -tilt;
+    return (OutputKeystonePlane((uv * 2.0f) - 1.0f, float2(anchorX, 0.0f), 0.0f, signedTiltY) * 0.5f) + 0.5f;
+}
+
+float2 OutputEyeAlignmentOffset(float eyeSign)
+{
+    float2 pixelOffset = OutputHeadsetPixelOffset(eyeSign);
+    if (output_geometry_lens_dependent_ipd <= 0.5f) {
+        pixelOffset.x += -eyeSign * OutputHeadsetIpdOffset();
+    }
+    return pixelOffset / max(float2((float)srcWidth, (float)srcHeight), float2(1.0f, 1.0f));
+}
+
+float2 OutputLensDependentIpdOffset(float eyeSign)
+{
+    if (output_geometry_lens_dependent_ipd <= 0.5f) {
+        return float2(0.0f, 0.0f);
+    }
+    return float2(-eyeSign * OutputHeadsetIpdOffset(), 0.0f) / max(float2((float)srcWidth, (float)srcHeight), float2(1.0f, 1.0f));
+}
+
+float2 RotateOutputEyeUv(float2 uv, float degreesValue)
+{
+    float angle = radians(degreesValue);
+    float s;
+    float c;
+    sincos(angle, s, c);
+    float2 d = uv - float2(0.5f, 0.5f);
+    return float2(d.x * c - d.y * s, d.x * s + d.y * c) + float2(0.5f, 0.5f);
+}
+
+float2 ApplyOutputEyeAlignment(float2 uv, float eyeSign)
+{
+    float degreesValue = OutputHeadsetRotation(eyeSign);
+    float2 alignedUv = ApplyOutputEyeKeystone(uv + OutputLensDependentIpdOffset(eyeSign), eyeSign);
+    return RotateOutputEyeUv(alignedUv + OutputEyeAlignmentOffset(eyeSign), degreesValue);
+}
+
+void ApplyStereoComposition(uint x, uint y, inout float4 leftColor, inout float4 rightColor)
+{
+    float mode = floor(output_composition_mode + 0.5f);
+    if (mode < 0.5f) {
+        return;
+    }
+
+    float4 composed = leftColor;
+    if (mode < 1.5f) {
+        composed = leftColor;
+    } else if (mode < 2.5f) {
+        composed = rightColor;
+    } else if (mode < 5.5f) {
+        float3 left = PrepareCompositionColor(leftColor.rgb, max(output_anaglyph_left_contrast, 0.0f));
+        float3 right = PrepareCompositionColor(rightColor.rgb, max(output_anaglyph_right_contrast, 0.0f));
+        composed = float4(ComposeAnaglyphColor(left, right, mode - 3.0f), max(leftColor.a, rightColor.a));
+    } else if (mode < 8.5f) {
+        float2 grid = InterlaceGridCoord(x, y);
+        uint gridX = (uint)grid.x;
+        uint gridY = (uint)grid.y;
+        uint parity = (mode < 6.5f) ? (gridY & 1u) : ((mode < 7.5f) ? (gridX & 1u) : ((gridX + gridY) & 1u));
+        if (output_interlace_swap > 0.5f) {
+            parity = 1u - parity;
+        }
+        float4 primary = (parity == 0u) ? leftColor : rightColor;
+        float4 secondary = (parity == 0u) ? rightColor : leftColor;
+        composed = lerp(primary, (primary + secondary) * 0.5f, saturate(output_interlace_blend));
+    } else {
+        uint parity = frame_index & 1u;
+        if (output_interlace_swap > 0.5f) {
+            parity = 1u - parity;
+        }
+        composed = (parity == 0u) ? leftColor : rightColor;
+    }
+
+    leftColor = composed;
+    rightColor = composed;
+}
+
+void WriteStereoViews(uint x, uint y, float4 leftFullColor, float4 leftReducedColor, float4 rightReducedColor, float4 rightFullColor)
+{
+    float4 leftColor = leftFullColor;
+    float4 rightColor = rightFullColor;
+    ApplyStereoComposition(x, y, leftColor, rightColor);
+    float compositionMode = floor(output_composition_mode + 0.5f);
+    if (compositionMode >= 0.5f) {
+        leftFullColor = leftColor;
+        leftReducedColor = leftColor;
+        rightReducedColor = rightColor;
+        rightFullColor = rightColor;
+    }
+
+    float4 firstColor = (output_eye_swap > 0.5f) ? rightFullColor : leftFullColor;
+    float4 firstReducedColor = (output_eye_swap > 0.5f) ? rightReducedColor : leftReducedColor;
+    float4 secondReducedColor = (output_eye_swap > 0.5f) ? leftReducedColor : rightReducedColor;
+    float4 secondColor = (output_eye_swap > 0.5f) ? leftFullColor : rightFullColor;
+    float layoutMode = floor(output_layout_mode + 0.5f);
+    uint markerParity = FrameMarkerParity();
+    if (layoutMode >= 4.0f) {
+        g_sbsOut[uint2(x, y)] = ApplyFrameMarker(x, y, srcWidth, srcHeight, firstColor, markerParity, layoutMode);
+        return;
+    }
+    if (layoutMode >= 3.0f) {
+        uint gapRows = max(1u, (uint)round((float)srcHeight * 0.08510638f));
+        uint outWidth = srcWidth;
+        uint outHeight = srcHeight * 2u + gapRows;
+        g_sbsOut[uint2(x, y)] = ApplyFrameMarker(x, y, outWidth, outHeight, firstColor, markerParity, layoutMode);
+        g_sbsOut[uint2(x, y + srcHeight + gapRows)] = ApplyFrameMarker(x, y + srcHeight + gapRows, outWidth, outHeight, secondColor, markerParity, layoutMode);
+        if (y < gapRows) {
+            g_sbsOut[uint2(x, y + srcHeight)] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        }
+        return;
+    }
+    if (layoutMode >= 2.0f) {
+        uint outWidth = srcWidth * 2u;
+        uint outHeight = srcHeight * 2u;
+        g_sbsOut[uint2(x, y)] = ApplyFrameMarker(x, y, outWidth, outHeight, firstColor, markerParity, layoutMode);
+        g_sbsOut[uint2(x + srcWidth, y)] = ApplyFrameMarker(x + srcWidth, y, outWidth, outHeight, firstReducedColor, markerParity, layoutMode);
+        g_sbsOut[uint2(x, y + srcHeight)] = ApplyFrameMarker(x, y + srcHeight, outWidth, outHeight, secondReducedColor, markerParity, layoutMode);
+        g_sbsOut[uint2(x + srcWidth, y + srcHeight)] = ApplyFrameMarker(x + srcWidth, y + srcHeight, outWidth, outHeight, secondColor, markerParity, layoutMode);
+        return;
+    }
+    if (layoutMode >= 1.0f) {
+        uint outWidth = srcWidth;
+        uint outHeight = srcHeight * 2u;
+        g_sbsOut[uint2(x, y)] = ApplyFrameMarker(x, y, outWidth, outHeight, firstColor, markerParity, layoutMode);
+        g_sbsOut[uint2(x, y + srcHeight)] = ApplyFrameMarker(x, y + srcHeight, outWidth, outHeight, secondColor, markerParity, layoutMode);
+        return;
+    }
+    uint outWidth = srcWidth * 2u;
+    uint outHeight = srcHeight;
+    g_sbsOut[uint2(x, y)] = ApplyFrameMarker(x, y, outWidth, outHeight, firstColor, markerParity, layoutMode);
+    g_sbsOut[uint2(x + srcWidth, y)] = ApplyFrameMarker(x + srcWidth, y, outWidth, outHeight, secondColor, markerParity, layoutMode);
+}
+
+void WriteStereoPair(uint x, uint y, float4 leftColor, float4 rightColor)
+{
+    WriteStereoViews(x, y, leftColor, lerp(leftColor, rightColor, 0.33333334f), lerp(leftColor, rightColor, 0.66666669f), rightColor);
+}
+
+float4 ApplyPresentationColor(float2 uv, float4 color)
+{
+    float sat = max(output_saturation, 0.0f);
+    float luma = ImageFilterLuma(color.rgb);
+    color.rgb = saturate(lerp(float3(luma, luma, luma), color.rgb, sat));
+
+    float strength = saturate(output_vignette_strength);
+    if (strength > 0.0f) {
+        float2 d = uv - 0.5f;
+        d.x *= (float)srcWidth / max((float)srcHeight, 1.0f);
+        float dist = length(d);
+        float radius = max(output_vignette_radius, 0.0f);
+        float feather = max(output_vignette_feather, 0.0001f);
+        float mask = smoothstep(radius, radius + feather, dist) * strength;
+        color.rgb = lerp(color.rgb, float3(0.0f, 0.0f, 0.0f), mask);
+    }
+    float hmdVignette = clamp(output_hmd_vignette, 0.0f, 10.0f);
+    if (hmdVignette > 0.0f) {
+        float2 shapedUv = saturate(-uv * uv + uv);
+        float hmdMask = saturate(shapedUv.x * shapedUv.y * pow(max(12.5f - hmdVignette, 0.0f), 3.0f));
+        color.rgb *= hmdMask;
+    }
+    return color;
+}
+
+float2 ApplyOutputGeometry(float2 uv)
+{
+    float2 d = uv - 0.5f;
+    if (output_geometry_axis_swap > 0.5f) {
+        d = d.yx;
+    }
+
+    float2 scale = OutputHeadsetScale();
+    float zoom = OutputHeadsetZoom();
+    d /= scale * zoom;
+    d.x *= max(1.0f - clamp(OutputHeadsetFov(), 0.0f, 0.25f), 0.0001f);
+
+    float aspect = (float)srcWidth / max((float)srcHeight, 1.0f);
+    float2 aspectD = float2(d.x * aspect, d.y);
+    float r2 = dot(aspectD, aspectD);
+    float r4 = r2 * r2;
+    float r6 = r4 * r2;
+    float barrel = output_geometry_barrel;
+    float radialK2 = output_geometry_radial_k2;
+    float radialK3 = output_geometry_radial_k3;
+    if (abs(barrel) > 0.00001f || abs(radialK2) > 0.00001f || abs(radialK3) > 0.00001f) {
+        d *= max(0.0f, 1.0f + barrel * r2 + radialK2 * r4 + radialK3 * r6);
+    }
+
+    return saturate(float2(0.5f + output_geometry_offset_x, 0.5f + output_geometry_offset_y) + d);
+}
+
+float2 StereoShift(float shift)
+{
+    return (stereo_axis_mode > 0.5f) ? float2(0.0f, shift) : float2(shift, 0.0f);
+}
+
+float UiAlphaMaskFromColor(float4 sampleColor)
+{
+    float strength = saturate(ui_alpha_mask_strength);
+    if (strength <= 0.0f) {
+        return 0.0f;
+    }
+
+    float threshold = saturate(ui_alpha_mask_threshold);
+    float feather = max(ui_alpha_mask_feather, 0.0001f);
+    return smoothstep(threshold, min(threshold + feather, 1.0f), sampleColor.a) * strength;
+}
+
+float UiAutoMaskFromColor(float4 sampleColor)
+{
+    float strength = saturate(ui_auto_mask_strength);
+    if (strength <= 0.0f) {
+        return 0.0f;
+    }
+
+    float luma = dot(sampleColor.rgb, float3(0.2126f, 0.7152f, 0.0722f));
+    float threshold = saturate(ui_auto_mask_threshold);
+    float feather = max(ui_auto_mask_feather, 0.0001f);
+    float brightMask = smoothstep(threshold, min(threshold + feather, 1.0f), luma);
+    float darkMask = 1.0f - smoothstep(max(threshold - feather, 0.0f), threshold, luma);
+    float mode = floor(ui_auto_mask_mode + 0.5f);
+    float mask = (mode < 0.5f) ? brightMask : ((mode < 1.5f) ? darkMask : max(brightMask, darkMask));
+    return saturate(mask * strength);
+}
+
+float UiAlphaMask(float2 uv)
+{
+    float4 sampleColor = g_colorTex.SampleLevel(g_linearSampler, saturate(uv), 0);
+    return saturate(max(UiAlphaMaskFromColor(sampleColor), UiAutoMaskFromColor(sampleColor)));
+}
+
+float ApplyUiAlphaDepthMask(float2 uv, float depth)
+{
+    float4 sampleColor = g_colorTex.SampleLevel(g_linearSampler, saturate(uv), 0);
+    float alphaMask = UiAlphaMaskFromColor(sampleColor);
+    float autoMask = UiAutoMaskFromColor(sampleColor);
+    depth = lerp(depth, saturate(ui_alpha_mask_target_depth), alphaMask);
+    return lerp(depth, saturate(ui_auto_mask_target_depth), autoMask);
+}
+
+float DebugDepthValue(float depth)
+{
+    float nearValue = saturate(debug_view_near);
+    float farValue = max(saturate(debug_view_far), nearValue + 0.0001f);
+    return saturate(((depth - nearValue) / (farValue - nearValue)) * max(debug_view_scale, 0.0f));
+}
+
+float3 DebugHeat(float v)
+{
+    return saturate(float3(v * 2.0f - 0.5f, 1.0f - abs(v * 2.0f - 1.0f), 1.5f - v * 2.0f));
+}
+
+float3 PackDepthValue24(float depth)
+{
+    float depthValue = saturate(depth) * (256.0f * 256.0f * 256.0f - 1.0f) / (256.0f * 256.0f * 256.0f);
+    float3 encode = frac(depthValue * float3(1.0f, 256.0f, 256.0f * 256.0f));
+    encode.xy -= encode.yz / 256.0f;
+    return encode;
+}
+
+float4 DibrDebugColor(float2 uv, float depth, float shift)
+{
+    float mode = floor(debug_view_mode + 0.5f);
+    float depthValue = DebugDepthValue(depth);
+    if (mode < 1.5f) {
+        return float4(depthValue, depthValue, depthValue, 1.0f);
+    }
+    if (mode < 2.5f) {
+        float disparity = saturate(abs(shift) * (float)srcWidth / max(abs(divergence), 1.0f) * max(debug_view_scale, 0.0f));
+        return float4(DebugHeat(disparity), 1.0f);
+    }
+
+    float mask = saturate(LetterboxMask(uv) + RegionDepthMask(uv, depth) + WeaponDepthMask(uv, depth) + AutoWeaponDepthMask(uv, depth) + ShapeDepthMask(uv, depth) + OutputMatteMask(uv) + UiAlphaMask(uv));
+    return float4(mask, depthValue * (1.0f - mask), 1.0f - mask, 1.0f);
+}
+
+float4 DibrAlignmentGridColor(float2 uv, float depth, float mode)
+{
+    float4 baseColor = SampleFilteredOutputColor(uv);
+    float2 gridUv = frac(uv * 16.0f);
+    float gridDist = min(min(gridUv.x, 1.0f - gridUv.x), min(gridUv.y, 1.0f - gridUv.y));
+    float gridLine = 1.0f - smoothstep(0.0f, 0.012f, gridDist);
+    float centerX = 1.0f - smoothstep(0.0f, 2.0f / max((float)srcWidth, 1.0f), abs(uv.x - 0.5f));
+    float centerY = 1.0f - smoothstep(0.0f, 2.0f / max((float)srcHeight, 1.0f), abs(uv.y - 0.5f));
+    float border = step(uv.x, 0.002f) + step(uv.y, 0.002f) + step(0.998f, uv.x) + step(0.998f, uv.y);
+
+    float3 gridColor = (mode < 6.5f) ? float3(0.0f, 1.0f, 0.0f) : DebugHeat(DebugDepthValue(depth));
+    float3 color = lerp(baseColor.rgb, gridColor, saturate(gridLine * 0.55f + border));
+    color = lerp(color, float3(1.0f, 0.0f, 0.0f), centerX);
+    color = lerp(color, float3(0.0f, 0.35f, 1.0f), centerY);
+    return float4(saturate(color), baseColor.a);
+}
+
+float LinearizeProjectionDepth(float depth)
+{
+    float strength = saturate(depth_linearize_strength);
+    if (strength <= 0.0f) {
+        return depth;
+    }
+
+    float nearZ = max(depth_linearize_near, 0.0001f);
+    float farZ = max(depth_linearize_far, nearZ + 0.0001f);
+    float d = saturate(depth);
+    float reversedMode = step(0.5f, floor(depth_linearize_mode + 0.5f));
+    float standardDenom = farZ - d * (farZ - nearZ);
+    float reversedDenom = nearZ + d * (farZ - nearZ);
+    float denom = max(lerp(standardDenom, reversedDenom, reversedMode), 0.0001f);
+    float eyeZ = (nearZ * farZ) / denom;
+    float linearDepth = saturate((eyeZ - nearZ) / (farZ - nearZ));
+    return lerp(depth, linearDepth, strength);
+}
+
+float DepthDitherNoise(float2 uv)
+{
+    float2 pixel = uv * float2((float)srcWidth, (float)srcHeight);
+    return frac(sin(dot(pixel, float2(12.9898f, 78.233f))) * 43758.5453f);
+}
+
+float ApplyDepthDither(float2 uv, float depth)
+{
+    float strength = saturate(depth_dither_strength);
+    if (strength <= 0.0f) {
+        return depth;
+    }
+    float bits = clamp(depth_dither_bits, 1.0f, 15.0f);
+    float stepSize = 1.0f / max(pow(2.0f, bits) - 1.0f, 1.0f);
+    float noise = DepthDitherNoise(uv) - 0.5f;
+    return saturate(depth + noise * stepSize * strength);
+}
+
+float ApplyDepthRangeBoost(float depth)
+{
+    float strength = saturate(depth_range_boost_strength);
+    if (strength <= 0.0f) {
+        return depth;
+    }
+
+    float center = saturate(depth_range_boost_center);
+    float width = max(depth_range_boost_width, 0.0001f);
+    float band = 1.0f - smoothstep(width, width * 2.0f, abs(saturate(depth) - center));
+    float scale = lerp(1.0f, max(depth_range_boost_scale, 1.0f), band * strength);
+    float focus = EffectiveConvergence();
+    return saturate(focus + (depth - focus) * scale);
+}
+
+float SamplePreparedDepthBase(float2 uv)
+{
+    float depth = SampleDepthTexture(TransformDepthUv(uv));
+    if (reverse_depth > 0.5f) {
+        depth = 1.0f - depth;
+    }
+    if (depth_value_flip > 0.5f) {
+        depth = 1.0f - depth;
+    }
+    depth = LinearizeProjectionDepth(depth);
+    depth = ApplyDepthDither(uv, depth);
+    return saturate(ApplyLetterboxDepthMask(uv, depth));
+}
+
+float ApplyDepthEdgeMask(float2 uv, float depth)
+{
+    float strength = clamp(depth_edge_mask_strength, -1.0f, 1.0f);
+    if (abs(strength) <= 0.0f) {
+        return depth;
+    }
+
+    float radius = max(depth_edge_mask_radius, 0.0f);
+    float2 texel = float2(1.0f / max((float)srcWidth, 1.0f), 1.0f / max((float)srcHeight, 1.0f)) * radius;
+    float dl = SamplePreparedDepthBase(uv - float2(texel.x, 0.0f));
+    float dr = SamplePreparedDepthBase(uv + float2(texel.x, 0.0f));
+    float du = SamplePreparedDepthBase(uv - float2(0.0f, texel.y));
+    float dd = SamplePreparedDepthBase(uv + float2(0.0f, texel.y));
+    float neighborAvg = (dl + dr + du + dd) * 0.25f;
+    float gradient = max(max(abs(depth - dl), abs(depth - dr)), max(abs(depth - du), abs(depth - dd)));
+    gradient = max(gradient, max(abs(dr - dl), abs(dd - du)));
+    float edgeMask = smoothstep(max(depth_edge_mask_threshold, 0.0f), max(depth_edge_mask_threshold, 0.0f) + max(depth_edge_mask_feather, 0.0001f), gradient);
+    float target = (strength >= 0.0f) ? neighborAvg : 1.0f;
+    return saturate(lerp(depth, target, edgeMask * abs(strength)));
+}
+
+float SamplePreparedDepth(float2 uv)
+{
+    return ApplyDepthEdgeMask(uv, SamplePreparedDepthBase(uv));
+}
+
+float ExpandDepth(float2 uv, float depth)
+{
+    float strength = saturate(depth_expand_strength);
+    if (strength <= 0.0f) {
+        return depth;
+    }
+
+    float radius = max(depth_expand_radius, 0.0f);
+    float2 texel = float2(1.0f / max((float)srcWidth, 1.0f), 1.0f / max((float)srcHeight, 1.0f)) * radius;
+    float dl = SamplePreparedDepth(uv - float2(texel.x, 0.0f));
+    float dr = SamplePreparedDepth(uv + float2(texel.x, 0.0f));
+    float du = SamplePreparedDepth(uv - float2(0.0f, texel.y));
+    float dd = SamplePreparedDepth(uv + float2(0.0f, texel.y));
+    float dlu = SamplePreparedDepth(uv - texel);
+    float dru = SamplePreparedDepth(uv + float2(texel.x, -texel.y));
+    float dld = SamplePreparedDepth(uv + float2(-texel.x, texel.y));
+    float drd = SamplePreparedDepth(uv + texel);
+
+    float localMin = min(depth, min(min(dl, dr), min(min(du, dd), min(min(dlu, dru), min(dld, drd)))));
+    float avg = (dl + dr + du + dd + dlu + dru + dld + drd) * 0.125f;
+    float gradient = max(abs(dr - dl), abs(dd - du));
+    float threshold = max(depth_expand_edge_threshold, 0.0001f);
+    float edgeMask = smoothstep(threshold, threshold * 2.0f, gradient);
+    float target = lerp(avg, localMin, saturate(depth_expand_near_bias));
+    return saturate(lerp(depth, target, strength * edgeMask));
+}
+
+float ReconstructDepth(float2 uv, float depth)
+{
+    float strength = saturate(depth_reconstruct_strength);
+    if (strength <= 0.0f) {
+        return depth;
+    }
+
+    float radius = max(depth_reconstruct_radius, 0.0f);
+    float2 texel = float2(1.0f / max((float)srcWidth, 1.0f), 1.0f / max((float)srcHeight, 1.0f)) * radius;
+    float dl = SamplePreparedDepth(uv - float2(texel.x, 0.0f));
+    float dr = SamplePreparedDepth(uv + float2(texel.x, 0.0f));
+    float du = SamplePreparedDepth(uv - float2(0.0f, texel.y));
+    float dd = SamplePreparedDepth(uv + float2(0.0f, texel.y));
+    float dlu = SamplePreparedDepth(uv - texel);
+    float dru = SamplePreparedDepth(uv + float2(texel.x, -texel.y));
+    float dld = SamplePreparedDepth(uv + float2(-texel.x, texel.y));
+    float drd = SamplePreparedDepth(uv + texel);
+
+    float localMin = min(depth, min(min(dl, dr), min(min(du, dd), min(min(dlu, dru), min(dld, drd)))));
+    float avg = (dl + dr + du + dd + dlu + dru + dld + drd) * 0.125f;
+    float gradient = max(abs(dr - dl), abs(dd - du));
+    float threshold = max(depth_reconstruct_edge_threshold, 0.0001f);
+    float edgeMask = smoothstep(threshold, threshold * 2.0f, gradient);
+    float target = lerp(avg, localMin, saturate(depth_reconstruct_near_bias) * edgeMask);
+    return saturate(lerp(depth, target, strength));
+}
+
+float ScreenEdgeGuard(float2 uv, float depth)
+{
+    float strength = saturate(edge_guard_strength);
+    if (strength <= 0.0f) {
+        return 1.0f;
+    }
+
+    float axisCoord = (stereo_axis_mode > 0.5f) ? uv.y : uv.x;
+    float edgeDist = min(saturate(axisCoord), 1.0f - saturate(axisCoord));
+    float edgeMask = saturate(1.0f - edgeDist / max(edge_guard_width, 0.0001f));
+    edgeMask = pow(edgeMask, max(edge_guard_shape, 0.01f));
+
+    float nearRange = edge_guard_near_depth;
+    float depthMask = (nearRange > 0.0f)
+        ? saturate((EffectiveConvergence() - depth) / max(nearRange, 0.0001f))
+        : 1.0f;
+    return 1.0f - edgeMask * depthMask * strength;
+}
+
+float ConvergenceBoundaryScale(float2 uv, float depth)
+{
+    float strength = saturate(convergence_boundary_strength);
+    if (strength <= 0.0f) {
+        return 1.0f;
+    }
+
+    float2 texel = float2(1.0f / max((float)srcWidth, 1.0f), 1.0f / max((float)srcHeight, 1.0f));
+    float dl = SamplePreparedDepth(uv - float2(texel.x, 0.0f));
+    float dr = SamplePreparedDepth(uv + float2(texel.x, 0.0f));
+    float du = SamplePreparedDepth(uv - float2(0.0f, texel.y));
+    float dd = SamplePreparedDepth(uv + float2(0.0f, texel.y));
+    float gradient = max(abs(dr - dl), abs(dd - du));
+    float threshold = max(convergence_boundary_threshold, 0.0f);
+    float feather = max(convergence_boundary_feather, 0.0001f);
+    float mask = smoothstep(threshold, threshold + feather, gradient) * strength;
+    return lerp(1.0f, saturate(convergence_boundary_scale), mask);
+}
+
+float DepthArtifactGuardScale(float2 uv, float depth)
+{
+    float strength = saturate(depth_artifact_guard_strength);
+    if (strength <= 0.0f) {
+        return 1.0f;
+    }
+
+    float2 texel = float2(1.0f / max((float)srcWidth, 1.0f), 1.0f / max((float)srcHeight, 1.0f));
+    float dl = SamplePreparedDepth(uv - float2(texel.x, 0.0f));
+    float dr = SamplePreparedDepth(uv + float2(texel.x, 0.0f));
+    float du = SamplePreparedDepth(uv - float2(0.0f, texel.y));
+    float dd = SamplePreparedDepth(uv + float2(0.0f, texel.y));
+    float gradient = max(abs(dr - dl), abs(dd - du));
+    float threshold = max(depth_artifact_guard_threshold, 0.0f);
+    float feather = max(depth_artifact_guard_feather, 0.0001f);
+    float mask = smoothstep(threshold, threshold + feather, gradient) * strength;
+    return lerp(1.0f, saturate(depth_artifact_guard_scale), mask);
+}
+
+[numthreads(16, 16, 1)]
+void CSMain(uint3 dtid : SV_DispatchThreadID)
+{
+    uint x = dtid.x;
+    uint y = dtid.y;
+    if (x >= srcWidth || y >= srcHeight) return;
+
+    float2 uv = float2((x + 0.5f) / (float)srcWidth,
+                        (y + 0.5f) / (float)srcHeight);
+
+    if (edge_compression > 0.0f) {
+        float2 s = (uv - 0.5f) * 2.0f;
+        float c = edge_compression * 3.0f;
+        float inv_atan_c = 1.0f / atan(c);
+        float2 s_warp = float2(atan(s.x * c), atan(s.y * c)) * inv_atan_c;
+        uv = s_warp * 0.5f + 0.5f;
+    }
+    else if (edge_compression < 0.0f) {
+        float2 s = (uv - 0.5f) * 2.0f;
+        float c = -edge_compression * 1.2f;
+        float inv_tan_c = 1.0f / tan(c);
+        float2 s_warp = float2(tan(s.x * c), tan(s.y * c)) * inv_tan_c;
+        uv = s_warp * 0.5f + 0.5f;
+    }
+    uv = ApplyOutputGeometry(uv);
+
+    float depth = SamplePreparedDepth(uv);
+    depth = ExpandDepth(uv, depth);
+    depth = ReconstructDepth(uv, depth);
+    depth = ApplyUiAlphaDepthMask(uv, ApplyShapeDepthMask(uv, ApplyWeaponDepthMask(uv, ApplyRegionDepthMask(uv, depth))));
+    depth = ApplyDepthRangeBoost(depth);
+    depth = ApplyFilterEmulatorDepthControls(depth);
+
+    float guardedDisparity = divergence * StereoDepthDelta(depth) * FilterEmulatorFocusScale(depth);
+    guardedDisparity *= ScreenEdgeGuard(uv, depth) * ConvergenceBoundaryScale(uv, depth) * DepthArtifactGuardScale(uv, depth) * WeaponBoundaryScale(uv, depth);
+    float leftScale = FocusReductionScale(uv, depth, 1.0f);
+    float rightScale = FocusReductionScale(uv, depth, -1.0f);
+    float leftOffset = (guardedDisparity * leftScale + perspective_shift) / (float)srcWidth;
+    float rightOffset = (guardedDisparity * rightScale + perspective_shift) / (float)srcWidth;
+    float offset = (guardedDisparity * 0.5f * (leftScale + rightScale) + perspective_shift) / (float)srcWidth;
+
+    float debugMode = floor(debug_view_mode + 0.5f);
+    if (debugMode >= 1.0f) {
+        float depthValue = DebugDepthValue(depth);
+        if (debugMode >= 5.5f) {
+            float4 debugColor = DibrAlignmentGridColor(uv, depth, debugMode);
+            WriteStereoPair(x, y, debugColor, debugColor);
+            return;
+        }
+        if (debugMode >= 4.0f) {
+            WriteStereoPair(x, y,
+                g_colorTex.SampleLevel(g_linearSampler, uv, 0),
+                (debugMode < 4.5f)
+                    ? float4(depthValue, depthValue, depthValue, 1.0f)
+                    : float4(PackDepthValue24(depthValue), 1.0f));
+            return;
+        }
+
+        float4 debugColor = DibrDebugColor(uv, depth, offset);
+        WriteStereoPair(x, y, debugColor, debugColor);
+        return;
+    }
+
+    float fullLeftOffset = 2.0f * leftOffset;
+    float fullRightOffset = 2.0f * rightOffset;
+    float refEye = mode_param0;
+    float4 centerColor = SampleFilteredOutputColor(uv);
+    float2 leftInterlaceOffset = InterlaceSampleOffset(1.0f);
+    float2 rightInterlaceOffset = InterlaceSampleOffset(-1.0f);
+
+    if (refEye < 0.5f) {
+        // Left reference: pristine left, synthesize right at full disparity.
+        float2 leftRefUV = ApplyOutputEyeAlignment(uv + leftInterlaceOffset, 1.0f);
+        float4 leftRefColor = SampleFilteredOutputColor(leftRefUV);
+        float4 outLeft = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftRefColor, centerColor))));
+        outLeft = ApplyAlignmentMarker(uv, leftRefUV, outLeft);
+
+        float2 rightUV = ApplyOutputEyeAlignment(uv - StereoShift(fullRightOffset) + rightInterlaceOffset, -1.0f);
+        float4 rightColor = SampleStereoColor(rightUV, uv, centerColor);
+        float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightColor, centerColor))));
+        outRight = ApplyAlignmentMarker(uv, rightUV, outRight);
+        if (floor(output_layout_mode + 0.5f) == 2.0f) {
+            float4 outLeftReduced = outLeft;
+            float2 rightReducedUV = ApplyOutputEyeAlignment(uv - StereoShift(fullRightOffset * 0.33333334f) + rightInterlaceOffset, -1.0f);
+            float4 rightReducedColor = SampleStereoColor(rightReducedUV, uv, centerColor);
+            float4 outRightReduced = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightReducedColor, centerColor))));
+            outRightReduced = ApplyAlignmentMarker(uv, rightReducedUV, outRightReduced);
+            WriteStereoViews(x, y, outLeft, outLeftReduced, outRightReduced, outRight);
+        } else {
+            WriteStereoPair(x, y, outLeft, outRight);
+        }
+    } else {
+        // Right reference: synthesize left at full disparity, pristine right.
+        float2 leftUV = ApplyOutputEyeAlignment(uv + StereoShift(fullLeftOffset) + leftInterlaceOffset, 1.0f);
+        float4 leftColor = SampleStereoColor(leftUV, uv, centerColor);
+        float4 outLeft = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftColor, centerColor))));
+        outLeft = ApplyAlignmentMarker(uv, leftUV, outLeft);
+
+        float2 rightRefUV = ApplyOutputEyeAlignment(uv + rightInterlaceOffset, -1.0f);
+        float4 rightRefColor = SampleFilteredOutputColor(rightRefUV);
+        float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightRefColor, centerColor))));
+        outRight = ApplyAlignmentMarker(uv, rightRefUV, outRight);
+        if (floor(output_layout_mode + 0.5f) == 2.0f) {
+            float2 leftReducedUV = ApplyOutputEyeAlignment(uv + StereoShift(fullLeftOffset * 0.33333334f) + leftInterlaceOffset, 1.0f);
+            float4 leftReducedColor = SampleStereoColor(leftReducedUV, uv, centerColor);
+            float4 outLeftReduced = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftReducedColor, centerColor))));
+            outLeftReduced = ApplyAlignmentMarker(uv, leftReducedUV, outLeftReduced);
+            float4 outRightReduced = outRight;
+            WriteStereoViews(x, y, outLeft, outLeftReduced, outRightReduced, outRight);
+        } else {
+            WriteStereoPair(x, y, outLeft, outRight);
+        }
+    }
+}

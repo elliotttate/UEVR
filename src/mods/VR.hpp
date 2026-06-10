@@ -456,6 +456,43 @@ public:
         return m_stereo_emulation_mode;
     }
 
+    // Requested DIBR mode as the UI combo index (0=Off, 1=YORO synth-right,
+    // 2=YORO synth-left, 3=Inverse, 4=Raymarch). The UEVR_DIBR env override
+    // wins over the persisted UI value. Defined in VR.cpp.
+    int32_t get_dibr_requested_mode() const;
+
+    // Shared DIBR preconditions (D3D12, not true AFR/extreme-compat, not 2D
+    // screen) matching run_dibr_synthesis' bail-outs. Defined in VR.cpp.
+    bool is_dibr_rendering_path_compatible() const;
+
+    // True when DIBR is set to a both-eyes-synthesized mode (Inverse/Raymarch):
+    // the engine then renders a centered view (per-eye offsets zeroed in the
+    // stereo hook) and DIBR reintroduces the stereo baseline from depth.
+    // Honors the UEVR_DIBR env override. Defined in VR.cpp.
+    bool is_dibr_mono_view_active() const;
+
+    // True when the engine should render only ONE view (the DIBR reference
+    // eye) and the DIBR pass synthesizes the other: a DIBR mode is enabled,
+    // the rendering method is plain Native Stereo, the stereo hook can control
+    // the view count, and the synthesis pipeline has proven itself (kernels
+    // ready + at least one frame synthesized) so the never-rendered eye can
+    // always be filled. The single view lands in the LEFT half of the
+    // double-wide RT regardless of which eye it represents. Defined in VR.cpp.
+    bool is_dibr_single_view_active() const;
+
+    // The eye the engine renders in DIBR single-view mode (the YORO reference
+    // eye): 0 = left, 1 = right. Both-eyes-synthesis modes use eye 0 with the
+    // per-eye offset zeroed (see is_dibr_mono_view_active).
+    int32_t get_dibr_reference_eye() const {
+        return get_dibr_requested_mode() == 2 ? 1 : 0;
+    }
+
+    // Render-thread notification from D3D12Component::run_dibr_synthesis on a
+    // successfully synthesized frame; arms is_dibr_single_view_active.
+    void notify_dibr_synthesis_succeeded() {
+        m_dibr_synthesis_proven.store(true, std::memory_order_release);
+    }
+
     void reset_present_event() {
         ResetEvent(m_present_finished_event);
     }
@@ -1245,6 +1282,67 @@ private:
     const ModToggle::Ptr m_grow_rectangle_for_projection_cropping{ModToggle::create(generate_name("GrowRectangleForProjectionCropping"), false)};
     const ModCombo::Ptr m_sync_mode{ ModCombo::create(generate_name("SynchronizationMode"), s_sync_mode_names, 2) };
 
+    // DIBR synthetic stereo (depth-image-based rendering; see DIBR_PORT_PLAN.md).
+    // Read each presented frame by D3D12Component::run_dibr_synthesis (friend).
+    // The UEVR_DIBR* env vars override these at startup for scripted testing.
+    static const inline std::vector<std::string> s_dibr_mode_names{
+        "Off",
+        "YORO (synthesize right eye)",
+        "YORO (synthesize left eye)",
+        "Inverse Warp (synthesize both)",
+        "Raymarch (synthesize both)",
+    };
+    static const inline std::vector<std::string> s_dibr_edge_fill_names{
+        "Mirror",
+        "Black",
+        "Stretch",
+    };
+    static const inline std::vector<std::string> s_dibr_linearize_mode_names{
+        "Standard Z",
+        "Reversed Z (UE default)",
+    };
+    static const inline std::vector<std::string> s_dibr_debug_view_names{
+        "Off",
+        "Depth heatmap",
+        "Disparity",
+        "Masks",
+        "Depth export",
+        "Depth export (alt)",
+        "Alignment grid",
+        "Alignment grid (lens)",
+    };
+
+    const ModCombo::Ptr m_dibr_mode{ ModCombo::create(generate_name("DIBR_Mode"), s_dibr_mode_names, 0) };
+    const ModSlider::Ptr m_dibr_divergence{ ModSlider::create(generate_name("DIBR_Divergence"), 0.0f, 100.0f, 30.0f) };
+    const ModSlider::Ptr m_dibr_convergence{ ModSlider::create(generate_name("DIBR_Convergence"), 0.0f, 1.0f, 0.5f) };
+    const ModSlider::Ptr m_dibr_zpd_balance{ ModSlider::create(generate_name("DIBR_AutoConvergence"), 0.0f, 1.0f, 0.0f) };
+    // Linearization (mode "Reversed Z") canonicalizes UE's reversed-Z buffer
+    // itself, so the raw flip toggle defaults off and is only for the
+    // linearization-disabled path. Near/far are in UE units (centimeters);
+    // far acts as the "depth = 1.0" distance scale.
+    const ModToggle::Ptr m_dibr_reverse_depth{ ModToggle::create(generate_name("DIBR_ReverseDepth"), false) };
+    const ModSlider::Ptr m_dibr_depth_linearize{ ModSlider::create(generate_name("DIBR_DepthLinearize"), 0.0f, 1.0f, 1.0f) };
+    const ModCombo::Ptr m_dibr_depth_linearize_mode{ ModCombo::create(generate_name("DIBR_DepthLinearizeMode"), s_dibr_linearize_mode_names, 1) };
+    const ModSlider::Ptr m_dibr_depth_linearize_near{ ModSlider::create(generate_name("DIBR_DepthLinearizeNear"), 0.01f, 1000.0f, 10.0f) };
+    const ModSlider::Ptr m_dibr_depth_linearize_far{ ModSlider::create(generate_name("DIBR_DepthLinearizeFar"), 100.0f, 200000.0f, 10000.0f) };
+    const ModSlider::Ptr m_dibr_depth_gain{ ModSlider::create(generate_name("DIBR_DepthGain"), 0.1f, 4.0f, 1.0f) };
+    const ModSlider::Ptr m_dibr_depth_curve{ ModSlider::create(generate_name("DIBR_DepthCurve"), 0.25f, 4.0f, 1.0f) };
+    const ModSlider::Ptr m_dibr_popout_limit{ ModSlider::create(generate_name("DIBR_PopoutLimit"), 0.0f, 1.0f, 1.0f) };
+    const ModCombo::Ptr m_dibr_edge_fill_mode{ ModCombo::create(generate_name("DIBR_EdgeFillMode"), s_dibr_edge_fill_names, 2) };
+    const ModSlider::Ptr m_dibr_disocclusion_strength{ ModSlider::create(generate_name("DIBR_DisocclusionGuard"), 0.0f, 1.0f, 0.6f) };
+    const ModSlider::Ptr m_dibr_edge_guard_strength{ ModSlider::create(generate_name("DIBR_EdgeGuard"), 0.0f, 1.0f, 0.0f) };
+    const ModSlider::Ptr m_dibr_foreground_protect{ ModSlider::create(generate_name("DIBR_ForegroundProtect"), 0.0f, 1.0f, 0.5f) };
+    const ModSlider::Ptr m_dibr_range_smoothing{ ModSlider::create(generate_name("DIBR_RangeSmoothing"), 0.0f, 1.0f, 0.35f) };
+    const ModInt32::Ptr m_dibr_raymarch_steps{ ModSliderInt32::create(generate_name("DIBR_RaymarchSteps"), 8, 128, 32) };
+    const ModSlider::Ptr m_dibr_foveation_strength{ ModSlider::create(generate_name("DIBR_RaymarchFoveation"), 0.0f, 1.0f, 0.0f) };
+    // Session-only on purpose (not registered in m_options): persisting a debug
+    // view would boot the next session into a diagnostic image.
+    const ModCombo::Ptr m_dibr_debug_view{ ModCombo::create(generate_name("DIBR_DebugView"), s_dibr_debug_view_names, 0) };
+    // Set once run_dibr_synthesis produces a frame; until then the engine keeps
+    // rendering both eyes and DIBR merely overwrites the synthesized one, so a
+    // half-initialized pipeline can never leave the second eye unrendered.
+    std::atomic<bool> m_dibr_synthesis_proven{false};
+
     // Snap turn settings and globals
     void gamepad_snapturn(XINPUT_STATE& state);
     void process_snapturn();
@@ -1575,6 +1673,25 @@ public:
             *m_horizontal_projection_override,
             *m_vertical_projection_override,
             *m_grow_rectangle_for_projection_cropping,
+            *m_dibr_mode,
+            *m_dibr_divergence,
+            *m_dibr_convergence,
+            *m_dibr_zpd_balance,
+            *m_dibr_reverse_depth,
+            *m_dibr_depth_linearize,
+            *m_dibr_depth_linearize_mode,
+            *m_dibr_depth_linearize_near,
+            *m_dibr_depth_linearize_far,
+            *m_dibr_depth_gain,
+            *m_dibr_depth_curve,
+            *m_dibr_popout_limit,
+            *m_dibr_edge_fill_mode,
+            *m_dibr_disocclusion_strength,
+            *m_dibr_edge_guard_strength,
+            *m_dibr_foreground_protect,
+            *m_dibr_range_smoothing,
+            *m_dibr_raymarch_steps,
+            *m_dibr_foveation_strength,
             *m_snapturn,
             *m_snapturn_joystick_deadzone,
             *m_snapturn_angle,

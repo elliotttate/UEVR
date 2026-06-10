@@ -34,6 +34,7 @@
 #include "d3d12/DirectXTK.hpp"
 
 #include "../../hooks/Sn2DebugResources.hpp"
+#include "../../hooks/DIBRDepthTracker.hpp"
 
 #include "D3D12Component.hpp"
 
@@ -3214,12 +3215,27 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         scene_depth_tex.Reset();
     }
 
+    // Single-view DIBR renders only the reference eye, so the other half of
+    // SceneDepthZ is never written this frame - don't hand it to the runtime
+    // as a composition depth layer. (run_dibr_synthesis re-resolves depth for
+    // the synthesis itself and only samples the rendered half.)
+    if (scene_depth_tex != nullptr && vr->is_dibr_single_view_active()) {
+        SPDLOG_INFO_EVERY_N_SEC(5, "[DIBR] Suppressing depth-layer submit while single-view synthesis is active");
+        scene_depth_tex.Reset();
+    }
+
     // 2026-05-24 SN2 RIGHT-EYE COLOR TRANSFER: process the SBS backbuffer's right half (give it the
     // left half's underwater color while keeping its own luminance) before the per-eye copies, so the
     // right eye displays underwater like the left. Gated by UEVR_SN2_RIGHT_EYE_COLOR_TRANSFER; no-op
     // otherwise. Runs synchronously (its own command context + fence wait) so the eye copies that read
     // `backbuffer` below see the processed image.
     ::sn2_color_transfer::run(backbuffer.Get(), scene_source_state, m_backbuffer_size[0], m_backbuffer_size[1]);
+
+    // DIBR synthetic stereo (see DIBR_PORT_PLAN.md): rewrite the SBS backbuffer in place
+    // with depth-synthesized stereo before the per-eye copies consume it. Env-gated via
+    // UEVR_DIBR; no-op otherwise. scene_depth_tex may have been suppressed above (mono
+    // expansion / debug toggles) - run_dibr_synthesis re-resolves SceneDepthZ itself.
+    run_dibr_synthesis(vr, backbuffer.Get(), scene_source_state, scene_depth_tex.Get());
 
     // If m_frame_count is even, we're rendering the left eye.
     if (is_left_eye_frame) {
@@ -4502,6 +4518,495 @@ void D3D12Component::on_post_present(VR* vr) {
     }
 }
 
+namespace dibr_config {
+// Phase 2 control surface: env vars only (the ImGui panel is Phase 3).
+//   UEVR_DIBR              off|0 (default) | 1|yoro|synth_right | yoro_left|synth_left | inverse | raymarch
+//   UEVR_DIBR_DIVERGENCE   float, pixel-space eye separation (default 30)
+//   UEVR_DIBR_CONVERGENCE  float 0..1, zero-parallax depth (default 0.5)
+//   UEVR_DIBR_REVERSE_DEPTH float, default 1 (UE renders reversed-Z)
+//   UEVR_DIBR_DEBUG_VIEW   float, kernel diagnostic view (1=depth heatmap, 2=disparity, ...)
+//   UEVR_DIBR_RAYMARCH_STEPS float, raymarch kernel step count (default 32)
+//   UEVR_DIBR_DEPTH_UV_AUTO 0 disables the automatic double-wide depth alignment
+struct Config {
+    bool enabled{false};
+    DIBRSynthesis::Mode mode{DIBRSynthesis::Mode::Yoro};
+    float yoro_reference_eye{0.0f}; // 0 = left reference (synthesize right)
+    bool depth_uv_auto{true};
+    std::optional<float> divergence{};
+    std::optional<float> convergence{};
+    std::optional<float> reverse_depth{};
+    std::optional<float> debug_view{};
+    std::optional<float> raymarch_steps{};
+    std::optional<float> linearize{};
+    std::optional<float> linearize_mode{};
+    std::optional<float> linearize_near{};
+    std::optional<float> linearize_far{};
+};
+
+std::optional<float> env_float(const char* name) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return std::nullopt;
+    }
+    char* end = nullptr;
+    const float parsed = std::strtof(v, &end);
+    if (end == v) {
+        return std::nullopt;
+    }
+    return parsed;
+}
+
+const Config& get() {
+    static const Config cfg = []() {
+        Config c{};
+
+        // Value overrides apply regardless of who enables DIBR (UI or env),
+        // so scripted runs can pin single parameters while the UI drives.
+        c.divergence = env_float("UEVR_DIBR_DIVERGENCE");
+        c.convergence = env_float("UEVR_DIBR_CONVERGENCE");
+        c.reverse_depth = env_float("UEVR_DIBR_REVERSE_DEPTH");
+        c.debug_view = env_float("UEVR_DIBR_DEBUG_VIEW");
+        c.raymarch_steps = env_float("UEVR_DIBR_RAYMARCH_STEPS");
+        c.linearize = env_float("UEVR_DIBR_LINEARIZE");
+        c.linearize_mode = env_float("UEVR_DIBR_LINEARIZE_MODE");
+        c.linearize_near = env_float("UEVR_DIBR_LINEARIZE_NEAR");
+        c.linearize_far = env_float("UEVR_DIBR_LINEARIZE_FAR");
+        c.depth_uv_auto = env_float("UEVR_DIBR_DEPTH_UV_AUTO").value_or(1.0f) != 0.0f;
+
+        const char* mode_env = std::getenv("UEVR_DIBR");
+        const std::string mode = mode_env != nullptr ? mode_env : "";
+
+        if (mode.empty() || mode == "0" || mode == "off") {
+            return c;
+        }
+
+        c.enabled = true;
+        if (mode == "1" || mode == "yoro" || mode == "synth_right") {
+            c.mode = DIBRSynthesis::Mode::Yoro;
+            c.yoro_reference_eye = 0.0f;
+        } else if (mode == "yoro_left" || mode == "synth_left") {
+            c.mode = DIBRSynthesis::Mode::Yoro;
+            c.yoro_reference_eye = 1.0f;
+        } else if (mode == "inverse") {
+            c.mode = DIBRSynthesis::Mode::InverseWarp;
+        } else if (mode == "raymarch") {
+            c.mode = DIBRSynthesis::Mode::Raymarch;
+        } else {
+            SPDLOG_WARN("[DIBR] unrecognized UEVR_DIBR value '{}', defaulting to yoro (synthesize right eye)", mode);
+        }
+
+        SPDLOG_INFO("[DIBR] enabled via env: mode={} yoro_ref={} divergence={} convergence={} reverse_depth={}",
+            mode, c.yoro_reference_eye, c.divergence.value_or(-1.0f), c.convergence.value_or(-1.0f),
+            c.reverse_depth.value_or(1.0f));
+        return c;
+    }();
+    return cfg;
+}
+
+// The kernel writes through a typed UAV, so the output must be a UAV-store
+// capable format in the same copy family as the backbuffer (the result is
+// copied straight back over it).
+DXGI_FORMAT uav_store_format_for(ID3D12Device* device, DXGI_FORMAT backbuffer_format) {
+    DXGI_FORMAT candidate = DXGI_FORMAT_UNKNOWN;
+    switch (backbuffer_format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        candidate = DXGI_FORMAT_R8G8B8A8_UNORM;
+        break;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        candidate = DXGI_FORMAT_B8G8R8A8_UNORM;
+        break;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        candidate = DXGI_FORMAT_R10G10B10A2_UNORM;
+        break;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        candidate = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        break;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{candidate};
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))) {
+        return DXGI_FORMAT_UNKNOWN;
+    }
+    if ((support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) == 0) {
+        return DXGI_FORMAT_UNKNOWN;
+    }
+    return candidate;
+}
+} // namespace dibr_config
+
+void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D12_RESOURCE_STATES scene_source_state, ID3D12Resource* scene_depth) {
+    if (backbuffer == nullptr) {
+        return;
+    }
+
+    auto* device = g_framework->get_d3d12_hook()->get_device();
+    if (device == nullptr) {
+        return;
+    }
+
+    const auto bb_desc = backbuffer->GetDesc();
+    const auto eye_width = static_cast<uint32_t>(bb_desc.Width / 2);
+    const auto eye_height = static_cast<uint32_t>(bb_desc.Height);
+    if (eye_width == 0 || eye_height == 0) {
+        return;
+    }
+
+    // Engine-side single-view state: the stereo hook renders ONLY the
+    // reference eye (into the left half of the double-wide backbuffer) while
+    // this is true, so every exit from this function must leave the right
+    // half filled - the engine never wrote it. The cooldown keeps the fill
+    // alive for the frames-in-flight window right after the policy flips off
+    // (mode switched, pipeline failure, device reset), when arriving
+    // backbuffers were still rendered with a single view.
+    const bool single_view = vr->is_dibr_single_view_active();
+    if (single_view) {
+        m_dibr_single_view_cooldown = 3;
+    } else if (m_dibr_single_view_cooldown > 0) {
+        --m_dibr_single_view_cooldown;
+    }
+    const bool right_half_needs_fill = single_view || m_dibr_single_view_cooldown > 0;
+
+    const auto barrier = [](ID3D12GraphicsCommandList* cmd_list, ID3D12Resource* res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        if (before == after) {
+            return;
+        }
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = res;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = before;
+        b.Transition.StateAfter = after;
+        cmd_list->ResourceBarrier(1, &b);
+    };
+
+    // Intermediate single-eye source: the kernels treat the whole color SRV
+    // as one source image, so one half of the SBS backbuffer is staged out.
+    // Also reused as the bounce buffer for the mono right-half fill, since
+    // D3D12 forbids same-subresource CopyTextureRegion.
+    const auto ensure_source_tex = [&]() -> bool {
+        if (m_dibr_source != nullptr && m_dibr_source_width == eye_width && m_dibr_source_height == eye_height &&
+            m_dibr_source_format == bb_desc.Format) {
+            return true;
+        }
+        m_dibr_source.Reset();
+
+        D3D12_HEAP_PROPERTIES heap_props{};
+        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = eye_width;
+        desc.Height = eye_height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = bb_desc.Format;
+        desc.SampleDesc.Count = 1;
+
+        if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&m_dibr_source)))) {
+            SPDLOG_ERROR_ONCE("[DIBR] failed to create {}x{} source staging texture", eye_width, eye_height);
+            return false;
+        }
+
+        m_dibr_source->SetName(L"DIBR Source (single eye)");
+        m_dibr_source_width = eye_width;
+        m_dibr_source_height = eye_height;
+        m_dibr_source_format = bb_desc.Format;
+        SPDLOG_INFO("[DIBR] source staging texture {}x{} (fmt {})", eye_width, eye_height, static_cast<int>(bb_desc.Format));
+        return true;
+    };
+
+    // Stage one half of the backbuffer (src_x = 0 or eye_width) into m_dibr_source.
+    const auto stage_source = [&](ID3D12GraphicsCommandList* cmd_list, uint32_t src_x) {
+        barrier(cmd_list, backbuffer, scene_source_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(cmd_list, m_dibr_source.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        D3D12_BOX src_box{};
+        src_box.left = src_x;
+        src_box.right = src_x + eye_width;
+        src_box.bottom = eye_height;
+        src_box.back = 1;
+
+        D3D12_TEXTURE_COPY_LOCATION src_loc{};
+        src_loc.pResource = backbuffer;
+        src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src_loc.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+        dst_loc.pResource = m_dibr_source.Get();
+        dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst_loc.SubresourceIndex = 0;
+        cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &src_box);
+
+        barrier(cmd_list, m_dibr_source.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(cmd_list, backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, scene_source_state);
+    };
+
+    // Copy the staged source over the backbuffer's right half (flat mono fill
+    // for the eye the engine did not render).
+    const auto copy_staged_to_right_half = [&](ID3D12GraphicsCommandList* cmd_list) {
+        barrier(cmd_list, m_dibr_source.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(cmd_list, backbuffer, scene_source_state, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        D3D12_BOX src_box{};
+        src_box.right = eye_width;
+        src_box.bottom = eye_height;
+        src_box.back = 1;
+
+        D3D12_TEXTURE_COPY_LOCATION src_loc{};
+        src_loc.pResource = m_dibr_source.Get();
+        src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src_loc.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+        dst_loc.pResource = backbuffer;
+        dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst_loc.SubresourceIndex = 0;
+        cmd_list->CopyTextureRegion(&dst_loc, eye_width, 0, 0, &src_loc, &src_box);
+
+        barrier(cmd_list, backbuffer, D3D12_RESOURCE_STATE_COPY_DEST, scene_source_state);
+        barrier(cmd_list, m_dibr_source.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    };
+
+    // Bail-out path while the engine is (or may still be) rendering a single
+    // view: mirror the rendered eye so the other half is never stale garbage.
+    const auto fill_right_half_mono = [&]() {
+        if (!right_half_needs_fill) {
+            return;
+        }
+        if (!m_dibr_commands.ready() && !m_dibr_commands.setup(L"DIBR Synthesis")) {
+            return;
+        }
+        std::scoped_lock _{m_dibr_commands.mtx};
+        m_dibr_commands.wait(INFINITE);
+        if (!ensure_source_tex()) {
+            return;
+        }
+        auto* cmd_list = m_dibr_commands.cmd_list.Get();
+        stage_source(cmd_list, 0);
+        copy_staged_to_right_half(cmd_list);
+        m_dibr_commands.has_commands = true;
+        m_dibr_commands.execute();
+        SPDLOG_WARNING_EVERY_N_SEC(5, "[DIBR] single-view active but synthesis unavailable; mirrored the rendered eye");
+    };
+
+    // Effective mode: the UEVR_DIBR env override (scripted testing) wins over
+    // the persisted UI combo; otherwise the UI drives.
+    const auto& env = dibr_config::get();
+    auto mode = DIBRSynthesis::Mode::Yoro;
+    float yoro_reference_eye = 0.0f;
+
+    if (env.enabled) {
+        mode = env.mode;
+        yoro_reference_eye = env.yoro_reference_eye;
+    } else {
+        switch (vr->m_dibr_mode->value()) {
+        case 1: // YORO, synthesize right
+            mode = DIBRSynthesis::Mode::Yoro;
+            yoro_reference_eye = 0.0f;
+            break;
+        case 2: // YORO, synthesize left
+            mode = DIBRSynthesis::Mode::Yoro;
+            yoro_reference_eye = 1.0f;
+            break;
+        case 3:
+            mode = DIBRSynthesis::Mode::InverseWarp;
+            break;
+        case 4:
+            mode = DIBRSynthesis::Mode::Raymarch;
+            break;
+        default:
+            fill_right_half_mono(); // engine may still be mid-transition out of single-view
+            return; // Off
+        }
+    }
+
+    if (m_dibr.failed()) {
+        fill_right_half_mono();
+        return;
+    }
+
+    // True AFR submits only the rendered eye's half each frame; the
+    // synthesized half would never be consumed, so don't burn GPU on it.
+    if (vr->m_rendering_method->value() == VR::RenderingMethod::ALTERNATING) {
+        SPDLOG_WARN_ONCE("[DIBR] Alternating (AFR) rendering ignores the synthesized eye; use Native Stereo or Synchronized Sequential");
+        fill_right_half_mono();
+        return;
+    }
+
+    // 2D screen mode shows the game on a flat virtual screen; synthesized
+    // parallax would never be visible.
+    if (vr->m_2d_screen_mode->value()) {
+        fill_right_half_mono();
+        return;
+    }
+
+    if (vr->is_extreme_compatibility_mode_enabled()) {
+        SPDLOG_WARN_ONCE("[DIBR] extreme compatibility mode submits the full backbuffer per eye; DIBR disabled");
+        fill_right_half_mono();
+        return;
+    }
+
+    // Kicks off the async kernel build on first use; no-op frames until ready.
+    if (!m_dibr.ensure(device)) {
+        SPDLOG_INFO_EVERY_N_SEC(5, "[DIBR] kernels still compiling; passing frame through untouched");
+        fill_right_half_mono();
+        return;
+    }
+
+    // DIBR needs the engine depth even when depth-layer submission is turned
+    // off, so fall back to a direct pool lookup. The pool hook only
+    // self-activates when depth submission is enabled - request activation
+    // ourselves (idempotent; it installs on the next engine tick).
+    Microsoft::WRL::ComPtr<ID3D12Resource> depth{scene_depth};
+    if (depth == nullptr) {
+        if (auto& rt_pool = vr->get_render_target_pool_hook(); rt_pool != nullptr) {
+            rt_pool->activate();
+            depth = rt_pool->get_texture<ID3D12Resource>(L"SceneDepthZ");
+        }
+    }
+
+    // Final fallback: device-level DSV discovery (the pool hook cannot install
+    // in every title - SN2's UE5 build defeats its signature scan). UE's scene
+    // depth always matches the swapchain extent, double-wide included.
+    if (depth == nullptr) {
+        depth = dibr_depth_tracker::select_scene_depth(static_cast<uint32_t>(bb_desc.Width), eye_height);
+        if (depth != nullptr) {
+            SPDLOG_INFO_ONCE("[DIBR] using DSV-discovered scene depth (render-target pool unavailable)");
+        }
+    }
+
+    if (depth == nullptr) {
+        SPDLOG_WARNING_EVERY_N_SEC(5, "[DIBR] no scene depth available; skipping synthesis this frame");
+        fill_right_half_mono();
+        return;
+    }
+
+    const auto output_format = dibr_config::uav_store_format_for(device, bb_desc.Format);
+    if (output_format == DXGI_FORMAT_UNKNOWN) {
+        SPDLOG_ERROR_ONCE("[DIBR] backbuffer format {} has no UAV-store-capable equivalent on this device; DIBR disabled",
+            static_cast<int>(bb_desc.Format));
+        fill_right_half_mono();
+        return;
+    }
+
+    if (!m_dibr_commands.ready() && !m_dibr_commands.setup(L"DIBR Synthesis")) {
+        return;
+    }
+
+    // The fence wait must precede any resource recreation below: dropping the
+    // staging/output textures while the previous frame's DIBR commands are
+    // still in flight would free GPU-referenced memory.
+    std::scoped_lock _{m_dibr_commands.mtx};
+    m_dibr_commands.wait(INFINITE);
+    auto* cmd_list = m_dibr_commands.cmd_list.Get();
+
+    m_dibr.set_output_format(output_format);
+
+    if (!ensure_source_tex()) {
+        return;
+    }
+
+    // 1) Stage the reference eye's half of the backbuffer as the synthesis
+    // source. While the engine renders (or may still be rendering) a single
+    // view it always lands in the LEFT half regardless of which eye it
+    // represents; in two-view mode the YORO reference eye owns its own half
+    // (the right half when synthesizing the left eye).
+    const bool reference_is_right = mode == DIBRSynthesis::Mode::Yoro && yoro_reference_eye > 0.5f;
+    const uint32_t source_x = (!right_half_needs_fill && reference_is_right) ? eye_width : 0;
+    stage_source(cmd_list, source_x);
+
+    // 2) Parameters: vrmod defaults -> persisted UI settings -> env overrides.
+    DIBRStereoParams params{};
+    params.mode_param0 = yoro_reference_eye;
+    params.divergence = env.divergence.value_or(vr->m_dibr_divergence->value());
+    params.convergence = env.convergence.value_or(vr->m_dibr_convergence->value());
+    params.zpd_balance = vr->m_dibr_zpd_balance->value();
+    params.reverse_depth = env.reverse_depth.value_or(vr->m_dibr_reverse_depth->value() ? 1.0f : 0.0f);
+    params.depth_linearize_strength = env.linearize.value_or(vr->m_dibr_depth_linearize->value());
+    params.depth_linearize_mode = env.linearize_mode.value_or(static_cast<float>(vr->m_dibr_depth_linearize_mode->value()));
+    params.depth_linearize_near = env.linearize_near.value_or(vr->m_dibr_depth_linearize_near->value());
+    params.depth_linearize_far = env.linearize_far.value_or(vr->m_dibr_depth_linearize_far->value());
+    params.depth_gain = vr->m_dibr_depth_gain->value();
+    params.depth_curve = vr->m_dibr_depth_curve->value();
+    params.popout_limit = vr->m_dibr_popout_limit->value();
+    params.edge_fill_mode = static_cast<float>(vr->m_dibr_edge_fill_mode->value());
+    params.disocclusion_strength = vr->m_dibr_disocclusion_strength->value();
+    params.edge_guard_strength = vr->m_dibr_edge_guard_strength->value();
+    params.foreground_protect = vr->m_dibr_foreground_protect->value();
+    params.range_smoothing = vr->m_dibr_range_smoothing->value();
+    params.raymarch_steps = env.raymarch_steps.value_or(static_cast<float>(vr->m_dibr_raymarch_steps->value()));
+    params.raymarch_foveation_strength = vr->m_dibr_foveation_strength->value();
+    params.debug_view_mode = env.debug_view.value_or(static_cast<float>(vr->m_dibr_debug_view->value()));
+
+    // SceneDepthZ can cover the full double-wide render while the source is a
+    // single eye; map output UVs onto the half of the depth texture that the
+    // staged color half was rendered with.
+    if (env.depth_uv_auto) {
+        const auto depth_desc = depth->GetDesc();
+        const float width_ratio = static_cast<float>(depth_desc.Width) / static_cast<float>(eye_width);
+        if (width_ratio > 1.5f) {
+            params.depth_uv_scale_x = 2.0f; // TransformDepthUv divides: uv.x / 2
+            // anchor 1 = top-left half, 2 = bottom-right half (scale_y stays 1, so y is unaffected)
+            params.depth_uv_anchor = source_x > 0 ? 2.0f : 1.0f;
+        }
+    }
+
+    // 3) Synthesize the packed SBS pair (records into the same command list).
+    auto* output = m_dibr.synthesize(device, cmd_list, mode,
+        m_dibr_source.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        depth.Get(), ENGINE_SRC_DEPTH,
+        params);
+
+    // 4) Copy the synthesized pair back over the backbuffer so every
+    // downstream consumer (OpenXR eye copies, OpenVR submits, mirror) sees it.
+    if (output != nullptr) {
+        barrier(cmd_list, output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(cmd_list, backbuffer, scene_source_state, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        D3D12_BOX full_out{};
+        full_out.right = eye_width * 2;
+        full_out.bottom = eye_height;
+        full_out.back = 1;
+
+        D3D12_TEXTURE_COPY_LOCATION out_loc{};
+        out_loc.pResource = output;
+        out_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        out_loc.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION bb_loc{};
+        bb_loc.pResource = backbuffer;
+        bb_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        bb_loc.SubresourceIndex = 0;
+        cmd_list->CopyTextureRegion(&bb_loc, 0, 0, 0, &out_loc, &full_out);
+
+        barrier(cmd_list, backbuffer, D3D12_RESOURCE_STATE_COPY_DEST, scene_source_state);
+        barrier(cmd_list, output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+
+        // Arms single-view mode: from here on the stereo hook may drop the
+        // engine's second view, knowing this pass can fill the other eye.
+        vr->notify_dibr_synthesis_succeeded();
+
+        SPDLOG_INFO_ONCE("[DIBR] first synthesized frame submitted (mode={}, {}x{} per eye)",
+            static_cast<int>(mode), eye_width, eye_height);
+    } else {
+        SPDLOG_WARNING_EVERY_N_SEC(5, "[DIBR] synthesize() returned null; frame passed through");
+        if (right_half_needs_fill) {
+            // The staged source is the rendered eye - mirror it flat so the
+            // never-rendered half is not stale garbage.
+            copy_staged_to_right_half(cmd_list);
+        }
+    }
+
+    m_dibr_commands.has_commands = true;
+    m_dibr_commands.execute();
+}
+
 void D3D12Component::on_reset(VR* vr) {
     m_force_reset = true;
     m_last_frame_timing_log = {};
@@ -4544,6 +5049,15 @@ void D3D12Component::on_reset(VR* vr) {
     m_scene_capture_tex.reset();
     m_shf_mono_scene_tex.reset();
     m_shf_mono_scene_commands.reset();
+
+    // Order matters: the command context reset waits for in-flight DIBR GPU
+    // work before the textures it references are released below.
+    m_dibr_commands.reset();
+    m_dibr.reset();
+    m_dibr_source.Reset();
+    m_dibr_source_width = 0;
+    m_dibr_source_height = 0;
+    m_dibr_source_format = DXGI_FORMAT_UNKNOWN;
     m_native_debug_dump_commands.reset();
     m_native_debug_dumped_backbuffer = false;
     m_native_debug_submit_count = 0;

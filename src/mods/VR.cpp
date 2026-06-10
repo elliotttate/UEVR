@@ -2036,6 +2036,96 @@ bool VR::should_force_native_stereo_fix_same_pass() const {
     return true;
 }
 
+int32_t VR::get_dibr_requested_mode() const {
+    // Mirrors dibr_config's UEVR_DIBR env override (D3D12Component.cpp).
+    static const int env_mode = []() -> int {
+        const char* v = std::getenv("UEVR_DIBR");
+        if (v == nullptr || v[0] == '\0') {
+            return -1; // no override; UI drives
+        }
+        const std::string m{v};
+        if (m == "0" || m == "off") {
+            return 0;
+        }
+        if (m == "inverse") {
+            return 3;
+        }
+        if (m == "raymarch") {
+            return 4;
+        }
+        if (m == "yoro_left" || m == "synth_left") {
+            return 2;
+        }
+        return 1; // yoro / synth_right / unrecognized
+    }();
+
+    return env_mode >= 0 ? env_mode : m_dibr_mode->value();
+}
+
+// Preconditions shared by every DIBR engine-side adjustment: they must match
+// run_dibr_synthesis' own bail-outs, so the stereo hook never reshapes the
+// engine's rendering on a frame the synthesis pass would refuse to touch.
+bool VR::is_dibr_rendering_path_compatible() const {
+    if (!g_framework->is_dx12()) {
+        return false;
+    }
+
+    // True AFR only ever consumes the rendered eye's half, and extreme compat
+    // submits the full backbuffer per eye; run_dibr_synthesis skips both.
+    if (m_rendering_method->value() == RenderingMethod::ALTERNATING || m_extreme_compat_mode->value()) {
+        return false;
+    }
+
+    // Flat virtual screen: synthesized parallax is never visible.
+    if (m_2d_screen_mode->value()) {
+        return false;
+    }
+
+    return true;
+}
+
+bool VR::is_dibr_mono_view_active() const {
+    if (!is_dibr_rendering_path_compatible()) {
+        return false;
+    }
+
+    const auto mode = get_dibr_requested_mode();
+    return mode == 3 || mode == 4; // Inverse Warp / Raymarch synthesize both eyes
+}
+
+bool VR::is_dibr_single_view_active() const {
+    if (get_dibr_requested_mode() == 0 || !is_dibr_rendering_path_compatible()) {
+        return false;
+    }
+
+    // Synchronized sequential drives its own per-frame eye alternation; only
+    // plain Native Stereo has a second view we can simply not render.
+    if (m_rendering_method->value() != RenderingMethod::NATIVE_STEREO) {
+        return false;
+    }
+
+    // These compatibility paths construct views with their own rect/pose logic.
+    if (is_splitscreen_compatibility_enabled() || is_sceneview_compatibility_enabled()) {
+        return false;
+    }
+
+    // Without view-count control the engine renders both eyes regardless, and
+    // claiming single-view would make the staging logic pick the wrong half.
+    if (m_fake_stereo_hook == nullptr || !m_fake_stereo_hook->has_view_count_control()) {
+        return false;
+    }
+
+    // Only drop the second eye once the synthesis pipeline is live AND has
+    // produced a frame; until then we stay in the additive overwrite mode,
+    // where a no-op DIBR pass still leaves valid native stereo behind.
+    if (!m_dibr_synthesis_proven.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    const auto& dibr = m_d3d12.get_dibr_synthesis();
+    return dibr.ready() && !dibr.failed();
+}
+
 bool VR::is_controller_camera_conflict_guard_active() const {
     if (!is_controller_camera_conflict_guard_enabled() || !is_hmd_active()) {
         return false;
@@ -6827,6 +6917,98 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             } else {
                 m_native_stereo_fix_same_pass->draw("Use Same Stereo Pass");
             }
+            ImGui::TreePop();
+        }
+
+        if (ImGui::TreeNode("Synthetic Stereo (DIBR)")) {
+            m_dibr_mode->draw("Mode");
+
+            auto& dibr = m_d3d12.get_dibr_synthesis();
+            if (m_dibr_mode->value() > 0) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("[%s]", dibr.state_name());
+                if (dibr.failed()) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Retry")) {
+                        dibr.reset();
+                    }
+                }
+            }
+
+            ImGui::TextWrapped(
+                "Synthesizes a stereo pair from one rendered eye + scene depth (D3D12 only). "
+                "YORO keeps the rendered eye untouched and warps the other - it sidesteps "
+                "per-eye rendering bugs and is the recommended mode. Requires the engine's "
+                "SceneDepthZ; no effect in Alternating (AFR) rendering.");
+
+            if (m_dibr_mode->value() > 0) {
+                if (is_dibr_single_view_active()) {
+                    ImGui::TextColored(ImVec4{0.4f, 1.0f, 0.4f, 1.0f},
+                        "Single-view: the engine renders only the %s eye (~half scene GPU cost)",
+                        get_dibr_reference_eye() == 1 ? "right" : "left");
+                } else if (m_rendering_method->value() == RenderingMethod::NATIVE_STEREO) {
+                    ImGui::TextDisabled("Both eyes still rendered (single-view engages once synthesis is proven)");
+                }
+            }
+
+            if (ImGui::Button("Comfort")) {
+                m_dibr_divergence->value() = 15.0f;
+                m_dibr_convergence->value() = 0.4f;
+                m_dibr_popout_limit->value() = 0.5f;
+                m_dibr_disocclusion_strength->value() = 0.8f;
+                m_dibr_edge_guard_strength->value() = 0.5f;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Balanced")) {
+                m_dibr_divergence->value() = 30.0f;
+                m_dibr_convergence->value() = 0.5f;
+                m_dibr_popout_limit->value() = 1.0f;
+                m_dibr_disocclusion_strength->value() = 0.6f;
+                m_dibr_edge_guard_strength->value() = 0.2f;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Pop-out")) {
+                m_dibr_divergence->value() = 50.0f;
+                m_dibr_convergence->value() = 0.65f;
+                m_dibr_popout_limit->value() = 1.0f;
+                m_dibr_disocclusion_strength->value() = 0.5f;
+                m_dibr_edge_guard_strength->value() = 0.0f;
+            }
+
+            m_dibr_divergence->draw("Divergence (stereo strength)");
+            m_dibr_convergence->draw("Convergence (screen-plane depth)");
+            m_dibr_zpd_balance->draw("Auto Convergence Balance");
+            m_dibr_depth_linearize->draw("Depth Linearization");
+            if (m_dibr_depth_linearize->value() > 0.0f) {
+                m_dibr_depth_linearize_mode->draw("Projection Type");
+                m_dibr_depth_linearize_near->draw("Near Plane (UE units)");
+                m_dibr_depth_linearize_far->draw("Far Scale (UE units)");
+            } else {
+                m_dibr_reverse_depth->draw("Flip Raw Depth (reversed-Z)");
+            }
+            m_dibr_edge_fill_mode->draw("Edge Fill");
+            m_dibr_edge_guard_strength->draw("Screen Edge Guard");
+
+            // These constants are only referenced by the raymarch kernel
+            // (verified via shader reflection) - vrmod implemented its
+            // advanced depth conditioning in that variant only.
+            if (ImGui::TreeNode("Raymarch Quality")) {
+                m_dibr_raymarch_steps->draw("Steps");
+                m_dibr_foveation_strength->draw("Foveation");
+                m_dibr_depth_gain->draw("Depth Gain");
+                m_dibr_depth_curve->draw("Depth Curve");
+                m_dibr_popout_limit->draw("Pop-out Limit");
+                m_dibr_disocclusion_strength->draw("Disocclusion Guard");
+                m_dibr_foreground_protect->draw("Foreground Protect");
+                m_dibr_range_smoothing->draw("Range Smoothing");
+                ImGui::TreePop();
+            }
+
+            m_dibr_debug_view->draw("Debug View");
+            if (m_dibr_debug_view->value() > 0) {
+                ImGui::TextWrapped("Debug views replace the image (1 = depth heatmap: validates the depth binding). Not saved between sessions.");
+            }
+
             ImGui::TreePop();
         }
 

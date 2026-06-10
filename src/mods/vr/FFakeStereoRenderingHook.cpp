@@ -17075,7 +17075,9 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     last_frame_count = g_frame_count;
 
-    const auto true_index = vr->is_using_afr() ? (g_frame_count + last_index) % 2 : last_index;
+    const auto true_index = vr->is_using_afr()
+        ? (g_frame_count + last_index) % 2
+        : (vr->is_dibr_single_view_active() ? vr->get_dibr_reference_eye() : last_index);
 
     if (subnautica2_is_current_game() &&
         vr->is_native_stereo_fix_enabled() &&
@@ -17912,7 +17914,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
     // This check might seem kind of arbitrary, but sometimes (rarely) the offset
     // for the views can be wrong so if the count is some sane number
     // then we can assume that the offset is correct
-    if (vr->is_using_afr() && views_ptr != nullptr && views_ptr->count >= 2 && views_ptr->count <= 4) {
+    if ((vr->is_using_afr() || vr->is_dibr_single_view_active()) && views_ptr != nullptr && views_ptr->count >= 2 && views_ptr->count <= 4) {
         SPDLOG_INFO_ONCE("Setting view count to 1 (from {})", views_ptr->count);
         views_ptr->count = 1;
     }
@@ -19326,6 +19328,10 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     if (subnautica2_synced_sequential_explicit_eye) {
         true_index = g_frame_count % 2;
     }
+    // DIBR single-view: one engine view per frame, pinned to the reference
+    // eye. It is simultaneously the first and last pass of the frame, so the
+    // per-frame bookkeeping gated on true_index 0/1 below must also fire.
+    const auto dibr_single_view = !vr->is_using_afr() && vr->is_dibr_single_view_active();
     const auto has_double_precision = g_hook->m_has_double_precision;
     const auto rot_d = (Rotator<double>*)view_rotation;
 
@@ -19382,9 +19388,11 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 }
             }
         }
+    } else if (dibr_single_view && !is_full_pass) {
+        true_index = vr->get_dibr_reference_eye();
     }
 
-    if (true_index == 0 && !is_full_pass) {
+    if ((true_index == 0 || dibr_single_view) && !is_full_pass) {
         if (has_double_precision) {
             g_hook->m_last_pre_rotation_double = *rot_d;
         } else {
@@ -19501,7 +19509,14 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         const auto current_eye_rotation_offset = glm::normalize(glm::quat{vr->get_eye_transform(true_index)});
 
         const auto new_rotation = glm::normalize(vqi_norm * current_hmd_rotation * current_eye_rotation_offset);
-        const auto eye_offset = glm::vec3{vr->get_eye_offset((VRRuntime::Eye)(true_index))};
+        auto eye_offset = glm::vec3{vr->get_eye_offset((VRRuntime::Eye)(true_index))};
+
+        // DIBR both-eyes-synthesis modes (Inverse/Raymarch) render one
+        // centered view; the stereo baseline is reintroduced synthetically
+        // from depth, so the engine's own eye separation must be zero.
+        if (vr->is_dibr_mono_view_active()) {
+            eye_offset = glm::vec3{0.0f, 0.0f, 0.0f};
+        }
 
 
         const auto standing_delta = vr->get_position(0) - vr->get_standing_origin();
@@ -19545,7 +19560,8 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         // Roomscale movement
         // only do it on the right eye pass
         // if we did it on the left, there would be eye desyncs when the right eye is rendered
-        if (true_index == 1 && (vr->is_roomscale_enabled() || vr->is_aim_pawn_control_rotation_enabled())) {
+        // (in DIBR single-view the lone pass is the frame's last pass, whichever eye it is)
+        if ((true_index == 1 || dibr_single_view) && (vr->is_roomscale_enabled() || vr->is_aim_pawn_control_rotation_enabled())) {
             const auto world = sdk::UEngine::get()->get_world();
 
             if (const auto controller = sdk::UGameplayStatics::get()->get_player_controller(world, 0); controller != nullptr) {
@@ -19607,7 +19623,7 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
             mod->on_post_calculate_stereo_view_offset(stereo, view_index, view_rotation, world_to_meters, view_location, g_hook->m_has_double_precision);
         }
 
-        if (true_index == 0) {
+        if (true_index == 0 || dibr_single_view) {
             if (has_double_precision) {
                 g_hook->m_last_rotation_double = *rot_d;
             } else {
@@ -19629,7 +19645,7 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
             vr->is_native_stereo_fix_enabled() &&
             !vr->is_native_stereo_fix_same_pass_enabled();
 
-        if (true_index == 1 &&
+        if ((true_index == 1 || dibr_single_view) &&
             !subnautica2_native_stereo_updates_control_rotation_before_views &&
             vr->is_any_aim_method_active() &&
             !controller_camera_guard_active &&
@@ -19758,9 +19774,12 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
 
     if (out != nullptr) {
         auto true_index = index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2);
-    
+
         if (vr->is_using_afr()) {
             true_index = g_frame_count % 2;
+        } else if (vr->is_dibr_single_view_active()) {
+            // The lone engine view is the DIBR reference eye.
+            true_index = vr->get_dibr_reference_eye();
         }
 
         auto& double_matrix = *(Matrix4x4d*)out;
@@ -19954,6 +19973,14 @@ uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoR
             return 2;
         }
 
+        return 1;
+    }
+
+    // DIBR single-view: the engine renders only the reference eye (left half
+    // of the double-wide RT) and the synthesis pass reconstructs the other.
+    // Submission stays on the native double-wide path - this is not AFR.
+    if (vr->is_dibr_single_view_active()) {
+        SPDLOG_INFO_ONCE("[DIBR] GetDesiredNumberOfViews returning 1 (single-view synthesis active)");
         return 1;
     }
 

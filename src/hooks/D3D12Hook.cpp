@@ -74,6 +74,7 @@
 #include "Sn2DebugResources.hpp"
 #include "Sn2RdgFogNaming.hpp"
 #include "Sn2RuntimeState.hpp"
+#include "DIBRDepthTracker.hpp"
 
 static D3D12Hook* g_d3d12_hook = nullptr;
 
@@ -11354,6 +11355,7 @@ void WINAPI D3D12Hook::create_depth_stencil_view(
         desc,
         descriptor);
     ::sn2_capture_truth::record_descriptor_view("dsv", resource, descriptor);
+    dibr_depth_tracker::record_dsv(resource, descriptor);
 }
 
 namespace {
