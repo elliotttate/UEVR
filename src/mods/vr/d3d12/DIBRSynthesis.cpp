@@ -161,10 +161,10 @@ bool validate_cbuffer_layout(const std::vector<uint8_t>& bytecode, const char* n
         // Field count + the last field's offset pin the layout exactly and are
         // backend-independent (FXC reports the cbuffer size padded to 16 bytes,
         // DXC's DXIL reflection may not - so total size is only sanity-ranged).
-        // 248 scalars (incl. reproj/scatter/overscan/temporal flags+pad) +
-        // three float4x4, which reflection counts as ONE variable each.
-        constexpr uint32_t expected_fields = 248u + 3u;
-        constexpr uint32_t expected_last_offset = offsetof(DIBRStereoParams, reproj_target_to_prev);
+        // 250 scalars (incl. reproj/scatter/overscan/temporal flags + out dims)
+        // + three float4x4, which reflection counts as ONE variable each.
+        constexpr uint32_t expected_fields = 250u + 3u;
+        constexpr uint32_t expected_last_offset = offsetof(DIBRStereoParams, out_height);
         constexpr uint32_t expected_size_min = sizeof(DIBRStereoParams);
         constexpr uint32_t expected_size_max = (sizeof(DIBRStereoParams) + 15u) & ~15u;
 
@@ -333,27 +333,34 @@ bool DIBRSynthesis::create_root_signature(ID3D12Device* device, DeviceObjects& o
 
 bool DIBRSynthesis::create_psos(ID3D12Device* device, DeviceObjects& objs) {
     struct Kernel {
-        const char* file;
+        const char* name;  // cache + staging + log identity
+        const char* file;  // on-disk override filename (UEVR_DIBR_SHADER_DIR)
         std::string (*embedded)();
+        const char* prefix; // optional prepended defines (specializations)
         ComPtr<ID3D12PipelineState>* pso;
     };
     const Kernel kernels[] = {
-        {"dibr_inverse.hlsl", &dibr_shaders::dibr_inverse_source, &objs.pso_inverse},
-        {"dibr_yoro.hlsl", &dibr_shaders::dibr_yoro_source, &objs.pso_yoro},
-        {"dibr_raymarch.hlsl", &dibr_shaders::dibr_raymarch_source, &objs.pso_raymarch},
-        {"dibr_scatter_clear.hlsl", &dibr_shaders::dibr_scatter_clear_source, &objs.pso_scatter_clear},
-        {"dibr_scatter_depth.hlsl", &dibr_shaders::dibr_scatter_depth_source, &objs.pso_scatter_depth},
-        {"dibr_scatter_color.hlsl", &dibr_shaders::dibr_scatter_color_source, &objs.pso_scatter_color},
-        {"dibr_scatter_fill.hlsl", &dibr_shaders::dibr_scatter_fill_source, &objs.pso_scatter_fill},
+        {"dibr_inverse.hlsl", "dibr_inverse.hlsl", &dibr_shaders::dibr_inverse_source, nullptr, &objs.pso_inverse},
+        {"dibr_yoro.hlsl", "dibr_yoro.hlsl", &dibr_shaders::dibr_yoro_source, nullptr, &objs.pso_yoro},
+        // Same source, gather machinery compiled out - the scatter compose PSO.
+        {"dibr_yoro_scatter.hlsl", "dibr_yoro.hlsl", &dibr_shaders::dibr_yoro_source, "#define SCATTER_COMPOSE 1\n", &objs.pso_yoro_scatter},
+        {"dibr_raymarch.hlsl", "dibr_raymarch.hlsl", &dibr_shaders::dibr_raymarch_source, nullptr, &objs.pso_raymarch},
+        {"dibr_scatter_clear.hlsl", "dibr_scatter_clear.hlsl", &dibr_shaders::dibr_scatter_clear_source, nullptr, &objs.pso_scatter_clear},
+        {"dibr_scatter_depth.hlsl", "dibr_scatter_depth.hlsl", &dibr_shaders::dibr_scatter_depth_source, nullptr, &objs.pso_scatter_depth},
+        {"dibr_scatter_color.hlsl", "dibr_scatter_color.hlsl", &dibr_shaders::dibr_scatter_color_source, nullptr, &objs.pso_scatter_color},
+        {"dibr_scatter_fill.hlsl", "dibr_scatter_fill.hlsl", &dibr_shaders::dibr_scatter_fill_source, nullptr, &objs.pso_scatter_fill},
     };
 
     for (const auto& k : kernels) {
-        const auto source = load_shader_source(k.file, k.embedded);
+        auto source = load_shader_source(k.file, k.embedded);
+        if (k.prefix != nullptr) {
+            source.insert(0, k.prefix);
+        }
         std::vector<uint8_t> bytecode{};
-        if (!compile_kernel(source, k.file, bytecode)) {
+        if (!compile_kernel(source, k.name, bytecode)) {
             return false;
         }
-        if (!validate_cbuffer_layout(bytecode, k.file)) {
+        if (!validate_cbuffer_layout(bytecode, k.name)) {
             return false;
         }
 
@@ -361,7 +368,7 @@ bool DIBRSynthesis::create_psos(ID3D12Device* device, DeviceObjects& objs) {
         pso_desc.pRootSignature = objs.root_sig.Get();
         pso_desc.CS = D3D12_SHADER_BYTECODE{bytecode.data(), bytecode.size()};
         if (FAILED(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(k.pso->ReleaseAndGetAddressOf())))) {
-            SPDLOG_ERROR("[DIBR] {}: CreateComputePipelineState failed", k.file);
+            SPDLOG_ERROR("[DIBR] {}: CreateComputePipelineState failed", k.name);
             return false;
         }
     }
@@ -533,9 +540,10 @@ ID3D12Resource* DIBRSynthesis::synthesize(
         pso = m_objs.pso_raymarch.Get();
         break;
     case Mode::YoroScatter:
-        // Final compose runs through the yoro kernel with scatter_compose set.
-        pso = m_objs.pso_yoro.Get();
-        if (m_objs.pso_scatter_clear == nullptr || m_objs.pso_scatter_depth == nullptr ||
+        // Final compose runs through the SCATTER_COMPOSE=1 specialization of
+        // the yoro kernel (gather machinery compiled out for occupancy).
+        pso = m_objs.pso_yoro_scatter.Get();
+        if (pso == nullptr || m_objs.pso_scatter_clear == nullptr || m_objs.pso_scatter_depth == nullptr ||
             m_objs.pso_scatter_color == nullptr || m_objs.pso_scatter_fill == nullptr) {
             pso = nullptr;
         } else {
@@ -557,7 +565,17 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     params.source_height = color_desc.Height;
     params.frame_index = m_frame_index;
 
-    if (!ensure_scatter(device, params.source_width, params.source_height)) {
+    // Output (submit) eye size: callers set it when the overscan-grown render
+    // target makes the source wider than the true-FOV output; everything else
+    // gets the historical out == src behavior.
+    if (params.out_width == 0 || params.out_height == 0 ||
+        params.out_width > params.source_width || params.out_height > params.source_height) {
+        params.out_width = params.source_width;
+        params.out_height = params.source_height;
+    }
+
+    // Scatter buffers (and the packed output) live in OUTPUT space.
+    if (!ensure_scatter(device, params.out_width, params.out_height)) {
         return nullptr;
     }
 
@@ -635,8 +653,12 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     cmd_list->SetComputeRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{gpu_base.ptr + slot_offset});
     cmd_list->SetComputeRootConstantBufferView(1, m_objs.cbuffer->GetGPUVirtualAddress() + static_cast<uint64_t>(slot) * kCbSlotSize);
 
-    const uint32_t gx = (params.source_width + 15) / 16;
-    const uint32_t gy = (params.source_height + 15) / 16;
+    // Source-space passes iterate rendered pixels; output-space passes cover
+    // the (possibly narrower) true-FOV target.
+    const uint32_t gx_src = (params.source_width + 15) / 16;
+    const uint32_t gy_src = (params.source_height + 15) / 16;
+    const uint32_t gx_out = (params.out_width + 15) / 16;
+    const uint32_t gy_out = (params.out_height + 15) / 16;
 
     if (mode == Mode::YoroScatter) {
         const auto uav_barrier = [cmd_list](ID3D12Resource* r) {
@@ -650,21 +672,24 @@ ID3D12Resource* DIBRSynthesis::synthesize(
 
         // clear -> depth scatter (nearest wins) -> color resolve -> hole fill.
         cmd_list->SetPipelineState(m_objs.pso_scatter_clear.Get());
-        cmd_list->Dispatch(gx, gy, 1);
+        cmd_list->Dispatch(gx_out, gy_out, 1);
         uav_barrier(m_scatter_key[cur].Get());
         uav_barrier(m_scatter_color[cur].Get());
 
         cmd_list->SetPipelineState(m_objs.pso_scatter_depth.Get());
-        cmd_list->Dispatch(gx, gy, 1);
+        cmd_list->Dispatch(gx_src, gy_src, 1);
         uav_barrier(m_scatter_key[cur].Get());
 
         cmd_list->SetPipelineState(m_objs.pso_scatter_color.Get());
-        cmd_list->Dispatch(gx, gy, 1);
+        cmd_list->Dispatch(gx_src, gy_src, 1);
         uav_barrier(m_scatter_color[cur].Get());
 
         cmd_list->SetPipelineState(m_objs.pso_scatter_fill.Get());
-        cmd_list->Dispatch(gx, gy, 1);
+        cmd_list->Dispatch(gx_out, gy_out, 1);
         uav_barrier(m_scatter_color[cur].Get());
+        // The fill pass also commits marker-bit keys; next frame reads this
+        // buffer as g_historyKey, so its writes need ordering too.
+        uav_barrier(m_scatter_key[cur].Get());
 
         // This frame's filled pair becomes the next frame's temporal history.
         m_scatter_index = cur ^ 1u;
@@ -673,8 +698,8 @@ ID3D12Resource* DIBRSynthesis::synthesize(
 
     cmd_list->SetPipelineState(pso);
 
-    // One thread per SOURCE pixel; each thread writes both eyes' output pixels.
-    cmd_list->Dispatch(gx, gy, 1);
+    // One thread per OUTPUT pixel; each thread writes both eyes' output pixels.
+    cmd_list->Dispatch(gx_out, gy_out, 1);
 
     transition(cmd_list, m_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     if (depth_needs_transition) {
@@ -763,8 +788,10 @@ uint32_t DIBRSynthesis::frame_pack_gap_height(const DIBRStereoParams& p) {
 }
 
 void DIBRSynthesis::packed_output_dimensions(const DIBRStereoParams& p, uint32_t& w, uint32_t& h) {
-    const uint32_t sw = p.source_width;
-    const uint32_t sh = p.source_height;
+    // Packed output is laid out in OUTPUT (submit) eye units, which only
+    // differ from the source when the overscan-grown RT widened the source.
+    const uint32_t sw = (p.out_width != 0) ? p.out_width : p.source_width;
+    const uint32_t sh = (p.out_height != 0) ? p.out_height : p.source_height;
     const uint32_t layout = output_layout_mode(p);
     if (layout >= 4) { // mono / debug passthrough
         w = sw;

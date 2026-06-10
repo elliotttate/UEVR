@@ -263,8 +263,12 @@ cbuffer StereoParams : register(b0) {
     float scatter_compose;
     float overscan_x;
     float temporal_enabled;
-    float temporal_pad0;
+    float temporal_blend;
     float4x4 reproj_target_to_prev;
+    // Output (submit) eye size - differs from srcWidth when the overscan-grown
+    // render target makes the source wider than the true-FOV output.
+    uint  out_width;
+    uint  out_height;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -315,14 +319,20 @@ float SynthEyeSign()
 [numthreads(16, 16, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
-    if (dtid.x >= srcWidth || dtid.y >= srcHeight) return;
+    // The fill pass runs entirely in OUTPUT (target eye) space.
+    if (dtid.x >= out_width || dtid.y >= out_height) return;
     if (g_scatterColor[dtid.xy].a > 0.5f) return; // already covered
 
     // Disocclusion hole: extend the BACKGROUND side (the deeper of the two
     // nearest valid scanline neighbors), never the occluder - YORO-paper
-    // doctrine. Search is capped; anything wider falls back to the source
-    // color at this position (flat mono fill).
-    const int kMaxSearch = 24;
+    // doctrine. Fine 1-px steps cover the common narrow reveals; coarse 4-px
+    // strides extend the reach to very-near-object holes (a stride can skip a
+    // thin valid run and land slightly farther out - fine for background
+    // extension). Anything wider falls back to the source color at this
+    // position (flat mono fill).
+    const int kFineSearch = 8;
+    const int kCoarseStep = 4;
+    const int kMaxSearch = 96;
     int lx = -1; uint lkey = 0u;
     int rx = -1; uint rkey = 0u;
 
@@ -330,16 +340,16 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // threads, this dispatch) - skip them so hole pixels never adopt other
     // hole pixels' fill as real geometry (that ordering race would shimmer).
     [loop]
-    for (int i = 1; i <= kMaxSearch; ++i) {
+    for (int i = 1; i <= kMaxSearch; i += (i < kFineSearch) ? 1 : kCoarseStep) {
         int x = (int)dtid.x - i;
         if (x < 0) break;
         uint k = g_scatterKey[uint2(x, dtid.y)];
         if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { lx = x; lkey = k; break; }
     }
     [loop]
-    for (int i = 1; i <= kMaxSearch; ++i) {
+    for (int i = 1; i <= kMaxSearch; i += (i < kFineSearch) ? 1 : kCoarseStep) {
         int x = (int)dtid.x + i;
-        if (x >= (int)srcWidth) break;
+        if (x >= (int)out_width) break;
         uint k = g_scatterKey[uint2(x, dtid.y)];
         if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { rx = x; rkey = k; break; }
     }
@@ -359,7 +369,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         c = g_scatterColor[uint2(rx, dtid.y)];
         fillKey = rkey;
     } else {
-        float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
+        float2 uv = float2((dtid.x + 0.5f) / (float)out_width, (dtid.y + 0.5f) / (float)out_height);
         if (overscan_x > 1.0f) {
             uv.x = 0.5f + (uv.x - 0.5f) / overscan_x; // crop overscanned source to true FOV
         }
@@ -377,18 +387,43 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // converging in a few frames so animated content doesn't freeze stale.
     if (temporal_enabled > 0.5f && fillKey != 0u) {
         float estDepth = asfloat(fillKey);
-        float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
+        float2 uv = float2((dtid.x + 0.5f) / (float)out_width, (dtid.y + 0.5f) / (float)out_height);
         float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
         float4 prev = mul(reproj_target_to_prev, float4(ndc, estDepth, 1.0f));
         float w = (abs(prev.w) > 1e-6f) ? prev.w : 1e-6f;
         float2 pn = prev.xy / w;
-        int px = (int)((pn.x * 0.5f + 0.5f) * (float)srcWidth);
-        int py = (int)((0.5f - pn.y * 0.5f) * (float)srcHeight);
-        if (px >= 0 && px < (int)srcWidth && py >= 0 && py < (int)srcHeight) {
+        int px = (int)((pn.x * 0.5f + 0.5f) * (float)out_width);
+        int py = (int)((0.5f - pn.y * 0.5f) * (float)out_height);
+        if (px >= 0 && px < (int)out_width && py >= 0 && py < (int)out_height) {
+            const float tol = max(0.15f * estDepth, 2e-4f);
             float4 h = g_historyColor[uint2(px, py)];
             uint hk = g_historyKey[uint2(px, py)] & 0x7FFFFFFFu; // strip fill marker
-            if (h.a > 0.5f && hk != 0u && abs(asfloat(hk) - estDepth) <= max(0.15f * estDepth, 2e-4f)) {
-                c.rgb = lerp(c.rgb, h.rgb, 0.85f);
+            bool validHistory = (h.a > 0.5f && hk != 0u && abs(asfloat(hk) - estDepth) <= tol);
+            if (!validHistory) {
+                // Rotation rounding often lands one texel off a valid history
+                // pixel; probe the 3x3 ring before giving up on history.
+                const int2 kRing[8] = {
+                    int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1),
+                    int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1)
+                };
+                [loop]
+                for (int n = 0; n < 8; ++n) {
+                    int nx = px + kRing[n].x;
+                    int ny = py + kRing[n].y;
+                    if (nx < 0 || nx >= (int)out_width || ny < 0 || ny >= (int)out_height) continue;
+                    float4 nh = g_historyColor[uint2(nx, ny)];
+                    uint nk = g_historyKey[uint2(nx, ny)] & 0x7FFFFFFFu;
+                    if (nh.a > 0.5f && nk != 0u && abs(asfloat(nk) - estDepth) <= tol) {
+                        h = nh;
+                        validHistory = true;
+                        break;
+                    }
+                }
+            }
+            if (validHistory) {
+                // temporal_blend is pre-scaled by the caller against the
+                // per-frame pose delta: fast motion favors fresh fill.
+                c.rgb = lerp(c.rgb, h.rgb, saturate(temporal_blend));
             }
         }
     }

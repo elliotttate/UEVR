@@ -295,12 +295,21 @@ struct DIBRStereoParams {
     // matrix below and validated against the stored depth key) before the
     // scanline fill. Set to 0 by DIBRSynthesis while no valid history exists.
     float temporal_enabled{0.0f};
-    float temporal_pad0{0.0f}; // aligns the matrix to 16 bytes
+    // EMA weight for validated history in the fill kernel (also keeps the
+    // matrix below 16-byte aligned). 0.85 = ~7x boil damping; the caller
+    // scales it down with per-frame pose delta so fast motion favors fresh
+    // fill over latched history.
+    float temporal_blend{0.85f};
     // Current target-eye clip -> previous frame's target-eye clip.
     float reproj_target_to_prev[16]{};
+    // Output (submit) eye size - differs from source_width when the
+    // overscan-grown render target makes the source wider than the true-FOV
+    // output. synthesize() defaults these to the source dims when zero.
+    uint32_t out_width{0};
+    uint32_t out_height{0};
 };
 
-static_assert(sizeof(DIBRStereoParams) == 248 * 4 + 3 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + 5 flags/pads + three float4x4)");
+static_assert(sizeof(DIBRStereoParams) == 250 * 4 + 3 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + 5 flags/pads + three float4x4 + out dims)");
 static_assert(offsetof(DIBRStereoParams, reproj_target_to_prev) % 16 == 0, "temporal reprojection matrix must be 16-byte aligned");
 static_assert(offsetof(DIBRStereoParams, reproj_source_to_left) % 16 == 0, "reprojection matrices must be 16-byte aligned to match HLSL cbuffer packing");
 
@@ -404,6 +413,7 @@ private:
         Microsoft::WRL::ComPtr<ID3D12RootSignature> root_sig{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_inverse{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_yoro{};
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_yoro_scatter{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_raymarch{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_clear{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_depth{};

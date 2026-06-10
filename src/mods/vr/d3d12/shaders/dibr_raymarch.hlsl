@@ -261,8 +261,12 @@ cbuffer StereoParams : register(b0) {
     float scatter_compose;
     float overscan_x;
     float temporal_enabled;
-    float temporal_pad0;
+    float temporal_blend;
     float4x4 reproj_target_to_prev;
+    // Output (submit) eye size - differs from srcWidth when the overscan-grown
+    // render target makes the source wider than the true-FOV output.
+    uint  out_width;
+    uint  out_height;
 };
 
 static const int MAX_STEPS = 48;

@@ -6,6 +6,14 @@
 // artifact distribution favours a sharp reference eye (marginally cheaper too).
 //
 // reference_eye: mode_param0, where 0.0 = left reference and 1.0 = right reference.
+//
+// SCATTER_COMPOSE=1 (a second PSO compiled from this same source) specializes
+// the kernel for the scatter pipeline: the gather search machinery is compiled
+// out entirely, the synthesized eye comes from g_scatterColor.
+
+#ifndef SCATTER_COMPOSE
+#define SCATTER_COMPOSE 0
+#endif
 
 Texture2D<float4> g_colorTex : register(t0);
 Texture2D<float>  g_depthTex : register(t1);
@@ -267,8 +275,12 @@ cbuffer StereoParams : register(b0) {
     float scatter_compose;
     float overscan_x;
     float temporal_enabled;
-    float temporal_pad0;
+    float temporal_blend;
     float4x4 reproj_target_to_prev;
+    // Output (submit) eye size - differs from srcWidth when the overscan-grown
+    // render target makes the source wider than the true-FOV output.
+    uint  out_width;
+    uint  out_height;
 };
 
 float EffectiveConvergence()
@@ -1479,41 +1491,43 @@ void WriteStereoViews(uint x, uint y, float4 leftFullColor, float4 leftReducedCo
     float4 secondColor = (output_eye_swap > 0.5f) ? leftFullColor : rightFullColor;
     float layoutMode = floor(output_layout_mode + 0.5f);
     uint markerParity = FrameMarkerParity();
+    // Output addressing uses out_width/out_height (== srcWidth/srcHeight
+    // unless the overscan-grown render target widened the source).
     if (layoutMode >= 4.0f) {
-        g_sbsOut[uint2(x, y)] = ApplyFrameMarker(x, y, srcWidth, srcHeight, firstColor, markerParity, layoutMode);
+        g_sbsOut[uint2(x, y)] = ApplyFrameMarker(x, y, out_width, out_height, firstColor, markerParity, layoutMode);
         return;
     }
     if (layoutMode >= 3.0f) {
-        uint gapRows = max(1u, (uint)round((float)srcHeight * 0.08510638f));
-        uint outWidth = srcWidth;
-        uint outHeight = srcHeight * 2u + gapRows;
+        uint gapRows = max(1u, (uint)round((float)out_height * 0.08510638f));
+        uint outWidth = out_width;
+        uint outHeight = out_height * 2u + gapRows;
         g_sbsOut[uint2(x, y)] = ApplyFrameMarker(x, y, outWidth, outHeight, firstColor, markerParity, layoutMode);
-        g_sbsOut[uint2(x, y + srcHeight + gapRows)] = ApplyFrameMarker(x, y + srcHeight + gapRows, outWidth, outHeight, secondColor, markerParity, layoutMode);
+        g_sbsOut[uint2(x, y + out_height + gapRows)] = ApplyFrameMarker(x, y + out_height + gapRows, outWidth, outHeight, secondColor, markerParity, layoutMode);
         if (y < gapRows) {
-            g_sbsOut[uint2(x, y + srcHeight)] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+            g_sbsOut[uint2(x, y + out_height)] = float4(0.0f, 0.0f, 0.0f, 1.0f);
         }
         return;
     }
     if (layoutMode >= 2.0f) {
-        uint outWidth = srcWidth * 2u;
-        uint outHeight = srcHeight * 2u;
+        uint outWidth = out_width * 2u;
+        uint outHeight = out_height * 2u;
         g_sbsOut[uint2(x, y)] = ApplyFrameMarker(x, y, outWidth, outHeight, firstColor, markerParity, layoutMode);
-        g_sbsOut[uint2(x + srcWidth, y)] = ApplyFrameMarker(x + srcWidth, y, outWidth, outHeight, firstReducedColor, markerParity, layoutMode);
-        g_sbsOut[uint2(x, y + srcHeight)] = ApplyFrameMarker(x, y + srcHeight, outWidth, outHeight, secondReducedColor, markerParity, layoutMode);
-        g_sbsOut[uint2(x + srcWidth, y + srcHeight)] = ApplyFrameMarker(x + srcWidth, y + srcHeight, outWidth, outHeight, secondColor, markerParity, layoutMode);
+        g_sbsOut[uint2(x + out_width, y)] = ApplyFrameMarker(x + out_width, y, outWidth, outHeight, firstReducedColor, markerParity, layoutMode);
+        g_sbsOut[uint2(x, y + out_height)] = ApplyFrameMarker(x, y + out_height, outWidth, outHeight, secondReducedColor, markerParity, layoutMode);
+        g_sbsOut[uint2(x + out_width, y + out_height)] = ApplyFrameMarker(x + out_width, y + out_height, outWidth, outHeight, secondColor, markerParity, layoutMode);
         return;
     }
     if (layoutMode >= 1.0f) {
-        uint outWidth = srcWidth;
-        uint outHeight = srcHeight * 2u;
+        uint outWidth = out_width;
+        uint outHeight = out_height * 2u;
         g_sbsOut[uint2(x, y)] = ApplyFrameMarker(x, y, outWidth, outHeight, firstColor, markerParity, layoutMode);
-        g_sbsOut[uint2(x, y + srcHeight)] = ApplyFrameMarker(x, y + srcHeight, outWidth, outHeight, secondColor, markerParity, layoutMode);
+        g_sbsOut[uint2(x, y + out_height)] = ApplyFrameMarker(x, y + out_height, outWidth, outHeight, secondColor, markerParity, layoutMode);
         return;
     }
-    uint outWidth = srcWidth * 2u;
-    uint outHeight = srcHeight;
+    uint outWidth = out_width * 2u;
+    uint outHeight = out_height;
     g_sbsOut[uint2(x, y)] = ApplyFrameMarker(x, y, outWidth, outHeight, firstColor, markerParity, layoutMode);
-    g_sbsOut[uint2(x + srcWidth, y)] = ApplyFrameMarker(x + srcWidth, y, outWidth, outHeight, secondColor, markerParity, layoutMode);
+    g_sbsOut[uint2(x + out_width, y)] = ApplyFrameMarker(x + out_width, y, outWidth, outHeight, secondColor, markerParity, layoutMode);
 }
 
 void WriteStereoPair(uint x, uint y, float4 leftColor, float4 rightColor)
@@ -2181,10 +2195,12 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
     uint x = dtid.x;
     uint y = dtid.y;
-    if (x >= srcWidth || y >= srcHeight) return;
+    // One thread per OUTPUT pixel (out == src unless the overscan-grown render
+    // target makes the source wider than the true-FOV output).
+    if (x >= out_width || y >= out_height) return;
 
-    float2 uv = float2((x + 0.5f) / (float)srcWidth,
-                        (y + 0.5f) / (float)srcHeight);
+    float2 uv = float2((x + 0.5f) / (float)out_width,
+                        (y + 0.5f) / (float)out_height);
 
     if (edge_compression > 0.0f) {
         float2 s = (uv - 0.5f) * 2.0f;
@@ -2202,23 +2218,25 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     }
     uv = ApplyOutputGeometry(uv);
 
-    float depth = SamplePreparedDepth(uv);
-    depth = ExpandDepth(uv, depth);
-    depth = ReconstructDepth(uv, depth);
-    depth = ApplyUiAlphaDepthMask(uv, ApplyShapeDepthMask(uv, ApplyWeaponDepthMask(uv, ApplyRegionDepthMask(uv, depth))));
-    depth = ApplyDepthRangeBoost(depth);
-    depth = ApplyFilterEmulatorDepthControls(depth);
-
-    float guardedDisparity = divergence * StereoDepthDelta(depth) * FilterEmulatorFocusScale(depth);
-    guardedDisparity *= ScreenEdgeGuard(uv, depth) * ConvergenceBoundaryScale(uv, depth) * DepthArtifactGuardScale(uv, depth) * WeaponBoundaryScale(uv, depth);
-    float leftScale = FocusReductionScale(uv, depth, 1.0f);
-    float rightScale = FocusReductionScale(uv, depth, -1.0f);
-    float leftOffset = (guardedDisparity * leftScale + perspective_shift) / (float)srcWidth;
-    float rightOffset = (guardedDisparity * rightScale + perspective_shift) / (float)srcWidth;
-    float offset = (guardedDisparity * 0.5f * (leftScale + rightScale) + perspective_shift) / (float)srcWidth;
-
     float debugMode = floor(debug_view_mode + 0.5f);
     if (debugMode >= 1.0f) {
+        // Debug views are the only consumer of the fully conditioned depth and
+        // the guarded disparity (the gather path searches on YoroSearchDepth,
+        // the scatter path on the raw chain) - keeping this work inside the
+        // branch takes it off the hot path for every mode.
+        float depth = SamplePreparedDepth(uv);
+        depth = ExpandDepth(uv, depth);
+        depth = ReconstructDepth(uv, depth);
+        depth = ApplyUiAlphaDepthMask(uv, ApplyShapeDepthMask(uv, ApplyWeaponDepthMask(uv, ApplyRegionDepthMask(uv, depth))));
+        depth = ApplyDepthRangeBoost(depth);
+        depth = ApplyFilterEmulatorDepthControls(depth);
+
+        float guardedDisparity = divergence * StereoDepthDelta(depth) * FilterEmulatorFocusScale(depth);
+        guardedDisparity *= ScreenEdgeGuard(uv, depth) * ConvergenceBoundaryScale(uv, depth) * DepthArtifactGuardScale(uv, depth) * WeaponBoundaryScale(uv, depth);
+        float leftScale = FocusReductionScale(uv, depth, 1.0f);
+        float rightScale = FocusReductionScale(uv, depth, -1.0f);
+        float offset = (guardedDisparity * 0.5f * (leftScale + rightScale) + perspective_shift) / (float)srcWidth;
+
         float depthValue = DebugDepthValue(depth);
         if (debugMode >= 5.5f) {
             float4 debugColor = DibrAlignmentGridColor(uv, depth, debugMode);
@@ -2246,11 +2264,17 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float2 leftInterlaceOffset = InterlaceSampleOffset(1.0f);
     float2 rightInterlaceOffset = InterlaceSampleOffset(-1.0f);
 
+#if SCATTER_COMPOSE
+    // The scatter chain already built the synthesized eye; the only depth
+    // consumer left is ScreenEdgeGuard's near-field gate - one cheap tap.
+    float searchDepth = SamplePreparedDepthBase(SourceRemapUv(uv));
+#else
     // Occlusion-aware source search for the synthesized eye. The two
     // depth-gradient guards are evaluated once here and folded into the
     // search's shift scale (see YoroSynthShiftBase).
     float searchDepth = YoroSearchDepth(SourceRemapUv(uv));
     float boundaryScale = ConvergenceBoundaryScale(uv, searchDepth) * DepthArtifactGuardScale(uv, searchDepth);
+#endif
 
     if (refEye < 0.5f) {
         // Left reference: pristine left, synthesize right at full disparity.
@@ -2261,28 +2285,35 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
         float2 rightUV = uv;
         float4 rightColor;
-        if (scatter_compose > 0.5f) {
-            // R2: the scatter pipeline already produced an occlusion-correct,
-            // hole-filled synthesized eye; fetch it, blending toward the
-            // unwarped center near the screen edges (the synthesized eye's
-            // outer band has no source data - same role as the gather path's
-            // ScreenEdgeGuard disparity squeeze).
-            float edgeKeep = ScreenEdgeGuard(uv, searchDepth);
-            rightColor = float4(lerp(centerColor.rgb, g_scatterColor[uint2(x, y)].rgb, edgeKeep), centerColor.a);
-        } else {
-            float2 rightSearchUV = YoroSearchUv(uv, -1.0f, searchDepth, boundaryScale, 1.0f);
-            rightUV = ApplyOutputEyeAlignment(rightSearchUV + rightInterlaceOffset, -1.0f);
-            rightColor = SampleSynthStereoColor(rightUV, uv, centerColor, searchDepth);
-        }
+#if SCATTER_COMPOSE
+        // R2: the scatter pipeline already produced an occlusion-correct,
+        // hole-filled synthesized eye; fetch it, blending toward the
+        // unwarped center near the screen edges (the synthesized eye's
+        // outer band has no source data - same role as the gather path's
+        // ScreenEdgeGuard disparity squeeze).
+        float edgeKeep = ScreenEdgeGuard(uv, searchDepth);
+        rightColor = float4(lerp(centerColor.rgb, g_scatterColor[uint2(x, y)].rgb, edgeKeep), centerColor.a);
+#else
+        float2 rightSearchUV = YoroSearchUv(uv, -1.0f, searchDepth, boundaryScale, 1.0f);
+        rightUV = ApplyOutputEyeAlignment(rightSearchUV + rightInterlaceOffset, -1.0f);
+        rightColor = SampleSynthStereoColor(rightUV, uv, centerColor, searchDepth);
+#endif
         float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightColor, centerColor))));
         outRight = ApplyAlignmentMarker(uv, rightUV, outRight);
         if (floor(output_layout_mode + 0.5f) == 2.0f) {
             float4 outLeftReduced = outLeft;
+#if SCATTER_COMPOSE
+            // The scatter chain has no reduced-disparity variant; reuse the
+            // full-disparity synthesized eye for the reduced view.
+            float2 rightReducedUV = rightUV;
+            float4 outRightReduced = outRight;
+#else
             float2 rightReducedSearchUV = YoroSearchUv(uv, -1.0f, searchDepth, boundaryScale, 0.33333334f);
             float2 rightReducedUV = ApplyOutputEyeAlignment(rightReducedSearchUV + rightInterlaceOffset, -1.0f);
             float4 rightReducedColor = SampleSynthStereoColor(rightReducedUV, uv, centerColor, searchDepth);
             float4 outRightReduced = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightReducedColor, centerColor))));
             outRightReduced = ApplyAlignmentMarker(uv, rightReducedUV, outRightReduced);
+#endif
             WriteStereoViews(x, y, outLeft, outLeftReduced, outRightReduced, outRight);
         } else {
             WriteStereoPair(x, y, outLeft, outRight);
@@ -2291,14 +2322,14 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         // Right reference: synthesize left at full disparity, pristine right.
         float2 leftUV = uv;
         float4 leftColor;
-        if (scatter_compose > 0.5f) {
-            float edgeKeep = ScreenEdgeGuard(uv, searchDepth);
-            leftColor = float4(lerp(centerColor.rgb, g_scatterColor[uint2(x, y)].rgb, edgeKeep), centerColor.a);
-        } else {
-            float2 leftSearchUV = YoroSearchUv(uv, 1.0f, searchDepth, boundaryScale, 1.0f);
-            leftUV = ApplyOutputEyeAlignment(leftSearchUV + leftInterlaceOffset, 1.0f);
-            leftColor = SampleSynthStereoColor(leftUV, uv, centerColor, searchDepth);
-        }
+#if SCATTER_COMPOSE
+        float edgeKeep = ScreenEdgeGuard(uv, searchDepth);
+        leftColor = float4(lerp(centerColor.rgb, g_scatterColor[uint2(x, y)].rgb, edgeKeep), centerColor.a);
+#else
+        float2 leftSearchUV = YoroSearchUv(uv, 1.0f, searchDepth, boundaryScale, 1.0f);
+        leftUV = ApplyOutputEyeAlignment(leftSearchUV + leftInterlaceOffset, 1.0f);
+        leftColor = SampleSynthStereoColor(leftUV, uv, centerColor, searchDepth);
+#endif
         float4 outLeft = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftColor, centerColor))));
         outLeft = ApplyAlignmentMarker(uv, leftUV, outLeft);
 
@@ -2307,11 +2338,15 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightRefColor, centerColor))));
         outRight = ApplyAlignmentMarker(uv, rightRefUV, outRight);
         if (floor(output_layout_mode + 0.5f) == 2.0f) {
+#if SCATTER_COMPOSE
+            float4 outLeftReduced = outLeft;
+#else
             float2 leftReducedSearchUV = YoroSearchUv(uv, 1.0f, searchDepth, boundaryScale, 0.33333334f);
             float2 leftReducedUV = ApplyOutputEyeAlignment(leftReducedSearchUV + leftInterlaceOffset, 1.0f);
             float4 leftReducedColor = SampleSynthStereoColor(leftReducedUV, uv, centerColor, searchDepth);
             float4 outLeftReduced = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftReducedColor, centerColor))));
             outLeftReduced = ApplyAlignmentMarker(uv, leftReducedUV, outLeftReduced);
+#endif
             float4 outRightReduced = outRight;
             WriteStereoViews(x, y, outLeft, outLeftReduced, outRightReduced, outRight);
         } else {

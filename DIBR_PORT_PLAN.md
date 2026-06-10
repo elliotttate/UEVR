@@ -514,6 +514,56 @@ the rendered eye (the hole-band EMA smooths even source TAA noise). Visual
 stills + a +/-8 cm lateral pose sweep stay artifact-free (correct logo
 parallax, single silhouettes, no displaced-history strips).
 
+### Improvement wave (2026-06-10, post-R3) — perf, resolution, robustness, UX
+
+Follow-up sweep after a fresh-eyes review of the whole pipeline:
+
+- **UAV barrier hardening**: the R3 fix made the fill pass write keys, but only
+  the color buffer had a post-fill barrier; next frame's history-key reads were
+  spec-level unordered vs those writes. Barrier added.
+- **Scatter compose specialization**: a second PSO compiles dibr_yoro.hlsl with
+  `-D SCATTER_COMPOSE=1` (prepended define; content-hashed cache picks it up as
+  dibr_yoro_scatter.hlsl). DXC dead-code-eliminates the entire gather machinery
+  - 337 KB DXIL vs 667 KB - and the hot path drops the 5-tap searchDepth and
+  both boundary-guard evaluations (single cheap depth tap feeds the edge
+  guard). Also sank the debug-only conditioned-depth + guarded-disparity chain
+  into the debug branch for every mode (it was computed unconditionally), and
+  the reduced-view (layout 2) path now reuses the scatter result instead of
+  silently running the gather search.
+- **Temporal robustness**: 3x3 history-ring probe when the reprojected fetch
+  lands on an invalid key (rotation rounding wastes valid history one texel
+  away); the EMA weight ships via the cbuffer (temporal_pad0 ->
+  temporal_blend) and is scaled down by the per-frame pose delta in C++
+  (~1 cm or ~1 deg/frame zeroes it) so fast motion favors fresh fill.
+- **Hole-fill reach**: scanline search now steps 1 px for the first 8, then
+  4 px out to 96 px (was hard 24 px) - very-near objects with large disparity
+  no longer fall back to flat mono fill.
+- **UI knobs**: DIBR panel gains Overscan (1.0-1.25), Temporal Hole Fill
+  toggle and Temporal Smoothing (0-0.95) - persisted ModValues; the
+  UEVR_DIBR_OVERSCAN / UEVR_DIBR_TEMPORAL env vars override them for scripts.
+- **Overscan RT growth (resolution recovery)**: the 12% frustum widening used
+  to cost 12% angular resolution (1280 px of widened FOV -> ~1143 px of true
+  FOV). Now the render target, the engine view rect AND the OpenXR scene
+  swapchains all grow to `VR::get_dibr_render_eye_width()` (hmd_width x
+  overscan, multiple of 4 - e.g. 1436 @ 1.12): full native detail across the
+  true FOV. Three traps found on the way, all load-bearing:
+  1. the growth gate must use STABLE config only (get_dibr_overscan_rt_factor;
+     no dibr.ready() - reallocation resets the pipeline, and a ready-coupled
+     gate oscillates grow->reset->shrink forever);
+  2. adjust_view_rect pins the view to hmd_width - without growing it too, the
+     engine keeps rendering 1280 into the wider target and depth discovery
+     finds nothing;
+  3. the submit path slices the double-wide at ITS half and copies eye-sized
+     boxes into the swapchain images, so the swapchains must grow with the RT
+     (a mid-session recreate triggers on width mismatch -
+     SWAPCHAIN_RECREATE_SCENE_EYE_EXTENT) and the synthesis output must span
+     the full grown backbuffer (out == src; the out_width/out_height cbuffer
+     plumbing stays as generalization).
+  UEVR_DIBR_OVERSCAN_RT=0 reverts to the ungrown behavior. Engagement
+  transition is a single ~400 ms reallocate+recreate; verified stable (no
+  realloc loops), eyes submitted at 1436x720 with full content, flicker ratio
+  unchanged (R/L 1.02).
+
 ### R1/R2 redesign (2026-06-10) — true matrices + forward scatter
 
 Major rebuild of the synthesis core (the gather/divergence model inherited from

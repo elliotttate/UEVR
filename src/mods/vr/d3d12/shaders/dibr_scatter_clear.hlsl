@@ -259,8 +259,12 @@ cbuffer StereoParams : register(b0) {
     float scatter_compose;
     float overscan_x;
     float temporal_enabled;
-    float temporal_pad0;
+    float temporal_blend;
     float4x4 reproj_target_to_prev;
+    // Output (submit) eye size - differs from srcWidth when the overscan-grown
+    // render target makes the source wider than the true-FOV output.
+    uint  out_width;
+    uint  out_height;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -311,7 +315,8 @@ float SynthEyeSign()
 [numthreads(16, 16, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
-    if (dtid.x >= srcWidth || dtid.y >= srcHeight) return;
+    // Scatter buffers live in OUTPUT (target eye) space.
+    if (dtid.x >= out_width || dtid.y >= out_height) return;
     g_scatterKey[dtid.xy] = 0u;                      // 0 = empty (farther than any depth; reversed-Z near = larger bits)
     g_scatterColor[dtid.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f);
 }

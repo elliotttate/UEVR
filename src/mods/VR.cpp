@@ -2120,14 +2120,19 @@ bool VR::is_dibr_mono_view_active() const {
 }
 
 float VR::get_dibr_overscan_factor() const {
-    static const float margin = []() {
+    // Env override beats the UI slider so launcher scripts keep working;
+    // -1 sentinel = no env, use the slider.
+    static const float env_margin = []() {
         const char* v = std::getenv("UEVR_DIBR_OVERSCAN");
         if (v == nullptr || v[0] == '\0') {
-            return 0.12f;
+            return -1.0f;
         }
         const float parsed = static_cast<float>(std::atof(v));
-        return (parsed >= 0.0f && parsed <= 0.5f) ? parsed : 0.12f;
+        return (parsed >= 0.0f && parsed <= 0.5f) ? parsed : -1.0f;
     }();
+
+    const float margin = (env_margin >= 0.0f) ? env_margin
+                                              : std::clamp(m_dibr_overscan->value() - 1.0f, 0.0f, 0.5f);
 
     // Scatter-mode only: the scatter kernels map source->target through the
     // (widened) matrices exactly, while the gather search assumes source and
@@ -2138,6 +2143,86 @@ float VR::get_dibr_overscan_factor() const {
     }
 
     return 1.0f + margin;
+}
+
+float VR::get_dibr_overscan_rt_factor() const {
+    // Render-target growth gate. Same margin as get_dibr_overscan_factor but
+    // deliberately EXCLUDES the live pipeline state (dibr.ready()/failed()):
+    // reallocating the render target resets the synthesis pipeline, so a size
+    // gate coupled to ready() oscillates grow->reset->shrink->reset forever.
+    // Only stable configuration goes into the size decision.
+    if (get_dibr_requested_mode() != 5 || !is_dibr_rendering_path_compatible() || is_mono_rendering_active()) {
+        return 1.0f;
+    }
+
+    const auto method = m_rendering_method->value();
+    if (method != RenderingMethod::NATIVE_STEREO && method != RenderingMethod::SYNTHETIC_DIBR) {
+        return 1.0f;
+    }
+
+    if (is_splitscreen_compatibility_enabled() || is_sceneview_compatibility_enabled()) {
+        return 1.0f;
+    }
+
+    if (m_fake_stereo_hook == nullptr || !m_fake_stereo_hook->has_view_count_control()) {
+        return 1.0f;
+    }
+
+    if (!m_dibr_synthesis_proven.load(std::memory_order_acquire)) {
+        return 1.0f;
+    }
+
+    static const float env_margin = []() {
+        const char* v = std::getenv("UEVR_DIBR_OVERSCAN");
+        if (v == nullptr || v[0] == '\0') {
+            return -1.0f;
+        }
+        const float parsed = static_cast<float>(std::atof(v));
+        return (parsed >= 0.0f && parsed <= 0.5f) ? parsed : -1.0f;
+    }();
+
+    const float margin = (env_margin >= 0.0f) ? env_margin
+                                              : std::clamp(m_dibr_overscan->value() - 1.0f, 0.0f, 0.5f);
+    return (margin > 0.0f) ? 1.0f + margin : 1.0f;
+}
+
+uint32_t VR::get_dibr_render_eye_width() const {
+    // Per-eye render width including the DIBR overscan growth (multiple of 4
+    // for engine-friendly extents). The render target, the engine view rect
+    // and the OpenXR scene swapchains must all use this same value - the
+    // submit path slices the double-wide at its half and copies eye-sized
+    // boxes into the swapchain images, so any disagreement black-screens.
+    static const bool rt_growth_disabled = []() {
+        const char* v = std::getenv("UEVR_DIBR_OVERSCAN_RT");
+        return v != nullptr && v[0] == '0';
+    }();
+
+    const uint32_t base = get_hmd_width();
+    const float factor = rt_growth_disabled ? 1.0f : get_dibr_overscan_rt_factor();
+    if (factor <= 1.0f) {
+        return base;
+    }
+    return (static_cast<uint32_t>(std::lround(static_cast<double>(base) * factor)) + 3u) & ~3u;
+}
+
+bool VR::is_dibr_temporal_enabled() const {
+    // Env override (UEVR_DIBR_TEMPORAL=0) beats the UI toggle.
+    static const int env_state = []() {
+        const char* v = std::getenv("UEVR_DIBR_TEMPORAL");
+        if (v == nullptr || v[0] == '\0') {
+            return -1;
+        }
+        return (v[0] == '0') ? 0 : 1;
+    }();
+
+    if (env_state >= 0) {
+        return env_state == 1;
+    }
+    return m_dibr_temporal->value();
+}
+
+float VR::get_dibr_temporal_blend() const {
+    return std::clamp(m_dibr_temporal_blend->value(), 0.0f, 0.95f);
 }
 
 bool VR::is_mono_rendering_active() const {
@@ -7057,6 +7142,21 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             }
             m_dibr_edge_fill_mode->draw("Edge Fill");
             m_dibr_edge_guard_strength->draw("Screen Edge Guard");
+
+            // Scatter-mode (YORO Scatter / dropdown DIBR default) knobs.
+            if (get_dibr_requested_mode() == 5) {
+                m_dibr_overscan->draw("Overscan (render wider for edge data)");
+                if (std::getenv("UEVR_DIBR_OVERSCAN") != nullptr) {
+                    ImGui::TextDisabled("UEVR_DIBR_OVERSCAN env var is overriding the slider");
+                }
+                m_dibr_temporal->draw("Temporal Hole Fill");
+                if (m_dibr_temporal->value()) {
+                    m_dibr_temporal_blend->draw("Temporal Smoothing");
+                }
+                if (std::getenv("UEVR_DIBR_TEMPORAL") != nullptr) {
+                    ImGui::TextDisabled("UEVR_DIBR_TEMPORAL env var is overriding the toggle");
+                }
+            }
 
             // The YORO kernels now share the raymarch kernel's parallax
             // search and disocclusion guard, so these tune both; only the

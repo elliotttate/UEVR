@@ -1527,6 +1527,7 @@ enum SwapchainRecreateReason : uint32_t {
     SWAPCHAIN_RECREATE_AFR_STATE = 1 << 3,
     SWAPCHAIN_RECREATE_DEPTH_EXTENT = 1 << 4,
     SWAPCHAIN_RECREATE_DEPTH_NULL_DEFAULTS = 1 << 5,
+    SWAPCHAIN_RECREATE_SCENE_EYE_EXTENT = 1 << 6,
 };
 
 std::string format_swapchain_recreate_reasons(uint32_t reasons) {
@@ -3408,6 +3409,20 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         vr->m_openxr->swapchains.contains(native_stereo_array_swapchain);
 
                     if (use_native_split_submit || use_native_array_submit) {
+                        // DIBR overscan growth resizes the engine render target
+                        // mid-session; the scene swapchains must follow or the
+                        // eye-sized box copies below become invalid (black eyes).
+                        if (use_native_array_submit) {
+                            const auto expected_eye_w = vr->get_dibr_render_eye_width();
+                            const auto& arr_sc = vr->m_openxr->swapchains[native_stereo_array_swapchain];
+                            if (arr_sc.width != static_cast<int32_t>(expected_eye_w)) {
+                                spdlog::info("[VR] Scene swapchain eye width {} != expected {}; recreating swapchains",
+                                    arr_sc.width, expected_eye_w);
+                                prepare_openxr_swapchain_recreate(vr, SWAPCHAIN_RECREATE_SCENE_EYE_EXTENT);
+                                m_openxr.create_swapchains();
+                            }
+                        }
+
                         const auto backbuffer_desc = backbuffer->GetDesc();
                         SPDLOG_INFO_ONCE("[NativeStereoDebug] Split submit source backbuffer={}x{} configured={}x{} state={} mode={}",
                             backbuffer_desc.Width,
@@ -4908,7 +4923,9 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     }
 
     if (depth == nullptr) {
-        SPDLOG_WARNING_EVERY_N_SEC(5, "[DIBR] no scene depth available; skipping synthesis this frame");
+        SPDLOG_WARNING_EVERY_N_SEC(5, "[DIBR] no scene depth available; skipping synthesis this frame (wanted full={} eye={}x{})",
+            static_cast<uint32_t>(bb_desc.Width), eye_width, eye_height);
+        SPDLOG_INFO_EVERY_N_SEC(10, "[DIBR] depth candidates on selection failure: {}", dibr_depth_tracker::describe_candidates());
         fill_right_half_mono(false);
         return;
     }
@@ -5059,12 +5076,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             // Engine-side motion (locomotion, animated cameras) is invisible
             // to this matrix; the fill kernel's depth validation rejects
             // history it can't explain, so it degrades to the scanline fill.
-            static const bool temporal_disabled = []() {
-                const char* v = std::getenv("UEVR_DIBR_TEMPORAL");
-                return v != nullptr && v[0] == '0';
-            }();
-
-            if (!temporal_disabled && mode == DIBRSynthesis::Mode::YoroScatter) {
+            if (vr->is_dibr_temporal_enabled() && mode == DIBRSynthesis::Mode::YoroScatter) {
                 static glm::mat4 s_prev_pose{1.0f};
                 static bool s_prev_valid{false};
 
@@ -5072,11 +5084,23 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                 pose[3] = glm::vec4{glm::vec3{vr->get_position(0)} * vr->get_world_to_meters(), 1.0f};
 
                 if (s_prev_valid) {
+                    const glm::mat4 d_raw = glm::inverse(s_prev_pose) * pose;
                     const glm::mat4 fz = glm::scale(glm::mat4{1.0f}, glm::vec3{1.0f, 1.0f, -1.0f});
-                    const glm::mat4 d_ue = fz * (glm::inverse(s_prev_pose) * pose) * fz;
+                    const glm::mat4 d_ue = fz * d_raw * fz;
                     const glm::mat4 hist = proj_dst * d_ue * glm::inverse(proj_dst);
                     std::memcpy(params.reproj_target_to_prev, &hist[0][0], sizeof(params.reproj_target_to_prev));
                     params.temporal_enabled = 1.0f;
+
+                    // Adaptive EMA: full smoothing while the head is steady,
+                    // fading to fresh scanline fill under fast motion (boil is
+                    // motion-masked there; latched history would smear). Knee:
+                    // ~1 cm or ~1 deg of pose change per frame zeroes the blend.
+                    const float trans_ue = glm::length(glm::vec3{d_raw[3]}); // UE units (cm at wtm=100)
+                    const float trans_cm = trans_ue * (100.0f / std::max(vr->get_world_to_meters(), 1.0f));
+                    const float cos_half = std::clamp((d_raw[0][0] + d_raw[1][1] + d_raw[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f);
+                    const float rot_deg = glm::degrees(std::acos(cos_half));
+                    const float motion = trans_cm + rot_deg;
+                    params.temporal_blend = vr->get_dibr_temporal_blend() * std::clamp(1.0f - motion, 0.0f, 1.0f);
                 }
 
                 s_prev_pose = pose;
@@ -5100,6 +5124,15 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             params.depth_uv_anchor = source_x > 0 ? 2.0f : 1.0f;
         }
     }
+
+    // Output stays at the source eye size: the submit path slices the
+    // double-wide backbuffer at its half and copies eye-sized boxes into the
+    // (equally grown) scene swapchains, so the packed pair must span the full
+    // backbuffer. With overscan growth the compose maps each output pixel
+    // through the true-FOV crop, so the grown eye carries the full native
+    // detail of the crop region.
+    params.out_width = eye_width;
+    params.out_height = eye_height;
 
     // 3) Synthesize the packed SBS pair (records into the same command list).
     auto* output = m_dibr.synthesize(device, cmd_list, mode,
@@ -5615,11 +5648,15 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
     };
 
     const auto double_wide_multiple = vr->is_using_afr() ? 1 : 2;
+    // DIBR overscan growth: the scene swapchains must match the (possibly
+    // grown) render target eye size, because the submit path copies eye-sized
+    // boxes sliced from the double-wide backbuffer.
+    const auto scene_eye_width = vr->get_dibr_render_eye_width();
 
     XrSwapchainCreateInfo standard_swapchain_create_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     standard_swapchain_create_info.arraySize = 1;
     standard_swapchain_create_info.format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-    standard_swapchain_create_info.width = vr->get_hmd_width() * double_wide_multiple;
+    standard_swapchain_create_info.width = scene_eye_width * double_wide_multiple;
     standard_swapchain_create_info.height = vr->get_hmd_height();
     standard_swapchain_create_info.mipCount = 1;
     standard_swapchain_create_info.faceCount = 1;
@@ -5627,7 +5664,7 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
     standard_swapchain_create_info.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
 
     auto hmd_desc = backbuffer_desc;
-    hmd_desc.Width = vr->get_hmd_width() * double_wide_multiple;
+    hmd_desc.Width = scene_eye_width * double_wide_multiple;
     hmd_desc.Height = vr->get_hmd_height();
     hmd_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 
@@ -5648,13 +5685,13 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
             auto native_stereo_array_create_info = standard_swapchain_create_info;
             auto native_stereo_array_desc = hmd_desc;
 
-            native_stereo_array_create_info.width = vr->get_hmd_width();
+            native_stereo_array_create_info.width = scene_eye_width;
             native_stereo_array_create_info.arraySize = 2;
-            native_stereo_array_desc.Width = vr->get_hmd_width();
+            native_stereo_array_desc.Width = scene_eye_width;
             native_stereo_array_desc.DepthOrArraySize = 2;
 
             spdlog::info("[VR] Creating native stereo texture array swapchain");
-            spdlog::info("[VR] Width: {}", vr->get_hmd_width());
+            spdlog::info("[VR] Width: {}", scene_eye_width);
             spdlog::info("[VR] Height: {}", vr->get_hmd_height());
             spdlog::info("[VR] Array size: 2");
             if (auto err = create_swapchain((uint32_t)runtimes::OpenXR::SwapchainIndex::NATIVE_STEREO_ARRAY, native_stereo_array_create_info, native_stereo_array_desc)) {

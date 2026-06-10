@@ -530,6 +530,21 @@ public:
     // overrides (fraction, e.g. 0.12). Defined in VR.cpp.
     float get_dibr_overscan_factor() const;
 
+    // Render-target growth variant: stable-config gates only (no live
+    // pipeline ready() state - that would oscillate the RT size, because
+    // reallocation itself resets the pipeline). Defined in VR.cpp.
+    float get_dibr_overscan_rt_factor() const;
+
+    // Per-eye render width including the DIBR overscan growth. The render
+    // target, view rect and OpenXR scene swapchains must all agree on this.
+    uint32_t get_dibr_render_eye_width() const;
+
+    // R3 temporal hole fill: master switch (UEVR_DIBR_TEMPORAL env overrides
+    // the UI toggle) and the base EMA weight for validated history (scaled
+    // down against the per-frame pose delta in the D3D12 component).
+    bool is_dibr_temporal_enabled() const;
+    float get_dibr_temporal_blend() const;
+
     void reset_present_event() {
         ResetEvent(m_present_finished_event);
     }
@@ -1388,6 +1403,11 @@ private:
     const ModSlider::Ptr m_dibr_range_smoothing{ ModSlider::create(generate_name("DIBR_RangeSmoothing"), 0.0f, 1.0f, 0.35f) };
     const ModInt32::Ptr m_dibr_raymarch_steps{ ModSliderInt32::create(generate_name("DIBR_RaymarchSteps"), 8, 128, 32) };
     const ModSlider::Ptr m_dibr_foveation_strength{ ModSlider::create(generate_name("DIBR_RaymarchFoveation"), 0.0f, 1.0f, 0.0f) };
+    // Scatter-mode knobs (UEVR_DIBR_OVERSCAN / UEVR_DIBR_TEMPORAL env vars
+    // override these when set - launcher scripts keep working).
+    const ModSlider::Ptr m_dibr_overscan{ ModSlider::create(generate_name("DIBR_Overscan"), 1.0f, 1.25f, 1.12f) };
+    const ModToggle::Ptr m_dibr_temporal{ ModToggle::create(generate_name("DIBR_TemporalFill"), true) };
+    const ModSlider::Ptr m_dibr_temporal_blend{ ModSlider::create(generate_name("DIBR_TemporalBlend"), 0.0f, 0.95f, 0.85f) };
     // Session-only on purpose (not registered in m_options): persisting a debug
     // view would boot the next session into a diagnostic image.
     const ModCombo::Ptr m_dibr_debug_view{ ModCombo::create(generate_name("DIBR_DebugView"), s_dibr_debug_view_names, 0) };
@@ -1745,6 +1765,9 @@ public:
             *m_dibr_range_smoothing,
             *m_dibr_raymarch_steps,
             *m_dibr_foveation_strength,
+            *m_dibr_overscan,
+            *m_dibr_temporal,
+            *m_dibr_temporal_blend,
             *m_snapturn,
             *m_snapturn_joystick_deadzone,
             *m_snapturn_angle,

@@ -19140,6 +19140,10 @@ bool FFakeStereoRenderingHook::is_stereo_enabled(FFakeStereoRendering* stereo) {
     return result;
 }
 
+// Defined above calculate_render_target_size; the engine's view rect must
+// track the same overscan-grown width as the render target it renders into.
+static uint32_t dibr_overscan_render_width(uint32_t base_width);
+
 void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, int32_t index, int* x, int* y, uint32_t* w, uint32_t* h) {
 #ifdef FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
     SPDLOG_INFO("adjust view rect called! {}", index);
@@ -19185,7 +19189,10 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
     if (VR::get()->is_stereo_emulation_enabled()) {
         *w *= 2;
     } else {
-        *w = VR::get()->get_hmd_width() * 2;
+        // Track the overscan-grown render target so the lone DIBR view
+        // actually renders at the grown width (the RT alone growing leaves
+        // the engine rendering a 1:1 view into a wider target).
+        *w = dibr_overscan_render_width(VR::get()->get_hmd_width()) * 2;
         *h = VR::get()->get_hmd_height();
     }
 
@@ -21460,6 +21467,21 @@ void VRRenderTargetManager_Base::update_viewport(bool use_separate_rt, const sdk
     //SPDLOG_INFO("Widget: {:x}", (uintptr_t)ViewportWidget);
 }
 
+// DIBR single-view overscan: render the lone view wider than the true FOV so
+// (a) the synthesized eye's outer band has real data and (b) the compose crop
+// back to the true FOV keeps full angular resolution instead of spreading
+// fewer rendered pixels across it. Returns the base width until the scatter
+// pipeline proves itself (get_dibr_overscan_factor is 1.0 before that), at
+// which point need_reallocate_view_target sees the change and the engine
+// reallocates. UEVR_DIBR_OVERSCAN_RT=0 keeps the ungrown target (overscan
+// then costs ~12% resolution as before).
+static uint32_t dibr_overscan_render_width(uint32_t base_width) {
+    // Single source of truth lives in VR so the RT, view rect and the OpenXR
+    // scene swapchains stay in agreement (base_width is hmd_width already).
+    (void)base_width;
+    return VR::get()->get_dibr_render_eye_width();
+}
+
 void VRRenderTargetManager_Base::calculate_render_target_size(const sdk::FViewport& viewport, uint32_t& x, uint32_t& y) {
     SPDLOG_INFO_ONCE("VRRenderTargetManager_Base::calculate_render_target_size called!");
 
@@ -21477,7 +21499,7 @@ void VRRenderTargetManager_Base::calculate_render_target_size(const sdk::FViewpo
         this->request_dedicated_ui_target(x, y);
     }
 
-    x = VR::get()->get_hmd_width() * 2;
+    x = dibr_overscan_render_width(VR::get()->get_hmd_width()) * 2;
     y = VR::get()->get_hmd_height();
 
     SPDLOG_DEBUG("RenderTargetSize After: {}x{}", x, y);
@@ -21576,7 +21598,7 @@ bool VRRenderTargetManager_Base::need_reallocate_view_target(const sdk::FViewpor
         SPDLOG_ERROR("Failed to find force separate rt offset! (Exception)");
     }
 
-    const auto w = VR::get()->get_hmd_width();
+    const auto w = dibr_overscan_render_width(VR::get()->get_hmd_width());
     const auto h = VR::get()->get_hmd_height();
 
     if (w != this->last_width || h != this->last_height || g_hook->should_recreate_textures()) {

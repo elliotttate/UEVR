@@ -259,8 +259,12 @@ cbuffer StereoParams : register(b0) {
     float scatter_compose;
     float overscan_x;
     float temporal_enabled;
-    float temporal_pad0;
+    float temporal_blend;
     float4x4 reproj_target_to_prev;
+    // Output (submit) eye size - differs from srcWidth when the overscan-grown
+    // render target makes the source wider than the true-FOV output.
+    uint  out_width;
+    uint  out_height;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -311,21 +315,23 @@ float SynthEyeSign()
 [numthreads(16, 16, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
+    // Iterate SOURCE pixels; the scatter target buffers live in OUTPUT space
+    // (true FOV - narrower than the overscan-grown source when RT growth is on).
     if (dtid.x >= srcWidth || dtid.y >= srcHeight) return;
     float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
     float d = SampleRawDeviceDepth(uv);
     float eyeSign = SynthEyeSign();
     float2 tUv = ReprojectSourceUv(uv, d, eyeSign);
-    float tx = tUv.x * (float)srcWidth - 0.5f;
-    int ty = (int)round(tUv.y * (float)srcHeight - 0.5f);
-    if (ty < 0 || ty >= (int)srcHeight) return;
+    float tx = tUv.x * (float)out_width - 0.5f;
+    int ty = (int)round(tUv.y * (float)out_height - 0.5f);
+    if (ty < 0 || ty >= (int)out_height) return;
     uint key = asuint(max(d, 1e-7f));
     float4 c = g_colorTex.SampleLevel(g_linearSampler, uv, 0);
     int x0 = (int)floor(tx);
     [unroll]
     for (int k = 0; k < 2; ++k) {
         int x = x0 + k;
-        if (x >= 0 && x < (int)srcWidth) {
+        if (x >= 0 && x < (int)out_width) {
             if (g_scatterKey[uint2(x, ty)] == key) {
                 g_scatterColor[uint2(x, ty)] = float4(c.rgb, 1.0f);
             }
