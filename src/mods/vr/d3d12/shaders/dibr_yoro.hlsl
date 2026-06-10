@@ -2039,7 +2039,10 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
     }
     float directDepth = YoroSearchDepth(directUv);
     float directError = abs(abs(YoroSynthShiftBase(saturate(directUv), directDepth, eyeSign) * boundaryScale * shiftScale) - absTarget);
-    return (bestError <= directError) ? bestUv : directUv;
+    // Stability margin: the direct candidate is temporally stable (it only
+    // depends on the destination depth), so the search winner must beat it
+    // CLEARLY - near-ties flipping per frame read as shimmer.
+    return (bestError < directError * 0.8f) ? bestUv : directUv;
 }
 
 // Edge-fill behavior of SampleStereoColor plus the raymarch kernel's
@@ -2056,15 +2059,19 @@ float4 SampleSynthStereoColor(float2 sampleUv, float2 centerUv, float4 centerCol
     }
 
     float sampleDepth = YoroSearchDepth(sampleUv);
-    // SIGNED test: only a sample meaningfully NEARER than the output pixel's
-    // own depth is a disocclusion error (foreground smeared into a revealed
-    // region). The previous absolute-difference test fired on ordinary depth
-    // variation across slanted surfaces, blending unwarped color over most of
-    // the image - a global double exposure that read as a blurry eye.
-    float depthDelta = (centerDepth - sampleDepth) * max(disocclusion_depth_weight, 0.0f);
+    // Two-sided, asymmetric test. Near side (sample NEARER than the output
+    // pixel = foreground smeared into a revealed region) keeps the tight
+    // threshold. Far side (sample much FARTHER = a large reveal being filled
+    // by stretching whatever the ray hits, e.g. an animated wave crest
+    // smeared into a rope-like band at strong silhouettes) needs a much
+    // higher threshold: small far-deltas are normal on slanted surfaces, and
+    // guarding them is exactly what used to blur the whole eye.
+    float w = max(disocclusion_depth_weight, 0.0f);
     float threshold = max(disocclusion_threshold, 0.0f);
     float feather = max(disocclusion_feather, 0.0001f);
-    float guardMask = smoothstep(threshold, threshold + feather, depthDelta) * saturate(disocclusion_strength);
+    float nearMask = smoothstep(threshold, threshold + feather, (centerDepth - sampleDepth) * w);
+    float farMask = smoothstep(threshold * 4.0f, threshold * 4.0f + feather * 2.0f, (sampleDepth - centerDepth) * w);
+    float guardMask = max(nearMask, farMask) * saturate(disocclusion_strength);
     return lerp(base, centerColor, guardMask);
 }
 
