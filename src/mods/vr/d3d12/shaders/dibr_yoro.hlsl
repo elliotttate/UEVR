@@ -1893,7 +1893,15 @@ float YoroSearchDepth(float2 uv)
 // not resample the depth gradient per probe.
 float YoroSynthShiftBase(float2 uv, float depth, float eyeSign)
 {
-    float guardedDisparity = divergence * StereoDepthDelta(depth) * FilterEmulatorFocusScale(depth);
+    float delta = StereoDepthDelta(depth);
+    // Same near-disparity clamp as the raymarch kernel's DepthToUvShiftBase:
+    // makes the Pop-out Limit slider effective in YORO and tames the warp on
+    // very close geometry.
+    float nearLimit = max(popout_limit, 0.0f);
+    if (nearLimit < 1.0f && delta < 0.0f) {
+        delta = max(delta, -nearLimit);
+    }
+    float guardedDisparity = divergence * delta * FilterEmulatorFocusScale(depth);
     guardedDisparity *= ScreenEdgeGuard(uv, depth) * WeaponBoundaryScale(uv, depth) * FocusReductionScale(uv, depth, eyeSign);
     return eyeSign * 2.0f * (guardedDisparity + perspective_shift) / max((float)srcWidth, 1.0f);
 }

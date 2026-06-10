@@ -373,6 +373,7 @@ protected:
     static void WINAPI rs_set_viewports(ID3D12GraphicsCommandList* command_list, UINT num_viewports, const D3D12_VIEWPORT* viewports);
     static void WINAPI rs_set_scissor_rects(ID3D12GraphicsCommandList* command_list, UINT num_rects, const D3D12_RECT* rects);
     static void WINAPI om_set_render_targets(ID3D12GraphicsCommandList* command_list, UINT num_render_target_descriptors, const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors, BOOL rts_single_handle_to_descriptor_range, const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor);
+    static void WINAPI begin_render_pass(ID3D12GraphicsCommandList4* command_list, UINT num_render_targets, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* render_targets, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* depth_stencil, D3D12_RENDER_PASS_FLAGS flags);
     static void WINAPI clear_render_target_view(ID3D12GraphicsCommandList* command_list, D3D12_CPU_DESCRIPTOR_HANDLE render_target_view, const FLOAT color_rgba[4], UINT num_rects, const D3D12_RECT* rects);
     static void WINAPI resource_barrier(ID3D12GraphicsCommandList* command_list, UINT num_barriers, const D3D12_RESOURCE_BARRIER* barriers);
     static void WINAPI set_graphics_root_descriptor_table(ID3D12GraphicsCommandList* command_list, UINT root_parameter_index, D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor);

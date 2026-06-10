@@ -1993,7 +1993,7 @@ inline std::string dibr_inverse_source() {
     return out;
 }
 
-// dibr_yoro.hlsl (84238 bytes, 8 chunks)
+// dibr_yoro.hlsl (84584 bytes, 8 chunks)
 inline const char* const g_dibr_yoro_chunks[] = {
 R"DIBR(// dibr_yoro.hlsl — YORO / Meta-style asymmetric inverse-warp DIBR
 //
@@ -3896,7 +3896,15 @@ float YoroSearchDepth(float2 uv)
 // not resample the depth gradient per probe.
 float YoroSynthShiftBase(float2 uv, float depth, float eyeSign)
 {
-    float guardedDisparity = divergence * StereoDepthDelta(depth) * FilterEmulatorFocusScale(depth);
+    float delta = StereoDepthDelta(depth);
+    // Same near-disparity clamp as the raymarch kernel's DepthToUvShiftBase:
+    // makes the Pop-out Limit slider effective in YORO and tames the warp on
+    // very close geometry.
+    float nearLimit = max(popout_limit, 0.0f);
+    if (nearLimit < 1.0f && delta < 0.0f) {
+        delta = max(delta, -nearLimit);
+    }
+    float guardedDisparity = divergence * delta * FilterEmulatorFocusScale(depth);
     guardedDisparity *= ScreenEdgeGuard(uv, depth) * WeaponBoundaryScale(uv, depth) * FocusReductionScale(uv, depth, eyeSign);
     return eyeSign * 2.0f * (guardedDisparity + perspective_shift) / max((float)srcWidth, 1.0f);
 }
@@ -4097,12 +4105,12 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float4 rightRefColor = SampleFilteredOutputColor(rightRefUV);
         float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightRefColor, centerColor))));
         outRight = ApplyAlignmentMarker(uv, rightRefUV, outRight);
-        if (floor(output_layout_mode + 0.5f) == 2.0f) {
+)DIBR",
+R"DIBR(        if (floor(output_layout_mode + 0.5f) == 2.0f) {
             float2 leftReducedSearchUV = YoroSearchUv(uv, 1.0f, searchDepth, boundaryScale, 0.33333334f);
             float2 leftReducedUV = ApplyOutputEyeAlignment(leftReducedSearchUV + leftInterlaceOffset, 1.0f);
             float4 leftReducedColor = SampleSynthStereoColor(leftReducedUV, uv, centerColor, searchDepth);
-)DIBR",
-R"DIBR(            float4 outLeftReduced = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftReducedColor, centerColor))));
+            float4 outLeftReduced = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftReducedColor, centerColor))));
             outLeftReduced = ApplyAlignmentMarker(uv, leftReducedUV, outLeftReduced);
             float4 outRightReduced = outRight;
             WriteStereoViews(x, y, outLeft, outLeftReduced, outRightReduced, outRight);

@@ -1,6 +1,8 @@
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "DIBRDepthTracker.hpp"
@@ -15,15 +17,24 @@ struct Candidate {
     uint32_t height{};
     DXGI_FORMAT format{};
     uint64_t sequence{};
+    // Present-window of the last DSV bind (OMSetRenderTargets/BeginRenderPass).
+    uint64_t last_bind_present{};
 };
 
 std::mutex g_mtx{};
 std::vector<Candidate> g_candidates{};
+// DSV descriptor handle -> resource, so bind-time hooks (which only see the
+// descriptor) can resolve the candidate. Rebuilt as DSVs are (re)created.
+std::unordered_map<SIZE_T, ID3D12Resource*> g_dsv_to_resource{};
 uint64_t g_sequence{0};
+// Incremented once per presented frame (in select_scene_depth); binds recorded
+// during a frame are tagged with the current value.
+std::atomic<uint64_t> g_present_seq{1};
 
 // Bounded: depth targets are created rarely (a handful per resolution), so a
 // small cap with oldest-first eviction covers resizes without growing.
 constexpr size_t kMaxCandidates = 32;
+constexpr size_t kMaxDsvMappings = 256;
 
 // vrmod depth_select format tiers (lower = better).
 int format_tier(DXGI_FORMAT f) {
@@ -66,6 +77,14 @@ void record_dsv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor
 
     std::scoped_lock _{g_mtx};
 
+    // Keep the descriptor->resource map bounded: descriptor handles get
+    // recycled by the game's DSV heaps, so stale entries are overwritten
+    // naturally; only wholesale growth needs trimming.
+    if (g_dsv_to_resource.size() >= kMaxDsvMappings) {
+        g_dsv_to_resource.clear();
+    }
+    g_dsv_to_resource[descriptor.ptr] = resource;
+
     for (auto& c : g_candidates) {
         if (c.resource.Get() == resource) {
             c.sequence = ++g_sequence; // refresh recency on DSV recreation
@@ -92,6 +111,28 @@ void record_dsv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor
     g_candidates.emplace_back(std::move(c));
 }
 
+void record_dsv_bind(D3D12_CPU_DESCRIPTOR_HANDLE descriptor) {
+    if (descriptor.ptr == 0) {
+        return;
+    }
+
+    const auto present = g_present_seq.load(std::memory_order_relaxed);
+
+    std::scoped_lock _{g_mtx};
+
+    const auto it = g_dsv_to_resource.find(descriptor.ptr);
+    if (it == g_dsv_to_resource.end()) {
+        return; // descriptor of a filtered-out / unknown depth target
+    }
+
+    for (auto& c : g_candidates) {
+        if (c.resource.Get() == it->second) {
+            c.last_bind_present = present;
+            return;
+        }
+    }
+}
+
 Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t width, uint32_t height) {
     if (width == 0 || height == 0) {
         return nullptr;
@@ -99,12 +140,18 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t width, uint32
 
     std::scoped_lock _{g_mtx};
 
-    // Exact extent match preferred; otherwise accept same-aspect candidates at
-    // or below the target (dynamic resolution / TSR renders the scene depth at
-    // internal res). Larger area wins, then depth format tier, then recency.
+    // Advance the per-present liveness window. Binds recorded during the frame
+    // just presented carry the pre-increment value; a candidate counts as live
+    // when bound within the last two presents (covers recording pipelining).
+    const uint64_t present = g_present_seq.fetch_add(1, std::memory_order_relaxed);
+
+    // LIVE candidates first - a stale-but-perfectly-shaped candidate (e.g. a
+    // frozen loading-screen depth) must always lose to one the game actually
+    // bound this frame. Then exact extent, area, depth format tier, recency.
     const float target_aspect = static_cast<float>(width) / static_cast<float>(height);
     const Candidate* best = nullptr;
     bool best_exact = false;
+    bool best_live = false;
 
     for (const auto& c : g_candidates) {
         const bool exact = c.width == width && c.height == height;
@@ -118,9 +165,21 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t width, uint32
             }
         }
 
+        const bool live = c.last_bind_present + 2 > present;
+
         if (best == nullptr) {
             best = &c;
             best_exact = exact;
+            best_live = live;
+            continue;
+        }
+
+        if (live != best_live) {
+            if (live) {
+                best = &c;
+                best_exact = exact;
+                best_live = true;
+            }
             continue;
         }
 

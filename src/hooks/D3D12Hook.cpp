@@ -201,6 +201,9 @@ constexpr size_t IA_SET_VERTEX_BUFFERS_VTABLE_INDEX = 44;
 constexpr size_t OM_SET_RENDER_TARGETS_VTABLE_INDEX = 46;
 constexpr size_t CLEAR_RENDER_TARGET_VIEW_VTABLE_INDEX = 48;
 constexpr size_t EXECUTE_INDIRECT_VTABLE_INDEX = 59;
+// ID3D12GraphicsCommandList4::BeginRenderPass — GCL(9-59) GCL1(60-65)
+// GCL2::WriteBufferImmediate(66) GCL3::SetProtectedResourceSession(67).
+constexpr size_t BEGIN_RENDER_PASS_VTABLE_INDEX = 68;
 constexpr size_t DISPATCH_MESH_VTABLE_INDEX = 79;
 constexpr size_t PIPELINE_LIBRARY_STORE_PIPELINE_VTABLE_INDEX = 8;
 constexpr size_t PIPELINE_LIBRARY_LOAD_GRAPHICS_PIPELINE_VTABLE_INDEX = 9;
@@ -3552,6 +3555,20 @@ void D3D12Hook::install_command_list_hooks(ID3D12GraphicsCommandList* command_li
             m_set_pipeline_state_slots
         );
 
+        // Always installed (independent of the diagnostic env): the DIBR depth
+        // tracker needs per-frame DSV-bind liveness so it never selects a stale
+        // depth target (e.g. a frozen loading-screen depth that matches the
+        // swapchain extent). The diagnostic recordings inside the hook body are
+        // still gated on enable_d3d12_diagnostic_command_list_hooks().
+        add_unique_pointer_hook(
+            iface,
+            OM_SET_RENDER_TARGETS_VTABLE_INDEX,
+            reinterpret_cast<void*>(&D3D12Hook::om_set_render_targets),
+            m_command_list_diagnostic_hooks,
+            m_command_list_diagnostic_hook_lookup,
+            m_command_list_diagnostic_slots
+        );
+
         if (!enable_d3d12_diagnostic_command_list_hooks()) {
             return;
         }
@@ -3722,14 +3739,7 @@ void D3D12Hook::install_command_list_hooks(ID3D12GraphicsCommandList* command_li
             m_command_list_diagnostic_slots
         );
 
-        add_unique_pointer_hook(
-            iface,
-            OM_SET_RENDER_TARGETS_VTABLE_INDEX,
-            reinterpret_cast<void*>(&D3D12Hook::om_set_render_targets),
-            m_command_list_diagnostic_hooks,
-            m_command_list_diagnostic_hook_lookup,
-            m_command_list_diagnostic_slots
-        );
+        // (OMSetRenderTargets is hooked unconditionally above for DIBR depth liveness.)
 
         add_unique_pointer_hook(
             iface,
@@ -3918,6 +3928,30 @@ void D3D12Hook::install_command_list_hooks(ID3D12GraphicsCommandList* command_li
 
     for (auto* iface : command_list_interfaces) {
         install_for_interface(iface);
+    }
+
+    // DIBR depth liveness, part 2 (always-on): UE5's D3D12 RHI binds the scene
+    // render targets through render passes on the modern interfaces, where
+    // OMSetRenderTargets never fires - hook BeginRenderPass (GCL4+) so those
+    // depth binds register with the depth tracker too.
+    {
+        const std::array<IUnknown*, 4> render_pass_interfaces{
+            command_list4.Get(),
+            command_list5.Get(),
+            command_list6.Get(),
+            command_list7.Get()
+        };
+
+        for (auto* iface : render_pass_interfaces) {
+            add_unique_pointer_hook(
+                iface,
+                BEGIN_RENDER_PASS_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::begin_render_pass),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+        }
     }
 
     if (enable_d3d12_diagnostic_command_list_hooks()) {
@@ -32035,42 +32069,76 @@ void WINAPI D3D12Hook::om_set_render_targets(
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::om_set_render_targets)*>() : nullptr;
 
+    // DIBR depth liveness (always-on; the hook is installed unconditionally):
+    // mark the bound DSV's resource as used this frame so the depth tracker
+    // never selects a stale depth target. Cheap descriptor-map probe.
+    if (depth_stencil_descriptor != nullptr) {
+        dibr_depth_tracker::record_dsv_bind(*depth_stencil_descriptor);
+    }
+
     if (is_stereo_trace_enabled()) {
         ++g_stereo_trace_counters.om_set_render_targets;
     }
 
-    const auto diagnostic_rtv_count = rts_single_handle_to_descriptor_range && num_render_target_descriptors > 1
-        ? 1
-        : num_render_target_descriptors;
+    // Everything below is diagnostics; the hook used to only exist when this
+    // env was set, so keep that behavior for the recording paths.
+    if (enable_d3d12_diagnostic_command_list_hooks()) {
+        const auto diagnostic_rtv_count = rts_single_handle_to_descriptor_range && num_render_target_descriptors > 1
+            ? 1
+            : num_render_target_descriptors;
 
-    render::D3D12Diagnostics::get().record_rtv_bind(
-        "D3D12Hook::OMSetRenderTargets",
-        diagnostic_rtv_count,
-        render_target_descriptors,
-        depth_stencil_descriptor);
-    render::StereoForensics::get().record_render_targets_set(
-        "D3D12Hook::OMSetRenderTargets",
-        reinterpret_cast<uintptr_t>(command_list),
-        num_render_target_descriptors,
-        render_target_descriptors,
-        rts_single_handle_to_descriptor_range != FALSE,
-        rts_single_handle_to_descriptor_range != FALSE ? sn2_rtv_descriptor_stride(command_list) : 0,
-        depth_stencil_descriptor);
+        render::D3D12Diagnostics::get().record_rtv_bind(
+            "D3D12Hook::OMSetRenderTargets",
+            diagnostic_rtv_count,
+            render_target_descriptors,
+            depth_stencil_descriptor);
+        render::StereoForensics::get().record_render_targets_set(
+            "D3D12Hook::OMSetRenderTargets",
+            reinterpret_cast<uintptr_t>(command_list),
+            num_render_target_descriptors,
+            render_target_descriptors,
+            rts_single_handle_to_descriptor_range != FALSE,
+            rts_single_handle_to_descriptor_range != FALSE ? sn2_rtv_descriptor_stride(command_list) : 0,
+            depth_stencil_descriptor);
 
-    // Eye-diff: capture RTV[0] handle so the draw-hook can fingerprint it.
-    if (num_render_target_descriptors > 0 && render_target_descriptors != nullptr) {
-        update_cmdlist_rtv0(command_list, &render_target_descriptors[0]);
+        // Eye-diff: capture RTV[0] handle so the draw-hook can fingerprint it.
+        if (num_render_target_descriptors > 0 && render_target_descriptors != nullptr) {
+            update_cmdlist_rtv0(command_list, &render_target_descriptors[0]);
+        }
+        // Full MRT array capture — needed to diagnose per-eye MRT-slot differences
+        // (e.g. SLW GBuffer slot 6 binding on right eye for resource 30085 lineage).
+        update_cmdlist_rtv_array(command_list,
+            num_render_target_descriptors,
+            render_target_descriptors,
+            rts_single_handle_to_descriptor_range != FALSE,
+            depth_stencil_descriptor);
     }
-    // Full MRT array capture — needed to diagnose per-eye MRT-slot differences
-    // (e.g. SLW GBuffer slot 6 binding on right eye for resource 30085 lineage).
-    update_cmdlist_rtv_array(command_list,
-        num_render_target_descriptors,
-        render_target_descriptors,
-        rts_single_handle_to_descriptor_range != FALSE,
-        depth_stencil_descriptor);
 
     if (original != nullptr) {
         original(command_list, num_render_target_descriptors, render_target_descriptors, rts_single_handle_to_descriptor_range, depth_stencil_descriptor);
+    }
+}
+
+void WINAPI D3D12Hook::begin_render_pass(
+    ID3D12GraphicsCommandList4* command_list,
+    UINT num_render_targets,
+    const D3D12_RENDER_PASS_RENDER_TARGET_DESC* render_targets,
+    const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* depth_stencil,
+    D3D12_RENDER_PASS_FLAGS flags
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[BEGIN_RENDER_PASS_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::begin_render_pass)*>() : nullptr;
+
+    // DIBR depth liveness: UE5's D3D12 RHI binds the scene depth through
+    // render passes, which OMSetRenderTargets never sees.
+    if (depth_stencil != nullptr) {
+        dibr_depth_tracker::record_dsv_bind(depth_stencil->cpuDescriptor);
+    }
+
+    if (original != nullptr) {
+        original(command_list, num_render_targets, render_targets, depth_stencil, flags);
     }
 }
 

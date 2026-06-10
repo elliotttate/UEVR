@@ -414,6 +414,25 @@ kernel switch) plus deep-dives of E:\Github\Depth3D and E:\Github\YORO-VR:
   not write depth and can only be mitigated (search + disocclusion guard), not
   fully fixed, without engine-side layer separation.
 
+### Depth liveness fix (2026-06-10) — stale-depth distortion + mid-frame seam
+
+In-game, DIBR showed depth-map-shaped distortion and a fixed mid-frame seam line in
+the synthesized eye. The depth heatmap (UEVR_DIBR_DEBUG_VIEW=1) revealed the cause:
+the DSV-discovery tracker had latched onto a **frozen loading-screen depth target**
+(the SUBNAUTICA 2 loading logo was literally visible in the sampled depth, plus
+uninitialized bands = the seam). Creation-time ranking is non-deterministic when
+several swapchain-extent depth targets exist.
+
+Fix: per-frame **bind liveness**. OMSetRenderTargets is now hooked unconditionally
+(diagnostic recordings inside stay env-gated) plus a new always-on
+ID3D12GraphicsCommandList4::BeginRenderPass hook (UE5's RHI binds scene targets via
+render passes, where OMSetRenderTargets never fires). Both feed
+`dibr_depth_tracker::record_dsv_bind`; `select_scene_depth` now prefers candidates
+bound within the last two presents above all other criteria. Verified by heatmap:
+live, smooth scene depth (and the menu logo turns out to write real depth).
+Also ported the raymarch `popout_limit` near-disparity clamp into YoroSynthShiftBase
+so the Pop-out Limit slider works in YORO and tames close-geometry warp.
+
 ### Rendering Method dropdown integration + Mono baseline (2026-06-10)
 
 - `RenderingMethod` gained two entries: **Synthetic Stereo (DIBR)** (3) — engages
