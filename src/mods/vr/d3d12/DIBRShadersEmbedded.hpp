@@ -6,7 +6,7 @@
 
 namespace vrmod::dibr_shaders {
 
-// dibr_inverse.hlsl (77496 bytes, 7 chunks)
+// dibr_inverse.hlsl (77519 bytes, 7 chunks)
 inline const char* const g_dibr_inverse_chunks[] = {
 R"DIBR(// dibr_inverse.hlsl — Inverse Warp DIBR (Industry Standard)
 //
@@ -267,6 +267,7 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_left;
     float4x4 reproj_source_to_right;
     float scatter_compose;
+    float overscan_x;
 };
 
 float EffectiveConvergence()
@@ -361,9 +362,9 @@ float LetterboxAutoMask(float2 uv)
         ? 1.0f - smoothstep(max(yExtent - feather, 0.0f), yExtent, min(uv.y, 1.0f - uv.y))
         : 0.0f;
     float3 color = g_colorTex.SampleLevel(g_linearSampler, saturate(uv), 0).rgb;
-    float luma = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
 )DIBR",
-R"DIBR(    float threshold = saturate(letterbox_auto_threshold);
+R"DIBR(    float luma = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+    float threshold = saturate(letterbox_auto_threshold);
     float darkMask = 1.0f - smoothstep(threshold, min(threshold + feather, 1.0f), luma);
     return saturate(max(xMask, yMask) * darkMask * strength);
 }
@@ -675,9 +676,9 @@ float CursorOverlayMask(float2 uv, float eyeSign)
 
     float2 d = uv - center;
     d.x *= (float)srcWidth / max((float)srcHeight, 1.0f);
-    float size = max(cursor_overlay_size, 0.0001f);
 )DIBR",
-R"DIBR(    float thickness = max(cursor_overlay_thickness, 0.0001f);
+R"DIBR(    float size = max(cursor_overlay_size, 0.0001f);
+    float thickness = max(cursor_overlay_thickness, 0.0001f);
     float feather = max(cursor_overlay_feather, 0.00001f);
     float lenD = length(d);
     float crossX = (1.0f - smoothstep(thickness, thickness + feather, abs(d.y)))
@@ -988,10 +989,10 @@ float3 ComposeSimpleAnaglyphColor(float3 left, float3 right, float pair)
 
 float3 ComposeOptimizedAnaglyphColor(float3 left, float3 right, float pair)
 {
-    if (pair < 0.5f) {
-        float3 dubois;
 )DIBR",
-R"DIBR(        dubois.r = dot(left, float3(0.437f, 0.449f, 0.164f)) + dot(right, float3(-0.062f, -0.062f, -0.024f));
+R"DIBR(    if (pair < 0.5f) {
+        float3 dubois;
+        dubois.r = dot(left, float3(0.437f, 0.449f, 0.164f)) + dot(right, float3(-0.062f, -0.062f, -0.024f));
         dubois.g = dot(left, float3(-0.011f, -0.032f, -0.007f)) + dot(right, float3(0.377f, 0.761f, -0.009f));
         dubois.b = dot(left, float3(-0.015f, -0.034f, -0.006f)) + dot(right, float3(-0.026f, -0.093f, 1.234f));
         return saturate(dubois);
@@ -1997,7 +1998,7 @@ inline std::string dibr_inverse_source() {
     return out;
 }
 
-// dibr_yoro.hlsl (92745 bytes, 8 chunks)
+// dibr_yoro.hlsl (93295 bytes, 8 chunks)
 inline const char* const g_dibr_yoro_chunks[] = {
 R"DIBR(// dibr_yoro.hlsl — YORO / Meta-style asymmetric inverse-warp DIBR
 //
@@ -2266,6 +2267,7 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_left;
     float4x4 reproj_source_to_right;
     float scatter_compose;
+    float overscan_x;
 };
 
 float EffectiveConvergence()
@@ -2356,9 +2358,9 @@ float LetterboxAutoMask(float2 uv)
     float xMask = (mode < 0.5f || mode >= 1.5f)
         ? 1.0f - smoothstep(max(xExtent - feather, 0.0f), xExtent, min(uv.x, 1.0f - uv.x))
         : 0.0f;
-    float yMask = (mode < 1.5f)
 )DIBR",
-R"DIBR(        ? 1.0f - smoothstep(max(yExtent - feather, 0.0f), yExtent, min(uv.y, 1.0f - uv.y))
+R"DIBR(    float yMask = (mode < 1.5f)
+        ? 1.0f - smoothstep(max(yExtent - feather, 0.0f), yExtent, min(uv.y, 1.0f - uv.y))
         : 0.0f;
     float3 color = g_colorTex.SampleLevel(g_linearSampler, saturate(uv), 0).rgb;
     float luma = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
@@ -3969,6 +3971,17 @@ int YoroSearchSteps(float2 uv, float requestedSteps)
 
 // ---- True-matrix reprojection (R1 redesign) ----
 
+// Maps a TARGET/reference-FOV uv into the (possibly overscanned) SOURCE
+// image. The overscan widening scales the projection's M[0][0] and M[2][0]
+// together, so ndc divides evenly: a pure x scale about ndc 0.
+float2 SourceRemapUv(float2 uv)
+{
+    if (overscan_x > 1.0f) {
+        uv.x = 0.5f + (uv.x - 0.5f) / overscan_x;
+    }
+    return uv;
+}
+
 float SampleRawDeviceDepth(float2 uv)
 {
     return SampleDepthTexture(TransformDepthUv(saturate(uv)));
@@ -4142,15 +4155,15 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
 // disocclusion guard: where the searched sample's depth disagrees with the
 // output pixel's depth (a revealed region with no true source data), blend
 // back toward the unwarped center color instead of smearing the occluder.
-float4 SampleSynthStereoColor(float2 sampleUv, float2 centerUv, float4 centerColor, float centerDepth)
+)DIBR",
+R"DIBR(float4 SampleSynthStereoColor(float2 sampleUv, float2 centerUv, float4 centerColor, float centerDepth)
 {
     float4 base = SampleStereoColor(sampleUv, centerUv, centerColor);
     float outside = (sampleUv.x < 0.0f || sampleUv.x > 1.0f ||
                      sampleUv.y < 0.0f || sampleUv.y > 1.0f) ? 1.0f : 0.0f;
     if (outside >= 0.5f) {
         return base;
-)DIBR",
-R"DIBR(    }
+    }
 
     float sampleDepth = YoroSearchDepth(sampleUv);
     // Two-sided, asymmetric test. Near side (sample NEARER than the output
@@ -4233,20 +4246,22 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     }
 
     float refEye = mode_param0;
-    float4 centerColor = SampleFilteredOutputColor(uv);
+    // SourceRemapUv crops the overscanned source render back to the true FOV
+    // (identity when overscan is off).
+    float4 centerColor = SampleFilteredOutputColor(SourceRemapUv(uv));
     float2 leftInterlaceOffset = InterlaceSampleOffset(1.0f);
     float2 rightInterlaceOffset = InterlaceSampleOffset(-1.0f);
 
     // Occlusion-aware source search for the synthesized eye. The two
     // depth-gradient guards are evaluated once here and folded into the
     // search's shift scale (see YoroSynthShiftBase).
-    float searchDepth = YoroSearchDepth(uv);
+    float searchDepth = YoroSearchDepth(SourceRemapUv(uv));
     float boundaryScale = ConvergenceBoundaryScale(uv, searchDepth) * DepthArtifactGuardScale(uv, searchDepth);
 
     if (refEye < 0.5f) {
         // Left reference: pristine left, synthesize right at full disparity.
         float2 leftRefUV = ApplyOutputEyeAlignment(uv + leftInterlaceOffset, 1.0f);
-        float4 leftRefColor = SampleFilteredOutputColor(leftRefUV);
+        float4 leftRefColor = SampleFilteredOutputColor(SourceRemapUv(leftRefUV));
         float4 outLeft = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftRefColor, centerColor))));
         outLeft = ApplyAlignmentMarker(uv, leftRefUV, outLeft);
 
@@ -4294,7 +4309,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         outLeft = ApplyAlignmentMarker(uv, leftUV, outLeft);
 
         float2 rightRefUV = ApplyOutputEyeAlignment(uv + rightInterlaceOffset, -1.0f);
-        float4 rightRefColor = SampleFilteredOutputColor(rightRefUV);
+        float4 rightRefColor = SampleFilteredOutputColor(SourceRemapUv(rightRefUV));
         float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightRefColor, centerColor))));
         outRight = ApplyAlignmentMarker(uv, rightRefUV, outRight);
         if (floor(output_layout_mode + 0.5f) == 2.0f) {
@@ -4319,7 +4334,7 @@ inline std::string dibr_yoro_source() {
     return out;
 }
 
-// dibr_raymarch.hlsl (83077 bytes, 7 chunks)
+// dibr_raymarch.hlsl (83100 bytes, 7 chunks)
 inline const char* const g_dibr_raymarch_chunks[] = {
 R"DIBR(// dibr_raymarch.hlsl - clean-room raymarch DIBR
 //
@@ -4582,6 +4597,7 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_left;
     float4x4 reproj_source_to_right;
     float scatter_compose;
+    float overscan_x;
 };
 
 static const int MAX_STEPS = 48;
@@ -6486,7 +6502,7 @@ inline std::string dibr_raymarch_source() {
     return out;
 }
 
-// dibr_scatter_clear.hlsl (10901 bytes, 1 chunks)
+// dibr_scatter_clear.hlsl (10924 bytes, 1 chunks)
 inline const char* const g_dibr_scatter_clear_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -6747,6 +6763,7 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_left;
     float4x4 reproj_source_to_right;
     float scatter_compose;
+    float overscan_x;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -6809,7 +6826,7 @@ inline std::string dibr_scatter_clear_source() {
     return out;
 }
 
-// dibr_scatter_depth.hlsl (11509 bytes, 1 chunks)
+// dibr_scatter_depth.hlsl (11532 bytes, 1 chunks)
 inline const char* const g_dibr_scatter_depth_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7070,6 +7087,7 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_left;
     float4x4 reproj_source_to_right;
     float scatter_compose;
+    float overscan_x;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -7147,7 +7165,7 @@ inline std::string dibr_scatter_depth_source() {
     return out;
 }
 
-// dibr_scatter_color.hlsl (11488 bytes, 1 chunks)
+// dibr_scatter_color.hlsl (11511 bytes, 1 chunks)
 inline const char* const g_dibr_scatter_color_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7408,6 +7426,7 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_left;
     float4x4 reproj_source_to_right;
     float scatter_compose;
+    float overscan_x;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -7487,7 +7506,7 @@ inline std::string dibr_scatter_color_source() {
     return out;
 }
 
-// dibr_scatter_fill.hlsl (12311 bytes, 2 chunks)
+// dibr_scatter_fill.hlsl (12573 bytes, 2 chunks)
 inline const char* const g_dibr_scatter_fill_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7748,6 +7767,7 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_left;
     float4x4 reproj_source_to_right;
     float scatter_compose;
+    float overscan_x;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -7827,14 +7847,17 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float4 c;
     if (lx >= 0 && rx >= 0) {
         // Smaller key bits = farther (reversed-Z) = the background side.
-        c = (lkey <= rkey) ? g_scatterColor[uint2(lx, dtid.y)] : g_scatterColor[uint2(rx, dtid.y)];
+)DIBR",
+R"DIBR(        c = (lkey <= rkey) ? g_scatterColor[uint2(lx, dtid.y)] : g_scatterColor[uint2(rx, dtid.y)];
     } else if (lx >= 0) {
         c = g_scatterColor[uint2(lx, dtid.y)];
-)DIBR",
-R"DIBR(    } else if (rx >= 0) {
+    } else if (rx >= 0) {
         c = g_scatterColor[uint2(rx, dtid.y)];
     } else {
         float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
+        if (overscan_x > 1.0f) {
+            uv.x = 0.5f + (uv.x - 0.5f) / overscan_x; // crop overscanned source to true FOV
+        }
         c = float4(g_colorTex.SampleLevel(g_linearSampler, uv, 0).rgb, 1.0f);
     }
     g_scatterColor[dtid.xy] = float4(c.rgb, 1.0f);

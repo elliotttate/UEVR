@@ -265,6 +265,7 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_left;
     float4x4 reproj_source_to_right;
     float scatter_compose;
+    float overscan_x;
 };
 
 float EffectiveConvergence()
@@ -1962,6 +1963,17 @@ int YoroSearchSteps(float2 uv, float requestedSteps)
 
 // ---- True-matrix reprojection (R1 redesign) ----
 
+// Maps a TARGET/reference-FOV uv into the (possibly overscanned) SOURCE
+// image. The overscan widening scales the projection's M[0][0] and M[2][0]
+// together, so ndc divides evenly: a pure x scale about ndc 0.
+float2 SourceRemapUv(float2 uv)
+{
+    if (overscan_x > 1.0f) {
+        uv.x = 0.5f + (uv.x - 0.5f) / overscan_x;
+    }
+    return uv;
+}
+
 float SampleRawDeviceDepth(float2 uv)
 {
     return SampleDepthTexture(TransformDepthUv(saturate(uv)));
@@ -2225,20 +2237,22 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     }
 
     float refEye = mode_param0;
-    float4 centerColor = SampleFilteredOutputColor(uv);
+    // SourceRemapUv crops the overscanned source render back to the true FOV
+    // (identity when overscan is off).
+    float4 centerColor = SampleFilteredOutputColor(SourceRemapUv(uv));
     float2 leftInterlaceOffset = InterlaceSampleOffset(1.0f);
     float2 rightInterlaceOffset = InterlaceSampleOffset(-1.0f);
 
     // Occlusion-aware source search for the synthesized eye. The two
     // depth-gradient guards are evaluated once here and folded into the
     // search's shift scale (see YoroSynthShiftBase).
-    float searchDepth = YoroSearchDepth(uv);
+    float searchDepth = YoroSearchDepth(SourceRemapUv(uv));
     float boundaryScale = ConvergenceBoundaryScale(uv, searchDepth) * DepthArtifactGuardScale(uv, searchDepth);
 
     if (refEye < 0.5f) {
         // Left reference: pristine left, synthesize right at full disparity.
         float2 leftRefUV = ApplyOutputEyeAlignment(uv + leftInterlaceOffset, 1.0f);
-        float4 leftRefColor = SampleFilteredOutputColor(leftRefUV);
+        float4 leftRefColor = SampleFilteredOutputColor(SourceRemapUv(leftRefUV));
         float4 outLeft = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftRefColor, centerColor))));
         outLeft = ApplyAlignmentMarker(uv, leftRefUV, outLeft);
 
@@ -2286,7 +2300,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         outLeft = ApplyAlignmentMarker(uv, leftUV, outLeft);
 
         float2 rightRefUV = ApplyOutputEyeAlignment(uv + rightInterlaceOffset, -1.0f);
-        float4 rightRefColor = SampleFilteredOutputColor(rightRefUV);
+        float4 rightRefColor = SampleFilteredOutputColor(SourceRemapUv(rightRefUV));
         float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightRefColor, centerColor))));
         outRight = ApplyAlignmentMarker(uv, rightRefUV, outRight);
         if (floor(output_layout_mode + 0.5f) == 2.0f) {

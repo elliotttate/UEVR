@@ -285,9 +285,14 @@ struct DIBRStereoParams {
     // scatter pipeline's filled buffer (u2) instead of running its gather
     // search - see the dibr_scatter_* kernels.
     float scatter_compose{0.0f};
+    // Horizontal overscan factor of the rendered source view (1 = none). The
+    // engine renders the lone view this much wider; the compose remaps the
+    // reference eye back to its true FOV (pure NDC x scale - the projection
+    // widening scales M[0][0] and M[2][0] together, so ndc divides evenly).
+    float overscan_x{1.0f};
 };
 
-static_assert(sizeof(DIBRStereoParams) == 245 * 4 + 2 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + reproj flag + two float4x4 + scatter flag)");
+static_assert(sizeof(DIBRStereoParams) == 246 * 4 + 2 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + reproj/scatter/overscan + two float4x4)");
 static_assert(offsetof(DIBRStereoParams, reproj_source_to_left) % 16 == 0, "reprojection matrices must be 16-byte aligned to match HLSL cbuffer packing");
 
 // DIBR stereo synthesis: a single compute dispatch that turns one rendered

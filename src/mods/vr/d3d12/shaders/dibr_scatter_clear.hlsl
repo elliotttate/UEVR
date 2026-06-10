@@ -257,6 +257,7 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_left;
     float4x4 reproj_source_to_right;
     float scatter_compose;
+    float overscan_x;
 };
 
 float2 TransformDepthUv(float2 uv)

@@ -257,6 +257,7 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_left;
     float4x4 reproj_source_to_right;
     float scatter_compose;
+    float overscan_x;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -343,6 +344,9 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         c = g_scatterColor[uint2(rx, dtid.y)];
     } else {
         float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
+        if (overscan_x > 1.0f) {
+            uv.x = 0.5f + (uv.x - 0.5f) / overscan_x; // crop overscanned source to true FOV
+        }
         c = float4(g_colorTex.SampleLevel(g_linearSampler, uv, 0).rgb, 1.0f);
     }
     g_scatterColor[dtid.xy] = float4(c.rgb, 1.0f);

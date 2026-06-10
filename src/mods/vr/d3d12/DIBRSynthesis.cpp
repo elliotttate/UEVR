@@ -161,10 +161,10 @@ bool validate_cbuffer_layout(const std::vector<uint8_t>& bytecode, const char* n
         // Field count + the last field's offset pin the layout exactly and are
         // backend-independent (FXC reports the cbuffer size padded to 16 bytes,
         // DXC's DXIL reflection may not - so total size is only sanity-ranged).
-        // 245 scalars (incl. reproj_enabled + scatter_compose) + two float4x4,
-        // which reflection counts as ONE variable each.
-        constexpr uint32_t expected_fields = 245u + 2u;
-        constexpr uint32_t expected_last_offset = offsetof(DIBRStereoParams, scatter_compose);
+        // 246 scalars (incl. reproj_enabled/scatter_compose/overscan_x) + two
+        // float4x4, which reflection counts as ONE variable each.
+        constexpr uint32_t expected_fields = 246u + 2u;
+        constexpr uint32_t expected_last_offset = offsetof(DIBRStereoParams, overscan_x);
         constexpr uint32_t expected_size_min = sizeof(DIBRStereoParams);
         constexpr uint32_t expected_size_max = (sizeof(DIBRStereoParams) + 15u) & ~15u;
 

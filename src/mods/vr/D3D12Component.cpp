@@ -5025,8 +5025,21 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
 
         if (ipd_ue != 0.0f) {
             const bool ref_left = yoro_reference_eye < 0.5f;
-            const auto& proj_src = ref_left ? proj_l : proj_r;
+            glm::mat4 proj_src = ref_left ? proj_l : proj_r;
             const auto& proj_dst = ref_left ? proj_r : proj_l;
+
+            // Overscan: the engine rendered the lone view this much wider (the
+            // stereo hook scales the projection's M[0][0]/M[2][0]); widen our
+            // copy of the source projection identically so the reprojection
+            // stays exact, and tell the kernels so the reference eye is
+            // cropped back to its true FOV.
+            const float overscan = vr->get_dibr_overscan_factor();
+            if (overscan > 1.0f) {
+                proj_src[0][0] /= overscan; // UE M[0][0]
+                proj_src[2][0] /= overscan; // UE M[2][0]
+            }
+            params.overscan_x = overscan;
+
             // The target eye sits at +/-IPD along view-space X relative to the
             // source eye; world points shift the opposite way in its view.
             const float dx = ref_left ? -ipd_ue : ipd_ue;
@@ -5038,8 +5051,8 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             std::memcpy(params.reproj_source_to_left, ref_left ? &ident[0][0] : &m[0][0], sizeof(params.reproj_source_to_left));
             params.reproj_enabled = 1.0f;
 
-            SPDLOG_INFO_ONCE("[DIBR] true-matrix reprojection active (ipd_ue={:.3f}, strength={:.2f}, sign={})",
-                ipd_ue, strength, reproj_sign);
+            SPDLOG_INFO_ONCE("[DIBR] true-matrix reprojection active (ipd_ue={:.3f}, strength={:.2f}, sign={}, overscan={:.2f})",
+                ipd_ue, strength, reproj_sign, overscan);
         }
     }
 

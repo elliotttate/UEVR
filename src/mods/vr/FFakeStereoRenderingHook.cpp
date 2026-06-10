@@ -19801,6 +19801,23 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
             const auto fmat = VR::get()->get_projection_matrix((VRRuntime::Eye)(true_index));
             double_matrix = fmat;
         }
+
+        // DIBR single-view overscan: widen the lone rendered view's horizontal
+        // frustum so the synthesized eye's outer screen band has REAL source
+        // data; the synthesis compose crops the reference eye back to its true
+        // FOV (the runtime keeps submitting the true per-eye projections).
+        // UE row-vector convention: x_clip = x*M[0][0] + z*M[2][0], so scaling
+        // both terms widens the tan bounds symmetrically about their center.
+        const float overscan = vr->get_dibr_overscan_factor();
+        if (overscan > 1.0f) {
+            if (!g_hook->m_has_double_precision) {
+                (*out)[0][0] /= overscan;
+                (*out)[2][0] /= overscan;
+            } else {
+                double_matrix[0][0] /= (double)overscan;
+                double_matrix[2][0] /= (double)overscan;
+            }
+        }
     } else {
         SPDLOG_ERROR("CalculateStereoProjectionMatrix returned nullptr!");
     }

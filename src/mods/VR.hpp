@@ -522,6 +522,14 @@ public:
         m_dibr_synthesis_proven.store(true, std::memory_order_release);
     }
 
+    // Horizontal overscan factor for the single rendered view in DIBR
+    // single-view mode (1.0 = none). Rendering the source slightly wider than
+    // the reference eye's frustum gives the synthesized eye REAL data for its
+    // outer screen band (otherwise a blind copy-fill strip); the compose step
+    // crops the reference eye back to its true FOV. UEVR_DIBR_OVERSCAN
+    // overrides (fraction, e.g. 0.12). Defined in VR.cpp.
+    float get_dibr_overscan_factor() const;
+
     void reset_present_event() {
         ResetEvent(m_present_finished_event);
     }

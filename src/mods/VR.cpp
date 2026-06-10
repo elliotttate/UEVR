@@ -2119,6 +2119,27 @@ bool VR::is_dibr_mono_view_active() const {
     return mode == 3 || mode == 4; // Inverse Warp / Raymarch synthesize both eyes
 }
 
+float VR::get_dibr_overscan_factor() const {
+    static const float margin = []() {
+        const char* v = std::getenv("UEVR_DIBR_OVERSCAN");
+        if (v == nullptr || v[0] == '\0') {
+            return 0.12f;
+        }
+        const float parsed = static_cast<float>(std::atof(v));
+        return (parsed >= 0.0f && parsed <= 0.5f) ? parsed : 0.12f;
+    }();
+
+    // Scatter-mode only: the scatter kernels map source->target through the
+    // (widened) matrices exactly, while the gather search assumes source and
+    // target share a screen space.
+    if (margin <= 0.0f || get_dibr_requested_mode() != 5 ||
+        !is_dibr_single_view_active() || is_mono_rendering_active()) {
+        return 1.0f;
+    }
+
+    return 1.0f + margin;
+}
+
 bool VR::is_mono_rendering_active() const {
     if (m_rendering_method->value() != RenderingMethod::MONO) {
         return false;
