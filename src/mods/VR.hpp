@@ -45,6 +45,14 @@ public:
         NATIVE_STEREO = 0,
         SYNCHRONIZED = 1,
         ALTERNATING = 2,
+        // Engine renders ONE view (the DIBR reference eye); the other eye is
+        // synthesized from depth by the DIBR compute pass (D3D12 only).
+        SYNTHETIC_DIBR = 3,
+        // Engine renders ONE centered view, mirrored flat to both eyes -
+        // the Oculus gearmono-style baseline (union frustum via the symmetric
+        // projection overrides; per-eye view_bounds crop the difference).
+        // No stereo parallax; the comparison baseline for DIBR (D3D12 only).
+        MONO = 4,
     };
 
     enum SynchronizeStage {
@@ -465,20 +473,41 @@ public:
     // screen) matching run_dibr_synthesis' bail-outs. Defined in VR.cpp.
     bool is_dibr_rendering_path_compatible() const;
 
-    // True when DIBR is set to a both-eyes-synthesized mode (Inverse/Raymarch):
-    // the engine then renders a centered view (per-eye offsets zeroed in the
-    // stereo hook) and DIBR reintroduces the stereo baseline from depth.
-    // Honors the UEVR_DIBR env override. Defined in VR.cpp.
+    // True when the engine's view(s) should be CENTERED (per-eye offsets
+    // zeroed in the stereo hook): the both-eyes-synthesized DIBR modes
+    // (Inverse/Raymarch, which reintroduce the stereo baseline from depth)
+    // and the Mono rendering method. Honors the UEVR_DIBR env override.
+    // Defined in VR.cpp.
     bool is_dibr_mono_view_active() const;
 
     // True when the engine should render only ONE view (the DIBR reference
-    // eye) and the DIBR pass synthesizes the other: a DIBR mode is enabled,
-    // the rendering method is plain Native Stereo, the stereo hook can control
-    // the view count, and the synthesis pipeline has proven itself (kernels
-    // ready + at least one frame synthesized) so the never-rendered eye can
-    // always be filled. The single view lands in the LEFT half of the
-    // double-wide RT regardless of which eye it represents. Defined in VR.cpp.
+    // eye) and the DIBR pass synthesizes the other: a DIBR mode is enabled
+    // (via the Synthetic Stereo rendering method or the DIBR panel/env), the
+    // stereo hook can control the view count, and the synthesis pipeline has
+    // proven itself (kernels ready + at least one frame synthesized) so the
+    // never-rendered eye can always be filled. The single view lands in the
+    // LEFT half of the double-wide RT regardless of which eye it represents.
+    // Defined in VR.cpp.
     bool is_dibr_single_view_active() const;
+
+    // True when the Mono rendering method is active and usable: the engine
+    // renders ONE centered union-frustum view (see the projection-override
+    // getters) and the D3D12 layer mirrors it flat to both eyes. This is the
+    // gearmono-style comparison baseline for DIBR. Defined in VR.cpp.
+    bool is_mono_rendering_active() const;
+
+    // Single-view rendering of ANY flavor (Mono or DIBR single-view): the
+    // stereo hook's view-count / pose / projection pinning keys off this.
+    bool is_single_view_rendering_active() const {
+        return is_mono_rendering_active() || is_dibr_single_view_active();
+    }
+
+    // The eye the engine's lone view represents: the DIBR reference eye, or
+    // eye 0 for Mono (whose view is centered via is_dibr_mono_view_active's
+    // offset zeroing + the forced symmetric projection).
+    int32_t get_single_view_reference_eye() const {
+        return is_mono_rendering_active() ? 0 : get_dibr_reference_eye();
+    }
 
     // The eye the engine renders in DIBR single-view mode (the YORO reference
     // eye): 0 = left, 1 = right. Both-eyes-synthesis modes use eye 0 with the
@@ -843,11 +872,21 @@ public:
         return m_extreme_compat_mode->value();
     }
 
-    auto get_horizontal_projection_override() const {
+    int32_t get_horizontal_projection_override() const {
+        // Mono rendering uses the gearmono-style union frustum: one centered
+        // view both eyes can sample, with per-eye view_bounds cropping each
+        // eye's true FOV out of it at submit time (see runtimes'
+        // update_matrices) - so force the symmetric override while active.
+        if (is_mono_rendering_active()) {
+            return HORIZONTAL_SYMMETRIC;
+        }
         return m_horizontal_projection_override->value();
     }
 
-    auto get_vertical_projection_override() const {
+    int32_t get_vertical_projection_override() const {
+        if (is_mono_rendering_active()) {
+            return VERTICAL_SYMMETRIC;
+        }
         return m_vertical_projection_override->value();
     }
 
@@ -1202,6 +1241,8 @@ private:
         "Native Stereo",
         "Synchronized Sequential",
         "Alternating/AFR",
+        "Synthetic Stereo (DIBR)",
+        "Mono (one eye to both)",
     };
 
     static const inline std::vector<std::string> s_sync_mode_names{

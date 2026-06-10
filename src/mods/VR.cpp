@@ -2059,7 +2059,20 @@ int32_t VR::get_dibr_requested_mode() const {
         return 1; // yoro / synth_right / unrecognized
     }();
 
-    return env_mode >= 0 ? env_mode : m_dibr_mode->value();
+    if (env_mode >= 0) {
+        return env_mode;
+    }
+
+    const auto ui_mode = m_dibr_mode->value();
+
+    // The "Synthetic Stereo (DIBR)" rendering method engages DIBR even with
+    // the panel combo on Off; default to YORO synth-right (the recommended
+    // kernel). The panel combo still selects the kernel when not Off.
+    if (ui_mode == 0 && m_rendering_method->value() == RenderingMethod::SYNTHETIC_DIBR) {
+        return 1;
+    }
+
+    return ui_mode;
 }
 
 // Preconditions shared by every DIBR engine-side adjustment: they must match
@@ -2070,9 +2083,12 @@ bool VR::is_dibr_rendering_path_compatible() const {
         return false;
     }
 
-    // True AFR only ever consumes the rendered eye's half, and extreme compat
-    // submits the full backbuffer per eye; run_dibr_synthesis skips both.
-    if (m_rendering_method->value() == RenderingMethod::ALTERNATING || m_extreme_compat_mode->value()) {
+    // True AFR only ever consumes the rendered eye's half, extreme compat
+    // submits the full backbuffer per eye, and Mono is the explicit
+    // no-synthesis baseline; run_dibr_synthesis skips all of them.
+    if (m_rendering_method->value() == RenderingMethod::ALTERNATING ||
+        m_rendering_method->value() == RenderingMethod::MONO ||
+        m_extreme_compat_mode->value()) {
         return false;
     }
 
@@ -2085,6 +2101,11 @@ bool VR::is_dibr_rendering_path_compatible() const {
 }
 
 bool VR::is_dibr_mono_view_active() const {
+    // The Mono rendering method renders one CENTERED view too (gearmono-style).
+    if (is_mono_rendering_active()) {
+        return true;
+    }
+
     if (!is_dibr_rendering_path_compatible()) {
         return false;
     }
@@ -2093,14 +2114,35 @@ bool VR::is_dibr_mono_view_active() const {
     return mode == 3 || mode == 4; // Inverse Warp / Raymarch synthesize both eyes
 }
 
+bool VR::is_mono_rendering_active() const {
+    if (m_rendering_method->value() != RenderingMethod::MONO) {
+        return false;
+    }
+
+    // The flat both-eyes fill lives in the D3D12 present path; without it the
+    // second eye would show stale garbage, so refuse configurations it can't
+    // serve (mirrors is_dibr_single_view_active's preconditions).
+    if (!g_framework->is_dx12() || m_extreme_compat_mode->value() || m_2d_screen_mode->value()) {
+        return false;
+    }
+
+    if (is_splitscreen_compatibility_enabled() || is_sceneview_compatibility_enabled()) {
+        return false;
+    }
+
+    return m_fake_stereo_hook != nullptr && m_fake_stereo_hook->has_view_count_control();
+}
+
 bool VR::is_dibr_single_view_active() const {
     if (get_dibr_requested_mode() == 0 || !is_dibr_rendering_path_compatible()) {
         return false;
     }
 
     // Synchronized sequential drives its own per-frame eye alternation; only
-    // plain Native Stereo has a second view we can simply not render.
-    if (m_rendering_method->value() != RenderingMethod::NATIVE_STEREO) {
+    // plain Native Stereo (or the dedicated Synthetic Stereo method) has a
+    // second view we can simply not render.
+    const auto method = m_rendering_method->value();
+    if (method != RenderingMethod::NATIVE_STEREO && method != RenderingMethod::SYNTHETIC_DIBR) {
         return false;
     }
 
@@ -6941,12 +6983,13 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 "per-eye rendering bugs and is the recommended mode. Requires the engine's "
                 "SceneDepthZ; no effect in Alternating (AFR) rendering.");
 
-            if (m_dibr_mode->value() > 0) {
+            if (get_dibr_requested_mode() > 0) {
                 if (is_dibr_single_view_active()) {
                     ImGui::TextColored(ImVec4{0.4f, 1.0f, 0.4f, 1.0f},
                         "Single-view: the engine renders only the %s eye (~half scene GPU cost)",
                         get_dibr_reference_eye() == 1 ? "right" : "left");
-                } else if (m_rendering_method->value() == RenderingMethod::NATIVE_STEREO) {
+                } else if (m_rendering_method->value() == RenderingMethod::NATIVE_STEREO ||
+                           m_rendering_method->value() == RenderingMethod::SYNTHETIC_DIBR) {
                     ImGui::TextDisabled("Both eyes still rendered (single-view engages once synthesis is proven)");
                 }
             }

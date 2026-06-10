@@ -17077,7 +17077,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     const auto true_index = vr->is_using_afr()
         ? (g_frame_count + last_index) % 2
-        : (vr->is_dibr_single_view_active() ? vr->get_dibr_reference_eye() : last_index);
+        : (vr->is_single_view_rendering_active() ? vr->get_single_view_reference_eye() : last_index);
 
     if (subnautica2_is_current_game() &&
         vr->is_native_stereo_fix_enabled() &&
@@ -17914,7 +17914,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
     // This check might seem kind of arbitrary, but sometimes (rarely) the offset
     // for the views can be wrong so if the count is some sane number
     // then we can assume that the offset is correct
-    if ((vr->is_using_afr() || vr->is_dibr_single_view_active()) && views_ptr != nullptr && views_ptr->count >= 2 && views_ptr->count <= 4) {
+    if ((vr->is_using_afr() || vr->is_single_view_rendering_active()) && views_ptr != nullptr && views_ptr->count >= 2 && views_ptr->count <= 4) {
         SPDLOG_INFO_ONCE("Setting view count to 1 (from {})", views_ptr->count);
         views_ptr->count = 1;
     }
@@ -19328,10 +19328,11 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     if (subnautica2_synced_sequential_explicit_eye) {
         true_index = g_frame_count % 2;
     }
-    // DIBR single-view: one engine view per frame, pinned to the reference
-    // eye. It is simultaneously the first and last pass of the frame, so the
-    // per-frame bookkeeping gated on true_index 0/1 below must also fire.
-    const auto dibr_single_view = !vr->is_using_afr() && vr->is_dibr_single_view_active();
+    // Single-view rendering (DIBR synthesis or Mono): one engine view per
+    // frame, pinned to the reference eye. It is simultaneously the first and
+    // last pass of the frame, so the per-frame bookkeeping gated on
+    // true_index 0/1 below must also fire.
+    const auto dibr_single_view = !vr->is_using_afr() && vr->is_single_view_rendering_active();
     const auto has_double_precision = g_hook->m_has_double_precision;
     const auto rot_d = (Rotator<double>*)view_rotation;
 
@@ -19389,7 +19390,7 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
             }
         }
     } else if (dibr_single_view && !is_full_pass) {
-        true_index = vr->get_dibr_reference_eye();
+        true_index = vr->get_single_view_reference_eye();
     }
 
     if ((true_index == 0 || dibr_single_view) && !is_full_pass) {
@@ -19777,9 +19778,9 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
 
         if (vr->is_using_afr()) {
             true_index = g_frame_count % 2;
-        } else if (vr->is_dibr_single_view_active()) {
-            // The lone engine view is the DIBR reference eye.
-            true_index = vr->get_dibr_reference_eye();
+        } else if (vr->is_single_view_rendering_active()) {
+            // The lone engine view is the reference eye (DIBR) / eye 0 (Mono).
+            true_index = vr->get_single_view_reference_eye();
         }
 
         auto& double_matrix = *(Matrix4x4d*)out;
@@ -19976,11 +19977,12 @@ uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoR
         return 1;
     }
 
-    // DIBR single-view: the engine renders only the reference eye (left half
-    // of the double-wide RT) and the synthesis pass reconstructs the other.
-    // Submission stays on the native double-wide path - this is not AFR.
-    if (vr->is_dibr_single_view_active()) {
-        SPDLOG_INFO_ONCE("[DIBR] GetDesiredNumberOfViews returning 1 (single-view synthesis active)");
+    // Single-view rendering (DIBR synthesis or Mono): the engine renders only
+    // the reference view (left half of the double-wide RT) and the D3D12 pass
+    // produces the other eye (synthesized or mirrored). Submission stays on
+    // the native double-wide path - this is not AFR.
+    if (vr->is_single_view_rendering_active()) {
+        SPDLOG_INFO_ONCE("[DIBR] GetDesiredNumberOfViews returning 1 (single-view rendering active)");
         return 1;
     }
 

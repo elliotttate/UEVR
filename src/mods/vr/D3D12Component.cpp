@@ -3215,12 +3215,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         scene_depth_tex.Reset();
     }
 
-    // Single-view DIBR renders only the reference eye, so the other half of
-    // SceneDepthZ is never written this frame - don't hand it to the runtime
-    // as a composition depth layer. (run_dibr_synthesis re-resolves depth for
+    // Single-view rendering (DIBR or Mono) only writes the reference view's
+    // half of SceneDepthZ - don't hand the stale other half to the runtime as
+    // a composition depth layer. (run_dibr_synthesis re-resolves depth for
     // the synthesis itself and only samples the rendered half.)
-    if (scene_depth_tex != nullptr && vr->is_dibr_single_view_active()) {
-        SPDLOG_INFO_EVERY_N_SEC(5, "[DIBR] Suppressing depth-layer submit while single-view synthesis is active");
+    if (scene_depth_tex != nullptr && vr->is_single_view_rendering_active()) {
+        SPDLOG_INFO_EVERY_N_SEC(5, "[DIBR] Suppressing depth-layer submit while single-view rendering is active");
         scene_depth_tex.Reset();
     }
 
@@ -4659,14 +4659,14 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         return;
     }
 
-    // Engine-side single-view state: the stereo hook renders ONLY the
-    // reference eye (into the left half of the double-wide backbuffer) while
-    // this is true, so every exit from this function must leave the right
-    // half filled - the engine never wrote it. The cooldown keeps the fill
-    // alive for the frames-in-flight window right after the policy flips off
-    // (mode switched, pipeline failure, device reset), when arriving
-    // backbuffers were still rendered with a single view.
-    const bool single_view = vr->is_dibr_single_view_active();
+    // Engine-side single-view state (DIBR synthesis or Mono): the stereo hook
+    // renders ONLY the reference view (into the left half of the double-wide
+    // backbuffer) while this is true, so every exit from this function must
+    // leave the right half filled - the engine never wrote it. The cooldown
+    // keeps the fill alive for the frames-in-flight window right after the
+    // policy flips off (mode switched, pipeline failure, device reset), when
+    // arriving backbuffers were still rendered with a single view.
+    const bool single_view = vr->is_single_view_rendering_active();
     if (single_view) {
         m_dibr_single_view_cooldown = 3;
     } else if (m_dibr_single_view_cooldown > 0) {
@@ -4774,9 +4774,11 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         barrier(cmd_list, m_dibr_source.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     };
 
-    // Bail-out path while the engine is (or may still be) rendering a single
-    // view: mirror the rendered eye so the other half is never stale garbage.
-    const auto fill_right_half_mono = [&]() {
+    // Mirror the rendered eye to the right half while the engine is (or may
+    // still be) rendering a single view. This is the INTENDED steady state of
+    // the Mono rendering method (expected=true) and the bail-out safety net
+    // for DIBR when synthesis can't run this frame (expected=false).
+    const auto fill_right_half_mono = [&](bool expected) {
         if (!right_half_needs_fill) {
             return;
         }
@@ -4793,8 +4795,19 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         copy_staged_to_right_half(cmd_list);
         m_dibr_commands.has_commands = true;
         m_dibr_commands.execute();
-        SPDLOG_WARNING_EVERY_N_SEC(5, "[DIBR] single-view active but synthesis unavailable; mirrored the rendered eye");
+        if (!expected) {
+            SPDLOG_WARNING_EVERY_N_SEC(5, "[DIBR] single-view active but synthesis unavailable; mirrored the rendered eye");
+        }
     };
+
+    // Mono rendering method: gearmono-style baseline. The engine rendered one
+    // centered union-frustum view into the left half; mirror it to the right
+    // half and skip synthesis entirely.
+    if (vr->is_mono_rendering_active()) {
+        SPDLOG_INFO_ONCE("[DIBR] Mono rendering method active: mirroring the centered view to both eyes");
+        fill_right_half_mono(true);
+        return;
+    }
 
     // Effective mode: the UEVR_DIBR env override (scripted testing) wins over
     // the persisted UI combo; otherwise the UI drives.
@@ -4806,7 +4819,9 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         mode = env.mode;
         yoro_reference_eye = env.yoro_reference_eye;
     } else {
-        switch (vr->m_dibr_mode->value()) {
+        // get_dibr_requested_mode also maps the "Synthetic Stereo (DIBR)"
+        // rendering method with the panel combo on Off to YORO synth-right.
+        switch (vr->get_dibr_requested_mode()) {
         case 1: // YORO, synthesize right
             mode = DIBRSynthesis::Mode::Yoro;
             yoro_reference_eye = 0.0f;
@@ -4822,13 +4837,13 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             mode = DIBRSynthesis::Mode::Raymarch;
             break;
         default:
-            fill_right_half_mono(); // engine may still be mid-transition out of single-view
+            fill_right_half_mono(false); // engine may still be mid-transition out of single-view
             return; // Off
         }
     }
 
     if (m_dibr.failed()) {
-        fill_right_half_mono();
+        fill_right_half_mono(false);
         return;
     }
 
@@ -4836,27 +4851,27 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     // synthesized half would never be consumed, so don't burn GPU on it.
     if (vr->m_rendering_method->value() == VR::RenderingMethod::ALTERNATING) {
         SPDLOG_WARN_ONCE("[DIBR] Alternating (AFR) rendering ignores the synthesized eye; use Native Stereo or Synchronized Sequential");
-        fill_right_half_mono();
+        fill_right_half_mono(false);
         return;
     }
 
     // 2D screen mode shows the game on a flat virtual screen; synthesized
     // parallax would never be visible.
     if (vr->m_2d_screen_mode->value()) {
-        fill_right_half_mono();
+        fill_right_half_mono(false);
         return;
     }
 
     if (vr->is_extreme_compatibility_mode_enabled()) {
         SPDLOG_WARN_ONCE("[DIBR] extreme compatibility mode submits the full backbuffer per eye; DIBR disabled");
-        fill_right_half_mono();
+        fill_right_half_mono(false);
         return;
     }
 
     // Kicks off the async kernel build on first use; no-op frames until ready.
     if (!m_dibr.ensure(device)) {
         SPDLOG_INFO_EVERY_N_SEC(5, "[DIBR] kernels still compiling; passing frame through untouched");
-        fill_right_half_mono();
+        fill_right_half_mono(false);
         return;
     }
 
@@ -4884,7 +4899,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
 
     if (depth == nullptr) {
         SPDLOG_WARNING_EVERY_N_SEC(5, "[DIBR] no scene depth available; skipping synthesis this frame");
-        fill_right_half_mono();
+        fill_right_half_mono(false);
         return;
     }
 
@@ -4892,7 +4907,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     if (output_format == DXGI_FORMAT_UNKNOWN) {
         SPDLOG_ERROR_ONCE("[DIBR] backbuffer format {} has no UAV-store-capable equivalent on this device; DIBR disabled",
             static_cast<int>(bb_desc.Format));
-        fill_right_half_mono();
+        fill_right_half_mono(false);
         return;
     }
 

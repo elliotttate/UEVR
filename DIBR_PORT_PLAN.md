@@ -414,6 +414,26 @@ kernel switch) plus deep-dives of E:\Github\Depth3D and E:\Github\YORO-VR:
   not write depth and can only be mitigated (search + disocclusion guard), not
   fully fixed, without engine-side layer separation.
 
+### Rendering Method dropdown integration + Mono baseline (2026-06-10)
+
+- `RenderingMethod` gained two entries: **Synthetic Stereo (DIBR)** (3) — engages
+  single-view DIBR from the main dropdown (DIBR panel combo on Off defaults to YORO
+  synth-right; otherwise the panel selects the kernel) — and **Mono (one eye to both)**
+  (4) — the comparison baseline where the engine renders ONE view shown flat in both eyes.
+- **Mono is a port of Oculus's gearmono / hybrid-mono camera setup**
+  (https://developers.meta.com/horizon/blog/hybrid-mono-rendering-in-ue4-and-unity/):
+  a centered camera on the eye plane (eye offsets zeroed via is_dibr_mono_view_active)
+  with the **union of both eyes' frusta** — implemented by force-enabling UEVR's existing
+  HORIZONTAL/VERTICAL_SYMMETRIC projection overrides while Mono is active, whose per-eye
+  `view_bounds` already crop each eye's true FOV out of the union image at submit time
+  (= the blog's "compositing accounts for projection differences" step). The near/far
+  hybrid split (stereo near-field + mono far-field) requires engine renderer surgery and
+  is out of scope for an injector.
+- Plumbing: `is_single_view_rendering_active()` (Mono OR DIBR-single-view) now drives the
+  stereo-hook view-count/pose/projection pinning and the depth-layer suppression;
+  `fill_right_half_mono(expected)` is Mono's intended steady state rather than a warning
+  path. Mono needs no kernel/latch - the fill is plain copies, available immediately.
+
 ## 6b. Phase 6 — Depth3D / SuperDepth3D-derived enhancements
 
 `E:\Github\Depth3D` (BlueSkyDefender's SuperDepth3D — the methodology the inverse-warp
