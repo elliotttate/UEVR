@@ -290,9 +290,18 @@ struct DIBRStereoParams {
     // reference eye back to its true FOV (pure NDC x scale - the projection
     // widening scales M[0][0] and M[2][0] together, so ndc divides evenly).
     float overscan_x{1.0f};
+    // R3: temporal hole fill. When > 0.5 the scatter fill kernel first tries
+    // last frame's synthesized eye (reprojected through the camera-delta
+    // matrix below and validated against the stored depth key) before the
+    // scanline fill. Set to 0 by DIBRSynthesis while no valid history exists.
+    float temporal_enabled{0.0f};
+    float temporal_pad0{0.0f}; // aligns the matrix to 16 bytes
+    // Current target-eye clip -> previous frame's target-eye clip.
+    float reproj_target_to_prev[16]{};
 };
 
-static_assert(sizeof(DIBRStereoParams) == 246 * 4 + 2 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + reproj/scatter/overscan + two float4x4)");
+static_assert(sizeof(DIBRStereoParams) == 248 * 4 + 3 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + 5 flags/pads + three float4x4)");
+static_assert(offsetof(DIBRStereoParams, reproj_target_to_prev) % 16 == 0, "temporal reprojection matrix must be 16-byte aligned");
 static_assert(offsetof(DIBRStereoParams, reproj_source_to_left) % 16 == 0, "reprojection matrices must be 16-byte aligned to match HLSL cbuffer packing");
 
 // DIBR stereo synthesis: a single compute dispatch that turns one rendered
@@ -424,7 +433,7 @@ private:
     // descriptor triplets rotate through a ring sized well past UEVR's frame
     // queue depth.
     static constexpr uint32_t kRing = 8;
-    static constexpr uint32_t kDescriptorsPerSlot = 5; // t0 color, t1 depth, u0 output, u1 scatter key, u2 scatter color
+    static constexpr uint32_t kDescriptorsPerSlot = 7; // t0 color, t1 depth, u0 output, u1/u2 scatter key+color, u3/u4 history color+key
     // Derived, not hardcoded: a fixed value overran the upload buffer when the
     // struct grew (the reprojection matrices pushed it past the old 1024).
     static constexpr uint32_t kCbSlotSize = (sizeof(DIBRStereoParams) + 255u) & ~255u;
@@ -444,10 +453,14 @@ private:
     DXGI_FORMAT m_output_format{DXGI_FORMAT_R8G8B8A8_UNORM};
 
     // Scatter pipeline intermediates (kept in UNORDERED_ACCESS; eye-sized).
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_scatter_key{};
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_scatter_color{};
+    // Ping-ponged: the previous frame's FILLED pair serves as the temporal
+    // hole-fill history for the current frame.
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_scatter_key[2]{};
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_scatter_color[2]{};
     uint32_t m_scatter_width{0};
     uint32_t m_scatter_height{0};
+    uint32_t m_scatter_index{0};
+    bool m_scatter_history_valid{false};
 
     uint32_t m_ring_index{0};
     uint32_t m_frame_index{0};

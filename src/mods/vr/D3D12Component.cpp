@@ -11,6 +11,7 @@
 #include <DirectXMath.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -5050,6 +5051,37 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             std::memcpy(params.reproj_source_to_right, ref_left ? &m[0][0] : &ident[0][0], sizeof(params.reproj_source_to_right));
             std::memcpy(params.reproj_source_to_left, ref_left ? &ident[0][0] : &m[0][0], sizeof(params.reproj_source_to_left));
             params.reproj_enabled = 1.0f;
+
+            // R3: camera-delta reprojection matrix for the temporal hole
+            // fill - current target-eye clip -> previous frame's target-eye
+            // clip, derived from the HMD pose delta expressed in UE view
+            // axes (OpenXR z-back -> UE z-forward via the z-flip conjugate).
+            // Engine-side motion (locomotion, animated cameras) is invisible
+            // to this matrix; the fill kernel's depth validation rejects
+            // history it can't explain, so it degrades to the scanline fill.
+            static const bool temporal_disabled = []() {
+                const char* v = std::getenv("UEVR_DIBR_TEMPORAL");
+                return v != nullptr && v[0] == '0';
+            }();
+
+            if (!temporal_disabled && mode == DIBRSynthesis::Mode::YoroScatter) {
+                static glm::mat4 s_prev_pose{1.0f};
+                static bool s_prev_valid{false};
+
+                glm::mat4 pose{glm::normalize(glm::quat{vr->get_rotation(0)})};
+                pose[3] = glm::vec4{glm::vec3{vr->get_position(0)} * vr->get_world_to_meters(), 1.0f};
+
+                if (s_prev_valid) {
+                    const glm::mat4 fz = glm::scale(glm::mat4{1.0f}, glm::vec3{1.0f, 1.0f, -1.0f});
+                    const glm::mat4 d_ue = fz * (glm::inverse(s_prev_pose) * pose) * fz;
+                    const glm::mat4 hist = proj_dst * d_ue * glm::inverse(proj_dst);
+                    std::memcpy(params.reproj_target_to_prev, &hist[0][0], sizeof(params.reproj_target_to_prev));
+                    params.temporal_enabled = 1.0f;
+                }
+
+                s_prev_pose = pose;
+                s_prev_valid = true;
+            }
 
             SPDLOG_INFO_ONCE("[DIBR] true-matrix reprojection active (ipd_ue={:.3f}, strength={:.2f}, sign={}, overscan={:.2f})",
                 ipd_ue, strength, reproj_sign, overscan);

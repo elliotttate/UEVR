@@ -6,7 +6,7 @@
 
 namespace vrmod::dibr_shaders {
 
-// dibr_inverse.hlsl (77519 bytes, 7 chunks)
+// dibr_inverse.hlsl (77611 bytes, 7 chunks)
 inline const char* const g_dibr_inverse_chunks[] = {
 R"DIBR(// dibr_inverse.hlsl — Inverse Warp DIBR (Industry Standard)
 //
@@ -268,6 +268,9 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_right;
     float scatter_compose;
     float overscan_x;
+    float temporal_enabled;
+    float temporal_pad0;
+    float4x4 reproj_target_to_prev;
 };
 
 float EffectiveConvergence()
@@ -361,9 +364,9 @@ float LetterboxAutoMask(float2 uv)
     float yMask = (mode < 1.5f)
         ? 1.0f - smoothstep(max(yExtent - feather, 0.0f), yExtent, min(uv.y, 1.0f - uv.y))
         : 0.0f;
-    float3 color = g_colorTex.SampleLevel(g_linearSampler, saturate(uv), 0).rgb;
 )DIBR",
-R"DIBR(    float luma = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+R"DIBR(    float3 color = g_colorTex.SampleLevel(g_linearSampler, saturate(uv), 0).rgb;
+    float luma = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
     float threshold = saturate(letterbox_auto_threshold);
     float darkMask = 1.0f - smoothstep(threshold, min(threshold + feather, 1.0f), luma);
     return saturate(max(xMask, yMask) * darkMask * strength);
@@ -675,9 +678,9 @@ float CursorOverlayMask(float2 uv, float eyeSign)
     center.x -= eyeSign * cursorShift;
 
     float2 d = uv - center;
-    d.x *= (float)srcWidth / max((float)srcHeight, 1.0f);
 )DIBR",
-R"DIBR(    float size = max(cursor_overlay_size, 0.0001f);
+R"DIBR(    d.x *= (float)srcWidth / max((float)srcHeight, 1.0f);
+    float size = max(cursor_overlay_size, 0.0001f);
     float thickness = max(cursor_overlay_thickness, 0.0001f);
     float feather = max(cursor_overlay_feather, 0.00001f);
     float lenD = length(d);
@@ -987,10 +990,10 @@ float3 ComposeSimpleAnaglyphColor(float3 left, float3 right, float pair)
     return float3(right.r, right.g, left.b);
 }
 
-float3 ComposeOptimizedAnaglyphColor(float3 left, float3 right, float pair)
-{
 )DIBR",
-R"DIBR(    if (pair < 0.5f) {
+R"DIBR(float3 ComposeOptimizedAnaglyphColor(float3 left, float3 right, float pair)
+{
+    if (pair < 0.5f) {
         float3 dubois;
         dubois.r = dot(left, float3(0.437f, 0.449f, 0.164f)) + dot(right, float3(-0.062f, -0.062f, -0.024f));
         dubois.g = dot(left, float3(-0.011f, -0.032f, -0.007f)) + dot(right, float3(0.377f, 0.761f, -0.009f));
@@ -1295,9 +1298,9 @@ float4 ApplyAlignmentMarker(float2 outputUv, float2 sampleUv, float4 color)
 
 float2 InterlaceGridCoord(uint x, uint y)
 {
-    float2 nativeSize = max(float2((float)srcWidth, (float)srcHeight), float2(1.0f, 1.0f));
 )DIBR",
-R"DIBR(    float2 uv = (float2((float)x, (float)y) + float2(0.5f, 0.5f)) / nativeSize;
+R"DIBR(    float2 nativeSize = max(float2((float)srcWidth, (float)srcHeight), float2(1.0f, 1.0f));
+    float2 uv = (float2((float)x, (float)y) + float2(0.5f, 0.5f)) / nativeSize;
     float mode = floor(output_interlace_scale_mode + 0.5f);
     if (mode < 0.5f) {
         return floor(float2((float)x, (float)y));
@@ -1595,11 +1598,11 @@ float UiAlphaMaskFromColor(float4 sampleColor)
 
 float UiAutoMaskFromColor(float4 sampleColor)
 {
-    float strength = saturate(ui_auto_mask_strength);
+)DIBR",
+R"DIBR(    float strength = saturate(ui_auto_mask_strength);
     if (strength <= 0.0f) {
         return 0.0f;
-)DIBR",
-R"DIBR(    }
+    }
 
     float luma = dot(sampleColor.rgb, float3(0.2126f, 0.7152f, 0.0722f));
     float threshold = saturate(ui_auto_mask_threshold);
@@ -1878,9 +1881,9 @@ float DepthArtifactGuardScale(float2 uv, float depth)
     float gradient = max(abs(dr - dl), abs(dd - du));
     float threshold = max(depth_artifact_guard_threshold, 0.0f);
     float feather = max(depth_artifact_guard_feather, 0.0001f);
-    float mask = smoothstep(threshold, threshold + feather, gradient) * strength;
 )DIBR",
-R"DIBR(    return lerp(1.0f, saturate(depth_artifact_guard_scale), mask);
+R"DIBR(    float mask = smoothstep(threshold, threshold + feather, gradient) * strength;
+    return lerp(1.0f, saturate(depth_artifact_guard_scale), mask);
 }
 
 [numthreads(16, 16, 1)]
@@ -1998,7 +2001,7 @@ inline std::string dibr_inverse_source() {
     return out;
 }
 
-// dibr_yoro.hlsl (93295 bytes, 8 chunks)
+// dibr_yoro.hlsl (93387 bytes, 8 chunks)
 inline const char* const g_dibr_yoro_chunks[] = {
 R"DIBR(// dibr_yoro.hlsl — YORO / Meta-style asymmetric inverse-warp DIBR
 //
@@ -2268,6 +2271,9 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_right;
     float scatter_compose;
     float overscan_x;
+    float temporal_enabled;
+    float temporal_pad0;
+    float4x4 reproj_target_to_prev;
 };
 
 float EffectiveConvergence()
@@ -2356,10 +2362,10 @@ float LetterboxAutoMask(float2 uv)
     float xExtent = saturate(letterbox_auto_max_x);
     float yExtent = saturate(letterbox_auto_max_y);
     float xMask = (mode < 0.5f || mode >= 1.5f)
-        ? 1.0f - smoothstep(max(xExtent - feather, 0.0f), xExtent, min(uv.x, 1.0f - uv.x))
-        : 0.0f;
 )DIBR",
-R"DIBR(    float yMask = (mode < 1.5f)
+R"DIBR(        ? 1.0f - smoothstep(max(xExtent - feather, 0.0f), xExtent, min(uv.x, 1.0f - uv.x))
+        : 0.0f;
+    float yMask = (mode < 1.5f)
         ? 1.0f - smoothstep(max(yExtent - feather, 0.0f), yExtent, min(uv.y, 1.0f - uv.y))
         : 0.0f;
     float3 color = g_colorTex.SampleLevel(g_linearSampler, saturate(uv), 0).rgb;
@@ -2669,10 +2675,10 @@ float CursorOverlayMask(float2 uv, float eyeSign)
         return 0.0f;
     }
 
-    float centerX = lerp(saturate(cursor_overlay_x), 0.5f, step(0.5f, cursor_overlay_lock_to_center));
-    float2 center = float2(centerX, saturate(cursor_overlay_y));
 )DIBR",
-R"DIBR(    float cursorShift = divergence * StereoDepthDelta(saturate(cursor_overlay_depth)) / (float)srcWidth;
+R"DIBR(    float centerX = lerp(saturate(cursor_overlay_x), 0.5f, step(0.5f, cursor_overlay_lock_to_center));
+    float2 center = float2(centerX, saturate(cursor_overlay_y));
+    float cursorShift = divergence * StereoDepthDelta(saturate(cursor_overlay_depth)) / (float)srcWidth;
     center.x -= eyeSign * cursorShift;
 
     float2 d = uv - center;
@@ -2973,14 +2979,14 @@ float3 PrepareCompositionColor(float3 color, float eyeContrast)
     float luma = ImageFilterLuma(color);
     color = lerp(float3(luma, luma, luma), color, sat);
     float contrast = max(output_anaglyph_contrast * eyeContrast, 0.0f);
-    return saturate((color - 0.5f) * contrast + 0.5f);
+)DIBR",
+R"DIBR(    return saturate((color - 0.5f) * contrast + 0.5f);
 }
 
 float3 ComposeSimpleAnaglyphColor(float3 left, float3 right, float pair)
 {
     if (pair < 0.5f) {
-)DIBR",
-R"DIBR(        return float3(left.r, right.g, right.b);
+        return float3(left.r, right.g, right.b);
     }
     if (pair < 1.5f) {
         return float3(right.r, left.g, right.b);
@@ -3280,15 +3286,15 @@ float4 ApplyAlignmentMarker(float2 outputUv, float2 sampleUv, float4 color)
     if (mode == 1.0f || mode >= 2.5f)
     {
         float imageMask = AlignmentCrossMask(sampleUv);
-        color.rgb = lerp(color.rgb, float3(1.0f, 1.0f, 0.0f), imageMask);
+)DIBR",
+R"DIBR(        color.rgb = lerp(color.rgb, float3(1.0f, 1.0f, 0.0f), imageMask);
         color.a = max(color.a, imageMask);
     }
 
     if (mode >= 1.5f)
     {
         float lensMask = AlignmentCrossMask(outputUv);
-)DIBR",
-R"DIBR(        color.rgb = lerp(color.rgb, float3(0.0f, 1.0f, 0.0f), lensMask);
+        color.rgb = lerp(color.rgb, float3(0.0f, 1.0f, 0.0f), lensMask);
         color.a = max(color.a, lensMask);
     }
     return color;
@@ -3581,7 +3587,8 @@ float2 StereoShift(float shift)
     return (stereo_axis_mode > 0.5f) ? float2(0.0f, shift) : float2(shift, 0.0f);
 }
 
-float UiAlphaMaskFromColor(float4 sampleColor)
+)DIBR",
+R"DIBR(float UiAlphaMaskFromColor(float4 sampleColor)
 {
     float strength = saturate(ui_alpha_mask_strength);
     if (strength <= 0.0f) {
@@ -3589,8 +3596,7 @@ float UiAlphaMaskFromColor(float4 sampleColor)
     }
 
     float threshold = saturate(ui_alpha_mask_threshold);
-)DIBR",
-R"DIBR(    float feather = max(ui_alpha_mask_feather, 0.0001f);
+    float feather = max(ui_alpha_mask_feather, 0.0001f);
     return smoothstep(threshold, min(threshold + feather, 1.0f), sampleColor.a) * strength;
 }
 
@@ -3871,11 +3877,11 @@ float DepthArtifactGuardScale(float2 uv, float depth)
     }
 
     float2 texel = float2(1.0f / max((float)srcWidth, 1.0f), 1.0f / max((float)srcHeight, 1.0f));
-    float dl = SamplePreparedDepth(uv - float2(texel.x, 0.0f));
+)DIBR",
+R"DIBR(    float dl = SamplePreparedDepth(uv - float2(texel.x, 0.0f));
     float dr = SamplePreparedDepth(uv + float2(texel.x, 0.0f));
     float du = SamplePreparedDepth(uv - float2(0.0f, texel.y));
-)DIBR",
-R"DIBR(    float dd = SamplePreparedDepth(uv + float2(0.0f, texel.y));
+    float dd = SamplePreparedDepth(uv + float2(0.0f, texel.y));
     float gradient = max(abs(dr - dl), abs(dd - du));
     float threshold = max(depth_artifact_guard_threshold, 0.0f);
     float feather = max(depth_artifact_guard_feather, 0.0001f);
@@ -4152,11 +4158,11 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
 }
 
 // Edge-fill behavior of SampleStereoColor plus the raymarch kernel's
-// disocclusion guard: where the searched sample's depth disagrees with the
+)DIBR",
+R"DIBR(// disocclusion guard: where the searched sample's depth disagrees with the
 // output pixel's depth (a revealed region with no true source data), blend
 // back toward the unwarped center color instead of smearing the occluder.
-)DIBR",
-R"DIBR(float4 SampleSynthStereoColor(float2 sampleUv, float2 centerUv, float4 centerColor, float centerDepth)
+float4 SampleSynthStereoColor(float2 sampleUv, float2 centerUv, float4 centerColor, float centerDepth)
 {
     float4 base = SampleStereoColor(sampleUv, centerUv, centerColor);
     float outside = (sampleUv.x < 0.0f || sampleUv.x > 1.0f ||
@@ -4334,7 +4340,7 @@ inline std::string dibr_yoro_source() {
     return out;
 }
 
-// dibr_raymarch.hlsl (83100 bytes, 7 chunks)
+// dibr_raymarch.hlsl (83192 bytes, 7 chunks)
 inline const char* const g_dibr_raymarch_chunks[] = {
 R"DIBR(// dibr_raymarch.hlsl - clean-room raymarch DIBR
 //
@@ -4598,6 +4604,9 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_right;
     float scatter_compose;
     float overscan_x;
+    float temporal_enabled;
+    float temporal_pad0;
+    float4x4 reproj_target_to_prev;
 };
 
 static const int MAX_STEPS = 48;
@@ -4696,13 +4705,13 @@ float2 ApplyOutputGeometry(float2 uv)
         d *= max(0.0f, 1.0f + barrel * r2 + radialK2 * r4 + radialK3 * r6);
     }
 
-    return saturate(float2(0.5f + output_geometry_offset_x, 0.5f + output_geometry_offset_y) + d);
+)DIBR",
+R"DIBR(    return saturate(float2(0.5f + output_geometry_offset_x, 0.5f + output_geometry_offset_y) + d);
 }
 
 float2 StereoShift(float shift)
 {
-)DIBR",
-R"DIBR(    return (stereo_axis_mode > 0.5f) ? float2(0.0f, shift) : float2(shift, 0.0f);
+    return (stereo_axis_mode > 0.5f) ? float2(0.0f, shift) : float2(shift, 0.0f);
 }
 
 float LinearizeProjectionDepth(float depth)
@@ -5022,13 +5031,13 @@ float ShapeDepthMask(float2 uv, float depth)
     return saturate(shape * depthMask * strength);
 }
 
-float ApplyShapeDepthMask(float2 uv, float depth)
+)DIBR",
+R"DIBR(float ApplyShapeDepthMask(float2 uv, float depth)
 {
     return lerp(depth, saturate(shape_mask_target_depth), ShapeDepthMask(uv, depth));
 }
 
-)DIBR",
-R"DIBR(float OutputMatteMask(float2 uv)
+float OutputMatteMask(float2 uv)
 {
     float strength = saturate(output_matte_strength);
     if (strength <= 0.0f) {
@@ -5333,9 +5342,9 @@ float OutputHeadsetRotation(float eyeSign)
     if (OutputHeadsetProfileEnabled()) {
         return 0.0f;
     }
-    bool useLeftAlignment = eyeSign > 0.0f || output_geometry_tie_right_alignment > 0.5f;
 )DIBR",
-R"DIBR(    return useLeftAlignment ? output_geometry_left_rotation_deg : output_geometry_right_rotation_deg;
+R"DIBR(    bool useLeftAlignment = eyeSign > 0.0f || output_geometry_tie_right_alignment > 0.5f;
+    return useLeftAlignment ? output_geometry_left_rotation_deg : output_geometry_right_rotation_deg;
 }
 
 float3 OutputHeadsetPolyK1()
@@ -5644,12 +5653,12 @@ float4 ApplyFrameMarker(uint outX, uint outY, uint outWidth, uint outHeight, flo
     cols = min(cols, outWidth);
 
     if (mode >= 2.5f) {
-        bool inCorner = outX < cols && outY < rows;
+)DIBR",
+R"DIBR(        bool inCorner = outX < cols && outY < rows;
         if (!inCorner) {
             return color;
         }
-)DIBR",
-R"DIBR(        color.rgb = (parity == 0u) ? float3(0.0f, 0.0f, 0.0f) : float3(1.0f, 1.0f, 1.0f);
+        color.rgb = (parity == 0u) ? float3(0.0f, 0.0f, 0.0f) : float3(1.0f, 1.0f, 1.0f);
         color.a = max(color.a, 1.0f);
         return color;
     }
@@ -5944,12 +5953,12 @@ float4 ApplyPresentationColor(float2 uv, float4 color)
 {
     float sat = max(output_saturation, 0.0f);
     float luma = ImageFilterLuma(color.rgb);
-    color.rgb = saturate(lerp(float3(luma, luma, luma), color.rgb, sat));
+)DIBR",
+R"DIBR(    color.rgb = saturate(lerp(float3(luma, luma, luma), color.rgb, sat));
 
     float strength = saturate(output_vignette_strength);
     if (strength > 0.0f) {
-)DIBR",
-R"DIBR(        float2 d = uv - 0.5f;
+        float2 d = uv - 0.5f;
         d.x *= (float)srcWidth / max((float)srcHeight, 1.0f);
         float dist = length(d);
         float radius = max(output_vignette_radius, 0.0f);
@@ -6239,12 +6248,12 @@ float SamplePreparedDepthWithGradient(float2 uv, out float sourceGradient)
         float expandMask = smoothstep(expandThreshold, expandThreshold * 2.0f, gradient) * expandStrength;
         float expandTarget = lerp(neighborAvg, minDepth, saturate(depth_expand_near_bias));
         d = saturate(lerp(d, expandTarget, expandMask));
-        minDepth = min(d, min(min(dl, dr), min(du, dd)));
+)DIBR",
+R"DIBR(        minDepth = min(d, min(min(dl, dr), min(du, dd)));
     }
 
     float edgeWeight = saturate(gradient * 24.0f);
-)DIBR",
-R"DIBR(    float smoothWeight = saturate(range_smoothing) * (1.0f - edgeWeight);
+    float smoothWeight = saturate(range_smoothing) * (1.0f - edgeWeight);
     float protectedWeight = edgeWeight * saturate(foreground_protect);
 
     float smoothedDepth = lerp(d, neighborAvg, smoothWeight);
@@ -6502,7 +6511,7 @@ inline std::string dibr_raymarch_source() {
     return out;
 }
 
-// dibr_scatter_clear.hlsl (10924 bytes, 1 chunks)
+// dibr_scatter_clear.hlsl (11016 bytes, 1 chunks)
 inline const char* const g_dibr_scatter_clear_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -6764,6 +6773,9 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_right;
     float scatter_compose;
     float overscan_x;
+    float temporal_enabled;
+    float temporal_pad0;
+    float4x4 reproj_target_to_prev;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -6826,7 +6838,7 @@ inline std::string dibr_scatter_clear_source() {
     return out;
 }
 
-// dibr_scatter_depth.hlsl (11532 bytes, 1 chunks)
+// dibr_scatter_depth.hlsl (11624 bytes, 1 chunks)
 inline const char* const g_dibr_scatter_depth_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7088,6 +7100,9 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_right;
     float scatter_compose;
     float overscan_x;
+    float temporal_enabled;
+    float temporal_pad0;
+    float4x4 reproj_target_to_prev;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -7165,7 +7180,7 @@ inline std::string dibr_scatter_depth_source() {
     return out;
 }
 
-// dibr_scatter_color.hlsl (11511 bytes, 1 chunks)
+// dibr_scatter_color.hlsl (11603 bytes, 1 chunks)
 inline const char* const g_dibr_scatter_color_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7427,6 +7442,9 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_right;
     float scatter_compose;
     float overscan_x;
+    float temporal_enabled;
+    float temporal_pad0;
+    float4x4 reproj_target_to_prev;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -7506,7 +7524,7 @@ inline std::string dibr_scatter_color_source() {
     return out;
 }
 
-// dibr_scatter_fill.hlsl (12573 bytes, 2 chunks)
+// dibr_scatter_fill.hlsl (14716 bytes, 2 chunks)
 inline const char* const g_dibr_scatter_fill_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7516,6 +7534,10 @@ Texture2D<float>  g_depthTex : register(t1);
 RWTexture2D<float4> g_sbsOut : register(u0);
 RWTexture2D<uint> g_scatterKey : register(u1);
 RWTexture2D<float4> g_scatterColor : register(u2);
+// Last frame's FILLED synthesized eye + its depth keys (ping-ponged by
+// DIBRSynthesis) - the R3 temporal hole-fill source.
+RWTexture2D<float4> g_historyColor : register(u3);
+RWTexture2D<uint> g_historyKey : register(u4);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
 
@@ -7768,6 +7790,9 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_right;
     float scatter_compose;
     float overscan_x;
+    float temporal_enabled;
+    float temporal_pad0;
+    float4x4 reproj_target_to_prev;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -7840,15 +7865,51 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     for (int i = 1; i <= kMaxSearch; ++i) {
         int x = (int)dtid.x + i;
         if (x >= (int)srcWidth) break;
-        uint k = g_scatterKey[uint2(x, dtid.y)];
+)DIBR",
+R"DIBR(        uint k = g_scatterKey[uint2(x, dtid.y)];
         if (k != 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { rx = x; rkey = k; break; }
+    }
+
+    // R3 temporal reuse: reproject this hole into LAST frame's synthesized
+    // eye (camera-delta matrix) and adopt it when the stored depth agrees -
+    // the revealed region was usually visible a few frames ago, and reusing
+    // it is temporally stable where the per-frame scanline fill shimmers.
+    // Depth validation rejects history the camera-delta matrix can't explain
+    // (engine-side locomotion, animated content), falling through to the
+    // scanline fill.
+    if (temporal_enabled > 0.5f) {
+        uint estKey = 0u;
+        if (lx >= 0 && rx >= 0) {
+            estKey = min(lkey, rkey); // background side of the reveal
+        } else if (lx >= 0) {
+            estKey = lkey;
+        } else if (rx >= 0) {
+            estKey = rkey;
+        }
+        if (estKey != 0u) {
+            float estDepth = asfloat(estKey);
+            float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
+            float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+            float4 prev = mul(reproj_target_to_prev, float4(ndc, estDepth, 1.0f));
+            float w = (abs(prev.w) > 1e-6f) ? prev.w : 1e-6f;
+            float2 pn = prev.xy / w;
+            int px = (int)((pn.x * 0.5f + 0.5f) * (float)srcWidth);
+            int py = (int)((0.5f - pn.y * 0.5f) * (float)srcHeight);
+            if (px >= 0 && px < (int)srcWidth && py >= 0 && py < (int)srcHeight) {
+                float4 h = g_historyColor[uint2(px, py)];
+                uint hk = g_historyKey[uint2(px, py)];
+                if (h.a > 0.5f && hk != 0u && abs(asfloat(hk) - estDepth) <= max(0.15f * estDepth, 2e-4f)) {
+                    g_scatterColor[dtid.xy] = float4(h.rgb, 1.0f);
+                    return;
+                }
+            }
+        }
     }
 
     float4 c;
     if (lx >= 0 && rx >= 0) {
         // Smaller key bits = farther (reversed-Z) = the background side.
-)DIBR",
-R"DIBR(        c = (lkey <= rkey) ? g_scatterColor[uint2(lx, dtid.y)] : g_scatterColor[uint2(rx, dtid.y)];
+        c = (lkey <= rkey) ? g_scatterColor[uint2(lx, dtid.y)] : g_scatterColor[uint2(rx, dtid.y)];
     } else if (lx >= 0) {
         c = g_scatterColor[uint2(lx, dtid.y)];
     } else if (rx >= 0) {

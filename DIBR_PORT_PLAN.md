@@ -476,6 +476,20 @@ Verified full-res left-vs-right: rock/seafloor/coral detail now matches the pris
 eye; the floating logo's glyph shimmer (thin far geometry at full disparity) remains
 the known limitation.
 
+### R3 (2026-06-10) — temporal history hole fill
+
+The scatter fill's last artifact class was per-frame shimmer in revealed bands
+(the scanline fill re-decides every frame over animated content). The scatter
+key/color buffers are now PING-PONGED: the previous frame's FILLED synthesized
+eye is bound as history (u3/u4), and hole pixels first reproject into it via a
+camera-delta matrix (current target clip -> previous target clip, from the HMD
+pose delta z-flip-conjugated into UE view axes) and adopt history ONLY when its
+stored depth key agrees (loose reversed-Z tolerance). Depth validation rejects
+history the pose delta can't explain (engine-side locomotion / animated
+cameras), falling back to the scanline fill - so the worst case is exactly the
+pre-R3 behavior. UEVR_DIBR_TEMPORAL=0 disables. History invalidates on
+resize/reset (temporal_enabled forced 0 until a frame exists).
+
 ### R1/R2 redesign (2026-06-10) — true matrices + forward scatter
 
 Major rebuild of the synthesis core (the gather/divergence model inherited from

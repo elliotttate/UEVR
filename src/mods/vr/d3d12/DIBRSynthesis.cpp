@@ -161,10 +161,10 @@ bool validate_cbuffer_layout(const std::vector<uint8_t>& bytecode, const char* n
         // Field count + the last field's offset pin the layout exactly and are
         // backend-independent (FXC reports the cbuffer size padded to 16 bytes,
         // DXC's DXIL reflection may not - so total size is only sanity-ranged).
-        // 246 scalars (incl. reproj_enabled/scatter_compose/overscan_x) + two
-        // float4x4, which reflection counts as ONE variable each.
-        constexpr uint32_t expected_fields = 246u + 2u;
-        constexpr uint32_t expected_last_offset = offsetof(DIBRStereoParams, overscan_x);
+        // 248 scalars (incl. reproj/scatter/overscan/temporal flags+pad) +
+        // three float4x4, which reflection counts as ONE variable each.
+        constexpr uint32_t expected_fields = 248u + 3u;
+        constexpr uint32_t expected_last_offset = offsetof(DIBRStereoParams, reproj_target_to_prev);
         constexpr uint32_t expected_size_min = sizeof(DIBRStereoParams);
         constexpr uint32_t expected_size_max = (sizeof(DIBRStereoParams) + 15u) & ~15u;
 
@@ -281,7 +281,7 @@ bool DIBRSynthesis::create_root_signature(ID3D12Device* device, DeviceObjects& o
     ranges[0].BaseShaderRegister = 0;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 3; // u0 output, u1 scatter key, u2 scatter color
+    ranges[1].NumDescriptors = 5; // u0 output, u1/u2 scatter key+color, u3/u4 history color+key
     ranges[1].BaseShaderRegister = 0;
     ranges[1].OffsetInDescriptorsFromTableStart = 2;
 
@@ -453,12 +453,18 @@ void DIBRSynthesis::set_output_format(DXGI_FORMAT format) {
 }
 
 bool DIBRSynthesis::ensure_scatter(ID3D12Device* device, uint32_t width, uint32_t height) {
-    if (m_scatter_key != nullptr && m_scatter_width == width && m_scatter_height == height) {
+    if (m_scatter_key[0] != nullptr && m_scatter_width == width && m_scatter_height == height) {
         return true;
     }
 
-    m_scatter_key.Reset();
-    m_scatter_color.Reset();
+    for (auto& r : m_scatter_key) {
+        r.Reset();
+    }
+    for (auto& r : m_scatter_color) {
+        r.Reset();
+    }
+    m_scatter_history_valid = false;
+    m_scatter_index = 0;
 
     D3D12_HEAP_PROPERTIES heap_props{};
     heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -472,26 +478,28 @@ bool DIBRSynthesis::ensure_scatter(ID3D12Device* device, uint32_t width, uint32_
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
-    desc.Format = DXGI_FORMAT_R32_UINT;
-    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_scatter_key)))) {
-        SPDLOG_ERROR_ONCE("[DIBR] failed to create {}x{} scatter key texture", width, height);
-        return false;
-    }
-    m_scatter_key->SetName(L"DIBR Scatter Key");
+    for (int i = 0; i < 2; ++i) {
+        desc.Format = DXGI_FORMAT_R32_UINT;
+        if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_scatter_key[i])))) {
+            SPDLOG_ERROR_ONCE("[DIBR] failed to create {}x{} scatter key texture", width, height);
+            return false;
+        }
+        m_scatter_key[i]->SetName(i == 0 ? L"DIBR Scatter Key A" : L"DIBR Scatter Key B");
 
-    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_scatter_color)))) {
-        SPDLOG_ERROR_ONCE("[DIBR] failed to create {}x{} scatter color texture", width, height);
-        m_scatter_key.Reset();
-        return false;
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_scatter_color[i])))) {
+            SPDLOG_ERROR_ONCE("[DIBR] failed to create {}x{} scatter color texture", width, height);
+            m_scatter_key[i].Reset();
+            return false;
+        }
+        m_scatter_color[i]->SetName(i == 0 ? L"DIBR Scatter Color A" : L"DIBR Scatter Color B");
     }
-    m_scatter_color->SetName(L"DIBR Scatter Color");
 
     m_scatter_width = width;
     m_scatter_height = height;
-    SPDLOG_INFO("[DIBR] scatter buffers {}x{}", width, height);
+    SPDLOG_INFO("[DIBR] scatter buffers {}x{} (ping-pong pair)", width, height);
     return true;
 }
 
@@ -532,6 +540,10 @@ ID3D12Resource* DIBRSynthesis::synthesize(
             pso = nullptr;
         } else {
             params.scatter_compose = 1.0f;
+            // Temporal hole fill needs a valid previous frame.
+            if (!m_scatter_history_valid) {
+                params.temporal_enabled = 0.0f;
+            }
         }
         break;
     }
@@ -581,15 +593,22 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     device->CreateUnorderedAccessView(m_output.Get(), nullptr, &uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 2 * m_objs.descriptor_stride});
 
+    const uint32_t cur = m_scatter_index;
+    const uint32_t prev = cur ^ 1u;
+
     D3D12_UNORDERED_ACCESS_VIEW_DESC key_uav{};
     key_uav.Format = DXGI_FORMAT_R32_UINT;
     key_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    device->CreateUnorderedAccessView(m_scatter_key.Get(), nullptr, &key_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 3 * m_objs.descriptor_stride});
+    device->CreateUnorderedAccessView(m_scatter_key[cur].Get(), nullptr, &key_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 3 * m_objs.descriptor_stride});
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC scol_uav{};
     scol_uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     scol_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    device->CreateUnorderedAccessView(m_scatter_color.Get(), nullptr, &scol_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 4 * m_objs.descriptor_stride});
+    device->CreateUnorderedAccessView(m_scatter_color[cur].Get(), nullptr, &scol_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 4 * m_objs.descriptor_stride});
+
+    // History (previous frame's filled pair) for the temporal hole fill.
+    device->CreateUnorderedAccessView(m_scatter_color[prev].Get(), nullptr, &scol_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 5 * m_objs.descriptor_stride});
+    device->CreateUnorderedAccessView(m_scatter_key[prev].Get(), nullptr, &key_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 6 * m_objs.descriptor_stride});
 
     // Read-combo states that already include NON_PIXEL_SHADER_RESOURCE (e.g.
     // UEVR's ENGINE_SRC_COLOR / ENGINE_SRC_DEPTH) are readable by compute
@@ -627,23 +646,29 @@ ID3D12Resource* DIBRSynthesis::synthesize(
             cmd_list->ResourceBarrier(1, &b);
         };
 
+        const uint32_t cur = m_scatter_index;
+
         // clear -> depth scatter (nearest wins) -> color resolve -> hole fill.
         cmd_list->SetPipelineState(m_objs.pso_scatter_clear.Get());
         cmd_list->Dispatch(gx, gy, 1);
-        uav_barrier(m_scatter_key.Get());
-        uav_barrier(m_scatter_color.Get());
+        uav_barrier(m_scatter_key[cur].Get());
+        uav_barrier(m_scatter_color[cur].Get());
 
         cmd_list->SetPipelineState(m_objs.pso_scatter_depth.Get());
         cmd_list->Dispatch(gx, gy, 1);
-        uav_barrier(m_scatter_key.Get());
+        uav_barrier(m_scatter_key[cur].Get());
 
         cmd_list->SetPipelineState(m_objs.pso_scatter_color.Get());
         cmd_list->Dispatch(gx, gy, 1);
-        uav_barrier(m_scatter_color.Get());
+        uav_barrier(m_scatter_color[cur].Get());
 
         cmd_list->SetPipelineState(m_objs.pso_scatter_fill.Get());
         cmd_list->Dispatch(gx, gy, 1);
-        uav_barrier(m_scatter_color.Get());
+        uav_barrier(m_scatter_color[cur].Get());
+
+        // This frame's filled pair becomes the next frame's temporal history.
+        m_scatter_index = cur ^ 1u;
+        m_scatter_history_valid = true;
     }
 
     cmd_list->SetPipelineState(pso);
@@ -674,10 +699,16 @@ void DIBRSynthesis::reset() {
     m_output.Reset();
     m_output_width = 0;
     m_output_height = 0;
-    m_scatter_key.Reset();
-    m_scatter_color.Reset();
+    for (auto& r : m_scatter_key) {
+        r.Reset();
+    }
+    for (auto& r : m_scatter_color) {
+        r.Reset();
+    }
     m_scatter_width = 0;
     m_scatter_height = 0;
+    m_scatter_index = 0;
+    m_scatter_history_valid = false;
     m_ring_index = 0;
     m_state.store(State::NotStarted, std::memory_order_release);
 }

@@ -258,6 +258,9 @@ cbuffer StereoParams : register(b0) {
     float4x4 reproj_source_to_right;
     float scatter_compose;
     float overscan_x;
+    float temporal_enabled;
+    float temporal_pad0;
+    float4x4 reproj_target_to_prev;
 };
 
 float EffectiveConvergence()
