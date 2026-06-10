@@ -7524,7 +7524,7 @@ inline std::string dibr_scatter_color_source() {
     return out;
 }
 
-// dibr_scatter_fill.hlsl (14716 bytes, 2 chunks)
+// dibr_scatter_fill.hlsl (15400 bytes, 2 chunks)
 inline const char* const g_dibr_scatter_fill_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7854,66 +7854,39 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     int lx = -1; uint lkey = 0u;
     int rx = -1; uint rkey = 0u;
 
+    // Keys with the MSB marker were committed by this fill pass itself (other
+    // threads, this dispatch) - skip them so hole pixels never adopt other
+    // hole pixels' fill as real geometry (that ordering race would shimmer).
     [loop]
     for (int i = 1; i <= kMaxSearch; ++i) {
         int x = (int)dtid.x - i;
         if (x < 0) break;
         uint k = g_scatterKey[uint2(x, dtid.y)];
-        if (k != 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { lx = x; lkey = k; break; }
+)DIBR",
+R"DIBR(        if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { lx = x; lkey = k; break; }
     }
     [loop]
     for (int i = 1; i <= kMaxSearch; ++i) {
         int x = (int)dtid.x + i;
         if (x >= (int)srcWidth) break;
-)DIBR",
-R"DIBR(        uint k = g_scatterKey[uint2(x, dtid.y)];
-        if (k != 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { rx = x; rkey = k; break; }
+        uint k = g_scatterKey[uint2(x, dtid.y)];
+        if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { rx = x; rkey = k; break; }
     }
 
-    // R3 temporal reuse: reproject this hole into LAST frame's synthesized
-    // eye (camera-delta matrix) and adopt it when the stored depth agrees -
-    // the revealed region was usually visible a few frames ago, and reusing
-    // it is temporally stable where the per-frame scanline fill shimmers.
-    // Depth validation rejects history the camera-delta matrix can't explain
-    // (engine-side locomotion, animated content), falling through to the
-    // scanline fill.
-    if (temporal_enabled > 0.5f) {
-        uint estKey = 0u;
-        if (lx >= 0 && rx >= 0) {
-            estKey = min(lkey, rkey); // background side of the reveal
-        } else if (lx >= 0) {
-            estKey = lkey;
-        } else if (rx >= 0) {
-            estKey = rkey;
-        }
-        if (estKey != 0u) {
-            float estDepth = asfloat(estKey);
-            float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
-            float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
-            float4 prev = mul(reproj_target_to_prev, float4(ndc, estDepth, 1.0f));
-            float w = (abs(prev.w) > 1e-6f) ? prev.w : 1e-6f;
-            float2 pn = prev.xy / w;
-            int px = (int)((pn.x * 0.5f + 0.5f) * (float)srcWidth);
-            int py = (int)((0.5f - pn.y * 0.5f) * (float)srcHeight);
-            if (px >= 0 && px < (int)srcWidth && py >= 0 && py < (int)srcHeight) {
-                float4 h = g_historyColor[uint2(px, py)];
-                uint hk = g_historyKey[uint2(px, py)];
-                if (h.a > 0.5f && hk != 0u && abs(asfloat(hk) - estDepth) <= max(0.15f * estDepth, 2e-4f)) {
-                    g_scatterColor[dtid.xy] = float4(h.rgb, 1.0f);
-                    return;
-                }
-            }
-        }
-    }
-
+    // Scanline fill candidate. Smaller key bits = farther (reversed-Z) = the
+    // background side of the reveal.
     float4 c;
+    uint fillKey = 0u;
     if (lx >= 0 && rx >= 0) {
-        // Smaller key bits = farther (reversed-Z) = the background side.
-        c = (lkey <= rkey) ? g_scatterColor[uint2(lx, dtid.y)] : g_scatterColor[uint2(rx, dtid.y)];
+        bool useLeft = (lkey <= rkey);
+        c = useLeft ? g_scatterColor[uint2(lx, dtid.y)] : g_scatterColor[uint2(rx, dtid.y)];
+        fillKey = useLeft ? lkey : rkey;
     } else if (lx >= 0) {
         c = g_scatterColor[uint2(lx, dtid.y)];
+        fillKey = lkey;
     } else if (rx >= 0) {
         c = g_scatterColor[uint2(rx, dtid.y)];
+        fillKey = rkey;
     } else {
         float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
         if (overscan_x > 1.0f) {
@@ -7921,7 +7894,41 @@ R"DIBR(        uint k = g_scatterKey[uint2(x, dtid.y)];
         }
         c = float4(g_colorTex.SampleLevel(g_linearSampler, uv, 0).rgb, 1.0f);
     }
+
+    // R3 temporal reuse: reproject this hole into LAST frame's synthesized eye
+    // (camera-delta matrix) and EMA-blend its content in when the stored depth
+    // agrees. The fill pass commits its keys (marker bit, below), so a
+    // persistent disocclusion band carries a valid history key and the blend
+    // chain latches - without that committed key the gate could never pass in
+    // the very bands it exists to stabilize. Depth validation rejects history
+    // the camera-delta matrix can't explain (engine-side locomotion, animated
+    // content); the 0.85 blend damps per-frame scanline boil ~7x while still
+    // converging in a few frames so animated content doesn't freeze stale.
+    if (temporal_enabled > 0.5f && fillKey != 0u) {
+        float estDepth = asfloat(fillKey);
+        float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
+        float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+        float4 prev = mul(reproj_target_to_prev, float4(ndc, estDepth, 1.0f));
+        float w = (abs(prev.w) > 1e-6f) ? prev.w : 1e-6f;
+        float2 pn = prev.xy / w;
+        int px = (int)((pn.x * 0.5f + 0.5f) * (float)srcWidth);
+        int py = (int)((0.5f - pn.y * 0.5f) * (float)srcHeight);
+        if (px >= 0 && px < (int)srcWidth && py >= 0 && py < (int)srcHeight) {
+            float4 h = g_historyColor[uint2(px, py)];
+            uint hk = g_historyKey[uint2(px, py)] & 0x7FFFFFFFu; // strip fill marker
+            if (h.a > 0.5f && hk != 0u && abs(asfloat(hk) - estDepth) <= max(0.15f * estDepth, 2e-4f)) {
+                c.rgb = lerp(c.rgb, h.rgb, 0.85f);
+            }
+        }
+    }
+
     g_scatterColor[dtid.xy] = float4(c.rgb, 1.0f);
+    if (fillKey != 0u) {
+        // Commit the adopted background key so next frame's temporal gate can
+        // validate this band. Device depths are positive floats, so the MSB is
+        // free to mark "filled, not scattered" for the search masks above.
+        g_scatterKey[dtid.xy] = fillKey | 0x80000000u;
+    }
 })DIBR",
 };
 

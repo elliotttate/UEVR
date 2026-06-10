@@ -490,6 +490,30 @@ cameras), falling back to the scanline fill - so the worst case is exactly the
 pre-R3 behavior. UEVR_DIBR_TEMPORAL=0 disables. History invalidates on
 resize/reset (temporal_enabled forced 0 until a frame exists).
 
+**R3 fix (2026-06-10, same day):** the first cut was dead code in steady state —
+the fill pass wrote only the COLOR buffer, never the key buffer, so a persistent
+disocclusion band (a hole every frame) always had history key 0 and the
+`hk != 0` depth gate could never pass exactly where it was meant to help.
+Measured proof: pixel-exact eye-dump bursts showed identical right-eye
+frame-to-frame instability with temporal ON vs OFF (R/L mad ratio 1.12 vs 1.07 —
+noise), matching the user still seeing flicker. Fix, in dibr_scatter_fill.hlsl:
+
+- The fill pass now COMMITS its adopted background key with the MSB set as a
+  "filled, not scattered" marker (device depths are positive floats, so the MSB
+  is free). The scanline searches mask marked keys out so concurrently-filled
+  hole pixels are never adopted as real geometry (that ordering race would be a
+  fresh shimmer source). Next frame's temporal gate strips the marker before
+  the depth compare.
+- History is EMA-BLENDED (0.85 history / 0.15 fresh fill) instead of adopted
+  verbatim: damps per-frame scanline boil ~7x and still converges in ~7 frames
+  so animated content (caustics, fish) doesn't freeze stale in the bands.
+
+Post-fix measurement, same static-pose burst methodology: R/L mad ratio 0.94,
+hot-pixel ratio 0.92 — the synthesized eye is now MORE temporally stable than
+the rendered eye (the hole-band EMA smooths even source TAA noise). Visual
+stills + a +/-8 cm lateral pose sweep stay artifact-free (correct logo
+parallax, single silhouettes, no displaced-history strips).
+
 ### R1/R2 redesign (2026-06-10) — true matrices + forward scatter
 
 Major rebuild of the synthesis core (the gather/divergence model inherited from
