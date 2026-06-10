@@ -48,3 +48,11 @@ crash_dumps/
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Stale local forensics logs from concluded SN2 investigation sessions
+/dump_run_launch.log
+/rdoc_tags_baseline_capture.log
+/rdoc_tags_control_off.log
+/rdoc_tags_validate_launch.log
+/rdoc_tags_validate_namesonly.log
+/st_scan_launch.log
