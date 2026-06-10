@@ -4922,6 +4922,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             ++s_pointer_switches;
             SPDLOG_INFO_EVERY_N_SEC(30, "[DIBR] depth pointer switches so far: {} (per-frame pooled ping-pong is normal)", s_pointer_switches);
         }
+        SPDLOG_INFO_EVERY_N_SEC(10, "[DIBR] depth candidates: {}", dibr_depth_tracker::describe_candidates());
     }
 
     const auto output_format = dibr_config::uav_store_format_for(device, bb_desc.Format);

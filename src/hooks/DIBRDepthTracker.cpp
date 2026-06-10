@@ -1,7 +1,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -34,6 +36,12 @@ struct Candidate {
     // are one frame STALE, doubling/twitching the warp during motion.
     uint64_t bind_window{};
     uint32_t bind_count{};
+    // Bind order of the FIRST bind in the current window. The presented
+    // frame's buffer starts binding right after the previous present; a
+    // pipelined next-frame buffer starts mid-window. When two candidates have
+    // comparable counts (deep CPU-ahead recording), the earliest starter is
+    // the presented frame's depth.
+    uint64_t window_first_bind{};
 };
 
 std::mutex g_mtx{};
@@ -144,13 +152,15 @@ void record_dsv_bind(D3D12_CPU_DESCRIPTOR_HANDLE descriptor) {
 
     for (auto& c : g_candidates) {
         if (c.resource.Get() == it->second) {
+            const auto order = g_bind_order.fetch_add(1, std::memory_order_relaxed);
             if (c.bind_window != present) {
                 c.bind_window = present;
                 c.bind_count = 0;
+                c.window_first_bind = order;
             }
             ++c.bind_count;
             c.last_bind_present = present;
-            c.last_bind_order = g_bind_order.fetch_add(1, std::memory_order_relaxed);
+            c.last_bind_order = order;
             return;
         }
     }
@@ -222,7 +232,22 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, u
         if (live) {
             const uint32_t c_count = (c.bind_window == present) ? c.bind_count : 0u;
             const uint32_t b_count = (best->bind_window == present) ? best->bind_count : 0u;
-            if (c_count != b_count) {
+            // Comparable counts (deep CPU-ahead: the next frame's recording may
+            // be nearly complete at present time): the EARLIEST window starter
+            // is the presented frame's depth. Lopsided counts: more binds wins
+            // (full frame of depth passes vs a capture depth or a just-started
+            // next-frame buffer).
+            const bool comparable = c_count > 0 && b_count > 0 &&
+                                    c_count < b_count * 2 && b_count < c_count * 2;
+            if (comparable) {
+                if (c.window_first_bind != best->window_first_bind) {
+                    if (c.window_first_bind < best->window_first_bind) {
+                        best = &c;
+                        best_exact = exact;
+                    }
+                    continue;
+                }
+            } else if (c_count != b_count) {
                 if (c_count > b_count) {
                     best = &c;
                     best_exact = exact;
@@ -256,5 +281,25 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, u
     }
 
     return best != nullptr ? best->resource : nullptr;
+}
+
+std::string describe_candidates() {
+    std::scoped_lock _{g_mtx};
+    const uint64_t present = g_present_seq.load(std::memory_order_relaxed);
+    std::string out;
+    for (const auto& c : g_candidates) {
+        if (c.last_bind_present + 4 <= present) {
+            continue; // long stale; not interesting
+        }
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "[0x%llx %ux%u f%u cnt=%u first=%llu last=%llu win=%llu] ",
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(c.resource.Get())),
+            c.width, c.height, static_cast<unsigned>(c.format), c.bind_count,
+            static_cast<unsigned long long>(c.window_first_bind),
+            static_cast<unsigned long long>(c.last_bind_order),
+            static_cast<unsigned long long>(c.bind_window));
+        out += buf;
+    }
+    return out;
 }
 } // namespace dibr_depth_tracker

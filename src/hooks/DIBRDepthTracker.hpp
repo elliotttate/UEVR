@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 #include <d3d12.h>
 #include <wrl.h>
@@ -38,4 +39,8 @@ void record_dsv_bind(D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
 // skip synthesis for the frame). Also advances the per-present liveness
 // window - call once per presented frame.
 Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, uint32_t eye_width, uint32_t height);
+
+// Diagnostic snapshot of the current candidates (extent/format/bind stats),
+// for periodic logging by the consumer.
+std::string describe_candidates();
 } // namespace dibr_depth_tracker

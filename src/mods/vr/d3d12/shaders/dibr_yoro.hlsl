@@ -1965,10 +1965,15 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
     float requestedSteps = (raymarch_steps > 0.0f) ? raymarch_steps : defaultSteps;
     int steps = YoroSearchSteps(uv, requestedSteps);
     float direction = (targetShift >= 0.0f) ? 1.0f : -1.0f;
-    float2 bestUv = saturate(directUv);
-    float bestT = 1.0f;
-    float bestError = 1000000.0f;
-    float previousDepth = centerDepth;
+
+    // March until the ray CROSSES the depth surface. f(t) = the travel the
+    // probe's own depth asks for, minus the travel needed to land on this
+    // output pixel; f starts positive and its FIRST sign change is the
+    // nearest surface that projects onto this pixel. (A global best-error
+    // scan instead picks later local minima and stamps repeated copies of
+    // high-contrast edges across disocclusion bands - the "3 edges" look.)
+    float prevT = 0.0f;
+    float hitT = -1.0f;
 
     [loop]
     for (int i = 1; i <= YORO_MAX_SEARCH_STEPS; ++i) {
@@ -1979,70 +1984,37 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
         float t = (float)i / (float)steps;
         float2 probeUv = saturate(uv + StereoShift(direction * absTarget * t));
         float probeDepth = YoroSearchDepth(probeUv);
-        float expectedTravel = absTarget * t;
-        float observedTravel = abs(YoroSynthShiftBase(probeUv, probeDepth, eyeSign) * boundaryScale * shiftScale);
-        float depthStep = abs(probeDepth - previousDepth);
-        float error = abs(observedTravel - expectedTravel) + depthStep * absTarget * 2.0f;
+        float f = abs(YoroSynthShiftBase(probeUv, probeDepth, eyeSign) * boundaryScale * shiftScale) - absTarget * t;
 
-        if (error < bestError) {
-            bestError = error;
-            bestUv = probeUv;
-            bestT = t;
-        }
-
-        // Early out after crossing a sharp foreground/background boundary.
-        if (depthStep > 0.08f && observedTravel + (1.5f / max((float)srcWidth, 1.0f)) < expectedTravel) {
+        if (f <= 0.0f) {
+            // Bisect the bracket for sub-step precision (Depth3D-style).
+            float lo = prevT;
+            float hi = t;
+            [loop]
+            for (int r = 0; r < 4; ++r) {
+                float mid = 0.5f * (lo + hi);
+                float2 midUv = saturate(uv + StereoShift(direction * absTarget * mid));
+                float fMid = abs(YoroSynthShiftBase(midUv, YoroSearchDepth(midUv), eyeSign) * boundaryScale * shiftScale) - absTarget * mid;
+                if (fMid <= 0.0f) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            hitT = hi;
             break;
         }
 
-        previousDepth = probeDepth;
+        prevT = t;
     }
 
-    // SuperDepth3D-style post-search refinement: probe midpoints around the
-    // best coarse hit and keep the lower-error side, giving sub-step
-    // precision so the final sample is a single coherent location.
-    float tLo = max(bestT - 1.0f / (float)steps, 0.0f);
-    float tHi = min(bestT + 1.0f / (float)steps, 1.0f);
-    [loop]
-    for (int r = 0; r < 3; ++r) {
-        float tA = lerp(tLo, tHi, 0.25f);
-        float tB = lerp(tLo, tHi, 0.75f);
-        float2 uvA = saturate(uv + StereoShift(direction * absTarget * tA));
-        float2 uvB = saturate(uv + StereoShift(direction * absTarget * tB));
-        float eA = abs(abs(YoroSynthShiftBase(uvA, YoroSearchDepth(uvA), eyeSign) * boundaryScale * shiftScale) - absTarget * tA);
-        float eB = abs(abs(YoroSynthShiftBase(uvB, YoroSearchDepth(uvB), eyeSign) * boundaryScale * shiftScale) - absTarget * tB);
-        if (eA <= eB) {
-            if (eA < bestError) {
-                bestError = eA;
-                bestUv = uvA;
-            }
-            tHi = 0.5f * (tLo + tHi);
-        } else {
-            if (eB < bestError) {
-                bestError = eB;
-                bestUv = uvB;
-            }
-            tLo = 0.5f * (tLo + tHi);
-        }
+    if (hitT < 0.0f) {
+        // No surface crossed within range: the destination-depth estimate
+        // stands (deterministic and temporally stable).
+        return directUv;
     }
 
-    // Snap, don't smear: lerping between two far-apart sample positions
-    // averages unrelated texels (it blurred the whole synthesized eye).
-    // Blend only when the candidates are within ~a texel of each other;
-    // otherwise score the direct candidate with the same error metric and
-    // take whichever explains this output pixel better (an actual contest
-    // beats an arbitrary confidence threshold for thin features).
-    float candidateDist = length((bestUv - directUv) * float2((float)srcWidth, (float)srcHeight));
-    if (candidateDist <= 1.5f) {
-        float confidence = saturate(1.0f - bestError * max((float)srcWidth, 1.0f) / max(abs(divergence), 1.0f));
-        return lerp(directUv, bestUv, confidence);
-    }
-    float directDepth = YoroSearchDepth(directUv);
-    float directError = abs(abs(YoroSynthShiftBase(saturate(directUv), directDepth, eyeSign) * boundaryScale * shiftScale) - absTarget);
-    // Stability margin: the direct candidate is temporally stable (it only
-    // depends on the destination depth), so the search winner must beat it
-    // CLEARLY - near-ties flipping per frame read as shimmer.
-    return (bestError < directError * 0.8f) ? bestUv : directUv;
+    return uv + StereoShift(direction * absTarget * hitT);
 }
 
 // Edge-fill behavior of SampleStereoColor plus the raymarch kernel's
