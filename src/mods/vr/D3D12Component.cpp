@@ -4903,15 +4903,24 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         return;
     }
 
-    // Selection diagnostics: a depth-target switch is the prime suspect for
-    // any sudden depth-shaped distortion, so make every switch visible.
+    // Selection diagnostics: a depth-target SHAPE switch is the prime suspect
+    // for sudden depth-shaped distortion. Pointer-only changes are normal
+    // (RDG ping-pongs SceneDepthZ between pooled textures every frame), so
+    // those are only summarized periodically.
     {
+        static uint64_t s_last_extent{0};
+        static uint32_t s_pointer_switches{0};
+        const auto dd = depth->GetDesc();
+        const auto extent_key = (static_cast<uint64_t>(dd.Width) << 32) ^ (static_cast<uint64_t>(dd.Height) << 8) ^ static_cast<uint64_t>(dd.Format);
+        if (extent_key != s_last_extent) {
+            s_last_extent = extent_key;
+            SPDLOG_INFO("[DIBR] depth target shape -> {}x{} fmt {}", dd.Width, dd.Height, static_cast<int>(dd.Format));
+        }
         static ID3D12Resource* s_last_depth{nullptr};
         if (depth.Get() != s_last_depth) {
             s_last_depth = depth.Get();
-            const auto dd = depth->GetDesc();
-            SPDLOG_INFO("[DIBR] depth target -> 0x{:x} {}x{} fmt {}",
-                reinterpret_cast<uintptr_t>(depth.Get()), dd.Width, dd.Height, static_cast<int>(dd.Format));
+            ++s_pointer_switches;
+            SPDLOG_INFO_EVERY_N_SEC(30, "[DIBR] depth pointer switches so far: {} (per-frame pooled ping-pong is normal)", s_pointer_switches);
         }
     }
 

@@ -25,6 +25,15 @@ struct Candidate {
     // separates it from a fixed-camera capture depth that is also bound every
     // frame (which made the warp sample a depth that never tracked the HMD).
     uint64_t last_bind_order{};
+    // Bind count within the current present window. The presented frame's
+    // scene depth accumulates a full frame of binds (prepass, basepass,
+    // decals, translucency, ...) while a pipelined next-frame buffer (RDG
+    // ping-pongs SceneDepthZ between two pooled textures every frame) or an
+    // auxiliary capture depth only collects a handful - picking by raw
+    // "latest bind" alternated onto the next-frame buffer, whose GPU contents
+    // are one frame STALE, doubling/twitching the warp during motion.
+    uint64_t bind_window{};
+    uint32_t bind_count{};
 };
 
 std::mutex g_mtx{};
@@ -135,6 +144,11 @@ void record_dsv_bind(D3D12_CPU_DESCRIPTOR_HANDLE descriptor) {
 
     for (auto& c : g_candidates) {
         if (c.resource.Get() == it->second) {
+            if (c.bind_window != present) {
+                c.bind_window = present;
+                c.bind_count = 0;
+            }
+            ++c.bind_count;
             c.last_bind_present = present;
             c.last_bind_order = g_bind_order.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -200,16 +214,28 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, u
             continue;
         }
 
-        // Among live candidates, the LATEST-bound one is the main view's
-        // scene depth: UE renders scene captures / auxiliary views first and
-        // the main view (with its late translucency/post passes) last. A
-        // fixed-camera capture depth is live too but always binds earlier.
-        if (live && c.last_bind_order != best->last_bind_order) {
-            if (c.last_bind_order > best->last_bind_order) {
-                best = &c;
-                best_exact = exact;
+        // Among live candidates, prefer the one the PRESENTED frame actually
+        // rendered with: it accumulated a full frame of depth binds in the
+        // window that just ended, while a pipelined next-frame buffer or an
+        // auxiliary capture depth only has a handful. Tie-break by latest
+        // bind order (scene captures render before the main view).
+        if (live) {
+            const uint32_t c_count = (c.bind_window == present) ? c.bind_count : 0u;
+            const uint32_t b_count = (best->bind_window == present) ? best->bind_count : 0u;
+            if (c_count != b_count) {
+                if (c_count > b_count) {
+                    best = &c;
+                    best_exact = exact;
+                }
+                continue;
             }
-            continue;
+            if (c.last_bind_order != best->last_bind_order) {
+                if (c.last_bind_order > best->last_bind_order) {
+                    best = &c;
+                    best_exact = exact;
+                }
+                continue;
+            }
         }
 
         if (exact != best_exact) {
