@@ -1993,7 +1993,7 @@ inline std::string dibr_inverse_source() {
     return out;
 }
 
-// dibr_yoro.hlsl (86654 bytes, 8 chunks)
+// dibr_yoro.hlsl (88640 bytes, 8 chunks)
 inline const char* const g_dibr_yoro_chunks[] = {
 R"DIBR(// dibr_yoro.hlsl — YORO / Meta-style asymmetric inverse-warp DIBR
 //
@@ -3882,7 +3882,35 @@ R"DIBR(    return lerp(1.0f, saturate(depth_artifact_guard_scale), mask);
 
 float YoroSearchDepth(float2 uv)
 {
-    float depth = SamplePreparedDepth(uv);
+    uv = saturate(uv);
+    float2 texel = float2(1.0f / max((float)srcWidth, 1.0f), 1.0f / max((float)srcHeight, 1.0f));
+
+    // Neighbors use the base sampler (no edge-mask recursion): keeps the
+    // inlined code size sane - SamplePreparedDepth expands to a 4-tap
+    // edge-mask chain per call, which blew DXC's compile time up when used
+    // for all five taps inside the search loop.
+    float d  = SamplePreparedDepthBase(uv);
+    float dl = SamplePreparedDepthBase(uv - float2(texel.x, 0.0f));
+    float dr = SamplePreparedDepthBase(uv + float2(texel.x, 0.0f));
+    float du = SamplePreparedDepthBase(uv - float2(0.0f, texel.y));
+    float dd = SamplePreparedDepthBase(uv + float2(0.0f, texel.y));
+
+    float minDepth = min(d, min(min(dl, dr), min(du, dd)));
+    float neighborAvg = (dl + dr + du + dd) * 0.25f;
+    float gradient = max(abs(dr - dl), abs(dd - du));
+
+    // Raymarch-kernel-style conditioning (Depth3D's always-on min-dilation):
+    // smooth flat areas, and on sharp edges pull depth toward the nearest
+    // local neighbor so thin foreground features (floating text, plant
+    // fronds) warp as one coherent block instead of shredding per pixel.
+    // Driven by the same live params as the raymarch kernel
+    // (range_smoothing 0.35 / foreground_protect 0.5 by default).
+    float edgeWeight = saturate(gradient * 24.0f);
+    float smoothWeight = saturate(range_smoothing) * (1.0f - edgeWeight);
+    float protectedWeight = edgeWeight * saturate(foreground_protect);
+    float depth = lerp(d, neighborAvg, smoothWeight);
+    depth = saturate(lerp(depth, minDepth, protectedWeight));
+
     depth = ApplyUiAlphaDepthMask(uv, ApplyShapeDepthMask(uv, ApplyWeaponDepthMask(uv, ApplyRegionDepthMask(uv, depth))));
     depth = ApplyDepthRangeBoost(depth);
     return ApplyFilterEmulatorDepthControls(depth);
@@ -3978,7 +4006,7 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
     // precision so the final sample is a single coherent location.
     float tLo = max(bestT - 1.0f / (float)steps, 0.0f);
     float tHi = min(bestT + 1.0f / (float)steps, 1.0f);
-    [unroll]
+    [loop]
     for (int r = 0; r < 3; ++r) {
         float tA = lerp(tLo, tHi, 0.25f);
         float tB = lerp(tLo, tHi, 0.75f);
@@ -4003,13 +4031,18 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
 
     // Snap, don't smear: lerping between two far-apart sample positions
     // averages unrelated texels (it blurred the whole synthesized eye).
-    // Blend only when the candidates are within ~a texel of each other.
-    float confidence = saturate(1.0f - bestError * max((float)srcWidth, 1.0f) / max(abs(divergence), 1.0f));
+    // Blend only when the candidates are within ~a texel of each other;
+    // otherwise score the direct candidate with the same error metric and
+    // take whichever explains this output pixel better (an actual contest
+    // beats an arbitrary confidence threshold for thin features).
     float candidateDist = length((bestUv - directUv) * float2((float)srcWidth, (float)srcHeight));
     if (candidateDist <= 1.5f) {
+        float confidence = saturate(1.0f - bestError * max((float)srcWidth, 1.0f) / max(abs(divergence), 1.0f));
         return lerp(directUv, bestUv, confidence);
     }
-    return (confidence >= 0.25f) ? bestUv : directUv;
+    float directDepth = YoroSearchDepth(directUv);
+    float directError = abs(abs(YoroSynthShiftBase(saturate(directUv), directDepth, eyeSign) * boundaryScale * shiftScale) - absTarget);
+    return (bestError <= directError) ? bestUv : directUv;
 }
 
 // Edge-fill behavior of SampleStereoColor plus the raymarch kernel's
@@ -4083,7 +4116,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (debugMode >= 1.0f) {
         float depthValue = DebugDepthValue(depth);
         if (debugMode >= 5.5f) {
-            float4 debugColor = DibrAlignmentGridColor(uv, depth, debugMode);
+)DIBR",
+R"DIBR(            float4 debugColor = DibrAlignmentGridColor(uv, depth, debugMode);
             WriteStereoPair(x, y, debugColor, debugColor);
             return;
         }
@@ -4122,8 +4156,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float2 rightSearchUV = YoroSearchUv(uv, -1.0f, searchDepth, boundaryScale, 1.0f);
         float2 rightUV = ApplyOutputEyeAlignment(rightSearchUV + rightInterlaceOffset, -1.0f);
         float4 rightColor = SampleSynthStereoColor(rightUV, uv, centerColor, searchDepth);
-)DIBR",
-R"DIBR(        float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightColor, centerColor))));
+        float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightColor, centerColor))));
         outRight = ApplyAlignmentMarker(uv, rightUV, outRight);
         if (floor(output_layout_mode + 0.5f) == 2.0f) {
             float4 outLeftReduced = outLeft;
