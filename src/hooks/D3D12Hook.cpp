@@ -6409,6 +6409,7 @@ void WINAPI D3D12Hook::create_render_target_view(
         descriptor);
     sn2_rt_snapshot::record_rtv(static_cast<uint64_t>(descriptor.ptr), resource);
     ::sn2_capture_truth::record_descriptor_view("rtv", resource, descriptor);
+    dibr_depth_tracker::record_rtv(resource, descriptor);
 }
 
 // 2026-05-16 SN2 fog SRV tracker. Hooks ID3D12Device::CreateShaderResourceView
@@ -11389,7 +11390,7 @@ void WINAPI D3D12Hook::create_depth_stencil_view(
         desc,
         descriptor);
     ::sn2_capture_truth::record_descriptor_view("dsv", resource, descriptor);
-    dibr_depth_tracker::record_dsv(resource, descriptor);
+    dibr_depth_tracker::record_dsv(resource, descriptor, desc);
 }
 
 namespace {
@@ -32076,6 +32077,26 @@ void WINAPI D3D12Hook::om_set_render_targets(
         dibr_depth_tracker::record_dsv_bind(*depth_stencil_descriptor);
     }
 
+    // Bind census (no-op unless UEVR_DIBR_BIND_CENSUS armed a window).
+    {
+        SIZE_T census_rtvs[8]{};
+        const UINT census_n = std::min<UINT>(num_render_target_descriptors, 8u);
+        if (render_target_descriptors != nullptr) {
+            for (UINT i = 0; i < census_n; ++i) {
+                // In single-handle mode only RTV[0] is addressable here; the
+                // census keys on RTV0 anyway.
+                census_rtvs[i] = rts_single_handle_to_descriptor_range ? render_target_descriptors[0].ptr
+                                                                       : render_target_descriptors[i].ptr;
+            }
+        }
+        dibr_depth_tracker::record_census_bind(census_rtvs, num_render_target_descriptors,
+            depth_stencil_descriptor != nullptr ? depth_stencil_descriptor->ptr : 0);
+        // Pre-translucency probe: records a copy into THIS command list before
+        // the bind takes effect (no-op unless an armed probe frame).
+        dibr_depth_tracker::record_probe_bind(command_list, census_rtvs[0], num_render_target_descriptors,
+            depth_stencil_descriptor != nullptr ? depth_stencil_descriptor->ptr : 0);
+    }
+
     if (is_stereo_trace_enabled()) {
         ++g_stereo_trace_counters.om_set_render_targets;
     }
@@ -32135,6 +32156,23 @@ void WINAPI D3D12Hook::begin_render_pass(
     // render passes, which OMSetRenderTargets never sees.
     if (depth_stencil != nullptr) {
         dibr_depth_tracker::record_dsv_bind(depth_stencil->cpuDescriptor);
+    }
+
+    // Bind census (no-op unless UEVR_DIBR_BIND_CENSUS armed a window).
+    {
+        SIZE_T census_rtvs[8]{};
+        const UINT census_n = std::min<UINT>(num_render_targets, 8u);
+        if (render_targets != nullptr) {
+            for (UINT i = 0; i < census_n; ++i) {
+                census_rtvs[i] = render_targets[i].cpuDescriptor.ptr;
+            }
+        }
+        dibr_depth_tracker::record_census_bind(census_rtvs, num_render_targets,
+            depth_stencil != nullptr ? depth_stencil->cpuDescriptor.ptr : 0);
+        // Pre-translucency probe: MUST record before original() opens the
+        // render pass (copies are illegal inside an open pass).
+        dibr_depth_tracker::record_probe_bind(command_list, census_rtvs[0], num_render_targets,
+            depth_stencil != nullptr ? depth_stencil->cpuDescriptor.ptr : 0);
     }
 
     if (original != nullptr) {

@@ -564,6 +564,44 @@ Follow-up sweep after a fresh-eyes review of the whole pipeline:
   realloc loops), eyes submitted at 1436x720 with full content, flicker ratio
   unchanged (R/L 1.02).
 
+### Translucency forensics (2026-06-10) — bind census + pre-translucency probe
+
+Tooling pass for the "translucents write no depth" limitation, plus a major
+correction to the problem statement itself.
+
+**Tools** (both env-gated, zero overhead when off, in DIBRDepthTracker +
+the always-installed bind hooks):
+
+- `UEVR_DIBR_BIND_CENSUS=1` — one present-window's ordered (RTV0, DSV) binds
+  every 10 s, with creation-time resource shapes/formats and the DSV
+  read-only flags. The frame-structure x-ray: SceneColor is the eye-sized
+  RGBA16F target, scene depth the f19 pair, ro=1/3 marks depth-read-only
+  passes (basepass-after-prepass, fog, translucency).
+- `UEVR_DIBR_PRETRANS_DUMP=1` — at every qualifying bind (single eye-sized
+  RGBA16F RTV + read-only DSV = the SceneColor signature) of an armed frame,
+  a CopyResource into a numbered slot is recorded INTO THE GAME'S OWN
+  command list at bind time - execution-order exact regardless of which
+  thread recorded the pass. Slots are read back two presents later and saved
+  as %TEMP%\uevr_dibr_pretrans_r<round>_s<slot>.ppm. RenderDoc was not an
+  option: its wrappers crash the title during UEVR's hook installation.
+
+**Findings (SN2 menu)**: the 8 slots show the frame build in execution order
+- s0 emissive-only, s1-s4 opaque+lighting buildup, s5-s6 water/fog
+composite + god rays, all in HDR scene color before post. Decisive: the
+LOGO LETTERS are present from s1 (dark basepass geometry) and fully shaded
+by s4 - they are depth-writing geometry, which is exactly why the R2
+scatter places them correctly. The genuine no-depth translucency in this
+scene is the water composite + god rays (the s4->s6 delta), and those sit
+near background depth anyway - their current background-depth treatment is
+approximately correct, which matches how clean the synthesized eye looks.
+
+**Future design (if a gameplay scene surfaces a real offender)**: the probe's
+injection point doubles as the production capture - capture the bracketing
+binds (last pre-translucency / first post-translucency) per frame, build a
+translucent-coverage mask from the HDR diff (valid: both sides pre-tonemap),
+and re-depth masked pixels in the scatter to an estimated translucent depth.
+Slot ordering proved stable across rounds in this title.
+
 ### R1/R2 redesign (2026-06-10) — true matrices + forward scatter
 
 Major rebuild of the synthesis core (the gather/divergence model inherited from

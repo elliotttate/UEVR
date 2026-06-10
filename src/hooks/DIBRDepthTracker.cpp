@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -61,6 +62,57 @@ std::atomic<uint64_t> g_bind_order{1};
 constexpr size_t kMaxCandidates = 32;
 constexpr size_t kMaxDsvMappings = 256;
 
+// === Bind census (translucency forensics) ===
+// Creation-time view shapes so the census never calls GetDesc on a
+// possibly-dead resource. Resource pointers are used as opaque keys only.
+struct ViewInfo {
+    void* resource{};
+    uint32_t width{};
+    uint32_t height{};
+    DXGI_FORMAT format{};
+    uint32_t dsv_flags{}; // D3D12_DSV_FLAGS (0 for RTVs / default views)
+};
+
+struct CensusEntry {
+    SIZE_T rtv0{};
+    uint32_t rtv_count{};
+    SIZE_T dsv{};
+};
+
+constexpr size_t kMaxViewMappings = 4096;
+constexpr size_t kMaxCensusEntries = 1024;
+
+std::unordered_map<SIZE_T, ViewInfo> g_rtv_views{};
+std::unordered_map<SIZE_T, ViewInfo> g_dsv_views{};
+std::vector<CensusEntry> g_census{};
+std::atomic<bool> g_census_armed{false};
+long long g_census_last_ms{0};
+
+bool census_enabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("UEVR_DIBR_BIND_CENSUS");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
+bool probe_enabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("UEVR_DIBR_PRETRANS_DUMP");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
+// The view maps feed both the census and the probe.
+bool view_tracking_enabled() {
+    return census_enabled() || probe_enabled();
+}
+
+long long now_ms() {
+    return static_cast<long long>(GetTickCount64());
+}
+
 // vrmod depth_select format tiers (lower = better).
 int format_tier(DXGI_FORMAT f) {
     switch (f) {
@@ -82,15 +134,31 @@ int format_tier(DXGI_FORMAT f) {
 }
 } // namespace
 
-void record_dsv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor) {
-    (void)descriptor;
+void record_dsv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor,
+    const D3D12_DEPTH_STENCIL_VIEW_DESC* view_desc) {
     if (resource == nullptr) {
         return;
     }
 
+    const auto desc = resource->GetDesc();
+
+    // Census view info records EVERY DSV (shadow atlases included) - the
+    // census is a frame-structure x-ray, not a scene-depth selector.
+    if (view_tracking_enabled()) {
+        std::scoped_lock _{g_mtx};
+        if (g_dsv_views.size() >= kMaxViewMappings) {
+            g_dsv_views.clear();
+        }
+        auto& vi = g_dsv_views[descriptor.ptr];
+        vi.resource = resource;
+        vi.width = static_cast<uint32_t>(desc.Width);
+        vi.height = desc.Height;
+        vi.format = desc.Format;
+        vi.dsv_flags = (view_desc != nullptr) ? static_cast<uint32_t>(view_desc->Flags) : 0u;
+    }
+
     // vrmod depth_select rejects: multi-sampled, square aspect (shadow atlas /
     // cube face), and tiny surfaces.
-    const auto desc = resource->GetDesc();
     if (desc.SampleDesc.Count > 1 || desc.Width < 256 || desc.Height < 256) {
         return;
     }
@@ -134,6 +202,120 @@ void record_dsv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor
     c.format = desc.Format;
     c.sequence = ++g_sequence;
     g_candidates.emplace_back(std::move(c));
+}
+
+void record_rtv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor) {
+    if (!view_tracking_enabled() || resource == nullptr || descriptor.ptr == 0) {
+        return;
+    }
+
+    const auto desc = resource->GetDesc();
+
+    std::scoped_lock _{g_mtx};
+    if (g_rtv_views.size() >= kMaxViewMappings) {
+        g_rtv_views.clear();
+    }
+    auto& vi = g_rtv_views[descriptor.ptr];
+    vi.resource = resource;
+    vi.width = static_cast<uint32_t>(desc.Width);
+    vi.height = desc.Height;
+    vi.format = desc.Format;
+    vi.dsv_flags = 0;
+}
+
+void record_census_bind(const SIZE_T* rtvs, uint32_t rtv_count, SIZE_T dsv) {
+    if (!g_census_armed.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    std::scoped_lock _{g_mtx};
+    if (g_census.size() >= kMaxCensusEntries) {
+        return;
+    }
+    CensusEntry e{};
+    e.rtv0 = (rtvs != nullptr && rtv_count > 0) ? rtvs[0] : 0;
+    e.rtv_count = rtv_count;
+    e.dsv = dsv;
+    g_census.emplace_back(e);
+}
+
+std::string take_census_report() {
+    if (!census_enabled()) {
+        return {};
+    }
+
+    std::scoped_lock _{g_mtx};
+
+    if (g_census_armed.load(std::memory_order_relaxed)) {
+        // A full present window has been collected - format and disarm.
+        g_census_armed.store(false, std::memory_order_relaxed);
+        g_census_last_ms = now_ms();
+
+        std::string out;
+        out.reserve(8192);
+        char line[256];
+        std::snprintf(line, sizeof(line), "bind census: %zu binds\n", g_census.size());
+        out += line;
+
+        const auto describe = [&](SIZE_T key, const std::unordered_map<SIZE_T, ViewInfo>& views, const char* tag) {
+            if (key == 0) {
+                std::snprintf(line, sizeof(line), " %s=none", tag);
+                out += line;
+                return;
+            }
+            const auto it = views.find(key);
+            if (it == views.end()) {
+                std::snprintf(line, sizeof(line), " %s=?", tag);
+                out += line;
+                return;
+            }
+            const auto& vi = it->second;
+            std::snprintf(line, sizeof(line), " %s=%p %ux%u f%d", tag, vi.resource, vi.width, vi.height,
+                static_cast<int>(vi.format));
+            out += line;
+            if (vi.dsv_flags != 0) {
+                std::snprintf(line, sizeof(line), " ro=%u", vi.dsv_flags);
+                out += line;
+            }
+        };
+
+        size_t i = 0;
+        while (i < g_census.size()) {
+            // Run-length collapse of consecutive identical binds.
+            size_t run = 1;
+            while (i + run < g_census.size() &&
+                   g_census[i + run].rtv0 == g_census[i].rtv0 &&
+                   g_census[i + run].dsv == g_census[i].dsv &&
+                   g_census[i + run].rtv_count == g_census[i].rtv_count) {
+                ++run;
+            }
+
+            std::snprintf(line, sizeof(line), "[%03zu]", i);
+            out += line;
+            describe(g_census[i].rtv0, g_rtv_views, "rtv0");
+            if (g_census[i].rtv_count > 1) {
+                std::snprintf(line, sizeof(line), " n=%u", g_census[i].rtv_count);
+                out += line;
+            }
+            describe(g_census[i].dsv, g_dsv_views, "dsv");
+            if (run > 1) {
+                std::snprintf(line, sizeof(line), " x%zu", run);
+                out += line;
+            }
+            out += '\n';
+            i += run;
+        }
+
+        g_census.clear();
+        return out;
+    }
+
+    // Re-arm every 10 s so the census tracks scene changes without spamming.
+    if (now_ms() - g_census_last_ms > 10000) {
+        g_census.clear();
+        g_census_armed.store(true, std::memory_order_relaxed);
+    }
+    return {};
 }
 
 void record_dsv_bind(D3D12_CPU_DESCRIPTOR_HANDLE descriptor) {
@@ -302,4 +484,303 @@ std::string describe_candidates() {
     }
     return out;
 }
+// === Translucency probe ===
+// Forensics tool AND the future capture mechanism: copies the SceneColor
+// resource at each qualifying bind of one armed frame. The copy is recorded
+// into the game's own command list at bind time, so it executes exactly
+// before that pass's draws regardless of which thread recorded it.
+namespace {
+struct ProbeSlot {
+    ComPtr<ID3D12Resource> texture{};
+    void* source{};
+    uint32_t width{};
+    uint32_t height{};
+    DXGI_FORMAT format{};
+    uint32_t rtv_count{};
+    uint32_t dsv_flags{};
+    bool filled{};
+};
+
+constexpr size_t kProbeSlots = 8;
+ProbeSlot g_probe_slots[kProbeSlots]{};
+std::atomic<bool> g_probe_armed{false};
+std::atomic<uint32_t> g_probe_next{0};
+long long g_probe_last_ms{0};
+int g_probe_flush_delay{0};
+uint32_t g_probe_round{0};
+
+// Half-float -> 8-bit sRGB-ish for the PPM dump (gamma 1/2.2, no tonemap).
+uint8_t half_to_u8(uint16_t h) {
+    const uint32_t sign = (h >> 15) & 1u;
+    const uint32_t exp = (h >> 10) & 0x1Fu;
+    const uint32_t man = h & 0x3FFu;
+    float f = 0.0f;
+    if (exp == 0) {
+        f = static_cast<float>(man) * (1.0f / 16777216.0f);
+    } else if (exp < 31) {
+        f = std::ldexp(1.0f + static_cast<float>(man) / 1024.0f, static_cast<int>(exp) - 15);
+    } else {
+        f = 1.0f;
+    }
+    if (sign) {
+        f = 0.0f;
+    }
+    f = std::pow(std::fmin(f, 1.0f), 1.0f / 2.2f);
+    return static_cast<uint8_t>(f * 255.0f + 0.5f);
+}
+} // namespace
+
+void record_probe_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint32_t rtv_count, SIZE_T dsv) {
+    if (!g_probe_armed.load(std::memory_order_relaxed) || cmd_list == nullptr || rtv0 == 0 || dsv == 0) {
+        return;
+    }
+
+    // Signature: single eye-sized RGBA16F RTV (SceneColor) + read-only DSV.
+    ViewInfo rtv_info{};
+    ViewInfo dsv_info{};
+    {
+        std::scoped_lock _{g_mtx};
+        const auto rit = g_rtv_views.find(rtv0);
+        const auto dit = g_dsv_views.find(dsv);
+        if (rit == g_rtv_views.end() || dit == g_dsv_views.end()) {
+            return;
+        }
+        rtv_info = rit->second;
+        dsv_info = dit->second;
+    }
+
+    if (rtv_count != 1 || rtv_info.format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        rtv_info.width < 1024 || dsv_info.dsv_flags == 0) {
+        return;
+    }
+
+    const auto slot_index = g_probe_next.fetch_add(1, std::memory_order_relaxed);
+    if (slot_index >= kProbeSlots) {
+        return;
+    }
+    auto& slot = g_probe_slots[slot_index];
+
+    ComPtr<ID3D12Device> device{};
+    if (FAILED(cmd_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
+        return;
+    }
+
+    // (Re)create the slot texture to match the source shape.
+    if (slot.texture == nullptr || slot.width != rtv_info.width || slot.height != rtv_info.height ||
+        slot.format != rtv_info.format) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = rtv_info.width;
+        desc.Height = rtv_info.height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = rtv_info.format;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(slot.texture.ReleaseAndGetAddressOf())))) {
+            return;
+        }
+        slot.width = rtv_info.width;
+        slot.height = rtv_info.height;
+        slot.format = rtv_info.format;
+    }
+
+    // The resource is bound as an RTV right after this call, so RENDER_TARGET
+    // is its current state.
+    auto* src = static_cast<ID3D12Resource*>(rtv_info.resource);
+    D3D12_RESOURCE_BARRIER to_copy{};
+    to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_copy.Transition.pResource = src;
+    to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cmd_list->ResourceBarrier(1, &to_copy);
+
+    cmd_list->CopyResource(slot.texture.Get(), src);
+
+    std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+    cmd_list->ResourceBarrier(1, &to_copy);
+
+    slot.source = rtv_info.resource;
+    slot.rtv_count = rtv_count;
+    slot.dsv_flags = dsv_info.dsv_flags;
+    slot.filled = true;
+}
+
+std::string probe_flush() {
+    if (!probe_enabled()) {
+        return {};
+    }
+
+    if (g_probe_armed.load(std::memory_order_relaxed)) {
+        // The armed frame just presented; give the GPU two more presents
+        // before reading the slots back.
+        g_probe_armed.store(false, std::memory_order_relaxed);
+        g_probe_flush_delay = 2;
+        return {};
+    }
+
+    if (g_probe_flush_delay > 0 && --g_probe_flush_delay == 0) {
+        // Read back and save every filled slot. Blocking - forensics only.
+        ComPtr<ID3D12Device> device{};
+        for (auto& slot : g_probe_slots) {
+            if (slot.filled && slot.texture != nullptr) {
+                slot.texture->GetDevice(IID_PPV_ARGS(&device));
+                break;
+            }
+        }
+        if (device == nullptr) {
+            g_probe_last_ms = now_ms();
+            return {};
+        }
+
+        ComPtr<ID3D12CommandQueue> queue{};
+        ComPtr<ID3D12CommandAllocator> alloc{};
+        ComPtr<ID3D12GraphicsCommandList> list{};
+        ComPtr<ID3D12Fence> fence{};
+        D3D12_COMMAND_QUEUE_DESC qdesc{};
+        qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (FAILED(device->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&queue))) ||
+            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+            g_probe_last_ms = now_ms();
+            return {};
+        }
+
+        struct Pending {
+            ComPtr<ID3D12Resource> readback{};
+            size_t slot_index{};
+            uint32_t row_pitch{};
+        };
+        std::vector<Pending> pending{};
+
+        for (size_t i = 0; i < kProbeSlots; ++i) {
+            auto& slot = g_probe_slots[i];
+            if (!slot.filled || slot.texture == nullptr) {
+                continue;
+            }
+
+            const uint32_t row_pitch = (slot.width * 8u + 255u) & ~255u; // RGBA16F
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = static_cast<uint64_t>(row_pitch) * slot.height;
+            desc.Height = 1;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+            Pending p{};
+            p.slot_index = i;
+            p.row_pitch = row_pitch;
+            if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&p.readback)))) {
+                continue;
+            }
+
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = slot.texture.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = p.readback.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Footprint.Format = slot.format;
+            dst.PlacedFootprint.Footprint.Width = slot.width;
+            dst.PlacedFootprint.Footprint.Height = slot.height;
+            dst.PlacedFootprint.Footprint.Depth = 1;
+            dst.PlacedFootprint.Footprint.RowPitch = row_pitch;
+
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = slot.texture.Get();
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            list->ResourceBarrier(1, &b);
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            list->ResourceBarrier(1, &b);
+
+            pending.emplace_back(std::move(p));
+        }
+
+        list->Close();
+        ID3D12CommandList* lists[] = {list.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(fence.Get(), 1);
+        if (fence->GetCompletedValue() < 1) {
+            const HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (evt != nullptr) {
+                fence->SetEventOnCompletion(1, evt);
+                WaitForSingleObject(evt, 5000);
+                CloseHandle(evt);
+            }
+        }
+
+        char temp_dir[MAX_PATH]{};
+        GetTempPathA(MAX_PATH, temp_dir);
+
+        std::string report;
+        report.reserve(1024);
+        char line[512]{};
+
+        for (const auto& p : pending) {
+            const auto& slot = g_probe_slots[p.slot_index];
+            void* mapped = nullptr;
+            const D3D12_RANGE read_all{0, static_cast<SIZE_T>(p.row_pitch) * slot.height};
+            if (FAILED(p.readback->Map(0, &read_all, &mapped)) || mapped == nullptr) {
+                continue;
+            }
+
+            char path[MAX_PATH]{};
+            std::snprintf(path, sizeof(path), "%suevr_dibr_pretrans_r%u_s%zu.ppm", temp_dir, g_probe_round, p.slot_index);
+            std::ofstream f{path, std::ios::binary | std::ios::trunc};
+            if (f) {
+                char header[64]{};
+                const int hlen = std::snprintf(header, sizeof(header), "P6\n%u %u\n255\n", slot.width, slot.height);
+                f.write(header, hlen);
+                std::vector<uint8_t> row(static_cast<size_t>(slot.width) * 3u);
+                for (uint32_t y = 0; y < slot.height; ++y) {
+                    const auto* px = reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(mapped) + static_cast<size_t>(y) * p.row_pitch);
+                    for (uint32_t x = 0; x < slot.width; ++x) {
+                        row[x * 3 + 0] = half_to_u8(px[x * 4 + 0]);
+                        row[x * 3 + 1] = half_to_u8(px[x * 4 + 1]);
+                        row[x * 3 + 2] = half_to_u8(px[x * 4 + 2]);
+                    }
+                    f.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
+                }
+            }
+
+            const D3D12_RANGE no_write{0, 0};
+            p.readback->Unmap(0, &no_write);
+
+            std::snprintf(line, sizeof(line), "slot %zu -> %s (src=%p ro=%u)\n", p.slot_index, path, slot.source, slot.dsv_flags);
+            report += line;
+        }
+
+        for (auto& slot : g_probe_slots) {
+            slot.filled = false;
+        }
+        g_probe_round++;
+        g_probe_last_ms = now_ms();
+        return report;
+    }
+
+    if (g_probe_flush_delay == 0 && now_ms() - g_probe_last_ms > 8000) {
+        for (auto& slot : g_probe_slots) {
+            slot.filled = false;
+        }
+        g_probe_next.store(0, std::memory_order_relaxed);
+        g_probe_armed.store(true, std::memory_order_relaxed);
+    }
+    return {};
+}
+
 } // namespace dibr_depth_tracker

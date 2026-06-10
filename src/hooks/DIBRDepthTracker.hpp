@@ -24,11 +24,41 @@
 // depth that matched the swapchain extent) - then exact backbuffer extent,
 // area, depth-format tier, and recency.
 namespace dibr_depth_tracker {
-void record_dsv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
+void record_dsv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor,
+    const D3D12_DEPTH_STENCIL_VIEW_DESC* desc = nullptr);
+
+// RTV creation record (descriptor -> resource shape), for the bind census
+// below. Shapes are snapshotted at creation so the census never has to call
+// GetDesc on a possibly-dead resource.
+void record_rtv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
 
 // Bind-time liveness signal (OMSetRenderTargets / BeginRenderPass). Cheap:
 // one mutex-guarded map probe; unknown descriptors are ignored.
 void record_dsv_bind(D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
+
+// Translucency forensics: when UEVR_DIBR_BIND_CENSUS=1, accumulate one
+// present-window's ordered (RTV0, DSV) binds every few seconds. The report
+// exposes each bind's resource shape/format and the DSV's read-only flags -
+// the signature data a pre-translucency scene-color capture keys on.
+void record_census_bind(const SIZE_T* rtvs, uint32_t rtv_count, SIZE_T dsv);
+
+// Returns the formatted census once per armed window (empty otherwise) and
+// re-arms the interval timer. Call once per presented frame.
+std::string take_census_report();
+
+// Translucency probe (UEVR_DIBR_PRETRANS_DUMP=1): at every qualifying bind
+// (eye-sized RGBA16F RTV0 + read-only DSV - the SceneColor signature) of one
+// armed frame, record a copy of the RTV resource into a numbered slot
+// directly inside the game's command list (execution-order exact). Call
+// BEFORE forwarding to the original bind function (render passes must not be
+// open around the copy).
+void record_probe_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint32_t rtv_count, SIZE_T dsv);
+
+// Per-present driver for the probe: arms a frame every few seconds, then two
+// presents later reads the slots back and writes uevr_dibr_pretrans_<N>.ppm
+// to %TEMP% (blocking; forensics only). Call once per presented frame.
+// Returns a summary of saved files (empty when nothing was flushed).
+std::string probe_flush();
 
 // Best LIVE candidate for the backbuffer: accepts BOTH double-wide
 // (full_width x height, two packed views) and single-eye (eye_width x height)

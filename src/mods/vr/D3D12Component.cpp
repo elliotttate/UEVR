@@ -4922,6 +4922,18 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         }
     }
 
+    // Translucency forensics (UEVR_DIBR_BIND_CENSUS=1): per-present flush of
+    // the ordered RTV/DSV bind window the command-list hooks collected.
+    if (const auto census = dibr_depth_tracker::take_census_report(); !census.empty()) {
+        SPDLOG_INFO("[DIBR] {}", census);
+    }
+
+    // Pre-translucency probe (UEVR_DIBR_PRETRANS_DUMP=1): scene-color copies
+    // at every qualifying bind of an armed frame, dumped to %TEMP% as .ppm.
+    if (const auto probe = dibr_depth_tracker::probe_flush(); !probe.empty()) {
+        SPDLOG_INFO("[DIBR] pretrans probe:\n{}", probe);
+    }
+
     if (depth == nullptr) {
         SPDLOG_WARNING_EVERY_N_SEC(5, "[DIBR] no scene depth available; skipping synthesis this frame (wanted full={} eye={}x{})",
             static_cast<uint32_t>(bb_desc.Width), eye_width, eye_height);
