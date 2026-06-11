@@ -750,9 +750,20 @@ bool sn2_hooks_disabled_by_env() {
 bool is_subnautica2_process();
 
 bool sn2_fog_producer_viewrect_tag_default_enabled() {
-    static const bool enabled =
-        is_subnautica2_process() &&
-        !env_flag_explicitly_disabled_a("UEVR_SN2_FOG_PRODUCER_VIEWRECT_TAG");
+    static const bool enabled = []() {
+        if (!is_subnautica2_process()) {
+            return false;
+        }
+        // Default OFF (opt-in via UEVR_SN2_FOG_PRODUCER_VIEWRECT_TAG=1). When on,
+        // this arms the FULL descriptor registry: record_copy hashes descriptor
+        // memory (a VirtualQuery syscall per hash, up to three per descriptor) on
+        // every CopyDescriptorsSimple on the RHI thread - measured >100ms/frame in
+        // SN2's bindless descriptor storm (the game-thread ticked at 5-8fps with
+        // idle GPU). It also installs the D3D12 device-vtable hooks that break the
+        // MetaXR Simulator's D3D12-on-Vulkan interop at xrCreateInstance, so a
+        // plain/default launch must NOT arm it; the fog investigation opts in.
+        return env_flag_enabled_a("UEVR_SN2_FOG_PRODUCER_VIEWRECT_TAG");
+    }();
     return enabled;
 }
 
@@ -1611,8 +1622,19 @@ std::string sn2_water_chain_cbv_redirect_roots_label() {
 // 3 = repair any PSO with this exact "previous full tail, current missing tail"
 //     shape, grouped per PS CRC.
 int sn2_tail_srv_repair_mode() {
-    static const int mode = std::clamp(env_int_a("UEVR_SN2_TAIL_SRV_REPAIR", 0), 0, 3);
+    static const int mode = []() {
+        const int raw_mode = std::clamp(env_int_a("UEVR_SN2_TAIL_SRV_REPAIR", 0), 0, 3);
+        if (raw_mode == 1 && !env_flag_enabled_a("UEVR_SN2_TAIL_SRV_REPAIR_VERBOSE")) {
+            return 0;
+        }
+        return raw_mode;
+    }();
     return mode;
+}
+
+bool sn2_tail_srv_repair_verbose_log_enabled() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_TAIL_SRV_REPAIR_VERBOSE");
+    return enabled;
 }
 
 uint32_t sn2_tail_srv_repair_target_crc() {
@@ -39623,7 +39645,7 @@ void WINAPI D3D12Hook::set_graphics_root_descriptor_table(
                 }
 
                 const auto n = s_capture_logs.fetch_add(1, std::memory_order_relaxed);
-                if (n < 24 || (n % 1000) == 0) {
+                if (sn2_tail_srv_repair_verbose_log_enabled() && (n < 24 || (n % 1000) == 0)) {
                     SPDLOG_WARN(
                         "[SN2-TailSRVRepair] source pso_crc=0x{:08x} table_gpu=0x{:x} table_cpu=0x{:x} slots={}..{} hash=0x{:016x} seq={} cap={}",
                         crc,
@@ -39659,7 +39681,7 @@ void WINAPI D3D12Hook::set_graphics_root_descriptor_table(
                     ((mode == 2 && target_match) || mode == 3);
 
                 const auto n = s_candidate_logs.fetch_add(1, std::memory_order_relaxed);
-                if (n < 64 || (n % 500) == 0) {
+                if (sn2_tail_srv_repair_verbose_log_enabled() && (n < 64 || (n % 500) == 0)) {
                     SPDLOG_WARN(
                         "[SN2-TailSRVRepair] candidate mode={} pso_crc=0x{:08x} target=0x{:08x} current_known={}/{} source={} table_gpu=0x{:x} table_cpu=0x{:x} src_cpu=0x{:x} cur_hash=0x{:016x} src_hash=0x{:016x} seq={} cand={}",
                         mode,
@@ -39697,7 +39719,7 @@ void WINAPI D3D12Hook::set_graphics_root_descriptor_table(
                         }
 
                         const auto rc = s_repair_count.fetch_add(1, std::memory_order_relaxed);
-                        if (rc < 64 || (rc % 500) == 0) {
+                        if (sn2_tail_srv_repair_verbose_log_enabled() && (rc < 64 || (rc % 500) == 0)) {
                             SPDLOG_WARN(
                                 "[SN2-TailSRVRepair] APPLIED mode={} pso_crc=0x{:08x} copied slots={}..{} dst_cpu=0x{:x} src_cpu=0x{:x} current_known={}/{} source_seq={} repair={}",
                                 mode,
@@ -39713,7 +39735,7 @@ void WINAPI D3D12Hook::set_graphics_root_descriptor_table(
                         }
                     } else {
                         const auto sk = s_skip_logs.fetch_add(1, std::memory_order_relaxed);
-                        if (sk < 32 || (sk % 500) == 0) {
+                        if (sn2_tail_srv_repair_verbose_log_enabled() && (sk < 32 || (sk % 500) == 0)) {
                             SPDLOG_WARN(
                                 "[SN2-TailSRVRepair] skip-unreadable pso_crc=0x{:08x} src=0x{:x} dst=0x{:x} bytes={} device={} skip={}",
                                 crc,

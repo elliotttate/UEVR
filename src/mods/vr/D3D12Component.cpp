@@ -5146,6 +5146,8 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                         m_afw_depth_seq_anchored = true;
                         m_afw_depth_seq_offset = vote;
                         m_afw_depth_seq_disagree = 0;
+                        m_afw_depth_seq_lag = static_cast<int64_t>(total_pushed) -
+                            m_afw_depth_seq_stride * static_cast<int64_t>(present_idx);
                         SPDLOG_INFO("[DIBR] AFW depth-seq anchor: stride={} offset={} ({} consecutive rest votes, present={}, pushed={})",
                             m_afw_depth_seq_stride, m_afw_depth_seq_offset, m_afw_depth_seq_vote_total, present_idx, total_pushed);
                     }
@@ -5155,7 +5157,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                     // and pushes diverged through a menu/loading stall). Drop
                     // back to the pool and re-calibrate rather than warp with
                     // wrong-phase depth forever.
-                    if (++m_afw_depth_seq_disagree >= 90) {
+                    if (++m_afw_depth_seq_disagree >= 30) {
                         SPDLOG_WARN("[DIBR] AFW depth-seq offset {} invalidated after {} disagreeing rest votes; re-calibrating",
                             m_afw_depth_seq_offset, m_afw_depth_seq_disagree);
                         m_afw_depth_seq_anchored = false;
@@ -5167,6 +5169,29 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                 } else {
                     m_afw_depth_seq_disagree = 0;
                 }
+            }
+        }
+
+        // Stride-break watchdog (runs every frame, motion or not): pushes
+        // minus stride*presents is constant within recording-overlap jitter
+        // while the per-frame qualifying-bind structure holds; a pass
+        // appearing or vanishing (the SingleLayerWater depth drops out when
+        // the camera leaves the water) walks it one entry per frame, and the
+        // pairing is then feeding the warp the OTHER eye's depth - the
+        // "flicks to another position" symptom. The at-rest disagreement vote
+        // cannot catch this while the player keeps moving, so detect it
+        // structurally and drop to the pool while the anchor recalibrates.
+        if (m_afw_depth_seq_anchored) {
+            const int64_t lag_now = static_cast<int64_t>(total_pushed) -
+                m_afw_depth_seq_stride * static_cast<int64_t>(present_idx);
+            if (std::llabs(lag_now - m_afw_depth_seq_lag) > m_afw_depth_seq_stride * 4) {
+                SPDLOG_WARN("[DIBR] AFW depth-seq stride break: lag {} -> {} (stride={}); re-calibrating",
+                    m_afw_depth_seq_lag, lag_now, m_afw_depth_seq_stride);
+                m_afw_depth_seq_anchored = false;
+                m_afw_depth_seq_vote_total = 0;
+                m_afw_depth_seq_disagree = 0;
+                m_afw_depth_seq_ref_present = present_idx;
+                m_afw_depth_seq_ref_pushed = total_pushed;
             }
         }
 
@@ -6178,19 +6203,113 @@ void D3D12Component::OpenXR::initialize(XrSessionCreateInfo& session_info) {
     auto device = hook->get_device();
     auto command_queue = hook->get_command_queue();
 
+    auto vr = VR::get();
+    auto* openxr = vr != nullptr ? vr->m_openxr.get() : nullptr;
+    auto fail = [&](const std::string& message) {
+        if (openxr != nullptr) {
+            openxr->error = message;
+        }
+        spdlog::error("[VR] {}", message);
+    };
+
+    if (device == nullptr) {
+        fail("Could not initialize OpenXR D3D12 binding: D3D12 device is null");
+        return;
+    }
+
+    if (command_queue == nullptr) {
+        fail("Could not initialize OpenXR D3D12 binding: D3D12 command queue is null");
+        return;
+    }
+
+    if (openxr == nullptr || openxr->instance == XR_NULL_HANDLE || openxr->system == XR_NULL_SYSTEM_ID) {
+        fail("Could not initialize OpenXR D3D12 binding: OpenXR instance/system is not ready");
+        return;
+    }
+
     this->binding.device = device;
     this->binding.queue = command_queue;
 
     spdlog::info("[VR] Searching for xrGetD3D12GraphicsRequirementsKHR...");
     PFN_xrGetD3D12GraphicsRequirementsKHR fn = nullptr;
-    xrGetInstanceProcAddr(VR::get()->m_openxr->instance, "xrGetD3D12GraphicsRequirementsKHR", (PFN_xrVoidFunction*)(&fn));
+    const auto proc_result = xrGetInstanceProcAddr(openxr->instance, "xrGetD3D12GraphicsRequirementsKHR", (PFN_xrVoidFunction*)(&fn));
+
+    if (proc_result != XR_SUCCESS || fn == nullptr) {
+        fail("Could not initialize OpenXR D3D12 binding: xrGetD3D12GraphicsRequirementsKHR not found (" +
+            openxr->get_result_string(proc_result) + ")");
+        return;
+    }
 
     XrGraphicsRequirementsD3D12KHR gr{XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
-    gr.adapterLuid = device->GetAdapterLuid();
-    gr.minFeatureLevel = D3D_FEATURE_LEVEL_11_0;
 
     spdlog::info("[VR] Calling xrGetD3D12GraphicsRequirementsKHR");
-    fn(VR::get()->m_openxr->instance, VR::get()->m_openxr->system, &gr);
+    const auto requirements_result = fn(openxr->instance, openxr->system, &gr);
+
+    if (requirements_result != XR_SUCCESS) {
+        fail("Could not initialize OpenXR D3D12 binding: xrGetD3D12GraphicsRequirementsKHR failed (" +
+            openxr->get_result_string(requirements_result) + ")");
+        return;
+    }
+
+    const auto device_luid = device->GetAdapterLuid();
+    const auto format_luid = [](const LUID& luid) {
+        std::ostringstream oss{};
+        oss << std::hex << static_cast<uint32_t>(luid.HighPart) << ":" << luid.LowPart;
+        return oss.str();
+    };
+    const auto same_luid = [](const LUID& a, const LUID& b) {
+        return a.LowPart == b.LowPart && a.HighPart == b.HighPart;
+    };
+    const auto highest_feature_level = [&]() {
+        D3D_FEATURE_LEVEL levels[] = {
+#ifdef D3D_FEATURE_LEVEL_12_2
+            D3D_FEATURE_LEVEL_12_2,
+#endif
+            D3D_FEATURE_LEVEL_12_1,
+            D3D_FEATURE_LEVEL_12_0,
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0
+        };
+        D3D12_FEATURE_DATA_FEATURE_LEVELS feature_levels{};
+        feature_levels.NumFeatureLevels = static_cast<UINT>(sizeof(levels) / sizeof(levels[0]));
+        feature_levels.pFeatureLevelsRequested = levels;
+        feature_levels.MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+
+        if (SUCCEEDED(device->CheckFeatureSupport(
+            D3D12_FEATURE_FEATURE_LEVELS,
+            &feature_levels,
+            sizeof(feature_levels)))) {
+            return feature_levels.MaxSupportedFeatureLevel;
+        }
+
+        return D3D_FEATURE_LEVEL_11_0;
+    }();
+
+    spdlog::info(
+        "[VR] OpenXR D3D12 requirements: runtime_adapter={} device_adapter={} runtime_min_feature=0x{:x} device_max_feature=0x{:x} device={} queue={}",
+        format_luid(gr.adapterLuid),
+        format_luid(device_luid),
+        static_cast<uint32_t>(gr.minFeatureLevel),
+        static_cast<uint32_t>(highest_feature_level),
+        static_cast<void*>(device),
+        static_cast<void*>(command_queue));
+
+    if (!same_luid(gr.adapterLuid, device_luid)) {
+        fail("Could not initialize OpenXR D3D12 binding: runtime requires adapter " +
+            format_luid(gr.adapterLuid) + " but the game D3D12 device is on adapter " +
+            format_luid(device_luid));
+        return;
+    }
+
+    if (highest_feature_level < gr.minFeatureLevel) {
+        std::ostringstream oss{};
+        oss << "Could not initialize OpenXR D3D12 binding: runtime requires feature level 0x"
+            << std::hex << static_cast<uint32_t>(gr.minFeatureLevel)
+            << " but the game D3D12 device supports 0x"
+            << static_cast<uint32_t>(highest_feature_level);
+        fail(oss.str());
+        return;
+    }
 
     session_info.next = &this->binding;
 }

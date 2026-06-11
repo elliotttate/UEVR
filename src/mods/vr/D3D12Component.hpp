@@ -282,6 +282,9 @@ private:
     uint64_t m_afw_depth_seq_ref_present{0};
     uint64_t m_afw_depth_seq_ref_pushed{0};
     bool m_afw_depth_seq_ref_valid{false};
+    // pushes - stride*presents at anchor time; a sustained walk away from it
+    // means the per-frame bind structure changed (stride break watchdog).
+    int64_t m_afw_depth_seq_lag{0};
     float m_afw_prev_other_loc[3]{};
     float m_afw_prev_rot[4]{}; // quat x,y,z,w
     bool m_afw_prev_pose_valid{false};

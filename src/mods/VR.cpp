@@ -2579,36 +2579,51 @@ std::optional<std::string> VR::initialize_openxr() {
             extensions.push_back(XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
         }
 
-        // Enumerate available extensions and enable depth extension if available
-        uint32_t extension_count{};
-        result = xrEnumerateInstanceExtensionProperties(nullptr, 0, &extension_count, nullptr);
+        char disable_optional_extensions_buf[16]{};
+        const auto disable_optional_extensions_len = GetEnvironmentVariableA(
+            "UEVR_OPENXR_DISABLE_OPTIONAL_EXTENSIONS",
+            disable_optional_extensions_buf,
+            sizeof(disable_optional_extensions_buf));
+        const bool disable_optional_extensions =
+            disable_optional_extensions_len > 0 &&
+            disable_optional_extensions_len < sizeof(disable_optional_extensions_buf) &&
+            disable_optional_extensions_buf[0] != '\0' &&
+            disable_optional_extensions_buf[0] != '0';
 
-        std::vector<XrExtensionProperties> extension_properties(extension_count, {XR_TYPE_EXTENSION_PROPERTIES});
+        if (disable_optional_extensions) {
+            spdlog::info("[VR] Optional OpenXR extensions disabled by UEVR_OPENXR_DISABLE_OPTIONAL_EXTENSIONS");
+        } else {
+            // Enumerate available extensions and enable optional composition helpers if available.
+            uint32_t extension_count{};
+            result = xrEnumerateInstanceExtensionProperties(nullptr, 0, &extension_count, nullptr);
 
-        if (!XR_FAILED(result)) try {
-            result = xrEnumerateInstanceExtensionProperties(nullptr, extension_count, &extension_count, extension_properties.data());
+            std::vector<XrExtensionProperties> extension_properties(extension_count, {XR_TYPE_EXTENSION_PROPERTIES});
 
-            if (!XR_FAILED(result)) {
-                for (const auto& extension_property : extension_properties) {
-                    spdlog::info("[VR] Found OpenXR extension: {}", extension_property.extensionName);
-                }
+            if (!XR_FAILED(result)) try {
+                result = xrEnumerateInstanceExtensionProperties(nullptr, extension_count, &extension_count, extension_properties.data());
 
-                const std::unordered_set<std::string> wanted_extensions {
-                    XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
-                    XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME
-                    // To be seen if we need more!
-                };
+                if (!XR_FAILED(result)) {
+                    for (const auto& extension_property : extension_properties) {
+                        spdlog::info("[VR] Found OpenXR extension: {}", extension_property.extensionName);
+                    }
 
-                for (const auto& extension_property : extension_properties) {
-                    if (wanted_extensions.contains(extension_property.extensionName)) {
-                        spdlog::info("[VR] Enabling {} extension", extension_property.extensionName);
-                        m_openxr->enabled_extensions.insert(extension_property.extensionName);
-                        extensions.push_back(extension_property.extensionName);
+                    const std::unordered_set<std::string> wanted_extensions {
+                        XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
+                        XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME
+                        // To be seen if we need more!
+                    };
+
+                    for (const auto& extension_property : extension_properties) {
+                        if (wanted_extensions.contains(extension_property.extensionName)) {
+                            spdlog::info("[VR] Enabling {} extension", extension_property.extensionName);
+                            m_openxr->enabled_extensions.insert(extension_property.extensionName);
+                            extensions.push_back(extension_property.extensionName);
+                        }
                     }
                 }
+            } catch(...) {
+                spdlog::error("[VR] Unknown error while enumerating OpenXR extensions");
             }
-        } catch(...) {
-            spdlog::error("[VR] Unknown error while enumerating OpenXR extensions");
         }
 
         XrInstanceCreateInfo instance_create_info{XR_TYPE_INSTANCE_CREATE_INFO};
@@ -2689,6 +2704,14 @@ std::optional<std::string> VR::initialize_openxr() {
         m_d3d12.openxr().initialize(session_create_info);
     } else {
         m_d3d11.openxr().initialize(session_create_info);
+    }
+
+    if (session_create_info.next == nullptr) {
+        if (!m_openxr->error) {
+            m_openxr->error = "Could not initialize OpenXR graphics binding";
+        }
+        spdlog::error("[VR] {}", m_openxr->error.value());
+        return std::nullopt;
     }
 
     spdlog::info("[VR] Creating OpenXR session");
