@@ -659,6 +659,22 @@ VRRuntime::Error OpenXR::refresh_stale_pose_before_submit(uint32_t frame_count, 
 }
 
 bool OpenXR::recover_focused_stale_frame_loop(const char* caller) {
+    // Empty-frame recovery is DEFAULT OFF. It is fork-only (not in upstream
+    // UEVR): it opens+ends a frame with layerCount=0 when a submit looks stale,
+    // and AFR's one-behind right-eye submit looks exactly like a stale/older
+    // frame - so the runtime gets empty layers and the right eye flickers black
+    // (and MetaXR rejects the zero frames, freezing the view). Off restores the
+    // upstream-simple loop. Opt back in with UEVR_OPENXR_ENABLE_FRAME_RECOVERY=1
+    // only if a specific title genuinely needs the stale-frame watchdog.
+    static const bool frame_recovery_enabled = []() {
+        char b[8]{};
+        const auto n = GetEnvironmentVariableA("UEVR_OPENXR_ENABLE_FRAME_RECOVERY", b, sizeof(b));
+        return n != 0 && b[0] != '\0' && b[0] != '0';
+    }();
+    if (!frame_recovery_enabled) {
+        return false;
+    }
+
     if (this->session == XR_NULL_HANDLE ||
         this->session_state != XR_SESSION_STATE_FOCUSED ||
         !this->session_ready ||

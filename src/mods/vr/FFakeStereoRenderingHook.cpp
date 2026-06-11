@@ -1009,6 +1009,21 @@ bool subnautica2_enable_volumetric_fog_per_view_hook() {
     return result;
 }
 
+// Master gate for SN2's render fixes (the fog/water/compose/VRT ViewRect patches
+// and the SN2 diagnostic hooks). DEFAULT OFF so a plain default launch installs
+// NONE of them - they were patching base rendering modes (e.g. rewriting view[1]
+// rects in Native Stereo) and are WIP fixes for the SN2 fog-in-VR investigation,
+// not core rendering. The investigation opts in with UEVR_SN2_RENDER_HOOKS=1 (the
+// clean-observe launcher sets it); individual hooks still honor their own flags.
+bool subnautica2_render_hooks_enabled() {
+    static const bool enabled = []() {
+        wchar_t value[16]{};
+        const auto len = GetEnvironmentVariableW(L"UEVR_SN2_RENDER_HOOKS", value, (DWORD)std::size(value));
+        return len != 0 && len < std::size(value) && value[0] != L'\0' && value[0] != L'0';
+    }();
+    return enabled;
+}
+
 // 2026-05-16 Phase 3: enable per-view SLW hook (sub_142EB72E0) for the bindless
 // descriptor swap fix. Default OFF until the hook + heap rewrite is validated.
 bool subnautica2_enable_slw_per_view_hook() {
@@ -14500,6 +14515,11 @@ bool FFakeStereoRenderingHook::hook() {
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
     hook_ue418_oculus_pixel_density_sink();
+
+    // SN2 render fixes (fog/water/compose/VRT patches + diagnostics) are gated OFF
+    // by default so a plain launch runs nothing SN2-specific. Opt in via
+    // UEVR_SN2_RENDER_HOOKS=1 for the fog investigation.
+    if (subnautica2_render_hooks_enabled()) {
     attempt_hook_subnautica2_compute_volumetric_fog();
     attempt_hook_subnautica2_init_volumetric_render_target();
     attempt_hook_subnautica2_reconstruct_volumetric_render_target();
@@ -14536,6 +14556,9 @@ bool FFakeStereoRenderingHook::hook() {
     attempt_hook_subnautica2_volumetric_fog_per_view();
     attempt_hook_subnautica2_single_layer_water_scene_without_water();
     attempt_hook_subnautica2_uwe_trace();
+    } else {
+        SPDLOG_INFO_ONCE("[Subnautica2] render hooks gated OFF by default; set UEVR_SN2_RENDER_HOOKS=1 to install the fog/water/compose fixes + diagnostics");
+    }
 
     const auto vtable = locate_fake_stereo_rendering_vtable();
 

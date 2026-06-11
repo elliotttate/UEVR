@@ -2591,6 +2591,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }
     }
 
+    // [DIBR][timing] mark post-sync. A render-thread stall between here and the
+    // first OpenXR copy leaves frame_synced set without frame_began, wedging the
+    // OpenXR submit so the recovery feeds MetaXR empty/black frames.
+    const auto onf_post_sync_time = std::chrono::steady_clock::now();
+
     const auto& ffsr = VR::get()->m_fake_stereo_hook;
     const auto ui_target = ffsr->get_render_target_manager()->get_ui_target();
 
@@ -3239,7 +3244,13 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     // with depth-synthesized stereo before the per-eye copies consume it. Env-gated via
     // UEVR_DIBR; no-op otherwise. scene_depth_tex may have been suppressed above (mono
     // expansion / debug toggles) - run_dibr_synthesis re-resolves SceneDepthZ itself.
+    const auto dibr_pre_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - onf_post_sync_time).count();
+    const auto dibr_synth_t0 = std::chrono::steady_clock::now();
     run_dibr_synthesis(vr, backbuffer.Get(), scene_source_state, scene_depth_tex.Get());
+    const auto dibr_synth_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dibr_synth_t0).count();
+    if (dibr_pre_ms >= 5.0 || dibr_synth_ms >= 5.0) {
+        SPDLOG_WARNING_EVERY_N_SEC(1, "[DIBR][timing] on_frame stall: post_sync->pre_dibr={:.1f}ms run_dibr_synthesis={:.1f}ms (>=5ms can wedge the OpenXR submit -> MetaXR black/freeze)", dibr_pre_ms, dibr_synth_ms);
+    }
 
     // If m_frame_count is even, we're rendering the left eye.
     if (is_left_eye_frame) {

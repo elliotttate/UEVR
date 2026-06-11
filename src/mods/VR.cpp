@@ -2101,8 +2101,15 @@ bool VR::is_dibr_rendering_path_compatible() const {
     // submits the full backbuffer per eye, and Mono is the explicit
     // no-synthesis baseline; run_dibr_synthesis skips all of them.
     if (m_rendering_method->value() == RenderingMethod::ALTERNATING ||
+        m_rendering_method->value() == RenderingMethod::NATIVE_STEREO ||
         m_rendering_method->value() == RenderingMethod::MONO ||
         m_extreme_compat_mode->value()) {
+        // Native Stereo renders both eyes itself - there is no single reference
+        // view to synthesize from, so DIBR/overscan must never engage here even
+        // if the DIBR panel combo is left on a synth mode. The Rendering Method
+        // dropdown is authoritative; otherwise the overscan inflates the
+        // swapchain (1884 vs the native 1680) and the unwritten edge band shows
+        // stale texture / forces endless swapchain recreation.
         return false;
     }
 
