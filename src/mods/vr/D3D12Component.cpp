@@ -4986,8 +4986,19 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     // phase error is an IPD-scale warp misregistration. (PureDark hit the
     // identical class with his depth/MV backups being overwritten by the
     // next frame's DLSS pass before the warp consumed them.)
-    dibr_depth_tracker::set_afw_depth_snapshot_enabled(afw);
-    if (afw) {
+    // OPT-IN (UEVR_DIBR_AFW_DEPTH_SNAP=1): A/B measurement on SN2 showed the
+    // snapshot's frame tag races the game thread (recording_frame is already
+    // N+1 while N's binds record on parallel workers), keying other-eye depth
+    // and CAUSING +/-20px alternation on near content - while the pool
+    // selection it was meant to replace measures clean (<=0.25px state
+    // offsets). Disabled until the tag derives from a recording-stream
+    // signal instead of the game-thread announcement.
+    static const bool afw_depth_snap_enabled = []() {
+        const char* v = std::getenv("UEVR_DIBR_AFW_DEPTH_SNAP");
+        return v != nullptr && v[0] == '1';
+    }();
+    dibr_depth_tracker::set_afw_depth_snapshot_enabled(afw && afw_depth_snap_enabled);
+    if (afw && afw_depth_snap_enabled) {
         if (auto snap = dibr_depth_tracker::get_afw_depth_snapshot(afw_presented_frame); snap != nullptr) {
             depth = snap;
             depth_state = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -5194,7 +5205,13 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             // one eye IN FRONT of the other - the reported fore/aft pumping
             // when looking sideways). Same fz-conjugated construction as the
             // dump-validated temporal history matrix.
-            if (afw && afw_eye_now >= 0) {
+            // Bisection lever: UEVR_DIBR_AFW_MEASURED_BASELINE=0 keeps the
+            // idealized translate above (isolates the measured-pair math).
+            static const bool measured_baseline_disabled = []() {
+                const char* v = std::getenv("UEVR_DIBR_AFW_MEASURED_BASELINE");
+                return v != nullptr && v[0] == '0';
+            }();
+            if (afw && !measured_baseline_disabled && afw_eye_now >= 0) {
                 const glm::quat qc{Matrix4x4f{
                     0, 0, -1, 0,
                     1, 0, 0, 0,

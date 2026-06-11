@@ -527,9 +527,19 @@ public:
     int32_t get_dibr_reference_eye(std::optional<uint32_t> engine_frame = std::nullopt) const {
         const auto mode = get_dibr_requested_mode();
         if (mode == 6) {
+            // Bisection lever: UEVR_DIBR_AFW_PERIOD=N alternates the eye
+            // every N frames instead of every frame (e.g. 120 = ~3s holds).
+            // Stable BETWEEN switches isolates the per-frame alternation as
+            // the artifact source; shaky between switches indicts the AFW
+            // plumbing independent of alternation. Default 1 = per-frame.
+            static const uint32_t period = []() {
+                const char* v = std::getenv("UEVR_DIBR_AFW_PERIOD");
+                const int p = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 1;
+                return (uint32_t)(p > 1 ? p : 1);
+            }();
             const auto frame = engine_frame ? *engine_frame
                                             : (uint32_t)get_runtime()->internal_frame_count;
-            return (int32_t)(frame & 1);
+            return (int32_t)((frame / period) & 1);
         }
         return mode == 2 ? 1 : 0;
     }
