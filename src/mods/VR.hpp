@@ -53,6 +53,12 @@ public:
         // projection overrides; per-eye view_bounds crop the difference).
         // No stereo parallax; the comparison baseline for DIBR (D3D12 only).
         MONO = 4,
+        // PureDark-style Alternate Frame Warping: the engine renders ONE view
+        // per frame with the eye ALTERNATING left/right; the DIBR scatter
+        // pass warps it into the other eye the same frame, with the previous
+        // frame's real render as temporal fill history. Equivalent to
+        // SYNTHETIC_DIBR with the panel mode combo on AFW (D3D12 only).
+        SYNTHETIC_AFW = 5,
     };
 
     enum SynchronizeStage {
@@ -1363,6 +1369,7 @@ private:
         "Alternating/AFR",
         "Synthetic Stereo (DIBR)",
         "Mono (one eye to both)",
+        "Alternate Frame Warping (AFW)",
     };
 
     static const inline std::vector<std::string> s_sync_mode_names{

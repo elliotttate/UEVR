@@ -2069,6 +2069,12 @@ int32_t VR::get_dibr_requested_mode() const {
         return env_mode;
     }
 
+    // The "Alternate Frame Warping (AFW)" rendering method IS the mode
+    // choice: scatter pipeline with the reference eye alternating per frame.
+    if (m_rendering_method->value() == RenderingMethod::SYNTHETIC_AFW) {
+        return 6;
+    }
+
     const auto ui_mode = m_dibr_mode->value();
 
     // The "Synthetic Stereo (DIBR)" rendering method engages DIBR even with
@@ -2161,7 +2167,8 @@ float VR::get_dibr_overscan_rt_factor() const {
     }
 
     const auto method = m_rendering_method->value();
-    if (method != RenderingMethod::NATIVE_STEREO && method != RenderingMethod::SYNTHETIC_DIBR) {
+    if (method != RenderingMethod::NATIVE_STEREO && method != RenderingMethod::SYNTHETIC_DIBR &&
+        method != RenderingMethod::SYNTHETIC_AFW) {
         return 1.0f;
     }
 
@@ -2255,10 +2262,11 @@ bool VR::is_dibr_single_view_active() const {
     }
 
     // Synchronized sequential drives its own per-frame eye alternation; only
-    // plain Native Stereo (or the dedicated Synthetic Stereo method) has a
-    // second view we can simply not render.
+    // plain Native Stereo (or the dedicated Synthetic Stereo / AFW methods)
+    // has a second view we can simply not render.
     const auto method = m_rendering_method->value();
-    if (method != RenderingMethod::NATIVE_STEREO && method != RenderingMethod::SYNTHETIC_DIBR) {
+    if (method != RenderingMethod::NATIVE_STEREO && method != RenderingMethod::SYNTHETIC_DIBR &&
+        method != RenderingMethod::SYNTHETIC_AFW) {
         return false;
     }
 
@@ -7110,7 +7118,8 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                             get_dibr_reference_eye() == 1 ? "right" : "left");
                     }
                 } else if (m_rendering_method->value() == RenderingMethod::NATIVE_STEREO ||
-                           m_rendering_method->value() == RenderingMethod::SYNTHETIC_DIBR) {
+                           m_rendering_method->value() == RenderingMethod::SYNTHETIC_DIBR ||
+                           m_rendering_method->value() == RenderingMethod::SYNTHETIC_AFW) {
                     ImGui::TextDisabled("Both eyes still rendered (single-view engages once synthesis is proven)");
                 }
             }
