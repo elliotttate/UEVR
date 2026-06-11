@@ -246,6 +246,10 @@ private:
     // with one view (see run_dibr_synthesis).
     uint32_t m_dibr_single_view_cooldown{};
 
+    // AFW forensics: set when the per-frame camera delta exceeds the motion
+    // threshold; arms the consecutive-frame dumper (UEVR_DIBR_AFW_DUMP=1).
+    std::atomic<bool> m_afw_dump_motion_trigger{false};
+
     std::unique_ptr<DirectX::DX12::GraphicsMemory> m_graphics_memory{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_backbuffer_batch{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_game_batch{};

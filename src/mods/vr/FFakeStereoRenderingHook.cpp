@@ -17077,7 +17077,14 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     const auto true_index = vr->is_using_afr()
         ? (g_frame_count + last_index) % 2
-        : (vr->is_single_view_rendering_active() ? vr->get_single_view_reference_eye() : last_index);
+        : (vr->is_single_view_rendering_active() ? vr->get_single_view_reference_eye(g_frame_count) : last_index);
+
+    if (vr->is_dibr_afw_requested() && vr->is_single_view_rendering_active()) {
+        static std::atomic<int> s_afw_trace{0};
+        if (s_afw_trace.fetch_add(1, std::memory_order_relaxed) < 240) {
+            SPDLOG_INFO("[DIBR][AFWTRACE] sceneview frame={} eye={}", g_frame_count, true_index);
+        }
+    }
 
     if (subnautica2_is_current_game() &&
         vr->is_native_stereo_fix_enabled() &&
@@ -17794,6 +17801,18 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
     auto runtime = vr->get_runtime();
     runtime->internal_frame_count = frame_count;
     runtime->on_pre_render_game_thread(frame_count);
+
+    // AFW: announce the authoritative ViewFamily frame number BEFORE this
+    // family's views are calculated (this handler runs first; verified
+    // empirically - publishing AFTER the view calc keys records one frame
+    // late and inverts the eye association). The view-calc capture uses
+    // this as its ring key, the same family the present-side lookup uses
+    // (it flows through enqueue_render_poses to m_render_frame_count) - so
+    // the rendered-eye association is structural, immune to the
+    // internal_frame_count wobble from out-of-band synchronize_frame calls.
+    if (vr->is_dibr_afw_requested()) {
+        vr->set_afw_family_frame(frame_count);
+    }
 
     // This is a HACKHACKHACK to get splitscreen working on around 4.20 to 4.27 something
     // This is completely borked on UE5
@@ -19343,6 +19362,16 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     const auto has_double_precision = g_hook->m_has_double_precision;
     const auto rot_d = (Rotator<double>*)view_rotation;
 
+    // AFW parity forensics: which sites actually run in this title, with
+    // which frame counters (correlate with the [DIBR][AFWTRACE] synth lines).
+    if (vr->is_dibr_afw_requested()) {
+        static std::atomic<int> s_afw_trace{0};
+        if (s_afw_trace.fetch_add(1, std::memory_order_relaxed) < 240) {
+            SPDLOG_INFO("[DIBR][AFWTRACE] offset_entry frame={} view_index={} full={} single_view={}",
+                g_frame_count, view_index, is_full_pass, dibr_single_view);
+        }
+    }
+
     const auto log_native_stereo_view_offset_sample = [&](std::string_view phase) {
         if (!subnautica2_explicit_view_zero_is_eye) {
             return;
@@ -19396,8 +19425,22 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 }
             }
         }
-    } else if (dibr_single_view && !is_full_pass) {
-        true_index = vr->get_single_view_reference_eye();
+    } else if (dibr_single_view) {
+        // NOT gated on !is_full_pass: titles whose lone view arrives as a
+        // FULL-classified index-0 pass (SN2) still apply the complete HMD+eye
+        // transform below with this true_index - without the pin the lone
+        // view stays on eye 0 forever, which under AFW leaves the pose static
+        // while the projection alternates (visible two-position oscillation).
+        true_index = vr->get_single_view_reference_eye(g_frame_count);
+        // AFW parity forensics: correlate against the synthesis-side trace
+        // ([DIBR][AFWTRACE] synth ...) to prove the rendered-eye/warp-direction
+        // association per engine frame.
+        if (vr->is_dibr_afw_requested()) {
+            static std::atomic<int> s_afw_trace{0};
+            if (s_afw_trace.fetch_add(1, std::memory_order_relaxed) < 240) {
+                SPDLOG_INFO("[DIBR][AFWTRACE] offset frame={} eye={} full={}", g_frame_count, true_index, is_full_pass);
+            }
+        }
     }
 
     if ((true_index == 0 || dibr_single_view) && !is_full_pass) {
@@ -19563,6 +19606,34 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 rot_d->yaw = euler.y;
                 rot_d->roll = euler.z;
             }
+        }
+
+        // AFW: publish this engine frame's final eye camera (orientation in
+        // the steamvr-style quat family + UE-world location, eye offset
+        // included). The synthesis pass reads it back by engine frame number
+        // for the authoritative rendered eye and the exact camera delta the
+        // temporal history reprojection needs (engine-side camera motion is
+        // invisible to a pure HMD-pose delta).
+        if (dibr_single_view && vr->is_dibr_afw_requested()) {
+            const auto final_loc = !has_double_precision
+                ? glm::vec3{view_location->x, view_location->y, view_location->z}
+                : glm::vec3{(float)view_d->x, (float)view_d->y, (float)view_d->z};
+            // The OTHER eye's camera through the exact same transform math
+            // (swap this eye's separation for the other's) - the synthesis
+            // pass needs the target eye's camera for the temporal history
+            // reprojection and must not re-derive it with its own axis
+            // conventions.
+            const auto other_eye = true_index == 0 ? 1 : 0;
+            const auto other_offset = glm::vec3{vr->get_eye_offset((VRRuntime::Eye)other_eye)};
+            const auto other_separation = quat_converter * (glm::normalize(new_rotation) * (other_offset * world_scale));
+            const auto other_loc = final_loc + glm::vec3{eye_separation} - glm::vec3{other_separation};
+            // Key by the family number announced by BeginRenderViewFamily for
+            // the family being built (the present-side lookup's family);
+            // g_frame_count is the empirically-equivalent fallback for paths
+            // where that handler never ran.
+            const auto family_frame = vr->get_afw_family_frame();
+            const auto record_key = family_frame != 0xFFFFFFFFu ? family_frame : g_frame_count;
+            vr->record_afw_view(record_key, true_index, glm::normalize(new_rotation), final_loc, other_loc);
         }
 
         // Roomscale movement
@@ -19786,8 +19857,15 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         if (vr->is_using_afr()) {
             true_index = g_frame_count % 2;
         } else if (vr->is_single_view_rendering_active()) {
-            // The lone engine view is the reference eye (DIBR) / eye 0 (Mono).
-            true_index = vr->get_single_view_reference_eye();
+            // The lone engine view is the reference eye (DIBR) / eye 0 (Mono);
+            // under AFW the eye alternates with the engine frame.
+            true_index = vr->get_single_view_reference_eye(g_frame_count);
+            if (vr->is_dibr_afw_requested()) {
+                static std::atomic<int> s_afw_trace{0};
+                if (s_afw_trace.fetch_add(1, std::memory_order_relaxed) < 240) {
+                    SPDLOG_INFO("[DIBR][AFWTRACE] projection frame={} eye={}", g_frame_count, true_index);
+                }
+            }
         }
 
         auto& double_matrix = *(Matrix4x4d*)out;

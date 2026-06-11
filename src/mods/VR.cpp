@@ -2059,6 +2059,9 @@ int32_t VR::get_dibr_requested_mode() const {
         if (m == "scatter" || m == "yoro_scatter") {
             return 5;
         }
+        if (m == "afw" || m == "alternate") {
+            return 6;
+        }
         return 1; // yoro / synth_right / unrecognized
     }();
 
@@ -2134,10 +2137,11 @@ float VR::get_dibr_overscan_factor() const {
     const float margin = (env_margin >= 0.0f) ? env_margin
                                               : std::clamp(m_dibr_overscan->value() - 1.0f, 0.0f, 0.5f);
 
-    // Scatter-mode only: the scatter kernels map source->target through the
-    // (widened) matrices exactly, while the gather search assumes source and
-    // target share a screen space.
-    if (margin <= 0.0f || get_dibr_requested_mode() != 5 ||
+    // Scatter-pipeline modes only (5 = scatter, 6 = AFW): these kernels map
+    // source->target through the (widened) matrices exactly, while the gather
+    // search assumes source and target share a screen space.
+    const auto overscan_mode = get_dibr_requested_mode();
+    if (margin <= 0.0f || (overscan_mode != 5 && overscan_mode != 6) ||
         !is_dibr_single_view_active() || is_mono_rendering_active()) {
         return 1.0f;
     }
@@ -2151,7 +2155,8 @@ float VR::get_dibr_overscan_rt_factor() const {
     // reallocating the render target resets the synthesis pipeline, so a size
     // gate coupled to ready() oscillates grow->reset->shrink->reset forever.
     // Only stable configuration goes into the size decision.
-    if (get_dibr_requested_mode() != 5 || !is_dibr_rendering_path_compatible() || is_mono_rendering_active()) {
+    const auto rt_mode = get_dibr_requested_mode();
+    if ((rt_mode != 5 && rt_mode != 6) || !is_dibr_rendering_path_compatible() || is_mono_rendering_active()) {
         return 1.0f;
     }
 
@@ -7096,9 +7101,14 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
             if (get_dibr_requested_mode() > 0) {
                 if (is_dibr_single_view_active()) {
-                    ImGui::TextColored(ImVec4{0.4f, 1.0f, 0.4f, 1.0f},
-                        "Single-view: the engine renders only the %s eye (~half scene GPU cost)",
-                        get_dibr_reference_eye() == 1 ? "right" : "left");
+                    if (is_dibr_afw_requested()) {
+                        ImGui::TextColored(ImVec4{0.4f, 1.0f, 0.4f, 1.0f},
+                            "AFW: one eye rendered per frame (alternating); the other is warped from it");
+                    } else {
+                        ImGui::TextColored(ImVec4{0.4f, 1.0f, 0.4f, 1.0f},
+                            "Single-view: the engine renders only the %s eye (~half scene GPU cost)",
+                            get_dibr_reference_eye() == 1 ? "right" : "left");
+                    }
                 } else if (m_rendering_method->value() == RenderingMethod::NATIVE_STEREO ||
                            m_rendering_method->value() == RenderingMethod::SYNTHETIC_DIBR) {
                     ImGui::TextDisabled("Both eyes still rendered (single-view engages once synthesis is proven)");
@@ -7143,8 +7153,8 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             m_dibr_edge_fill_mode->draw("Edge Fill");
             m_dibr_edge_guard_strength->draw("Screen Edge Guard");
 
-            // Scatter-mode (YORO Scatter / dropdown DIBR default) knobs.
-            if (get_dibr_requested_mode() == 5) {
+            // Scatter-pipeline (YORO Scatter / AFW / dropdown DIBR default) knobs.
+            if (get_dibr_requested_mode() == 5 || get_dibr_requested_mode() == 6) {
                 m_dibr_overscan->draw("Overscan (render wider for edge data)");
                 if (std::getenv("UEVR_DIBR_OVERSCAN") != nullptr) {
                     ImGui::TextDisabled("UEVR_DIBR_OVERSCAN env var is overriding the slider");

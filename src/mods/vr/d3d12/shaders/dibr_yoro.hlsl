@@ -22,6 +22,10 @@ RWTexture2D<float4> g_sbsOut : register(u0);
 // scatter_compose > 0.5.
 RWTexture2D<uint> g_scatterKey : register(u1);
 RWTexture2D<float4> g_scatterColor : register(u2);
+// Temporal history (AFW: last frame's REAL render of the eye being
+// synthesized + its device-depth keys); only read when temporal_enabled > 1.5.
+RWTexture2D<float4> g_historyColor : register(u3);
+RWTexture2D<uint> g_historyKey : register(u4);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
 
@@ -2190,6 +2194,69 @@ float4 SampleSynthStereoColor(float2 sampleUv, float2 centerUv, float4 centerCol
     return lerp(base, centerColor, guardMask);
 }
 
+#if SCATTER_COMPOSE
+// AFW CombinedWarping: pull the synthesized eye toward last frame's REAL
+// render of the same eye (reprojected through the exact camera delta and
+// depth-validated). The warp output and a native render of the same view
+// differ subtly in resampling character and disocclusion treatment; under
+// per-frame eye alternation that difference flickers at half rate. Blending
+// validated real history into the WHOLE synthesized eye (not just holes)
+// collapses the difference. Gated on temporal_enabled > 1.5 (the AFW mode;
+// plain scatter history is the previous synthesized output, which would
+// smear here).
+float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
+{
+    if (temporal_enabled < 1.5f) {
+        return c;
+    }
+    uint sk = g_scatterKey[px] & 0x7FFFFFFFu; // strip the fill's marker bit
+    if (sk == 0u) {
+        return c; // sky / no geometry: nothing to validate against
+    }
+    float estDepth = asfloat(sk);
+    float2 uvRaw = float2((px.x + 0.5f) / (float)out_width,
+                          (px.y + 0.5f) / (float)out_height);
+    float2 ndc = float2(uvRaw.x * 2.0f - 1.0f, 1.0f - uvRaw.y * 2.0f);
+    float4 prev = mul(reproj_target_to_prev, float4(ndc, estDepth, 1.0f));
+    float w = (abs(prev.w) > 1e-6f) ? prev.w : 1e-6f;
+    float2 pn = prev.xy / w;
+    // Bilinear history fetch. The reprojection lands at fractional pixel
+    // positions almost everywhere (the overscan mapping is a ~1/1.12 scale),
+    // so a nearest-neighbor read snaps each sample by up to half a pixel in
+    // a sawtooth pattern across the screen - blended at high weight that
+    // reads as whole-screen micro-shake alternating with the real frames.
+    float fx = (pn.x * 0.5f + 0.5f) * (float)out_width - 0.5f;
+    float fy = (0.5f - pn.y * 0.5f) * (float)out_height - 0.5f;
+    if (fx < 0.0f || fy < 0.0f || fx > (float)(out_width - 1u) || fy > (float)(out_height - 1u)) {
+        return c;
+    }
+    int x0 = (int)fx;
+    int y0 = (int)fy;
+    int x1 = min(x0 + 1, (int)out_width - 1);
+    int y1 = min(y0 + 1, (int)out_height - 1);
+    float wx = fx - (float)x0;
+    float wy = fy - (float)y0;
+    // Depth-validate at the nearest tap (keys don't interpolate).
+    uint hk = g_historyKey[uint2((wx > 0.5f) ? x1 : x0, (wy > 0.5f) ? y1 : y0)] & 0x7FFFFFFFu;
+    const float tol = max(0.15f * estDepth, 2e-4f);
+    if (hk != 0u && abs(asfloat(hk) - estDepth) <= tol) {
+        float3 h = lerp(
+            lerp(g_historyColor[uint2(x0, y0)].rgb, g_historyColor[uint2(x1, y0)].rgb, wx),
+            lerp(g_historyColor[uint2(x0, y1)].rgb, g_historyColor[uint2(x1, y1)].rgb, wx), wy);
+        // Color-agreement gate: the blend exists to cancel the SUBTLE
+        // real-vs-warp resampling difference, where history and warp agree
+        // closely. Object-space animation (swaying plants, fish) moves under
+        // a camera-only reprojection while its depth still validates -
+        // blending that paints a displaced double image. Large color deltas
+        // therefore reject history instead (the warp result stands alone).
+        float lumDiff = dot(abs(h - c), float3(0.299f, 0.587f, 0.114f));
+        float gate = saturate(1.0f - lumDiff * 8.0f);
+        c = lerp(c, h, saturate(temporal_blend) * gate);
+    }
+    return c;
+}
+#endif
+
 [numthreads(16, 16, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
@@ -2293,6 +2360,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         // ScreenEdgeGuard disparity squeeze).
         float edgeKeep = ScreenEdgeGuard(uv, searchDepth);
         rightColor = float4(lerp(centerColor.rgb, g_scatterColor[uint2(x, y)].rgb, edgeKeep), centerColor.a);
+        rightColor.rgb = ApplyAfwHistoryBlend(uint2(x, y), rightColor.rgb);
 #else
         float2 rightSearchUV = YoroSearchUv(uv, -1.0f, searchDepth, boundaryScale, 1.0f);
         rightUV = ApplyOutputEyeAlignment(rightSearchUV + rightInterlaceOffset, -1.0f);
@@ -2325,6 +2393,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 #if SCATTER_COMPOSE
         float edgeKeep = ScreenEdgeGuard(uv, searchDepth);
         leftColor = float4(lerp(centerColor.rgb, g_scatterColor[uint2(x, y)].rgb, edgeKeep), centerColor.a);
+        leftColor.rgb = ApplyAfwHistoryBlend(uint2(x, y), leftColor.rgb);
 #else
         float2 leftSearchUV = YoroSearchUv(uv, 1.0f, searchDepth, boundaryScale, 1.0f);
         leftUV = ApplyOutputEyeAlignment(leftSearchUV + leftInterlaceOffset, 1.0f);

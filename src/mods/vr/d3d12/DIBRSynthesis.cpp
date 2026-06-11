@@ -349,6 +349,7 @@ bool DIBRSynthesis::create_psos(ID3D12Device* device, DeviceObjects& objs) {
         {"dibr_scatter_depth.hlsl", "dibr_scatter_depth.hlsl", &dibr_shaders::dibr_scatter_depth_source, nullptr, &objs.pso_scatter_depth},
         {"dibr_scatter_color.hlsl", "dibr_scatter_color.hlsl", &dibr_shaders::dibr_scatter_color_source, nullptr, &objs.pso_scatter_color},
         {"dibr_scatter_fill.hlsl", "dibr_scatter_fill.hlsl", &dibr_shaders::dibr_scatter_fill_source, nullptr, &objs.pso_scatter_fill},
+        {"dibr_afw_stash.hlsl", "dibr_afw_stash.hlsl", &dibr_shaders::dibr_afw_stash_source, nullptr, &objs.pso_afw_stash},
     };
 
     for (const auto& k : kernels) {
@@ -510,6 +511,52 @@ bool DIBRSynthesis::ensure_scatter(ID3D12Device* device, uint32_t width, uint32_
     return true;
 }
 
+bool DIBRSynthesis::ensure_afw_history(ID3D12Device* device, uint32_t width, uint32_t height) {
+    // Sized like the scatter buffers (out == source space).
+    if (m_afw_history_key != nullptr) {
+        const auto d = m_afw_history_key->GetDesc();
+        if (d.Width == width && d.Height == height) {
+            return true;
+        }
+    }
+
+    m_afw_history_key.Reset();
+    m_afw_history_color.Reset();
+    m_afw_history_valid = false;
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    desc.Format = DXGI_FORMAT_R32_UINT;
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_afw_history_key)))) {
+        SPDLOG_ERROR_ONCE("[DIBR] failed to create {}x{} AFW history key texture", width, height);
+        return false;
+    }
+    m_afw_history_key->SetName(L"DIBR AFW History Key");
+
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_afw_history_color)))) {
+        SPDLOG_ERROR_ONCE("[DIBR] failed to create {}x{} AFW history color texture", width, height);
+        m_afw_history_key.Reset();
+        return false;
+    }
+    m_afw_history_color->SetName(L"DIBR AFW History Color");
+
+    SPDLOG_INFO("[DIBR] AFW real-render history buffers {}x{}", width, height);
+    return true;
+}
+
 ID3D12Resource* DIBRSynthesis::synthesize(
     ID3D12Device* device,
     ID3D12GraphicsCommandList* cmd_list,
@@ -523,8 +570,17 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     }
 
     // Scatter requires the true-matrix reprojection inputs; without them it
-    // degrades to the plain gather kernel.
+    // degrades to the plain gather kernel - EXCEPT in AFW mode: the gather's
+    // screen-space disparity model is not geometrically exact, and with the
+    // reference eye flipping per frame an inexact warp oscillates violently.
+    // A mirrored mono frame (the caller's null path) is strictly better for
+    // the transient frames where the reprojection inputs are unavailable
+    // (e.g. eye offsets not yet populated, runtime pose stalls).
     if (mode == Mode::YoroScatter && params.reproj_enabled < 0.5f) {
+        if (m_afw_mode) {
+            SPDLOG_WARNING_EVERY_N_SEC(5, "[DIBR] AFW: reprojection inputs unavailable; mirroring instead of gather fallback");
+            return nullptr;
+        }
         mode = Mode::Yoro;
     }
 
@@ -544,12 +600,14 @@ ID3D12Resource* DIBRSynthesis::synthesize(
         // the yoro kernel (gather machinery compiled out for occupancy).
         pso = m_objs.pso_yoro_scatter.Get();
         if (pso == nullptr || m_objs.pso_scatter_clear == nullptr || m_objs.pso_scatter_depth == nullptr ||
-            m_objs.pso_scatter_color == nullptr || m_objs.pso_scatter_fill == nullptr) {
+            m_objs.pso_scatter_color == nullptr || m_objs.pso_scatter_fill == nullptr ||
+            (m_afw_mode && m_objs.pso_afw_stash == nullptr)) {
             pso = nullptr;
         } else {
             params.scatter_compose = 1.0f;
-            // Temporal hole fill needs a valid previous frame.
-            if (!m_scatter_history_valid) {
+            // Temporal hole fill needs a valid previous frame (the real-render
+            // stash in AFW mode, the filled scatter pair otherwise).
+            if (m_afw_mode ? !m_afw_history_valid : !m_scatter_history_valid) {
                 params.temporal_enabled = 0.0f;
             }
         }
@@ -576,6 +634,11 @@ ID3D12Resource* DIBRSynthesis::synthesize(
 
     // Scatter buffers (and the packed output) live in OUTPUT space.
     if (!ensure_scatter(device, params.out_width, params.out_height)) {
+        return nullptr;
+    }
+
+    if (m_afw_mode && mode == Mode::YoroScatter &&
+        !ensure_afw_history(device, params.out_width, params.out_height)) {
         return nullptr;
     }
 
@@ -624,9 +687,14 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     scol_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     device->CreateUnorderedAccessView(m_scatter_color[cur].Get(), nullptr, &scol_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 4 * m_objs.descriptor_stride});
 
-    // History (previous frame's filled pair) for the temporal hole fill.
-    device->CreateUnorderedAccessView(m_scatter_color[prev].Get(), nullptr, &scol_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 5 * m_objs.descriptor_stride});
-    device->CreateUnorderedAccessView(m_scatter_key[prev].Get(), nullptr, &key_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 6 * m_objs.descriptor_stride});
+    // History for the temporal hole fill: the previous frame's filled scatter
+    // pair, or in AFW mode the real-render stash (which the stash pass then
+    // overwrites with THIS frame's source after the fill has read it).
+    const bool afw_history = m_afw_mode && mode == Mode::YoroScatter && m_afw_history_color != nullptr;
+    ID3D12Resource* history_color = afw_history ? m_afw_history_color.Get() : m_scatter_color[prev].Get();
+    ID3D12Resource* history_key = afw_history ? m_afw_history_key.Get() : m_scatter_key[prev].Get();
+    device->CreateUnorderedAccessView(history_color, nullptr, &scol_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 5 * m_objs.descriptor_stride});
+    device->CreateUnorderedAccessView(history_key, nullptr, &key_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 6 * m_objs.descriptor_stride});
 
     // Read-combo states that already include NON_PIXEL_SHADER_RESOURCE (e.g.
     // UEVR's ENGINE_SRC_COLOR / ENGINE_SRC_DEPTH) are readable by compute
@@ -701,6 +769,27 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     // One thread per OUTPUT pixel; each thread writes both eyes' output pixels.
     cmd_list->Dispatch(gx_out, gy_out, 1);
 
+    if (mode == Mode::YoroScatter && afw_history) {
+        const auto uav_barrier = [cmd_list](ID3D12Resource* r) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            b.UAV.pResource = r;
+            cmd_list->ResourceBarrier(1, &b);
+        };
+
+        // The fill AND the compose above have consumed the previous stash;
+        // only now overwrite it with THIS frame's raw source render for the
+        // next frame. The UAV barriers order the read-then-write on the
+        // shared history pair.
+        uav_barrier(m_afw_history_color.Get());
+        uav_barrier(m_afw_history_key.Get());
+        cmd_list->SetPipelineState(m_objs.pso_afw_stash.Get());
+        cmd_list->Dispatch(gx_out, gy_out, 1);
+        uav_barrier(m_afw_history_color.Get());
+        uav_barrier(m_afw_history_key.Get());
+        m_afw_history_valid = true;
+    }
+
     transition(cmd_list, m_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     if (depth_needs_transition) {
         transition(cmd_list, depth, shader_read, depth_state);
@@ -734,6 +823,9 @@ void DIBRSynthesis::reset() {
     m_scatter_height = 0;
     m_scatter_index = 0;
     m_scatter_history_valid = false;
+    m_afw_history_key.Reset();
+    m_afw_history_color.Reset();
+    m_afw_history_valid = false;
     m_ring_index = 0;
     m_state.store(State::NotStarted, std::memory_order_release);
 }

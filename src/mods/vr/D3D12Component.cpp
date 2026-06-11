@@ -4549,6 +4549,7 @@ struct Config {
     bool enabled{false};
     DIBRSynthesis::Mode mode{DIBRSynthesis::Mode::Yoro};
     float yoro_reference_eye{0.0f}; // 0 = left reference (synthesize right)
+    bool afw{false}; // alternate the reference eye every engine frame
     bool depth_uv_auto{true};
     std::optional<float> divergence{};
     std::optional<float> convergence{};
@@ -4612,6 +4613,11 @@ const Config& get() {
         } else if (mode == "scatter" || mode == "yoro_scatter") {
             c.mode = DIBRSynthesis::Mode::YoroScatter;
             c.yoro_reference_eye = 0.0f;
+        } else if (mode == "afw" || mode == "alternate") {
+            // AFW: scatter pipeline with the reference eye flipping every
+            // engine frame (PureDark-style Alternate Frame Warping cadence).
+            c.mode = DIBRSynthesis::Mode::YoroScatter;
+            c.afw = true;
         } else {
             SPDLOG_WARN("[DIBR] unrecognized UEVR_DIBR value '{}', defaulting to yoro (synthesize right eye)", mode);
         }
@@ -4835,10 +4841,12 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     const auto& env = dibr_config::get();
     auto mode = DIBRSynthesis::Mode::Yoro;
     float yoro_reference_eye = 0.0f;
+    bool afw = false;
 
     if (env.enabled) {
         mode = env.mode;
         yoro_reference_eye = env.yoro_reference_eye;
+        afw = env.afw;
     } else {
         // get_dibr_requested_mode also maps the "Synthetic Stereo (DIBR)"
         // rendering method with the panel combo on Off to YORO synth-right.
@@ -4861,9 +4869,58 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             mode = DIBRSynthesis::Mode::YoroScatter;
             yoro_reference_eye = 0.0f;
             break;
+        case 6: // AFW: alternate frame warping (scatter + per-frame eye flip)
+            mode = DIBRSynthesis::Mode::YoroScatter;
+            afw = true;
+            break;
         default:
             fill_right_half_mono(false); // engine may still be mid-transition out of single-view
             return; // Off
+        }
+    }
+
+    // AFW: resolve the rendered (reference) eye of the frame being presented.
+    // The authoritative source is the stereo hook's per-engine-frame view
+    // ring (captured at view-calc time, looked up by m_render_frame_count -
+    // the same counter UEVR's AFR submit path keys its eye off). Frame
+    // parity is only the fallback for ring misses (engagement transitions).
+    // UEVR_DIBR_AFW_PARITY=1 flips the fallback if a title's counter skews.
+    uint32_t afw_presented_frame = 0;
+    int32_t afw_eye_now = -1;
+    glm::quat afw_rot_now{};
+    glm::vec3 afw_loc_now{};
+    glm::vec3 afw_other_loc_now{};
+    if (afw) {
+        static const uint32_t parity_flip = []() {
+            const char* v = std::getenv("UEVR_DIBR_AFW_PARITY");
+            return (v != nullptr && v[0] == '1') ? 1u : 0u;
+        }();
+        afw_presented_frame = (uint32_t)vr->m_render_frame_count;
+        if (vr->m_fake_stereo_hook != nullptr) {
+            afw_presented_frame -= (uint32_t)vr->m_fake_stereo_hook->get_frame_delay_compensation();
+        }
+        if (vr->get_afw_view(afw_presented_frame, afw_eye_now, afw_rot_now, afw_loc_now, afw_other_loc_now)) {
+            // UEVR_DIBR_AFW_PARITY=1 also flips ring hits: if a title's
+            // pipeline is one frame deeper than the counter chain assumes,
+            // the ring hit is stale-but-valid and the eye association is
+            // systematically inverted - this is the diagnostic lever for it.
+            yoro_reference_eye = (float)(((uint32_t)afw_eye_now ^ parity_flip) & 1u);
+        } else {
+            afw_eye_now = -1;
+            yoro_reference_eye = (float)((afw_presented_frame ^ parity_flip) & 1u);
+        }
+        SPDLOG_INFO_ONCE("[DIBR] AFW active: reference eye alternates per frame (this frame: {})",
+            yoro_reference_eye > 0.5f ? "right" : "left");
+
+        // Parity forensics partner of the stereo hook's offset trace.
+        if (single_view) {
+            static std::atomic<int> s_afw_trace{0};
+            if (s_afw_trace.fetch_add(1, std::memory_order_relaxed) < 240) {
+                SPDLOG_INFO("[DIBR][AFWTRACE] synth rframe={} mframe={} iframe={} ref={} ring={}",
+                    (uint32_t)vr->m_render_frame_count, (uint32_t)vr->m_frame_count,
+                    (uint32_t)vr->get_runtime()->internal_frame_count, yoro_reference_eye,
+                    afw_eye_now >= 0 ? "hit" : "MISS");
+            }
         }
     }
 
@@ -4994,7 +5051,8 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     // view it always lands in the LEFT half regardless of which eye it
     // represents; in two-view mode the YORO reference eye owns its own half
     // (the right half when synthesizing the left eye).
-    const bool reference_is_right = mode == DIBRSynthesis::Mode::Yoro && yoro_reference_eye > 0.5f;
+    const bool reference_is_right = (mode == DIBRSynthesis::Mode::Yoro || mode == DIBRSynthesis::Mode::YoroScatter) &&
+                                    yoro_reference_eye > 0.5f;
     const uint32_t source_x = (!right_half_needs_fill && reference_is_right) ? eye_width : 0;
     stage_source(cmd_list, source_x);
 
@@ -5048,10 +5106,25 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         const auto off_l = glm::vec3{vr->get_eye_offset(VRRuntime::Eye::LEFT)};
         const auto off_r = glm::vec3{vr->get_eye_offset(VRRuntime::Eye::RIGHT)};
 
-        const float strength = env.divergence.has_value()
+        float strength = env.divergence.has_value()
             ? (*env.divergence / 30.0f)
             : (vr->m_dibr_divergence->value() / 30.0f);
-        const float ipd_ue = glm::length(off_r - off_l) * vr->get_world_to_meters() * strength * reproj_sign;
+        float baseline_sign = reproj_sign;
+        if (afw) {
+            // AFW: the warp must reproduce the engine's EXACT eye baseline -
+            // the synthesized eye alternates with a REAL render of the same
+            // eye every frame, so any baseline scale or sign deviation
+            // becomes a two-position oscillation at half refresh. Divergence
+            // and UEVR_DIBR_REPROJ_SIGN are taste knobs for the
+            // always-synthesized modes only.
+            strength = 1.0f;
+            baseline_sign = 1.0f;
+            SPDLOG_INFO_ONCE("[DIBR] AFW: warp baseline pinned to the true IPD (Divergence/REPROJ_SIGN ignored)");
+        }
+        // get_world_scale() matches the stereo hook's eye displacement
+        // (world_to_meters * world_scale); omitting it desynchronizes the
+        // warp baseline from the engine baseline whenever world scale != 1.
+        const float ipd_ue = glm::length(off_r - off_l) * vr->get_world_to_meters() * vr->get_world_scale() * strength * baseline_sign;
 
         if (ipd_ue != 0.0f) {
             const bool ref_left = yoro_reference_eye < 0.5f;
@@ -5088,7 +5161,87 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             // Engine-side motion (locomotion, animated cameras) is invisible
             // to this matrix; the fill kernel's depth validation rejects
             // history it can't explain, so it degrades to the scanline fill.
-            if (vr->is_dibr_temporal_enabled() && mode == DIBRSynthesis::Mode::YoroScatter) {
+            if (vr->is_dibr_temporal_enabled() && mode == DIBRSynthesis::Mode::YoroScatter && afw) {
+                // AFW: history is last frame's REAL render of the eye being
+                // synthesized now. Build the reprojection from the hook's
+                // captured per-frame eye cameras - the FULL camera delta
+                // (engine-side camera motion + head motion + eye offset), so
+                // history stays registered while the game camera drifts
+                // (a pure HMD-pose delta can't see engine motion and the
+                // depth validation rejects history whenever the camera
+                // moves). No motion fade either: the delta is exact for
+                // static world content; the fill's depth validation handles
+                // animated content.
+                int32_t prev_eye = -1;
+                glm::quat prev_rot{};
+                glm::vec3 prev_loc{};
+                glm::vec3 prev_other_loc{};
+                const int target_eye = ref_left ? 1 : 0;
+                if (afw_eye_now >= 0 &&
+                    vr->get_afw_view(afw_presented_frame - 1, prev_eye, prev_rot, prev_loc, prev_other_loc) &&
+                    prev_eye == target_eye) {
+                    // pose_now = the TARGET eye's camera this frame (the
+                    // hook computed it through its own transform math - the
+                    // record's other_location); pose_prev = the previous
+                    // frame's RENDERED camera, which IS the same physical
+                    // eye. Translations are remapped into the hook's quat
+                    // family with the hook's own (improper) quat_converter
+                    // quat - do not substitute the matrix, glm's mat->quat
+                    // conversion of it is a different map. fz conjugation as
+                    // in the proven mode-5 path.
+                    const glm::quat qc{Matrix4x4f{
+                        0, 0, -1, 0,
+                        1, 0, 0, 0,
+                        0, 1, 0, 0,
+                        0, 0, 0, 1}};
+                    const glm::quat qc_inv = glm::inverse(qc);
+
+                    glm::mat4 pose_now{glm::normalize(afw_rot_now)};
+                    pose_now[3] = glm::vec4{qc_inv * afw_other_loc_now, 1.0f};
+                    glm::mat4 pose_prev{glm::normalize(prev_rot)};
+                    pose_prev[3] = glm::vec4{qc_inv * prev_loc, 1.0f};
+
+                    const glm::mat4 d_raw = glm::inverse(pose_prev) * pose_now;
+                    const glm::mat4 fz = glm::scale(glm::mat4{1.0f}, glm::vec3{1.0f, 1.0f, -1.0f});
+                    const glm::mat4 d_ue = fz * d_raw * fz;
+
+                    // Forensics: the same-eye frame delta should be small and
+                    // smooth (camera drift + head sway), never IPD-sized.
+                    {
+                        static std::atomic<int> s_afw_hist_trace{0};
+                        if (s_afw_hist_trace.fetch_add(1, std::memory_order_relaxed) < 120) {
+                            const float dtrans = glm::length(glm::vec3{d_raw[3]});
+                            const float cos_half = std::clamp((d_raw[0][0] + d_raw[1][1] + d_raw[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f);
+                            SPDLOG_INFO("[DIBR][AFWTRACE] hist dtrans={:.4f} drot={:.3f}deg", dtrans, glm::degrees(std::acos(cos_half)));
+                        }
+                        // Motion trigger for the consecutive-frame dumper: the
+                        // static-pose captures are provably stable; the
+                        // reported flicker correlates with head motion, so
+                        // capture exactly then.
+                        const float dtrans = glm::length(glm::vec3{d_raw[3]});
+                        const float cos_half = std::clamp((d_raw[0][0] + d_raw[1][1] + d_raw[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f);
+                        const float drot_deg = glm::degrees(std::acos(cos_half));
+                        if (dtrans > 0.4f || drot_deg > 0.15f) {
+                            m_afw_dump_motion_trigger.store(true, std::memory_order_relaxed);
+                        }
+                    }
+
+                    // The history is the raw render, which carries the
+                    // overscan-widened projection.
+                    glm::mat4 prev_proj = proj_dst;
+                    if (overscan > 1.0f) {
+                        prev_proj[0][0] /= overscan;
+                        prev_proj[2][0] /= overscan;
+                    }
+                    const glm::mat4 hist = prev_proj * d_ue * glm::inverse(proj_dst);
+                    std::memcpy(params.reproj_target_to_prev, &hist[0][0], sizeof(params.reproj_target_to_prev));
+                    // 2.0 = AFW level: the fill uses real-render history for
+                    // holes AND the compose blends it into the whole
+                    // synthesized eye (CombinedWarping-style consistency).
+                    params.temporal_enabled = 2.0f;
+                    params.temporal_blend = vr->get_dibr_temporal_blend();
+                }
+            } else if (vr->is_dibr_temporal_enabled() && mode == DIBRSynthesis::Mode::YoroScatter) {
                 static glm::mat4 s_prev_pose{1.0f};
                 static bool s_prev_valid{false};
 
@@ -5146,6 +5299,12 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     params.out_width = eye_width;
     params.out_height = eye_height;
 
+    // AFW: the synthesis pass stashes each frame's source render (color +
+    // device depth) as the next frame's temporal-fill history - under
+    // alternation that history IS the real render of the eye being
+    // synthesized, so disocclusion holes fill with one-frame-old real pixels.
+    m_dibr.set_alternate_history(afw);
+
     // 3) Synthesize the packed SBS pair (records into the same command list).
     auto* output = m_dibr.synthesize(device, cmd_list, mode,
         m_dibr_source.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -5182,6 +5341,105 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
 
         SPDLOG_INFO_ONCE("[DIBR] first synthesized frame submitted (mode={}, {}x{} per eye)",
             static_cast<int>(mode), eye_width, eye_height);
+
+        // AFW forensics (UEVR_DIBR_AFW_DUMP=1): grab 4 CONSECUTIVE presented
+        // frames (both eyes, post-synthesis) so per-parity geometry can be
+        // measured without slow camera sway confounding seconds-apart
+        // samples. Saved to %TEMP%\uevr_afw_dump_<i>_ref<eye>_rf<frame>.ppm.
+        static const bool afw_dump_enabled = []() {
+            const char* v = std::getenv("UEVR_DIBR_AFW_DUMP");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (afw_dump_enabled && afw && single_view) {
+            constexpr uint32_t kDumpCount = 4;
+            static uint32_t s_captured = 0;
+            static Microsoft::WRL::ComPtr<ID3D12Resource> s_readback[kDumpCount];
+            static uint64_t s_row_pitch = 0;
+            static float s_ref[kDumpCount];
+            static uint32_t s_rframe[kDumpCount];
+            static bool s_saved = false;
+            // Armed by sustained head/camera motion (see the temporal block):
+            // static-pose frames measure stable; the flicker reproduces under
+            // motion, so capture exactly that condition.
+            const bool armed = m_afw_dump_motion_trigger.load(std::memory_order_relaxed);
+
+            if (armed && s_captured < kDumpCount) {
+                const auto out_desc = output->GetDesc();
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+                UINT64 total{};
+                device->GetCopyableFootprints(&out_desc, 0, 1, 0, &fp, nullptr, nullptr, &total);
+                s_row_pitch = fp.Footprint.RowPitch;
+
+                auto& rb = s_readback[s_captured];
+                if (rb == nullptr) {
+                    D3D12_HEAP_PROPERTIES hp{};
+                    hp.Type = D3D12_HEAP_TYPE_READBACK;
+                    D3D12_RESOURCE_DESC bd{};
+                    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                    bd.Width = total;
+                    bd.Height = 1;
+                    bd.DepthOrArraySize = 1;
+                    bd.MipLevels = 1;
+                    bd.SampleDesc.Count = 1;
+                    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                    device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb));
+                }
+                if (rb != nullptr) {
+                    barrier(cmd_list, output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+                    src_loc.pResource = output;
+                    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    src_loc.SubresourceIndex = 0;
+                    D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+                    dst_loc.pResource = rb.Get();
+                    dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    dst_loc.PlacedFootprint = fp;
+                    cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+                    barrier(cmd_list, output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    s_ref[s_captured] = yoro_reference_eye;
+                    s_rframe[s_captured] = afw_presented_frame;
+                    ++s_captured;
+                }
+            } else if (s_captured == kDumpCount && !s_saved) {
+                // The per-frame fence wait at the top of this function
+                // guarantees the last capture's GPU copy completed.
+                s_saved = true;
+                const auto out_desc = output->GetDesc();
+                const uint32_t w = (uint32_t)out_desc.Width;
+                const uint32_t h = out_desc.Height;
+                char temp_path[MAX_PATH]{};
+                GetTempPathA(MAX_PATH, temp_path);
+                for (uint32_t i = 0; i < kDumpCount; ++i) {
+                    if (s_readback[i] == nullptr) {
+                        continue;
+                    }
+                    uint8_t* data = nullptr;
+                    if (FAILED(s_readback[i]->Map(0, nullptr, (void**)&data)) || data == nullptr) {
+                        continue;
+                    }
+                    const auto path = fmt::format("{}uevr_afw_dump_{}_ref{}_rf{}.ppm",
+                        temp_path, i, (int)(s_ref[i] + 0.5f), s_rframe[i]);
+                    if (FILE* f = fopen(path.c_str(), "wb"); f != nullptr) {
+                        fprintf(f, "P6\n%u %u\n255\n", w, h);
+                        std::vector<uint8_t> row(w * 3);
+                        for (uint32_t y = 0; y < h; ++y) {
+                            const uint8_t* src_row = data + y * s_row_pitch;
+                            for (uint32_t x = 0; x < w; ++x) {
+                                // BGRA8 -> RGB (fmt 87 family)
+                                row[x * 3 + 0] = src_row[x * 4 + 2];
+                                row[x * 3 + 1] = src_row[x * 4 + 1];
+                                row[x * 3 + 2] = src_row[x * 4 + 0];
+                            }
+                            fwrite(row.data(), 1, row.size(), f);
+                        }
+                        fclose(f);
+                        SPDLOG_INFO("[DIBR][AFWDUMP] saved {}", path);
+                    }
+                    s_readback[i]->Unmap(0, nullptr);
+                }
+            }
+        }
     } else {
         SPDLOG_WARNING_EVERY_N_SEC(5, "[DIBR] synthesize() returned null; frame passed through");
         if (right_half_needs_fill) {

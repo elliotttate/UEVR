@@ -384,6 +384,14 @@ public:
         ID3D12Resource* depth, D3D12_RESOURCE_STATES depth_state,
         DIBRStereoParams params);
 
+    // AFW (alternate frame warping): when enabled, each synthesize() call
+    // stashes the raw source render (color + device-depth keys) into a
+    // dedicated history pair AFTER the fill pass consumed the previous stash,
+    // and the fill's temporal history binds to that pair instead of the
+    // scatter ping-pong. Under per-frame eye alternation the stash is the
+    // REAL render of the eye being synthesized next frame.
+    void set_alternate_history(bool enabled) { m_afw_mode = enabled; }
+
     // Output texture format. Default R8G8B8A8_UNORM (guaranteed typed UAV
     // store support). Changing it forces the output texture to be recreated;
     // the caller is responsible for picking a UAV-capable format.
@@ -419,6 +427,7 @@ private:
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_depth{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_color{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_fill{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_afw_stash{};
         Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap{};
         uint32_t descriptor_stride{0};
         Microsoft::WRL::ComPtr<ID3D12Resource> cbuffer{};
@@ -431,6 +440,7 @@ private:
     static bool create_rings(ID3D12Device* device, DeviceObjects& objs);
     bool ensure_output(ID3D12Device* device, uint32_t width, uint32_t height);
     bool ensure_scatter(ID3D12Device* device, uint32_t width, uint32_t height);
+    bool ensure_afw_history(ID3D12Device* device, uint32_t width, uint32_t height);
     void join_worker();
 
     static DXGI_FORMAT color_srv_format(DXGI_FORMAT f);
@@ -471,6 +481,14 @@ private:
     uint32_t m_scatter_height{0};
     uint32_t m_scatter_index{0};
     bool m_scatter_history_valid{false};
+
+    // AFW real-render history (see set_alternate_history). Single pair: the
+    // fill reads it before the stash pass overwrites it (UAV barriers order
+    // the read-then-write within the frame's command list).
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_afw_history_key{};
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_afw_history_color{};
+    bool m_afw_history_valid{false};
+    bool m_afw_mode{false};
 
     uint32_t m_ring_index{0};
     uint32_t m_frame_index{0};

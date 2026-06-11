@@ -18,7 +18,8 @@ $shaders = @(
     @{ File = 'dibr_scatter_clear.hlsl'; Name = 'dibr_scatter_clear' },
     @{ File = 'dibr_scatter_depth.hlsl'; Name = 'dibr_scatter_depth' },
     @{ File = 'dibr_scatter_color.hlsl'; Name = 'dibr_scatter_color' },
-    @{ File = 'dibr_scatter_fill.hlsl';  Name = 'dibr_scatter_fill'  }
+    @{ File = 'dibr_scatter_fill.hlsl';  Name = 'dibr_scatter_fill'  },
+    @{ File = 'dibr_afw_stash.hlsl';     Name = 'dibr_afw_stash'     }
 )
 
 $maxChunk = 12000

@@ -504,17 +504,114 @@ public:
 
     // The eye the engine's lone view represents: the DIBR reference eye, or
     // eye 0 for Mono (whose view is centered via is_dibr_mono_view_active's
-    // offset zeroing + the forced symmetric projection).
-    int32_t get_single_view_reference_eye() const {
-        return is_mono_rendering_active() ? 0 : get_dibr_reference_eye();
+    // offset zeroing + the forced symmetric projection). AFW alternates per
+    // engine frame, so callers on the game/render thread must pass the engine
+    // frame number they are working on (the stereo hook's g_frame_count) so
+    // every per-frame decision agrees on the same eye.
+    int32_t get_single_view_reference_eye(std::optional<uint32_t> engine_frame = std::nullopt) const {
+        return is_mono_rendering_active() ? 0 : get_dibr_reference_eye(engine_frame);
     }
 
     // The eye the engine renders in DIBR single-view mode (the YORO reference
     // eye): 0 = left, 1 = right. Both-eyes-synthesis modes use eye 0 with the
-    // per-eye offset zeroed (see is_dibr_mono_view_active).
-    int32_t get_dibr_reference_eye() const {
-        return get_dibr_requested_mode() == 2 ? 1 : 0;
+    // per-eye offset zeroed (see is_dibr_mono_view_active). AFW (mode 6)
+    // renders LEFT on even engine frames and RIGHT on odd ones - the
+    // PureDark-style alternate-frame cadence; the synthesis pass mirrors the
+    // same parity on the presented frame (see run_dibr_synthesis).
+    int32_t get_dibr_reference_eye(std::optional<uint32_t> engine_frame = std::nullopt) const {
+        const auto mode = get_dibr_requested_mode();
+        if (mode == 6) {
+            const auto frame = engine_frame ? *engine_frame
+                                            : (uint32_t)get_runtime()->internal_frame_count;
+            return (int32_t)(frame & 1);
+        }
+        return mode == 2 ? 1 : 0;
     }
+
+    // AFW: Alternate Frame Warping (mode 6) - single-view rendering whose
+    // reference eye flips every engine frame. Each eye receives REAL pixels
+    // every other frame and the synthesis fill can pull disocclusion data
+    // from the other eye's one-frame-old real render.
+    bool is_dibr_afw_requested() const {
+        return get_dibr_requested_mode() == 6;
+    }
+
+    // AFW per-engine-frame view records. The stereo hook stores the lone
+    // view's final eye camera (orientation in the steamvr-style quat family
+    // the hook composes poses in + UE-world location, eye offset included)
+    // keyed by engine frame; the synthesis pass looks up the frame it is
+    // presenting to get the AUTHORITATIVE rendered eye (no frame-parity
+    // arithmetic) and the exact camera delta for the temporal history
+    // (includes engine-side camera motion the HMD pose can't see).
+    struct AfwViewRecord {
+        std::atomic<uint32_t> seq{0}; // odd while the writer is mid-update
+        uint32_t frame{};
+        int32_t eye{};
+        glm::quat rotation{glm::identity<glm::quat>()};
+        glm::vec3 location{};       // the RENDERED eye's camera (UE world)
+        glm::vec3 other_location{}; // the other eye's camera through the same transform
+    };
+
+    // Record this frame's view data under the given frame key. The key must
+    // be the AUTHORITATIVE ViewFamily frame number - the same family the
+    // present-side lookup uses (it flows through enqueue_render_poses to
+    // m_render_frame_count). The BeginRenderViewFamily handler announces it
+    // via set_afw_family_frame BEFORE the family's views are calculated
+    // (measured order in UE5.7: BeginRenderViewFamily -> view calc), so the
+    // capture site reads it back with get_afw_family_frame.
+    void record_afw_view(uint32_t frame, int32_t eye, const glm::quat& rotation,
+        const glm::vec3& location, const glm::vec3& other_location) {
+        auto& r = m_afw_view_ring[frame % kAfwViewRingSize];
+        r.seq.fetch_add(1, std::memory_order_acq_rel);
+        r.frame = frame;
+        r.eye = eye;
+        r.rotation = rotation;
+        r.location = location;
+        r.other_location = other_location;
+        r.seq.fetch_add(1, std::memory_order_release);
+    }
+
+    void set_afw_family_frame(uint32_t frame) {
+        m_afw_family_frame.store(frame, std::memory_order_release);
+    }
+
+    // Authoritative frame number of the view family currently being built on
+    // the game thread; 0xFFFFFFFF until the first family announcement.
+    uint32_t get_afw_family_frame() const {
+        return m_afw_family_frame.load(std::memory_order_acquire);
+    }
+
+    bool get_afw_view(uint32_t frame, int32_t& eye, glm::quat& rotation,
+        glm::vec3& location, glm::vec3& other_location) const {
+        const auto& r = m_afw_view_ring[frame % kAfwViewRingSize];
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            const auto s0 = r.seq.load(std::memory_order_acquire);
+            if ((s0 & 1u) != 0u) {
+                continue;
+            }
+            const auto f = r.frame;
+            const auto e = r.eye;
+            const auto q = r.rotation;
+            const auto l = r.location;
+            const auto ol = r.other_location;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (r.seq.load(std::memory_order_relaxed) == s0) {
+                if (f != frame) {
+                    return false; // slot holds a different frame; no point retrying
+                }
+                eye = e;
+                rotation = q;
+                location = l;
+                other_location = ol;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static constexpr uint32_t kAfwViewRingSize = 16;
+    mutable std::array<AfwViewRecord, kAfwViewRingSize> m_afw_view_ring{};
+    std::atomic<uint32_t> m_afw_family_frame{0xFFFFFFFFu};
 
     // Render-thread notification from D3D12Component::run_dibr_synthesis on a
     // successfully synthesized frame; arms is_dibr_single_view_active.
@@ -1356,6 +1453,7 @@ private:
         "Inverse Warp (synthesize both)",
         "Raymarch (synthesize both)",
         "YORO Scatter (occlusion-exact)",
+        "AFW: Alternate Frame Warping",
     };
     static const inline std::vector<std::string> s_dibr_edge_fill_names{
         "Mirror",
