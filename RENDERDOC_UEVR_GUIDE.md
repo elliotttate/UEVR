@@ -112,6 +112,9 @@ folder, so all three compose with it:
    Steam overlay for capture sessions — `GameOverlayRenderer64.dll` is a third
    Present-hooking framework in the process.
 
+Full walkthrough with a verified Subnautica 2 (Steam) example, measured bounce
+timings, and a troubleshooting table: **`docs/RENDERDOC_STEAM_LAUNCH.md`**.
+
 Capture triggering in this mode is file-based: a request writes
 `%TEMP%\uevr_renderdoc_capture.req` (first line = capture path template,
 optional `frames=N` on later lines); the in-process watcher performs
