@@ -496,6 +496,19 @@ public:
     // Defined in VR.cpp.
     bool is_dibr_single_view_active() const;
 
+    // Same STATIC configuration as is_dibr_single_view_active (Synthetic
+    // Stereo/AFW method + a single-reference DIBR mode + view-count control,
+    // DX12, not 2D/Mono/compat) but WITHOUT the runtime proven/ready gate.
+    // The projection-override getters key off this so the lone reference is
+    // rendered at the UNION frustum from the very first update_matrices: the
+    // proven/ready flags only flip true AFTER the matrices are baked, so gating
+    // the override on them leaves the projections asymmetric forever and the
+    // synthesized eye's outer band has no source (garbled strip). Engaging on
+    // config alone is safe - the native-stereo fallback that runs until
+    // synthesis proves renders each eye at the union and the same view_bounds
+    // crop slices its true per-eye FOV back out. Defined in VR.cpp.
+    bool is_dibr_single_view_projection_configured() const;
+
     // True when the Mono rendering method is active and usable: the engine
     // renders ONE centered union-frustum view (see the projection-override
     // getters) and the D3D12 layer mirrors it flat to both eyes. This is the
@@ -1028,14 +1041,24 @@ public:
         // view both eyes can sample, with per-eye view_bounds cropping each
         // eye's true FOV out of it at submit time (see runtimes'
         // update_matrices) - so force the symmetric override while active.
-        if (is_mono_rendering_active()) {
+        // DIBR single-view (YORO/scatter/AFW) is the same situation: one
+        // rendered reference, the other eye synthesized. On a canted/asymmetric
+        // HMD the per-eye FOVs differ, so the lone reference must cover the
+        // UNION of both eyes' horizontal FOV or the synthesized eye's outer band
+        // has no source (garbled strip) while the inner band over-covers (ghost).
+        // The union frustum + per-eye view_bounds crop fixes both, and replaces
+        // the symmetric-overscan hack (which can't match an asymmetric FOV).
+        // NB: keyed off the *_configured() predicate, not is_dibr_single_view_active
+        // - the latter requires synthesis_proven/ready, which flip true only AFTER
+        // update_matrices bakes the projections, so the override would never engage.
+        if (is_mono_rendering_active() || is_dibr_single_view_projection_configured()) {
             return HORIZONTAL_SYMMETRIC;
         }
         return m_horizontal_projection_override->value();
     }
 
     int32_t get_vertical_projection_override() const {
-        if (is_mono_rendering_active()) {
+        if (is_mono_rendering_active() || is_dibr_single_view_projection_configured()) {
             return VERTICAL_SYMMETRIC;
         }
         return m_vertical_projection_override->value();

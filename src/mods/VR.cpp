@@ -2136,6 +2136,21 @@ bool VR::is_dibr_mono_view_active() const {
 }
 
 float VR::get_dibr_overscan_factor() const {
+    // The DIBR single-view path now renders the lone reference at the UNION of
+    // both eyes' FOV (HORIZONTAL_SYMMETRIC; see get_horizontal_projection_override)
+    // and crops each eye's true FOV at submit time via view_bounds - the same
+    // gearmono mechanism Mono uses. That union frustum SUPERSEDES the symmetric
+    // overscan: stacking them would render union*overscan wide while the
+    // view_bounds crop still assumes plain union, shifting the crop and
+    // reintroducing exactly the asymmetric-FOV strip/ghost we're fixing. So
+    // whenever the union override is active the overscan collapses to a no-op
+    // and the union frustum is the single coverage mechanism. (This is the only
+    // condition the legacy overscan ever ran under, since it required
+    // is_dibr_single_view_active, which is precisely what forces the union.)
+    if (get_horizontal_projection_override() == HORIZONTAL_SYMMETRIC) {
+        return 1.0f;
+    }
+
     // Env override beats the UI slider so launcher scripts keep working;
     // -1 sentinel = no env, use the slider.
     static const float env_margin = []() {
@@ -2168,6 +2183,17 @@ float VR::get_dibr_overscan_rt_factor() const {
     // reallocating the render target resets the synthesis pipeline, so a size
     // gate coupled to ready() oscillates grow->reset->shrink->reset forever.
     // Only stable configuration goes into the size decision.
+    //
+    // Union-frustum supersession (matches get_dibr_overscan_factor): once the
+    // single-view path forces the symmetric union projection, the swapchain must
+    // stay at the native per-eye width so the view_bounds crop fractions (which
+    // assume a plain-union image) line up with the rendered pixels. Growing the
+    // RT here while the warp/engine no longer overscan would spread the union
+    // across a wider target that the crop never accounts for.
+    if (get_horizontal_projection_override() == HORIZONTAL_SYMMETRIC) {
+        return 1.0f;
+    }
+
     const auto rt_mode = get_dibr_requested_mode();
     if ((rt_mode != 5 && rt_mode != 6) || !is_dibr_rendering_path_compatible() || is_mono_rendering_active()) {
         return 1.0f;
@@ -2297,6 +2323,34 @@ bool VR::is_dibr_single_view_active() const {
 
     const auto& dibr = m_d3d12.get_dibr_synthesis();
     return dibr.ready() && !dibr.failed();
+}
+
+bool VR::is_dibr_single_view_projection_configured() const {
+    // STATIC twin of is_dibr_single_view_active: identical configuration gates,
+    // but deliberately omits the m_dibr_synthesis_proven / dibr.ready() runtime
+    // gate so the projection override (union frustum) engages from the FIRST
+    // update_matrices. The proven/ready flags only become true after the engine
+    // has already baked the per-eye projections, so a proven-gated override
+    // never takes effect and the synthesized eye keeps its asymmetric-FOV strip.
+    if (get_dibr_requested_mode() == 0 || !is_dibr_rendering_path_compatible()) {
+        return false;
+    }
+
+    const auto method = m_rendering_method->value();
+    if (method != RenderingMethod::NATIVE_STEREO && method != RenderingMethod::SYNTHETIC_DIBR &&
+        method != RenderingMethod::SYNTHETIC_AFW) {
+        return false;
+    }
+
+    if (is_splitscreen_compatibility_enabled() || is_sceneview_compatibility_enabled()) {
+        return false;
+    }
+
+    if (m_fake_stereo_hook == nullptr || !m_fake_stereo_hook->has_view_count_control()) {
+        return false;
+    }
+
+    return true;
 }
 
 bool VR::is_controller_camera_conflict_guard_active() const {

@@ -207,6 +207,15 @@ struct VRRuntime {
     bool should_recalculate_eye_projections{false};
     bool is_modifying_eye_texture_scale{false};
 
+    // Last projection-override values folded into the cached eye projections.
+    // The projection cache (should_recalculate_eye_projections) is otherwise only
+    // refreshed on init / nearz change, so a runtime override flip (e.g. DIBR
+    // single-view switching to the union frustum once it engages) would never
+    // reach the matrices. update_matrices compares these and forces a recompute
+    // when the active override changes. -1 sentinel = force the first derive.
+    int32_t last_horizontal_projection_override{-1};
+    int32_t last_vertical_projection_override{-1};
+
     // factor to scale the recommended eye texture size where we're cropping due to projection overrides, but
     // want to retain the final eye texture resolution
     float eye_width_adjustment{1};

@@ -1627,6 +1627,24 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
         };
     };
 
+    // Force a projection recompute when the active projection override changes.
+    // The cached projections are otherwise frozen at whatever override was in
+    // effect when first derived; DIBR single-view engages the union frustum
+    // (HORIZONTAL_SYMMETRIC) only once its config is live, which can be after the
+    // first derive, so without this the synthesized eye keeps the asymmetric-FOV
+    // strip. get_mat reads these overrides, so any change must invalidate the cache.
+    {
+        const auto& vr_override = VR::get();
+        const int32_t h_override = vr_override->get_horizontal_projection_override();
+        const int32_t v_override = vr_override->get_vertical_projection_override();
+        if (h_override != this->last_horizontal_projection_override ||
+            v_override != this->last_vertical_projection_override) {
+            this->should_recalculate_eye_projections = true;
+            this->last_horizontal_projection_override = h_override;
+            this->last_vertical_projection_override = v_override;
+        }
+    }
+
     // if we've not yet derived an eye projection matrix, or we've changed the projection, derive it here
     // Hacky way to check for an uninitialised eye matrix - is there something better, is this necessary?
     if (this->should_recalculate_eye_projections || this->last_eye_matrix_nearz != nearz || this->projections[0][2][3] == 0) {
