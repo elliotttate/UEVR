@@ -4975,6 +4975,28 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     // self-activates when depth submission is enabled - request activation
     // ourselves (idempotent; it installs on the next engine tick).
     Microsoft::WRL::ComPtr<ID3D12Resource> depth{scene_depth};
+    D3D12_RESOURCE_STATES depth_state = ENGINE_SRC_DEPTH;
+
+    // AFW: prefer the exact-phase per-frame depth snapshot (copied inside the
+    // presented frame's own command stream at its first read-only depth
+    // bind). The present-time pool selection can pick a texture the in-flight
+    // next frame's recording has already bound - whose GPU content at our
+    // execution point is a frame stale. Same-eye-stale was benign in mode 5;
+    // under AFW BOTH neighboring frames are the OTHER eye, so any depth
+    // phase error is an IPD-scale warp misregistration. (PureDark hit the
+    // identical class with his depth/MV backups being overwritten by the
+    // next frame's DLSS pass before the warp consumed them.)
+    dibr_depth_tracker::set_afw_depth_snapshot_enabled(afw);
+    if (afw) {
+        if (auto snap = dibr_depth_tracker::get_afw_depth_snapshot(afw_presented_frame); snap != nullptr) {
+            depth = snap;
+            depth_state = D3D12_RESOURCE_STATE_COPY_DEST;
+            SPDLOG_INFO_ONCE("[DIBR] AFW: using exact-phase depth snapshots");
+        } else {
+            SPDLOG_INFO_EVERY_N_SEC(5, "[DIBR] AFW: no depth snapshot for frame {}; falling back to pool selection", afw_presented_frame);
+        }
+    }
+
     if (depth == nullptr) {
         if (auto& rt_pool = vr->get_render_target_pool_hook(); rt_pool != nullptr) {
             rt_pool->activate();
@@ -5159,7 +5181,38 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             // The target eye sits at +/-IPD along view-space X relative to the
             // source eye; world points shift the opposite way in its view.
             const float dx = ref_left ? -ipd_ue : ipd_ue;
-            const glm::mat4 t = glm::translate(glm::mat4{1.0f}, glm::vec3{dx, 0.0f, 0.0f});
+            glm::mat4 t = glm::translate(glm::mat4{1.0f}, glm::vec3{dx, 0.0f, 0.0f});
+
+            // AFW: replace the idealized pure-X baseline with the MEASURED
+            // source->target camera transform from the hook's per-frame view
+            // records (the engine's rendered eye camera and the other eye's
+            // camera through the same transform math). The pure-X model and
+            // the engine's actual eye placement agree exactly at zero head
+            // yaw - where everything was calibrated - but if their axis
+            // conventions differ at all, the true baseline acquires
+            // view-space Y/Z components with head rotation (a Z component is
+            // one eye IN FRONT of the other - the reported fore/aft pumping
+            // when looking sideways). Same fz-conjugated construction as the
+            // dump-validated temporal history matrix.
+            if (afw && afw_eye_now >= 0) {
+                const glm::quat qc{Matrix4x4f{
+                    0, 0, -1, 0,
+                    1, 0, 0, 0,
+                    0, 1, 0, 0,
+                    0, 0, 0, 1}};
+                const glm::quat qc_inv = glm::inverse(qc);
+
+                glm::mat4 pose_src{glm::normalize(afw_rot_now)};
+                pose_src[3] = glm::vec4{qc_inv * afw_loc_now, 1.0f};
+                glm::mat4 pose_dst = pose_src; // same orientation, other eye's position
+                pose_dst[3] = glm::vec4{qc_inv * afw_other_loc_now, 1.0f};
+
+                const glm::mat4 d_raw = glm::inverse(pose_dst) * pose_src; // source view -> target view
+                const glm::mat4 fz = glm::scale(glm::mat4{1.0f}, glm::vec3{1.0f, 1.0f, -1.0f});
+                t = fz * d_raw * fz;
+                SPDLOG_INFO_ONCE("[DIBR] AFW: warp baseline from measured per-frame camera pair");
+            }
+
             const glm::mat4 m = proj_dst * t * glm::inverse(proj_src);
             const glm::mat4 ident{1.0f};
 
@@ -5321,7 +5374,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     // 3) Synthesize the packed SBS pair (records into the same command list).
     auto* output = m_dibr.synthesize(device, cmd_list, mode,
         m_dibr_source.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-        depth.Get(), ENGINE_SRC_DEPTH,
+        depth.Get(), depth_state,
         params);
 
     // 4) Copy the synthesized pair back over the backbuffer so every

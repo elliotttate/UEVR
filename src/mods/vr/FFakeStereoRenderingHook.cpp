@@ -61,6 +61,7 @@
 #include "mods/UObjectHook.hpp"
 #include "mods/GameSpecific.hpp"
 #include "hooks/D3D12Hook.hpp"  // for sn2_fog_srv_map::lookup_by_gpu_va
+#include "hooks/DIBRDepthTracker.hpp" // AFW per-frame depth snapshot tagging
 #include "hooks/Sn2EyePairingHook.hpp"
 
 #include <bdshemu.h>
@@ -17812,6 +17813,9 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
     // internal_frame_count wobble from out-of-band synchronize_frame calls.
     if (vr->is_dibr_afw_requested()) {
         vr->set_afw_family_frame(frame_count);
+        // Tag the depth-snapshot machinery with the same frame so the copy
+        // recorded at this frame's depth bind is keyed to it.
+        dibr_depth_tracker::set_recording_frame(frame_count);
     }
 
     // This is a HACKHACKHACK to get splitscreen working on around 4.20 to 4.27 something

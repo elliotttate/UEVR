@@ -32095,6 +32095,9 @@ void WINAPI D3D12Hook::om_set_render_targets(
         // the bind takes effect (no-op unless an armed probe frame).
         dibr_depth_tracker::record_probe_bind(command_list, census_rtvs[0], num_render_target_descriptors,
             depth_stencil_descriptor != nullptr ? depth_stencil_descriptor->ptr : 0);
+        // AFW exact-phase depth snapshot (no-op unless AFW is active).
+        dibr_depth_tracker::record_afw_depth_bind(command_list, census_rtvs[0], num_render_target_descriptors,
+            depth_stencil_descriptor != nullptr ? depth_stencil_descriptor->ptr : 0);
     }
 
     if (is_stereo_trace_enabled()) {
@@ -32172,6 +32175,9 @@ void WINAPI D3D12Hook::begin_render_pass(
         // Pre-translucency probe: MUST record before original() opens the
         // render pass (copies are illegal inside an open pass).
         dibr_depth_tracker::record_probe_bind(command_list, census_rtvs[0], num_render_targets,
+            depth_stencil != nullptr ? depth_stencil->cpuDescriptor.ptr : 0);
+        // AFW exact-phase depth snapshot (no-op unless AFW is active).
+        dibr_depth_tracker::record_afw_depth_bind(command_list, census_rtvs[0], num_render_targets,
             depth_stencil != nullptr ? depth_stencil->cpuDescriptor.ptr : 0);
     }
 

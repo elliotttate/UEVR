@@ -73,4 +73,35 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, u
 // Diagnostic snapshot of the current candidates (extent/format/bind stats),
 // for periodic logging by the consumer.
 std::string describe_candidates();
+
+// === AFW per-frame depth snapshots ===
+// Under AFW the engine's eye alternates per frame, so a depth that is off by
+// ONE frame in either direction belongs to the OTHER eye - the present-time
+// pool selection (which can pick a texture the in-flight next frame's
+// recording has already bound, still holding stale content at our GPU
+// execution point) turns into IPD-scale warp misregistration. PureDark hit
+// the same class in his AFW: depth/MV backups taken in one pass were
+// overwritten by the next frame before the warp consumed them.
+//
+// Fix: at the FIRST qualifying read-only depth bind of each recording frame
+// (the SceneColor + read-only-DSV signature - opaque depth is complete
+// there), record a CopyResource of the depth into a small per-frame ring
+// directly inside the game's command list. GPU stream order then guarantees
+// the snapshot holds exactly that frame's opaque depth by the time the
+// present-time synthesis reads it.
+void set_afw_depth_snapshot_enabled(bool enabled);
+
+// The engine frame whose views/passes are about to be recorded (game thread,
+// BeginRenderViewFamily - same source as the AFW view-record keying).
+void set_recording_frame(uint32_t engine_frame);
+
+// Bind-site hook: call BEFORE forwarding the bind (render passes must not be
+// open around the copy). No-op unless enabled and this recording frame has
+// not been snapshotted yet.
+void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint32_t rtv_count, SIZE_T dsv);
+
+// The snapshot for an engine frame (nullptr if none). The returned texture is
+// in COPY_DEST state and remains valid until its ring slot is reused
+// (kAfwDepthSlots frames later).
+Microsoft::WRL::ComPtr<ID3D12Resource> get_afw_depth_snapshot(uint32_t engine_frame);
 } // namespace dibr_depth_tracker

@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -104,9 +105,23 @@ bool probe_enabled() {
     return enabled;
 }
 
-// The view maps feed both the census and the probe.
+// AFW depth snapshots also need the view maps (set dynamically by the
+// synthesis pass each frame, and statically from the env so views created
+// before the first present are captured when AFW is requested at launch).
+std::atomic<bool> g_afw_depth_enabled{false};
+
+bool afw_requested_via_env() {
+    static const bool requested = []() {
+        const char* v = std::getenv("UEVR_DIBR");
+        return v != nullptr && (std::strcmp(v, "afw") == 0 || std::strcmp(v, "alternate") == 0);
+    }();
+    return requested;
+}
+
+// The view maps feed the census, the probe, and the AFW depth snapshots.
 bool view_tracking_enabled() {
-    return census_enabled() || probe_enabled();
+    return census_enabled() || probe_enabled() || afw_requested_via_env() ||
+           g_afw_depth_enabled.load(std::memory_order_relaxed);
 }
 
 long long now_ms() {
@@ -608,6 +623,134 @@ void record_probe_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint32_
     slot.rtv_count = rtv_count;
     slot.dsv_flags = dsv_info.dsv_flags;
     slot.filled = true;
+}
+
+// === AFW per-frame depth snapshots (see header) ===
+namespace {
+struct AfwDepthSlot {
+    ComPtr<ID3D12Resource> texture{};
+    uint32_t frame{0xFFFFFFFFu};
+    uint64_t width{};
+    uint32_t height{};
+    DXGI_FORMAT format{};
+};
+constexpr size_t kAfwDepthSlots = 4;
+AfwDepthSlot g_afw_depth_slots[kAfwDepthSlots]{};
+std::mutex g_afw_depth_mtx{};
+// g_afw_depth_enabled lives near view_tracking_enabled (it feeds the gate).
+std::atomic<uint32_t> g_recording_frame{0xFFFFFFFFu};
+std::atomic<uint32_t> g_afw_depth_done_frame{0xFFFFFFFFu};
+} // namespace
+
+void set_afw_depth_snapshot_enabled(bool enabled) {
+    g_afw_depth_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+void set_recording_frame(uint32_t engine_frame) {
+    g_recording_frame.store(engine_frame, std::memory_order_release);
+}
+
+void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint32_t rtv_count, SIZE_T dsv) {
+    if (!g_afw_depth_enabled.load(std::memory_order_relaxed) || cmd_list == nullptr || rtv0 == 0 || dsv == 0) {
+        return;
+    }
+
+    const uint32_t frame = g_recording_frame.load(std::memory_order_acquire);
+    if (frame == 0xFFFFFFFFu || g_afw_depth_done_frame.load(std::memory_order_relaxed) == frame) {
+        return;
+    }
+
+    // Same signature as the pretrans probe: single eye-sized RGBA16F RTV
+    // (SceneColor) + READ-ONLY DSV. At this bind the opaque depth is complete
+    // - exactly the content the scatter warp wants.
+    ViewInfo rtv_info{};
+    ViewInfo dsv_info{};
+    {
+        std::scoped_lock _{g_mtx};
+        const auto rit = g_rtv_views.find(rtv0);
+        const auto dit = g_dsv_views.find(dsv);
+        if (rit == g_rtv_views.end() || dit == g_dsv_views.end()) {
+            return;
+        }
+        rtv_info = rit->second;
+        dsv_info = dit->second;
+    }
+
+    if (rtv_count != 1 || rtv_info.format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        rtv_info.width < 1024 || dsv_info.dsv_flags == 0 || dsv_info.resource == nullptr) {
+        return;
+    }
+
+    // First qualifying bind per recording frame only.
+    if (g_afw_depth_done_frame.exchange(frame, std::memory_order_relaxed) == frame) {
+        return;
+    }
+
+    ComPtr<ID3D12Device> device{};
+    if (FAILED(cmd_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
+        return;
+    }
+
+    auto* src = static_cast<ID3D12Resource*>(dsv_info.resource);
+    const auto sdesc = src->GetDesc();
+
+    std::scoped_lock _{g_afw_depth_mtx};
+    auto& slot = g_afw_depth_slots[frame % kAfwDepthSlots];
+    if (slot.texture == nullptr || slot.width != sdesc.Width || slot.height != sdesc.Height ||
+        slot.format != sdesc.Format) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = sdesc.Width;
+        desc.Height = sdesc.Height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = sdesc.Format;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(slot.texture.ReleaseAndGetAddressOf())))) {
+            slot.frame = 0xFFFFFFFFu;
+            return;
+        }
+        slot.texture->SetName(L"DIBR AFW Depth Snapshot");
+        slot.width = sdesc.Width;
+        slot.height = sdesc.Height;
+        slot.format = sdesc.Format;
+    }
+
+    // The DSV is bound READ-ONLY right after this call; UE keeps read-only
+    // depth in DEPTH_READ combined with the SRV states (it samples scene
+    // depth in the same passes).
+    constexpr D3D12_RESOURCE_STATES read_only_depth =
+        D3D12_RESOURCE_STATE_DEPTH_READ |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+    D3D12_RESOURCE_BARRIER to_copy{};
+    to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_copy.Transition.pResource = src;
+    to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_copy.Transition.StateBefore = read_only_depth;
+    to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cmd_list->ResourceBarrier(1, &to_copy);
+
+    cmd_list->CopyResource(slot.texture.Get(), src);
+
+    std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+    cmd_list->ResourceBarrier(1, &to_copy);
+
+    slot.frame = frame;
+}
+
+Microsoft::WRL::ComPtr<ID3D12Resource> get_afw_depth_snapshot(uint32_t engine_frame) {
+    std::scoped_lock _{g_afw_depth_mtx};
+    const auto& slot = g_afw_depth_slots[engine_frame % kAfwDepthSlots];
+    if (slot.frame == engine_frame && slot.texture != nullptr) {
+        return slot.texture;
+    }
+    return nullptr;
 }
 
 std::string probe_flush() {
