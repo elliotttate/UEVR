@@ -4881,10 +4881,15 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
 
     // AFW: resolve the rendered (reference) eye of the frame being presented.
     // The authoritative source is the stereo hook's per-engine-frame view
-    // ring (captured at view-calc time, looked up by m_render_frame_count -
-    // the same counter UEVR's AFR submit path keys its eye off). Frame
-    // parity is only the fallback for ring misses (engagement transitions).
-    // UEVR_DIBR_AFW_PARITY=1 flips the fallback if a title's counter skews.
+    // ring, looked up by m_render_frame_count. VERIFIED by consecutive-frame
+    // captures (2026-06-10): this keying is sub-pixel stable, while keying by
+    // the LATEST record inverts the eye on 100% of frames - the game thread
+    // runs ahead, so at present time the newest record already belongs to
+    // the NEXT frame (measured key=N+1 while presenting N: +/-80px/frame
+    // whole-image oscillation, both eyes). latest-1 is only the fallback for
+    // the window where enqueue_render_poses has not started driving the
+    // counter yet (it sits frozen pre-engagement, every lookup missing).
+    // UEVR_DIBR_AFW_PARITY=1 flips the association for per-title diagnosis.
     uint32_t afw_presented_frame = 0;
     int32_t afw_eye_now = -1;
     glm::quat afw_rot_now{};
@@ -4899,7 +4904,15 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         if (vr->m_fake_stereo_hook != nullptr) {
             afw_presented_frame -= (uint32_t)vr->m_fake_stereo_hook->get_frame_delay_compensation();
         }
-        if (vr->get_afw_view(afw_presented_frame, afw_eye_now, afw_rot_now, afw_loc_now, afw_other_loc_now)) {
+        bool afw_ring_hit = vr->get_afw_view(afw_presented_frame, afw_eye_now, afw_rot_now, afw_loc_now, afw_other_loc_now);
+        if (!afw_ring_hit) {
+            const uint32_t latest = vr->get_afw_latest_frame();
+            if (latest != 0xFFFFFFFFu && latest != 0u) {
+                afw_presented_frame = latest - 1u;
+                afw_ring_hit = vr->get_afw_view(afw_presented_frame, afw_eye_now, afw_rot_now, afw_loc_now, afw_other_loc_now);
+            }
+        }
+        if (afw_ring_hit) {
             // UEVR_DIBR_AFW_PARITY=1 also flips ring hits: if a title's
             // pipeline is one frame deeper than the counter chain assumes,
             // the ring hit is stale-but-valid and the eye association is
@@ -4916,8 +4929,8 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         if (single_view) {
             static std::atomic<int> s_afw_trace{0};
             if (s_afw_trace.fetch_add(1, std::memory_order_relaxed) < 240) {
-                SPDLOG_INFO("[DIBR][AFWTRACE] synth rframe={} mframe={} iframe={} ref={} ring={}",
-                    (uint32_t)vr->m_render_frame_count, (uint32_t)vr->m_frame_count,
+                SPDLOG_INFO("[DIBR][AFWTRACE] synth key={} rframe={} iframe={} ref={} ring={}",
+                    afw_presented_frame, (uint32_t)vr->m_render_frame_count,
                     (uint32_t)vr->get_runtime()->internal_frame_count, yoro_reference_eye,
                     afw_eye_now >= 0 ? "hit" : "MISS");
             }

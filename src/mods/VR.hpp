@@ -575,6 +575,7 @@ public:
         r.location = location;
         r.other_location = other_location;
         r.seq.fetch_add(1, std::memory_order_release);
+        m_afw_latest_frame.store(frame, std::memory_order_release);
     }
 
     void set_afw_family_frame(uint32_t frame) {
@@ -585,6 +586,19 @@ public:
     // the game thread; 0xFFFFFFFF until the first family announcement.
     uint32_t get_afw_family_frame() const {
         return m_afw_family_frame.load(std::memory_order_acquire);
+    }
+
+    // The frame number of the MOST RECENT AFW view record - i.e. the eye whose
+    // real pixels the engine just rendered into the backbuffer the synthesis
+    // pass is about to process. This is the authoritative present-side key for
+    // AFW: m_render_frame_count is only driven by enqueue_render_poses, which
+    // some titles' render paths (SN2's native-stereo single-view) never call,
+    // leaving it frozen so a frame-number lookup misses every frame and the
+    // reference eye sticks. The latest record is keyed by the same family
+    // frame the record side uses, so the lookup always hits. 0xFFFFFFFF until
+    // the first record.
+    uint32_t get_afw_latest_frame() const {
+        return m_afw_latest_frame.load(std::memory_order_acquire);
     }
 
     bool get_afw_view(uint32_t frame, int32_t& eye, glm::quat& rotation,
@@ -618,6 +632,7 @@ public:
     static constexpr uint32_t kAfwViewRingSize = 16;
     mutable std::array<AfwViewRecord, kAfwViewRingSize> m_afw_view_ring{};
     std::atomic<uint32_t> m_afw_family_frame{0xFFFFFFFFu};
+    std::atomic<uint32_t> m_afw_latest_frame{0xFFFFFFFFu};
 
     // Render-thread notification from D3D12Component::run_dibr_synthesis on a
     // successfully synthesized frame; arms is_dibr_single_view_active.
