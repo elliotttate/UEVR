@@ -257,6 +257,38 @@ private:
     // block in run_dibr_synthesis).
     int m_afw_parity_anchor{-1};
 
+    // AFW sequence-paired depth identity (see run_dibr_synthesis): each
+    // present consumes the bind hook's per-recording-frame depth-pointer
+    // sequence at a fixed offset, anchored per run by consecutive agreeing
+    // votes against the pool selection while the head is at rest (the regime
+    // where the pool is measured correct). The offset can be any magnitude -
+    // pushes start with the first qualifying scene bind while presents only
+    // count depth-found frames, so menus/loading skew the counters by
+    // hundreds. The pose memory is the previous frame's OTHER-eye camera -
+    // consecutive AFW frames alternate eyes, so at rest this frame's
+    // rendered camera matches it exactly (its own previous location differs
+    // by the IPD).
+    uint64_t m_afw_depth_present_count{0};
+    bool m_afw_depth_seq_anchored{false};
+    int64_t m_afw_depth_seq_offset{0};
+    int64_t m_afw_depth_seq_candidate{0};
+    uint32_t m_afw_depth_seq_vote_total{0};
+    uint32_t m_afw_depth_seq_disagree{0};
+    // Pushes per present (the pairing slope): SN2 binds TWO eye-sized depths
+    // with the SceneColor signature per frame (SceneDepthZ + the
+    // SingleLayerWater scene-without-water depth), so seq advances at an
+    // integer multiple of presents. 0 = not yet measured.
+    int64_t m_afw_depth_seq_stride{0};
+    uint64_t m_afw_depth_seq_ref_present{0};
+    uint64_t m_afw_depth_seq_ref_pushed{0};
+    bool m_afw_depth_seq_ref_valid{false};
+    float m_afw_prev_other_loc[3]{};
+    float m_afw_prev_rot[4]{}; // quat x,y,z,w
+    bool m_afw_prev_pose_valid{false};
+    // Per-frame rest signal from the pose memory above; gates depth-seq
+    // voting and the parity calibration's early start.
+    bool m_afw_at_rest{false};
+
     std::unique_ptr<DirectX::DX12::GraphicsMemory> m_graphics_memory{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_backbuffer_batch{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_game_batch{};

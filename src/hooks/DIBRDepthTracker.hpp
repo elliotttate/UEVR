@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <d3d12.h>
 #include <wrl.h>
@@ -104,4 +105,32 @@ void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uin
 // in COPY_DEST state and remains valid until its ring slot is reused
 // (kAfwDepthSlots frames later).
 Microsoft::WRL::ComPtr<ID3D12Resource> get_afw_depth_snapshot(uint32_t engine_frame);
+
+// === AFW sequence-paired depth identity ===
+// The depth frame-phase fix that needs NO copies and NO game-thread tag: the
+// bind hook observes each recording frame's SceneColor<->depth pairing in
+// recording order, and RDG ping-pongs SceneDepthZ between pooled textures
+// every frame - so a change of the bound depth RESOURCE between qualifying
+// binds delimits a new recording frame. Each delimited frame pushes its depth
+// pointer with a monotonically increasing sequence number; present k then
+// consumes seq k + offset, a structural pairing that stays exact under camera
+// motion (where the present-time pool heuristics measurably go one frame
+// stale = the OTHER eye's depth under AFW). The offset is anchored per run by
+// the consumer (majority vote against the at-rest pool selection - the regime
+// where the pool is measured correct). The game-thread frame tag is captured
+// per entry as a tie-breaker only: it races recording by +1, which is exactly
+// why it can never be the pairing key (the snapshot lesson).
+struct AfwDepthSeqEntry {
+    uint64_t seq{};       // monotonic recording-frame index
+    uint32_t frame_tag{}; // game-thread frame at push time (races by +1)
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource{};
+};
+
+// Enable pushing (the synthesis pass sets it while AFW is active). Disabling
+// drops the held resource references.
+void set_afw_depth_sequence_enabled(bool enabled);
+
+// Copy of the retained window, oldest first; total_pushed reports the
+// lifetime push count (== the seq the NEXT push will get).
+std::vector<AfwDepthSeqEntry> get_afw_depth_sequence(uint64_t& total_pushed);
 } // namespace dibr_depth_tracker

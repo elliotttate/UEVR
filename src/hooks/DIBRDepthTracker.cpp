@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -640,6 +641,17 @@ std::mutex g_afw_depth_mtx{};
 // g_afw_depth_enabled lives near view_tracking_enabled (it feeds the gate).
 std::atomic<uint32_t> g_recording_frame{0xFFFFFFFFu};
 std::atomic<uint32_t> g_afw_depth_done_frame{0xFFFFFFFFu};
+
+// Sequence-paired depth identity (see header): recording frames delimited by
+// the bound depth RESOURCE changing between qualifying binds (RDG ping-pongs
+// SceneDepthZ every frame; all qualifying binds within one frame share one
+// depth). Window sized well past any realistic CPU-ahead depth.
+std::atomic<bool> g_afw_seq_enabled{false};
+constexpr size_t kAfwSeqWindow = 16;
+AfwDepthSeqEntry g_afw_seq_ring[kAfwSeqWindow]{};
+uint64_t g_afw_seq_pushed{0};
+ID3D12Resource* g_afw_seq_last{nullptr};
+std::mutex g_afw_seq_mtx{};
 } // namespace
 
 void set_afw_depth_snapshot_enabled(bool enabled) {
@@ -651,12 +663,9 @@ void set_recording_frame(uint32_t engine_frame) {
 }
 
 void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint32_t rtv_count, SIZE_T dsv) {
-    if (!g_afw_depth_enabled.load(std::memory_order_relaxed) || cmd_list == nullptr || rtv0 == 0 || dsv == 0) {
-        return;
-    }
-
-    const uint32_t frame = g_recording_frame.load(std::memory_order_acquire);
-    if (frame == 0xFFFFFFFFu || g_afw_depth_done_frame.load(std::memory_order_relaxed) == frame) {
+    const bool snap_enabled = g_afw_depth_enabled.load(std::memory_order_relaxed);
+    const bool seq_enabled = g_afw_seq_enabled.load(std::memory_order_relaxed);
+    if ((!snap_enabled && !seq_enabled) || cmd_list == nullptr || rtv0 == 0 || dsv == 0) {
         return;
     }
 
@@ -678,6 +687,31 @@ void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uin
 
     if (rtv_count != 1 || rtv_info.format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
         rtv_info.width < 1024 || dsv_info.dsv_flags == 0 || dsv_info.resource == nullptr) {
+        return;
+    }
+
+    // Sequence-paired identity: one push per recording frame, delimited by
+    // the depth resource changing between qualifying binds. The frame tag is
+    // a tie-breaker for the consumer's calibration only - it races recording
+    // by +1, which is exactly why it cannot be the pairing key.
+    if (seq_enabled) {
+        auto* dres = static_cast<ID3D12Resource*>(dsv_info.resource);
+        std::scoped_lock _{g_afw_seq_mtx};
+        if (dres != g_afw_seq_last) {
+            g_afw_seq_last = dres;
+            auto& e = g_afw_seq_ring[g_afw_seq_pushed % kAfwSeqWindow];
+            e.seq = g_afw_seq_pushed++;
+            e.frame_tag = g_recording_frame.load(std::memory_order_acquire);
+            e.resource = dres;
+        }
+    }
+
+    if (!snap_enabled) {
+        return;
+    }
+
+    const uint32_t frame = g_recording_frame.load(std::memory_order_acquire);
+    if (frame == 0xFFFFFFFFu) {
         return;
     }
 
@@ -751,6 +785,31 @@ Microsoft::WRL::ComPtr<ID3D12Resource> get_afw_depth_snapshot(uint32_t engine_fr
         return slot.texture;
     }
     return nullptr;
+}
+
+void set_afw_depth_sequence_enabled(bool enabled) {
+    const bool was = g_afw_seq_enabled.exchange(enabled, std::memory_order_relaxed);
+    if (was && !enabled) {
+        // Drop the held resource references when AFW turns off.
+        std::scoped_lock _{g_afw_seq_mtx};
+        for (auto& e : g_afw_seq_ring) {
+            e = {};
+        }
+        g_afw_seq_pushed = 0;
+        g_afw_seq_last = nullptr;
+    }
+}
+
+std::vector<AfwDepthSeqEntry> get_afw_depth_sequence(uint64_t& total_pushed) {
+    std::vector<AfwDepthSeqEntry> out;
+    std::scoped_lock _{g_afw_seq_mtx};
+    total_pushed = g_afw_seq_pushed;
+    const uint64_t n = std::min<uint64_t>(g_afw_seq_pushed, kAfwSeqWindow);
+    out.reserve(static_cast<size_t>(n));
+    for (uint64_t i = g_afw_seq_pushed - n; i < g_afw_seq_pushed; ++i) {
+        out.push_back(g_afw_seq_ring[i % kAfwSeqWindow]);
+    }
+    return out;
 }
 
 std::string probe_flush() {

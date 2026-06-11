@@ -4939,6 +4939,32 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                     afw_eye_now >= 0 ? "hit" : "MISS");
             }
         }
+
+        // Rest detection, shared by the depth-seq voting and the parity
+        // calibration's early start: consecutive AFW frames alternate eyes,
+        // so at rest this frame's rendered camera coincides with the
+        // PREVIOUS frame's other-eye camera (its own previous location
+        // differs by the IPD).
+        m_afw_at_rest = false;
+        if (afw_eye_now >= 0) {
+            const glm::quat rot_now = glm::normalize(afw_rot_now);
+            if (m_afw_prev_pose_valid) {
+                const glm::vec3 prev_other{m_afw_prev_other_loc[0], m_afw_prev_other_loc[1], m_afw_prev_other_loc[2]};
+                const glm::quat prev_rot{m_afw_prev_rot[3], m_afw_prev_rot[0], m_afw_prev_rot[1], m_afw_prev_rot[2]};
+                const float dtrans = glm::length(afw_loc_now - prev_other);
+                const float qdot = std::clamp(std::fabs(glm::dot(rot_now, prev_rot)), 0.0f, 1.0f);
+                const float drot_deg = glm::degrees(2.0f * std::acos(qdot));
+                m_afw_at_rest = dtrans < 0.2f && drot_deg < 0.1f;
+            }
+            m_afw_prev_other_loc[0] = afw_other_loc_now.x;
+            m_afw_prev_other_loc[1] = afw_other_loc_now.y;
+            m_afw_prev_other_loc[2] = afw_other_loc_now.z;
+            m_afw_prev_rot[0] = rot_now.x;
+            m_afw_prev_rot[1] = rot_now.y;
+            m_afw_prev_rot[2] = rot_now.z;
+            m_afw_prev_rot[3] = rot_now.w;
+            m_afw_prev_pose_valid = true;
+        }
     }
 
     if (m_dibr.failed()) {
@@ -5026,6 +5052,148 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         depth = dibr_depth_tracker::select_scene_depth(static_cast<uint32_t>(bb_desc.Width), eye_width, eye_height);
         if (depth != nullptr) {
             SPDLOG_INFO_ONCE("[DIBR] using DSV-discovered scene depth (render-target pool unavailable)");
+        }
+    }
+
+    // AFW sequence-paired depth identity - the depth frame-phase fix. The
+    // bind hook pushes each recording frame's depth pointer with a monotonic
+    // sequence number (frames delimited by the RDG ping-pong pointer change),
+    // and present k consumes seq k + offset: a structural pairing that stays
+    // exact under camera motion, where the pool heuristics measurably go one
+    // frame stale (one frame off = the OTHER eye's depth under AFW = +/-5px
+    // alternating misregistration - the "looking at objects" jitter). The
+    // offset is anchored per run by majority vote against the pool selection
+    // while the head is at rest, the regime where the pool is measured
+    // correct (<=0.24px state offsets). Same-pointer candidates two frames
+    // apart are disambiguated by each entry's game-thread frame tag, which
+    // races by at most +1 - useless as a pairing key (the snapshot lesson),
+    // fine as a tie-breaker. UEVR_DIBR_AFW_DEPTH_SEQ=0 disables.
+    static const bool afw_depth_seq_disabled = []() {
+        const char* v = std::getenv("UEVR_DIBR_AFW_DEPTH_SEQ");
+        return v != nullptr && v[0] == '0';
+    }();
+    dibr_depth_tracker::set_afw_depth_sequence_enabled(afw && !afw_depth_seq_disabled);
+    if (afw && !afw_depth_seq_disabled && depth != nullptr && depth_state == ENGINE_SRC_DEPTH) {
+        const uint64_t present_idx = m_afw_depth_present_count++;
+        uint64_t total_pushed = 0;
+        const auto seq_window = dibr_depth_tracker::get_afw_depth_sequence(total_pushed);
+
+        // Rest signal computed once in the eye-resolution section (shared
+        // with the parity calibration's early start).
+        const bool at_rest = m_afw_at_rest;
+
+        // The pairing slope (pushes per present) must be measured before any
+        // vote means anything: a title can bind SEVERAL eye-sized depths with
+        // the SceneColor signature per frame (SN2: SceneDepthZ + the
+        // SingleLayerWater scene-without-water depth = exactly 2), and a
+        // wrong slope drifts the vote by stride-1 every frame.
+        if (!m_afw_depth_seq_ref_valid) {
+            m_afw_depth_seq_ref_present = present_idx;
+            m_afw_depth_seq_ref_pushed = total_pushed;
+            m_afw_depth_seq_ref_valid = true;
+        }
+        if (!m_afw_depth_seq_anchored) {
+            const uint64_t dp = present_idx - m_afw_depth_seq_ref_present;
+            const uint64_t dr = total_pushed - m_afw_depth_seq_ref_pushed;
+            if (dp >= 32) {
+                const double ratio = static_cast<double>(dr) / static_cast<double>(dp);
+                const int64_t stride = static_cast<int64_t>(std::llround(ratio));
+                m_afw_depth_seq_stride =
+                    (stride >= 1 && std::fabs(ratio - static_cast<double>(stride)) < 0.02) ? stride : 0;
+                if (dp >= 512) {
+                    // Slide the reference so a scene-structure change (a pass
+                    // appearing/vanishing) re-converges instead of averaging.
+                    m_afw_depth_seq_ref_present = present_idx;
+                    m_afw_depth_seq_ref_pushed = total_pushed;
+                }
+            }
+        }
+
+        if (at_rest && !seq_window.empty() && m_afw_depth_seq_stride >= 1) {
+            // Which window entry is the pool's (trusted-at-rest) pick? Window
+            // is oldest-first; <= prefers the NEWER entry on tag-distance
+            // ties, which resolves them toward the true frame (an older
+            // same-pointer entry can tie only through the +1 race).
+            int64_t vote = 0;
+            bool has_vote = false;
+            uint32_t vote_tag_dist = UINT32_MAX;
+            for (const auto& e : seq_window) {
+                if (e.resource.Get() != depth.Get()) {
+                    continue;
+                }
+                const auto tag_dist = static_cast<uint32_t>(
+                    std::llabs(static_cast<int64_t>(e.frame_tag) - static_cast<int64_t>(afw_presented_frame)));
+                if (tag_dist <= vote_tag_dist) {
+                    vote_tag_dist = tag_dist;
+                    vote = static_cast<int64_t>(e.seq) -
+                           m_afw_depth_seq_stride * static_cast<int64_t>(present_idx);
+                    has_vote = true;
+                }
+            }
+            if (has_vote) {
+                if (!m_afw_depth_seq_anchored) {
+                    // Consecutive-agreement anchoring: the structural offset
+                    // is constant, so the true vote repeats every rest frame;
+                    // any contamination (a wrong tag tie-break) resets the
+                    // run rather than polluting a histogram.
+                    if (m_afw_depth_seq_vote_total > 0 && vote == m_afw_depth_seq_candidate) {
+                        ++m_afw_depth_seq_vote_total;
+                    } else {
+                        m_afw_depth_seq_candidate = vote;
+                        m_afw_depth_seq_vote_total = 1;
+                    }
+                    if (m_afw_depth_seq_vote_total >= 24) {
+                        m_afw_depth_seq_anchored = true;
+                        m_afw_depth_seq_offset = vote;
+                        m_afw_depth_seq_disagree = 0;
+                        SPDLOG_INFO("[DIBR] AFW depth-seq anchor: stride={} offset={} ({} consecutive rest votes, present={}, pushed={})",
+                            m_afw_depth_seq_stride, m_afw_depth_seq_offset, m_afw_depth_seq_vote_total, present_idx, total_pushed);
+                    }
+                } else if (vote != m_afw_depth_seq_offset) {
+                    // Sustained at-rest disagreement = the pairing slipped (a
+                    // scene-structure change altered the stride, or presents
+                    // and pushes diverged through a menu/loading stall). Drop
+                    // back to the pool and re-calibrate rather than warp with
+                    // wrong-phase depth forever.
+                    if (++m_afw_depth_seq_disagree >= 90) {
+                        SPDLOG_WARN("[DIBR] AFW depth-seq offset {} invalidated after {} disagreeing rest votes; re-calibrating",
+                            m_afw_depth_seq_offset, m_afw_depth_seq_disagree);
+                        m_afw_depth_seq_anchored = false;
+                        m_afw_depth_seq_vote_total = 0;
+                        m_afw_depth_seq_disagree = 0;
+                        m_afw_depth_seq_ref_present = present_idx;
+                        m_afw_depth_seq_ref_pushed = total_pushed;
+                    }
+                } else {
+                    m_afw_depth_seq_disagree = 0;
+                }
+            }
+        }
+
+        if (!m_afw_depth_seq_anchored) {
+            SPDLOG_INFO_EVERY_N_SEC(5, "[DIBR] AFW depth-seq calibrating: stride={} candidate={} votes={} present={} pushed={} window={} rest={}",
+                m_afw_depth_seq_stride, m_afw_depth_seq_candidate, m_afw_depth_seq_vote_total, present_idx, total_pushed,
+                seq_window.size(), at_rest ? 1 : 0);
+        }
+
+        if (m_afw_depth_seq_anchored) {
+            const int64_t want = m_afw_depth_seq_stride * static_cast<int64_t>(present_idx) + m_afw_depth_seq_offset;
+            const dibr_depth_tracker::AfwDepthSeqEntry* hit = nullptr;
+            for (const auto& e : seq_window) {
+                if (static_cast<int64_t>(e.seq) == want) {
+                    hit = &e;
+                    break;
+                }
+            }
+            if (hit != nullptr && hit->resource != nullptr) {
+                depth = hit->resource;
+                SPDLOG_INFO_ONCE("[DIBR] AFW: sequence-paired depth active");
+            } else {
+                SPDLOG_INFO_EVERY_N_SEC(5, "[DIBR] AFW depth-seq miss: want={} window=[{}..{}] (pool fallback this frame)",
+                    want,
+                    seq_window.empty() ? 0 : static_cast<int64_t>(seq_window.front().seq),
+                    seq_window.empty() ? 0 : static_cast<int64_t>(seq_window.back().seq));
+            }
         }
     }
 
@@ -5442,12 +5610,25 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         // (sync timing shifts the offset run to run), so this is measured
         // from the pixels every run instead of trusted from any counter.
         if (afw && single_view && m_afw_parity_anchor < 0) {
-            constexpr uint32_t kCalibStart = 240; // post-engagement, scene settled
+            // Until both anchors land the run is visibly wrong (possibly
+            // inverted eyes), so start as early as the signal allows: from
+            // frame 60 post-engagement at the FIRST at-rest frame (engagement
+            // settle motion would contaminate the consecutive-frame shift
+            // measurement), falling back to an unconditional start at 240
+            // (the original schedule) if rest never registers.
+            constexpr uint32_t kCalibMin = 60;
+            constexpr uint32_t kCalibForce = 240;
+            static uint32_t s_calib_start = 0;
             static uint32_t s_calib_counter = 0;
             static Microsoft::WRL::ComPtr<ID3D12Resource> s_calib_rb[2];
             static uint64_t s_calib_pitch = 0;
             static uint32_t s_calib_have = 0;
             ++s_calib_counter;
+            if (s_calib_start == 0 && s_calib_counter >= kCalibMin &&
+                (m_afw_at_rest || s_calib_counter >= kCalibForce)) {
+                s_calib_start = s_calib_counter;
+            }
+            const uint32_t kCalibStart = s_calib_start; // 0 = not yet scheduled
 
             const auto capture_to = [&](uint32_t slot) {
                 const auto out_desc = output->GetDesc();
@@ -5487,7 +5668,9 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                 return true;
             };
 
-            if (s_calib_counter == kCalibStart || s_calib_counter == kCalibStart + 1) {
+            if (kCalibStart == 0) {
+                // waiting for the first at-rest frame past kCalibMin
+            } else if (s_calib_counter == kCalibStart || s_calib_counter == kCalibStart + 1) {
                 if (capture_to(s_calib_counter - kCalibStart)) {
                     ++s_calib_have;
                 }
@@ -5549,7 +5732,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                 }
                 s_calib_rb[0].Reset();
                 s_calib_rb[1].Reset();
-            } else if (s_calib_counter > kCalibStart + 10) {
+            } else if (kCalibStart != 0 && s_calib_counter > kCalibStart + 10) {
                 m_afw_parity_anchor = 0; // captures never landed; assume aligned
             }
         }
@@ -5569,13 +5752,22 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             static uint64_t s_row_pitch = 0;
             static float s_ref[kDumpCount];
             static uint32_t s_rframe[kDumpCount];
-            static bool s_saved = false;
+            static bool s_capturing = false;
+            static uint32_t s_round = 0;
+            static uint64_t s_next_arm_ms = 0;
             // Armed by sustained head/camera motion (see the temporal block):
             // static-pose frames measure stable; the flicker reproduces under
-            // motion, so capture exactly that condition.
-            const bool armed = m_afw_dump_motion_trigger.load(std::memory_order_relaxed);
+            // motion, so capture exactly that condition. RE-ARMABLE: each
+            // motion event past a cooldown captures a fresh round-numbered
+            // 4-frame burst - the FIRST trigger of a run is the spawn settle
+            // (a one-frame teleport spike followed by rest frames), never the
+            // motion under test.
+            const bool triggered = m_afw_dump_motion_trigger.exchange(false, std::memory_order_relaxed);
+            if (!s_capturing && triggered && GetTickCount64() >= s_next_arm_ms) {
+                s_capturing = true;
+            }
 
-            if (armed && s_captured < kDumpCount) {
+            if (s_capturing && s_captured < kDumpCount) {
                 const auto out_desc = output->GetDesc();
                 D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
                 UINT64 total{};
@@ -5613,10 +5805,9 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                     s_rframe[s_captured] = afw_presented_frame;
                     ++s_captured;
                 }
-            } else if (s_captured == kDumpCount && !s_saved) {
+            } else if (s_captured == kDumpCount) {
                 // The per-frame fence wait at the top of this function
                 // guarantees the last capture's GPU copy completed.
-                s_saved = true;
                 const auto out_desc = output->GetDesc();
                 const uint32_t w = (uint32_t)out_desc.Width;
                 const uint32_t h = out_desc.Height;
@@ -5630,8 +5821,8 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                     if (FAILED(s_readback[i]->Map(0, nullptr, (void**)&data)) || data == nullptr) {
                         continue;
                     }
-                    const auto path = fmt::format("{}uevr_afw_dump_{}_ref{}_rf{}.ppm",
-                        temp_path, i, (int)(s_ref[i] + 0.5f), s_rframe[i]);
+                    const auto path = fmt::format("{}uevr_afw_dump_r{}_{}_ref{}_rf{}.ppm",
+                        temp_path, s_round, i, (int)(s_ref[i] + 0.5f), s_rframe[i]);
                     if (FILE* f = fopen(path.c_str(), "wb"); f != nullptr) {
                         fprintf(f, "P6\n%u %u\n255\n", w, h);
                         std::vector<uint8_t> row(w * 3);
@@ -5650,6 +5841,10 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                     }
                     s_readback[i]->Unmap(0, nullptr);
                 }
+                ++s_round;
+                s_captured = 0;
+                s_capturing = false;
+                s_next_arm_ms = GetTickCount64() + 5000;
             }
         }
     } else {
