@@ -92,6 +92,26 @@ and only then resumes the main thread. No race, no late-attach, every object
 wrapped from frame zero (the status report shows `wrapped=true
 vtable_module=renderdoc.dll` for present-time objects).
 
+**Steam titles** exit and relaunch through Steam when started directly
+(`SteamAPI_RestartAppIfNecessary`), which discards the launcher's injection.
+With Steam running, any of these defeats the bounce — the launcher's child
+inherits its environment and defaults the working directory to the exe's
+folder, so all three compose with it:
+
+1. `steam_appid.txt` containing just the AppID, placed next to the shipping
+   exe; launch as normal.
+2. `SteamAppId`/`SteamGameId` env vars set in the shell before running the
+   launcher.
+3. Steam Launch Options:
+   `"<path>\UEVRRenderDocLauncher.exe" --exe "<shipping exe>" -- %command%` —
+   Steam starts the launcher in full Steam context. Keep the explicit `--exe`
+   aimed at the *shipping* exe: `%command%` often points at a root bootstrap
+   stub that respawns the real game, and injecting into the stub captures
+   nothing (the launcher does not follow children). The `-- %command%` tail
+   absorbs Steam's substitution as a harmless extra game argument. Disable the
+   Steam overlay for capture sessions — `GameOverlayRenderer64.dll` is a third
+   Present-hooking framework in the process.
+
 Capture triggering in this mode is file-based: a request writes
 `%TEMP%\uevr_renderdoc_capture.req` (first line = capture path template,
 optional `frames=N` on later lines); the in-process watcher performs
