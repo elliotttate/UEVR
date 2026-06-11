@@ -250,6 +250,13 @@ private:
     // threshold; arms the consecutive-frame dumper (UEVR_DIBR_AFW_DUMP=1).
     std::atomic<bool> m_afw_dump_motion_trigger{false};
 
+    // AFW per-run parity anchor, measured from the pixels at engagement:
+    // -1 = uncalibrated, 0 = counters aligned, 1 = inverted (flip the ring
+    // eye). The record<->present counter alignment is nondeterministic per
+    // launch, so no static convention can be trusted (see the calibration
+    // block in run_dibr_synthesis).
+    int m_afw_parity_anchor{-1};
+
     std::unique_ptr<DirectX::DX12::GraphicsMemory> m_graphics_memory{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_backbuffer_batch{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_game_batch{};

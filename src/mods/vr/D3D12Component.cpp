@@ -4913,14 +4913,18 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             }
         }
         if (afw_ring_hit) {
-            // UEVR_DIBR_AFW_PARITY=1 also flips ring hits: if a title's
-            // pipeline is one frame deeper than the counter chain assumes,
-            // the ring hit is stale-but-valid and the eye association is
-            // systematically inverted - this is the diagnostic lever for it.
+            // Self-calibrated parity anchor (see the calibration block after
+            // synthesis): the counter chain's record<->present alignment is
+            // NONDETERMINISTIC per launch (sync timing shifts the offset), so
+            // the anchor is measured from the pixels each run. The env flip
+            // remains as a manual override on top.
+            if (m_afw_parity_anchor == 1) {
+                afw_eye_now ^= 1;
+            }
             yoro_reference_eye = (float)(((uint32_t)afw_eye_now ^ parity_flip) & 1u);
         } else {
             afw_eye_now = -1;
-            yoro_reference_eye = (float)((afw_presented_frame ^ parity_flip) & 1u);
+            yoro_reference_eye = (float)((afw_presented_frame ^ (m_afw_parity_anchor == 1 ? 1u : 0u) ^ parity_flip) & 1u);
         }
         SPDLOG_INFO_ONCE("[DIBR] AFW active: reference eye alternates per frame (this frame: {})",
             yoro_reference_eye > 0.5f ? "right" : "left");
@@ -5260,9 +5264,12 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                 glm::vec3 prev_loc{};
                 glm::vec3 prev_other_loc{};
                 const int target_eye = ref_left ? 1 : 0;
-                if (afw_eye_now >= 0 &&
-                    vr->get_afw_view(afw_presented_frame - 1, prev_eye, prev_rot, prev_loc, prev_other_loc) &&
-                    prev_eye == target_eye) {
+                bool prev_ok = afw_eye_now >= 0 &&
+                    vr->get_afw_view(afw_presented_frame - 1, prev_eye, prev_rot, prev_loc, prev_other_loc);
+                if (prev_ok && m_afw_parity_anchor == 1) {
+                    prev_eye ^= 1; // uniform label correction (see anchor)
+                }
+                if (prev_ok && prev_eye == target_eye) {
                     // pose_now = the TARGET eye's camera this frame (the
                     // hook computed it through its own transform math - the
                     // record's other_location); pose_prev = the previous
@@ -5424,6 +5431,128 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
 
         SPDLOG_INFO_ONCE("[DIBR] first synthesized frame submitted (mode={}, {}x{} per eye)",
             static_cast<int>(mode), eye_width, eye_height);
+
+        // AFW parity self-calibration: capture two CONSECUTIVE presented
+        // frames at engagement and measure the per-eye-half shift between
+        // them. Under a CORRECT eye association, frame N's synthesized eye
+        // and frame N+1's real render of the same eye share a viewpoint
+        // (shift ~0); under an inverted association each half jumps by two
+        // disparities (tens of px). The counter alignment between the view
+        // records and the presented frame is nondeterministic per launch
+        // (sync timing shifts the offset run to run), so this is measured
+        // from the pixels every run instead of trusted from any counter.
+        if (afw && single_view && m_afw_parity_anchor < 0) {
+            constexpr uint32_t kCalibStart = 240; // post-engagement, scene settled
+            static uint32_t s_calib_counter = 0;
+            static Microsoft::WRL::ComPtr<ID3D12Resource> s_calib_rb[2];
+            static uint64_t s_calib_pitch = 0;
+            static uint32_t s_calib_have = 0;
+            ++s_calib_counter;
+
+            const auto capture_to = [&](uint32_t slot) {
+                const auto out_desc = output->GetDesc();
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+                UINT64 total{};
+                device->GetCopyableFootprints(&out_desc, 0, 1, 0, &fp, nullptr, nullptr, &total);
+                s_calib_pitch = fp.Footprint.RowPitch;
+                auto& rb = s_calib_rb[slot];
+                if (rb == nullptr) {
+                    D3D12_HEAP_PROPERTIES hp{};
+                    hp.Type = D3D12_HEAP_TYPE_READBACK;
+                    D3D12_RESOURCE_DESC bd{};
+                    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                    bd.Width = total;
+                    bd.Height = 1;
+                    bd.DepthOrArraySize = 1;
+                    bd.MipLevels = 1;
+                    bd.SampleDesc.Count = 1;
+                    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                    device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb));
+                }
+                if (rb == nullptr) {
+                    return false;
+                }
+                barrier(cmd_list, output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION src_loc{};
+                src_loc.pResource = output;
+                src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                src_loc.SubresourceIndex = 0;
+                D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+                dst_loc.pResource = rb.Get();
+                dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                dst_loc.PlacedFootprint = fp;
+                cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+                barrier(cmd_list, output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+                return true;
+            };
+
+            if (s_calib_counter == kCalibStart || s_calib_counter == kCalibStart + 1) {
+                if (capture_to(s_calib_counter - kCalibStart)) {
+                    ++s_calib_have;
+                }
+            } else if (s_calib_counter == kCalibStart + 3 && s_calib_have == 2) {
+                // Both captures' GPU copies completed (the per-frame fence
+                // wait at the top of this function covers the second one two
+                // presents ago).
+                uint8_t* p0 = nullptr;
+                uint8_t* p1 = nullptr;
+                if (SUCCEEDED(s_calib_rb[0]->Map(0, nullptr, (void**)&p0)) &&
+                    SUCCEEDED(s_calib_rb[1]->Map(0, nullptr, (void**)&p1)) && p0 && p1) {
+                    const auto out_desc = output->GetDesc();
+                    const int w = (int)out_desc.Width;   // double-wide
+                    const int h = (int)out_desc.Height;
+                    const int half = w / 2;
+                    // Per half: integer SAD argmin over +/-60 px on a
+                    // downsampled luma band.
+                    const auto half_shift = [&](int x0) {
+                        constexpr int kMax = 60;
+                        const int y0 = h / 4, y1 = h * 3 / 4, ystep = 6;
+                        const int xa = x0 + kMax, xb = x0 + half - kMax;
+                        double best = 1e30;
+                        int best_s = 0;
+                        for (int s = -kMax; s <= kMax; s += 2) {
+                            double acc = 0.0;
+                            int n = 0;
+                            for (int y = y0; y < y1; y += ystep) {
+                                const uint8_t* r0 = p0 + (size_t)y * s_calib_pitch;
+                                const uint8_t* r1 = p1 + (size_t)y * s_calib_pitch;
+                                for (int x = xa; x < xb; x += 4) {
+                                    const uint8_t* a = r0 + (size_t)(x + s) * 4;
+                                    const uint8_t* b = r1 + (size_t)x * 4;
+                                    acc += std::abs((int)a[0] - (int)b[0]) + std::abs((int)a[1] - (int)b[1]) + std::abs((int)a[2] - (int)b[2]);
+                                    ++n;
+                                }
+                            }
+                            if (n > 0) {
+                                acc /= n;
+                                if (acc < best) {
+                                    best = acc;
+                                    best_s = s;
+                                }
+                            }
+                        }
+                        return best_s;
+                    };
+                    const int s_left = half_shift(0);
+                    const int s_right = half_shift(half);
+                    const int metric = (std::max)(std::abs(s_left), std::abs(s_right));
+                    m_afw_parity_anchor = metric > 8 ? 1 : 0;
+                    SPDLOG_INFO("[DIBR] AFW parity calibration: consecutive-frame half shifts L={} R={} -> anchor={} ({})",
+                        s_left, s_right, m_afw_parity_anchor,
+                        m_afw_parity_anchor == 1 ? "counter alignment INVERTED this run; flipping eye labels" : "aligned");
+                    s_calib_rb[0]->Unmap(0, nullptr);
+                    s_calib_rb[1]->Unmap(0, nullptr);
+                } else {
+                    m_afw_parity_anchor = 0;
+                    SPDLOG_WARN("[DIBR] AFW parity calibration readback failed; assuming aligned");
+                }
+                s_calib_rb[0].Reset();
+                s_calib_rb[1].Reset();
+            } else if (s_calib_counter > kCalibStart + 10) {
+                m_afw_parity_anchor = 0; // captures never landed; assume aligned
+            }
+        }
 
         // AFW forensics (UEVR_DIBR_AFW_DUMP=1): grab 4 CONSECUTIVE presented
         // frames (both eyes, post-synthesis) so per-parity geometry can be
