@@ -7378,7 +7378,7 @@ inline std::string dibr_scatter_color_source() {
     return out;
 }
 
-// dibr_scatter_fill.hlsl (33101 bytes, 3 chunks)
+// dibr_scatter_fill.hlsl (33811 bytes, 3 chunks)
 inline const char* const g_dibr_scatter_fill_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7721,9 +7721,39 @@ float SynthEyeSign()
     return (mode_param0 < 0.5f) ? -1.0f : 1.0f;
 }
 
-// Average a short run of covered BACKGROUND pixels starting at a scanline
+// A neighborhood-probe hit must be SOLID: backed by a same-depth covered
 )DIBR",
-R"DIBR(// neighbour and stepping `dir` further AWAY from the hole (always into
+R"DIBR(// texel one step further from the hole. The silhouette-stretch zone scatters
+// ISOLATED occluder samples into reveal bands; trusting a stray as a "side"
+// misclassified reveals as interior/same-surface gaps and smeared occluder
+// color across them - starving the history paths that hold the real
+// content. Strays fail this test and the probe walks on.
+bool SolidCoverage(int2 p, int2 away, out uint key)
+{
+    key = 0u;
+    uint k = g_scatterKey[uint2(p)];
+    if (k == 0u || (k & 0x80000000u) != 0u || g_scatterColor[uint2(p)].a <= 0.5f) {
+        return false;
+    }
+    int2 p2 = p + away;
+    if (p2.x < 0 || p2.x >= (int)synth_width || p2.y < 0 || p2.y >= (int)synth_height) {
+        key = k; // image edge backs the sample
+        return true;
+    }
+    uint k2 = g_scatterKey[uint2(p2)];
+    if (k2 == 0u || (k2 & 0x80000000u) != 0u || g_scatterColor[uint2(p2)].a <= 0.5f) {
+        return false;
+    }
+    float d = asfloat(k & 0x7FFFFFFFu);
+    if (abs(asfloat(k2 & 0x7FFFFFFFu) - d) > max(0.10f * d, 1e-3f)) {
+        return false;
+    }
+    key = k;
+    return true;
+}
+
+// Average a short run of covered BACKGROUND pixels starting at a scanline
+// neighbour and stepping `dir` further AWAY from the hole (always into
 // already-covered territory). This dilutes the anti-aliased occluder-edge
 // pixel - the colour that otherwise smears across the reveal - and lowers the
 // per-row colour variance that reads as a "shredded" band. The run stops the
@@ -7773,17 +7803,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         for (int s = 1; s <= 12 && (xl < 0 || xr < 0); ++s) {
             if (xl < 0) {
                 int x = (int)dtid.x - s;
-                if (x >= 0) {
-                    uint k = g_scatterKey[uint2(x, dtid.y)];
-                    if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { xl = x; kl = k; }
-                }
+                uint k;
+                if (x >= 0 && SolidCoverage(int2(x, dtid.y), int2(-1, 0), k)) { xl = x; kl = k; }
             }
             if (xr < 0) {
                 int x = (int)dtid.x + s;
-                if (x < (int)synth_width) {
-                    uint k = g_scatterKey[uint2(x, dtid.y)];
-                    if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { xr = x; kr = k; }
-                }
+                uint k;
+                if (x < (int)synth_width && SolidCoverage(int2(x, dtid.y), int2(1, 0), k)) { xr = x; kr = k; }
             }
         }
     }
@@ -7858,17 +7884,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         for (int s = 1; s <= 8 && (yu < 0 || yd < 0); ++s) {
             if (yu < 0) {
                 int yy = (int)dtid.y - s;
-                if (yy >= 0) {
-                    uint k = g_scatterKey[uint2(dtid.x, yy)];
-                    if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(dtid.x, yy)].a > 0.5f) { yu = yy; ku = k; }
-                }
+                uint k;
+                if (yy >= 0 && SolidCoverage(int2(dtid.x, yy), int2(0, -1), k)) { yu = yy; ku = k; }
             }
             if (yd < 0) {
                 int yy = (int)dtid.y + s;
-                if (yy < (int)synth_height) {
-                    uint k = g_scatterKey[uint2(dtid.x, yy)];
-                    if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(dtid.x, yy)].a > 0.5f) { yd = yy; kd = k; }
-                }
+                uint k;
+                if (yy < (int)synth_height && SolidCoverage(int2(dtid.x, yy), int2(0, 1), k)) { yd = yy; kd = k; }
             }
         }
         if (yu >= 0 && yd >= 0) {
@@ -7942,7 +7964,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         }
     }
 
-    if (!haveFallback) {
+)DIBR",
+R"DIBR(    if (!haveFallback) {
         if (bx >= 0) {
             // Average a short run a few pixels INTO the background (stepping
             // away from the hole) instead of copying the single hole-edge
@@ -7958,8 +7981,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         }
     }
 
-)DIBR",
-R"DIBR(    // R3 temporal reuse: reproject this hole into LAST frame's synthesized eye
+    // R3 temporal reuse: reproject this hole into LAST frame's synthesized eye
     // (camera-delta matrix) and EMA-blend its content in when the stored depth
     // agrees. The fill pass commits its keys (marker bit, below), so a
     // persistent disocclusion band carries a valid history key and the blend
