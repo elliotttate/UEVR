@@ -408,6 +408,13 @@ void configure_default_options() {
     g_api->SetCaptureOptionU32(eRENDERDOC_Option_CaptureAllCmdLists, 1);
     g_api->SetCaptureOptionU32(eRENDERDOC_Option_DebugOutputMute, 1);
 
+    // Allow NVIDIA (PCI vendor 0x10DE) vendor extensions through capture so
+    // NVAPI-using titles don't crash or lose state under RenderDoc. The header
+    // documents no values; 0x10DE is the vendor-ID byte-value RenderDoc's NV
+    // path expects. Replays of captures using these extensions may be
+    // corrupted on non-NVIDIA replay machines — acceptable for our use.
+    g_api->SetCaptureOptionU32(eRENDERDOC_Option_AllowUnsupportedVendorExtensions, 0x10DE);
+
     // Keep all resources (including transient/aliased ones that RDG recycles
     // per-frame) alive inside the capture so that froxel/scene-color buffers
     // are inspectable. Without this flag, RenderDoc may drop references to
