@@ -173,14 +173,17 @@ void record_dsv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor
         vi.dsv_flags = (view_desc != nullptr) ? static_cast<uint32_t>(view_desc->Flags) : 0u;
     }
 
-    // vrmod depth_select rejects: multi-sampled, square aspect (shadow atlas /
-    // cube face), and tiny surfaces.
+    // vrmod depth_select rejects: multi-sampled, EXACTLY square targets, and
+    // tiny surfaces. Shadow atlases and cube faces are exactly square; the
+    // previous +/-5% aspect BAND also swallowed Quest 3's near-square
+    // 1680x1760 single-view eye depth -> zero candidates -> the warp fell
+    // back to a frame-stale depth copy, which under AFW alternation is the
+    // OTHER eye's depth = whole-image two-position oscillation.
     if (desc.SampleDesc.Count > 1 || desc.Width < 256 || desc.Height < 256) {
         return;
     }
 
-    const float aspect = static_cast<float>(desc.Width) / static_cast<float>(desc.Height);
-    if (std::fabs(aspect - 1.0f) < 0.05f) {
+    if (desc.Width == desc.Height) {
         return;
     }
 
