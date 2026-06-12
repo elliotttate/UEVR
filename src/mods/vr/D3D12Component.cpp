@@ -4928,6 +4928,83 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         if (vr->m_fake_stereo_hook != nullptr) {
             afw_presented_frame -= (uint32_t)vr->m_fake_stereo_hook->get_frame_delay_compensation();
         }
+
+        // Fused keying: the raw counter is sampled cross-thread and jitters
+        // +/-1 around the truly-presented frame under load - observed as
+        // key_d=2,0 pairs about once a second on SN2's menu, each mislabeling
+        // the source eye for exactly one present. Consecutive AFW frames are
+        // OPPOSITE eyes, so that single mislabel is a whole-image IPD flip.
+        // The RHI-side recorded-frame stream (depth-seq pushes) jitters too,
+        // but INDEPENDENTLY: either signal reporting "advanced by 1" confirms
+        // normal pacing; both agreeing on an anomaly makes it real (pause:
+        // both 0; load skip: both 2+). Gross divergence resyncs to the
+        // counter, and a dead seq stream degrades to raw-counter behavior.
+        {
+            const uint32_t raw_key = afw_presented_frame;
+            uint64_t pushed_now = 0;
+            (void)dibr_depth_tracker::get_afw_depth_sequence(pushed_now);
+            const int64_t stride = m_afw_depth_seq_stride;
+            static uint32_t s_fuse_prev_raw = 0;
+            static uint64_t s_fuse_prev_pushed = 0;
+            static uint32_t s_fuse_key = 0;
+            static bool s_fuse_valid = false;
+            if (!s_fuse_valid) {
+                s_fuse_key = raw_key;
+                s_fuse_valid = true;
+            } else {
+                const int32_t raw_d = (int32_t)(raw_key - s_fuse_prev_raw);
+                int32_t push_frames = -1; // unknown (seq dead or stride unmeasured)
+                if (stride >= 1 && pushed_now >= s_fuse_prev_pushed) {
+                    const int64_t pd = (int64_t)(pushed_now - s_fuse_prev_pushed);
+                    push_frames = (int32_t)((pd + stride / 2) / stride);
+                }
+                int32_t advance = raw_d;
+                if (push_frames >= 0) {
+                    if (raw_d == 1 || push_frames == 1) {
+                        advance = 1;
+                    } else if (raw_d == push_frames) {
+                        advance = raw_d; // both sources agree: real skip/stall
+                    } else {
+                        advance = 1; // disagreement = independent jitter
+                    }
+                }
+                if (advance < 0) {
+                    advance = 0;
+                }
+                s_fuse_key += (uint32_t)advance;
+                const int32_t drift = (int32_t)(raw_key - s_fuse_key);
+                if (drift <= -3 || drift >= 3) {
+                    s_fuse_key = raw_key; // real divergence: counter is authoritative
+                }
+                // Log only actual correction events (the absorbed jitter edge),
+                // not every frame of a steady +/-1 counter lead - the (2,0)
+                // pairs arrive every few frames on SN2's menu and a per-frame
+                // line would dominate the log.
+                if (advance != raw_d && push_frames >= 0) {
+                    SPDLOG_INFO_EVERY_N_SEC(5, "[DIBR][AFWANOM] jitter absorbed: raw={} fused={} raw_d={} push_frames={} stride={}",
+                        raw_key, s_fuse_key, raw_d, push_frames, stride);
+                }
+            }
+            s_fuse_prev_raw = raw_key;
+            s_fuse_prev_pushed = pushed_now;
+            afw_presented_frame = s_fuse_key;
+
+            // Bind-chain liveness watchdog: with AFW running, the SceneColor
+            // signature should push every frame. A dead stream after the
+            // grace period is the warm-boot descriptor race (scene targets
+            // created before the device hooks installed - unresolvable at
+            // bind time); ask the game thread for a render-target recreation
+            // so the descriptors are re-observed.
+            static uint32_t s_health_presents = 0;
+            ++s_health_presents;
+            if (pushed_now == 0 && s_health_presents % 900 == 0) {
+                SPDLOG_WARN("[DIBR] AFW bind-signature chain dead after {} presents; requesting render-target recreate ({})",
+                    s_health_presents, dibr_depth_tracker::bind_health_report());
+                vr->request_dibr_rt_recreate();
+            }
+            SPDLOG_INFO_EVERY_N_SEC(10, "[DIBR][bindhealth] {}", dibr_depth_tracker::bind_health_report());
+        }
+
         bool afw_ring_hit = vr->get_afw_view(afw_presented_frame, afw_eye_now, afw_rot_now, afw_loc_now, afw_other_loc_now);
         if (!afw_ring_hit) {
             const uint32_t latest = vr->get_afw_latest_frame();
@@ -4962,6 +5039,13 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                     (uint32_t)vr->get_runtime()->internal_frame_count, yoro_reference_eye,
                     afw_eye_now >= 0 ? "hit" : "MISS");
             }
+        }
+
+        // Ring misses still get their own line - the fusion trace above only
+        // sees counter/seq pacing, not lookup health.
+        if (single_view && afw_eye_now < 0) {
+            SPDLOG_INFO_EVERY_N_SEC(5, "[DIBR][AFWANOM] view ring MISS at key={} (parity fallback ref={})",
+                afw_presented_frame, yoro_reference_eye);
         }
 
         // Rest detection, shared by the depth-seq voting and the parity

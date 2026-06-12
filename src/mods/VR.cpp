@@ -4346,6 +4346,34 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     const bool hitch_diagnostics_enabled = m_enable_hitch_diagnostics->value();
 
     m_cvar_manager->on_pre_engine_tick(engine, delta);
+
+    // DIBR bind-signature remediation: dip r.ScreenPercentage one percent for
+    // a few ticks, then restore it. Both transitions make the RDG pool
+    // recreate the scene targets, re-creating their RTV/DSV descriptors
+    // through the (now installed) device hooks - reviving the depth-seq
+    // pairing and velocity snapshot on warm boots where the originals were
+    // created before injection's hooks landed and so can never be resolved
+    // at bind time. Requested by the present-side watchdog; capped per
+    // session; runs here because cvar writes belong on the game thread.
+    if (m_dibr_rt_recreate_state == 1) {
+        if (--m_dibr_rt_recreate_ticks <= 0) {
+            sdk::set_cvar_float(L"Renderer", L"r.ScreenPercentage", m_dibr_rt_recreate_saved);
+            m_dibr_rt_recreate_state = 0;
+            spdlog::info("[DIBR] rt-recreate nudge: restored r.ScreenPercentage={}", m_dibr_rt_recreate_saved);
+        }
+    } else if (m_dibr_rt_recreate_requested.exchange(false, std::memory_order_relaxed)) {
+        if (m_dibr_rt_recreate_count < 2) {
+            const auto cur = sdk::get_cvar_float(L"Renderer", L"r.ScreenPercentage");
+            const float base = (cur.has_value() && *cur >= 25.0f && *cur <= 200.0f) ? *cur : 100.0f;
+            m_dibr_rt_recreate_saved = base;
+            sdk::set_cvar_float(L"Renderer", L"r.ScreenPercentage", base - 1.0f);
+            m_dibr_rt_recreate_state = 1;
+            m_dibr_rt_recreate_ticks = 15;
+            ++m_dibr_rt_recreate_count;
+            spdlog::info("[DIBR] rt-recreate nudge {}: r.ScreenPercentage {} -> {} (bind-signature chain dead)",
+                m_dibr_rt_recreate_count, base, base - 1.0f);
+        }
+    }
     if (!hitch_diagnostics_enabled) {
         if (m_hitch_diagnostics_enabled_last_frame) {
             stop_hitch_snapshot_writer();

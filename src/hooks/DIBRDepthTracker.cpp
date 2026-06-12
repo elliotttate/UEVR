@@ -55,6 +55,14 @@ std::vector<Candidate> g_candidates{};
 // DSV descriptor handle -> resource, so bind-time hooks (which only see the
 // descriptor) can resolve the candidate. Rebuilt as DSVs are (re)created.
 std::unordered_map<SIZE_T, ID3D12Resource*> g_dsv_to_resource{};
+// Liveness recording is armed by the first consumer call (select_scene_depth
+// or the AFW setters). Until then record_dsv_bind is a single relaxed atomic
+// load — the bind hook is installed in EVERY D3D12 game, and at defaults
+// (DIBR off) nothing reads the liveness data, so it must not take g_mtx on
+// the hot OMSetRenderTargets/BeginRenderPass path. The candidate set itself
+// still populates at DSV creation, so arming mid-session works; the first
+// armed select falls back to stale candidates for one frame by design.
+std::atomic<bool> g_liveness_armed{false};
 uint64_t g_sequence{0};
 // Incremented once per presented frame (in select_scene_depth); binds recorded
 // during a frame are tagged with the current value.
@@ -91,6 +99,31 @@ std::unordered_map<SIZE_T, ViewInfo> g_rtv_views{};
 std::unordered_map<SIZE_T, ViewInfo> g_dsv_views{};
 std::vector<CensusEntry> g_census{};
 std::atomic<bool> g_census_armed{false};
+
+// Bind-chain health: counts where the signature chain dies in a session
+// (resolve = descriptor missing from the creation-observed view maps - e.g.
+// the target was created before the device hooks installed on a warm boot;
+// qualify = shape/flags mismatch). Read by bind_health_report().
+std::atomic<uint64_t> g_health_vel_calls{0};
+std::atomic<uint64_t> g_health_vel_resolve_miss{0};
+std::atomic<uint64_t> g_health_vel_qualify_fail{0};
+std::atomic<uint64_t> g_health_afw_calls{0};
+std::atomic<uint64_t> g_health_afw_resolve_miss{0};
+std::atomic<uint64_t> g_health_afw_qualify_fail{0};
+std::atomic<uint64_t> g_health_afw_seq_push{0};
+std::atomic<uint64_t> g_view_map_evictions{0};
+
+// Evict instead of clearing wholesale: a full clear() silently destroyed the
+// long-lived SceneColor/velocity entries (created once at VR engagement,
+// never recreated), killing every bind-signature consumer for the rest of
+// the session once descriptor churn hit the cap.
+template <typename Map> void evict_quarter(Map& map) {
+    const size_t target = map.size() - map.size() / 4;
+    for (auto it = map.begin(); it != map.end() && map.size() > target;) {
+        it = map.erase(it);
+    }
+    g_view_map_evictions.fetch_add(1, std::memory_order_relaxed);
+}
 long long g_census_last_ms{0};
 
 bool census_enabled() {
@@ -166,7 +199,7 @@ void record_dsv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor
     if (view_tracking_enabled()) {
         std::scoped_lock _{g_mtx};
         if (g_dsv_views.size() >= kMaxViewMappings) {
-            g_dsv_views.clear();
+            evict_quarter(g_dsv_views);
         }
         auto& vi = g_dsv_views[descriptor.ptr];
         vi.resource = resource;
@@ -257,7 +290,7 @@ void record_rtv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor
 
     std::scoped_lock _{g_mtx};
     if (g_rtv_views.size() >= kMaxViewMappings) {
-        g_rtv_views.clear();
+        evict_quarter(g_rtv_views);
     }
     auto& vi = g_rtv_views[descriptor.ptr];
     vi.resource = resource;
@@ -363,7 +396,7 @@ std::string take_census_report() {
 }
 
 void record_dsv_bind(D3D12_CPU_DESCRIPTOR_HANDLE descriptor) {
-    if (descriptor.ptr == 0) {
+    if (!g_liveness_armed.load(std::memory_order_relaxed) || descriptor.ptr == 0) {
         return;
     }
 
@@ -396,6 +429,9 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, u
     if (full_width == 0 || eye_width == 0 || height == 0) {
         return nullptr;
     }
+
+    // A consumer exists — start recording bind liveness from here on.
+    g_liveness_armed.store(true, std::memory_order_relaxed);
 
     std::scoped_lock _{g_mtx};
 
@@ -507,6 +543,29 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, u
     }
 
     return best != nullptr ? best->resource : nullptr;
+}
+
+std::string bind_health_report() {
+    size_t rtv_n = 0;
+    size_t dsv_n = 0;
+    {
+        std::scoped_lock _{g_mtx};
+        rtv_n = g_rtv_views.size();
+        dsv_n = g_dsv_views.size();
+    }
+    char buf[320]{};
+    std::snprintf(buf, sizeof(buf),
+        "views rtv=%zu dsv=%zu evict=%llu | afw_bind calls=%llu resolve_miss=%llu qualify_fail=%llu seq_push=%llu | vel_bind calls=%llu resolve_miss=%llu qualify_fail=%llu",
+        rtv_n, dsv_n,
+        (unsigned long long)g_view_map_evictions.load(std::memory_order_relaxed),
+        (unsigned long long)g_health_afw_calls.load(std::memory_order_relaxed),
+        (unsigned long long)g_health_afw_resolve_miss.load(std::memory_order_relaxed),
+        (unsigned long long)g_health_afw_qualify_fail.load(std::memory_order_relaxed),
+        (unsigned long long)g_health_afw_seq_push.load(std::memory_order_relaxed),
+        (unsigned long long)g_health_vel_calls.load(std::memory_order_relaxed),
+        (unsigned long long)g_health_vel_resolve_miss.load(std::memory_order_relaxed),
+        (unsigned long long)g_health_vel_qualify_fail.load(std::memory_order_relaxed));
+    return buf;
 }
 
 std::string describe_candidates() {
@@ -683,6 +742,9 @@ std::mutex g_afw_seq_mtx{};
 } // namespace
 
 void set_afw_depth_snapshot_enabled(bool enabled) {
+    if (enabled) {
+        g_liveness_armed.store(true, std::memory_order_relaxed);
+    }
     g_afw_depth_enabled.store(enabled, std::memory_order_relaxed);
 }
 
@@ -734,12 +796,14 @@ void record_velocity_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint
         return;
     }
 
+    g_health_vel_calls.fetch_add(1, std::memory_order_relaxed);
     ViewInfo info{};
     bool extent_matches_depth = false;
     {
         std::scoped_lock _{g_mtx};
         const auto it = g_rtv_views.find(rtv0);
         if (it == g_rtv_views.end()) {
+            g_health_vel_resolve_miss.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         info = it->second;
@@ -760,6 +824,7 @@ void record_velocity_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint
     if ((info.format != DXGI_FORMAT_R16G16B16A16_UNORM && info.format != DXGI_FORMAT_R16G16_UNORM) ||
         info.resource == nullptr || !extent_matches_depth ||
         info.width < 1024 || info.height < 256 || info.width == info.height) {
+        g_health_vel_qualify_fail.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
@@ -895,9 +960,14 @@ void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uin
         return;
     }
 
-    // Same signature as the pretrans probe: single eye-sized RGBA16F RTV
-    // (SceneColor) + READ-ONLY DSV. At this bind the opaque depth is complete
-    // - exactly the content the scatter warp wants.
+    // Same signature as the pretrans probe: a single scene-sized SceneColor
+    // RTV + READ-ONLY DSV. At this bind the opaque depth is complete -
+    // exactly the content the scatter warp wants. SceneColor's format is
+    // scalability-dependent: RGBA16F at high post-process quality,
+    // R11G11B10F at low (sg.PostProcessQuality drops it) - SN2 flips between
+    // BOOTS as auto-scalability re-benchmarks, and a single-format check
+    // silently killed the seq pairing + velocity snapshot on the low tier.
+    g_health_afw_calls.fetch_add(1, std::memory_order_relaxed);
     ViewInfo rtv_info{};
     ViewInfo dsv_info{};
     {
@@ -905,14 +975,17 @@ void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uin
         const auto rit = g_rtv_views.find(rtv0);
         const auto dit = g_dsv_views.find(dsv);
         if (rit == g_rtv_views.end() || dit == g_dsv_views.end()) {
+            g_health_afw_resolve_miss.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         rtv_info = rit->second;
         dsv_info = dit->second;
     }
 
-    if (rtv_count != 1 || rtv_info.format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+    if (rtv_count != 1 ||
+        (rtv_info.format != DXGI_FORMAT_R16G16B16A16_FLOAT && rtv_info.format != DXGI_FORMAT_R11G11B10_FLOAT) ||
         rtv_info.width < 1024 || dsv_info.dsv_flags == 0 || dsv_info.resource == nullptr) {
+        g_health_afw_qualify_fail.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
@@ -929,6 +1002,7 @@ void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uin
             e.seq = g_afw_seq_pushed++;
             e.frame_tag = g_recording_frame.load(std::memory_order_acquire);
             e.resource = dres;
+            g_health_afw_seq_push.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -1018,6 +1092,9 @@ Microsoft::WRL::ComPtr<ID3D12Resource> get_afw_depth_snapshot(uint32_t engine_fr
 }
 
 void set_afw_depth_sequence_enabled(bool enabled) {
+    if (enabled) {
+        g_liveness_armed.store(true, std::memory_order_relaxed);
+    }
     const bool was = g_afw_seq_enabled.exchange(enabled, std::memory_order_relaxed);
     if (was && !enabled) {
         // Drop the held resource references when AFW turns off.
@@ -1213,6 +1290,18 @@ std::string probe_flush() {
         g_probe_armed.store(true, std::memory_order_relaxed);
     }
     return {};
+}
+
+bool bind_capture_armed() {
+    // Superset of every record_*_bind gate, so the always-installed bind hooks
+    // can skip the whole census/probe/AFW/velocity block with one call at
+    // defaults: census window arms only under census_enabled(), the probe
+    // window only under probe_enabled(), and the AFW/velocity paths check the
+    // same atomics/statics read here.
+    return census_enabled() || probe_enabled() ||
+           g_afw_depth_enabled.load(std::memory_order_relaxed) ||
+           g_afw_seq_enabled.load(std::memory_order_relaxed) ||
+           velocity_snapshot_enabled();
 }
 
 } // namespace dibr_depth_tracker

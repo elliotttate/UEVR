@@ -33,9 +33,17 @@ void record_dsv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor
 // GetDesc on a possibly-dead resource.
 void record_rtv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
 
-// Bind-time liveness signal (OMSetRenderTargets / BeginRenderPass). Cheap:
-// one mutex-guarded map probe; unknown descriptors are ignored.
+// Bind-time liveness signal (OMSetRenderTargets / BeginRenderPass). A single
+// relaxed atomic load (no lock) until the first select_scene_depth / AFW
+// setter call arms liveness recording; armed cost is one mutex-guarded map
+// probe, and unknown descriptors are ignored. The first armed select sees no
+// liveness data and uses its stale-candidate fallback for that frame.
 void record_dsv_bind(D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
+
+// True when any of the bind-time capture paths below (census, probe, AFW
+// depth snapshot/sequence, velocity) could record. The always-installed bind
+// hooks use this single check to skip the whole block at defaults.
+bool bind_capture_armed();
 
 // Translucency forensics: when UEVR_DIBR_BIND_CENSUS=1, accumulate one
 // present-window's ordered (RTV0, DSV) binds every few seconds. The report
@@ -74,6 +82,13 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, u
 // Diagnostic snapshot of the current candidates (extent/format/bind stats),
 // for periodic logging by the consumer.
 std::string describe_candidates();
+
+// One-line bind-chain health summary (view-map sizes, per-stage failure
+// counters for the AFW depth-signature and velocity bind sites). Cheap;
+// intended for periodic logging while AFW is active. The key diagnostic:
+// resolve_miss growing means descriptors predate the device hooks (warm-boot
+// creation race) - the consumer should request a render-target recreation.
+std::string bind_health_report();
 
 // === Motion-vector (velocity GBuffer) snapshot ===
 // Select/bind/sample wiring for UE's SceneVelocity (PF_A16B16G16R16 on

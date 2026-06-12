@@ -479,6 +479,14 @@ public:
     // screen) matching run_dibr_synthesis' bail-outs. Defined in VR.cpp.
     bool is_dibr_rendering_path_compatible() const;
 
+    // Present-side watchdog request: the DIBR bind-signature chain reports
+    // dead (descriptors predate the device hooks on warm boots), so the game
+    // thread should force one scene render-target recreation (a brief
+    // r.ScreenPercentage dip-and-restore). Consumed in on_pre_engine_tick.
+    void request_dibr_rt_recreate() {
+        m_dibr_rt_recreate_requested.store(true, std::memory_order_relaxed);
+    }
+
     // True when the engine's view(s) should be CENTERED (per-eye offsets
     // zeroed in the stereo hook): the both-eyes-synthesized DIBR modes
     // (Inverse/Raymarch, which reintroduce the stereo baseline from depth)
@@ -1281,6 +1289,13 @@ private:
     std::chrono::steady_clock::time_point m_last_engine_tick{};
     std::chrono::steady_clock::time_point m_last_mod_frame{};
     std::chrono::steady_clock::time_point m_last_tick_gap_log{};
+
+    // DIBR bind-signature remediation (see request_dibr_rt_recreate).
+    std::atomic<bool> m_dibr_rt_recreate_requested{false};
+    int m_dibr_rt_recreate_state{0}; // 1 = dipped, restore pending
+    int m_dibr_rt_recreate_ticks{0};
+    int m_dibr_rt_recreate_count{0};
+    float m_dibr_rt_recreate_saved{100.0f};
 
     struct UILayerPoseTelemetrySnapshot {
         uint64_t sample_count{};
