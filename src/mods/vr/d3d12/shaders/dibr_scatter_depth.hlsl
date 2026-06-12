@@ -341,10 +341,28 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (ty < 0 || ty >= (int)synth_height) return;
     uint key = asuint(max(d, 1e-7f)); // strictly > 0 so 0 stays "empty"
     int x0 = (int)floor(tx);
-    // 2-wide splat closes sub-pixel pinholes between adjacent scattered samples.
-    [unroll]
-    for (int k = 0; k < 2; ++k) {
-        int x = x0 + k;
+    // Adaptive span splat: when the SAME surface continues at the next
+    // source column, fill the full stretched span between the two targets.
+    // A fixed 2-wide splat leaves gaps wherever a magnifying silhouette
+    // flank stretches neighbors more than 2px apart - background then wins
+    // the in-between texels and the object turns into see-through dashes at
+    // those view angles. Depth agreement keeps the span from bridging real
+    // silhouettes (those gaps ARE disocclusions and belong to the fill).
+    int span = 2;
+    int dirX = 1;
+    {
+        float2 uvR = float2((dtid.x + 1.5f) / (float)srcWidth, uv.y);
+        float dR = SampleRawDeviceDepth(uvR);
+        if (abs(dR - d) <= max(0.10f * max(d, dR), 1e-3f)) {
+            float2 tUvR = ReprojectSourceUv(uvR, dR, eyeSign);
+            float txR = tUvR.x * (float)synth_width - 0.5f;
+            dirX = (txR >= tx) ? 1 : -1;
+            span = clamp((int)ceil(abs(txR - tx)) + 1, 2, 6);
+        }
+    }
+    [loop]
+    for (int k = 0; k < span; ++k) {
+        int x = x0 + dirX * k;
         if (x >= 0 && x < (int)synth_width) {
             InterlockedMax(g_scatterKey[uint2(x, ty)], key); // reversed-Z: larger bits = nearer wins
         }

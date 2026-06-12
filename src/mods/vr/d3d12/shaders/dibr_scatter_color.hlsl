@@ -342,9 +342,25 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     uint key = asuint(max(d, 1e-7f));
     float4 c = g_colorTex.SampleLevel(g_linearSampler, uv, 0);
     int x0 = (int)floor(tx);
-    [unroll]
-    for (int k = 0; k < 2; ++k) {
-        int x = x0 + k;
+    // Mirror the depth pass's adaptive span exactly (same neighbor probe,
+    // same depth agreement, same cap) so every texel whose key this sample
+    // won also receives its color - a key without color reads as covered-
+    // without-content downstream.
+    int span = 2;
+    int dirX = 1;
+    {
+        float2 uvR = float2((dtid.x + 1.5f) / (float)srcWidth, uv.y);
+        float dR = SampleRawDeviceDepth(uvR);
+        if (abs(dR - d) <= max(0.10f * max(d, dR), 1e-3f)) {
+            float2 tUvR = ReprojectSourceUv(uvR, dR, eyeSign);
+            float txR = tUvR.x * (float)synth_width - 0.5f;
+            dirX = (txR >= tx) ? 1 : -1;
+            span = clamp((int)ceil(abs(txR - tx)) + 1, 2, 6);
+        }
+    }
+    [loop]
+    for (int k = 0; k < span; ++k) {
+        int x = x0 + dirX * k;
         if (x >= 0 && x < (int)synth_width) {
             if (g_scatterKey[uint2(x, ty)] == key) {
                 g_scatterColor[uint2(x, ty)] = float4(c.rgb, 1.0f);

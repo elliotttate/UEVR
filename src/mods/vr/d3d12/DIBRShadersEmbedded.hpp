@@ -6650,7 +6650,7 @@ inline std::string dibr_raymarch_source() {
     return out;
 }
 
-// dibr_scatter_depth.hlsl (12209 bytes, 2 chunks)
+// dibr_scatter_depth.hlsl (13120 bytes, 2 chunks)
 inline const char* const g_dibr_scatter_depth_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -6995,11 +6995,29 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (ty < 0 || ty >= (int)synth_height) return;
     uint key = asuint(max(d, 1e-7f)); // strictly > 0 so 0 stays "empty"
     int x0 = (int)floor(tx);
-    // 2-wide splat closes sub-pixel pinholes between adjacent scattered samples.
-    [unroll]
+    // Adaptive span splat: when the SAME surface continues at the next
 )DIBR",
-R"DIBR(    for (int k = 0; k < 2; ++k) {
-        int x = x0 + k;
+R"DIBR(    // source column, fill the full stretched span between the two targets.
+    // A fixed 2-wide splat leaves gaps wherever a magnifying silhouette
+    // flank stretches neighbors more than 2px apart - background then wins
+    // the in-between texels and the object turns into see-through dashes at
+    // those view angles. Depth agreement keeps the span from bridging real
+    // silhouettes (those gaps ARE disocclusions and belong to the fill).
+    int span = 2;
+    int dirX = 1;
+    {
+        float2 uvR = float2((dtid.x + 1.5f) / (float)srcWidth, uv.y);
+        float dR = SampleRawDeviceDepth(uvR);
+        if (abs(dR - d) <= max(0.10f * max(d, dR), 1e-3f)) {
+            float2 tUvR = ReprojectSourceUv(uvR, dR, eyeSign);
+            float txR = tUvR.x * (float)synth_width - 0.5f;
+            dirX = (txR >= tx) ? 1 : -1;
+            span = clamp((int)ceil(abs(txR - tx)) + 1, 2, 6);
+        }
+    }
+    [loop]
+    for (int k = 0; k < span; ++k) {
+        int x = x0 + dirX * k;
         if (x >= 0 && x < (int)synth_width) {
             InterlockedMax(g_scatterKey[uint2(x, ty)], key); // reversed-Z: larger bits = nearer wins
         }
@@ -7013,7 +7031,7 @@ inline std::string dibr_scatter_depth_source() {
     return out;
 }
 
-// dibr_scatter_color.hlsl (12188 bytes, 2 chunks)
+// dibr_scatter_color.hlsl (12918 bytes, 2 chunks)
 inline const char* const g_dibr_scatter_color_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7359,11 +7377,27 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     uint key = asuint(max(d, 1e-7f));
     float4 c = g_colorTex.SampleLevel(g_linearSampler, uv, 0);
     int x0 = (int)floor(tx);
-    [unroll]
-    for (int k = 0; k < 2; ++k) {
-        int x = x0 + k;
+    // Mirror the depth pass's adaptive span exactly (same neighbor probe,
 )DIBR",
-R"DIBR(        if (x >= 0 && x < (int)synth_width) {
+R"DIBR(    // same depth agreement, same cap) so every texel whose key this sample
+    // won also receives its color - a key without color reads as covered-
+    // without-content downstream.
+    int span = 2;
+    int dirX = 1;
+    {
+        float2 uvR = float2((dtid.x + 1.5f) / (float)srcWidth, uv.y);
+        float dR = SampleRawDeviceDepth(uvR);
+        if (abs(dR - d) <= max(0.10f * max(d, dR), 1e-3f)) {
+            float2 tUvR = ReprojectSourceUv(uvR, dR, eyeSign);
+            float txR = tUvR.x * (float)synth_width - 0.5f;
+            dirX = (txR >= tx) ? 1 : -1;
+            span = clamp((int)ceil(abs(txR - tx)) + 1, 2, 6);
+        }
+    }
+    [loop]
+    for (int k = 0; k < span; ++k) {
+        int x = x0 + dirX * k;
+        if (x >= 0 && x < (int)synth_width) {
             if (g_scatterKey[uint2(x, ty)] == key) {
                 g_scatterColor[uint2(x, ty)] = float4(c.rgb, 1.0f);
             }
