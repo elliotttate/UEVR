@@ -2331,7 +2331,14 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     // onto the object's true previous position. Misses (wrong texel via the
     // disparity-blind lookup) still fail the depth/color gates below - the
     // failure mode is the status quo, not a new artifact.
-    {
+    // NOT for fill bands: the disparity-blind velocity lookup at a reveal
+    // lands on the OCCLUDER (the plant that opened the hole), so the fetch
+    // gets advected by the occluder's motion onto unrelated background - and
+    // wasFilled bypasses the color gate below, so the misplaced content
+    // blends in unchecked (seen as a woven band of displaced logo/water).
+    // A reveal's true content is background, which rarely writes velocity;
+    // the camera-only reprojection is the right fetch there.
+    if (!wasFilled) {
         uint vw, vh;
         g_velocityTex.GetDimensions(vw, vh);
         if (vw != 0u) {

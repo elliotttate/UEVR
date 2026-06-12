@@ -1985,7 +1985,7 @@ inline std::string dibr_inverse_source() {
     return out;
 }
 
-// dibr_yoro.hlsl (105897 bytes, 9 chunks)
+// dibr_yoro.hlsl (106428 bytes, 9 chunks)
 inline const char* const g_dibr_yoro_chunks[] = {
 R"DIBR(// dibr_yoro.hlsl — YORO / Meta-style asymmetric inverse-warp DIBR
 //
@@ -4327,7 +4327,14 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     // onto the object's true previous position. Misses (wrong texel via the
     // disparity-blind lookup) still fail the depth/color gates below - the
     // failure mode is the status quo, not a new artifact.
-    {
+    // NOT for fill bands: the disparity-blind velocity lookup at a reveal
+    // lands on the OCCLUDER (the plant that opened the hole), so the fetch
+    // gets advected by the occluder's motion onto unrelated background - and
+    // wasFilled bypasses the color gate below, so the misplaced content
+    // blends in unchecked (seen as a woven band of displaced logo/water).
+    // A reveal's true content is background, which rarely writes velocity;
+    // the camera-only reprojection is the right fetch there.
+    if (!wasFilled) {
         uint vw, vh;
         g_velocityTex.GetDimensions(vw, vh);
         if (vw != 0u) {
@@ -4385,7 +4392,8 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
         // pass naturally.
         // EXCEPT in fill bands: there the warp side is synthetic fill and the
         // depth-validated history is the actual render of the reveal, so a
-        // disagreement is precisely the case where history must win.
+)DIBR",
+R"DIBR(        // disagreement is precisely the case where history must win.
         float lumDiff = dot(abs(h - c), float3(0.299f, 0.587f, 0.114f));
         float gate = wasFilled ? 1.0f : saturate(1.0f - lumDiff * 8.0f);
         c = lerp(c, h, saturate(temporal_blend) * gate);
@@ -4401,8 +4409,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     uint y = dtid.y;
     // One thread per OUTPUT pixel (out == src unless the overscan-grown render
     // target makes the source wider than the true-FOV output).
-)DIBR",
-R"DIBR(    if (x >= out_width || y >= out_height) return;
+    if (x >= out_width || y >= out_height) return;
 
     float2 uv = float2((x + 0.5f) / (float)out_width,
                         (y + 0.5f) / (float)out_height);
@@ -7287,7 +7294,7 @@ inline std::string dibr_scatter_color_source() {
     return out;
 }
 
-// dibr_scatter_fill.hlsl (21087 bytes, 2 chunks)
+// dibr_scatter_fill.hlsl (21881 bytes, 2 chunks)
 inline const char* const g_dibr_scatter_fill_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7691,12 +7698,28 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // threads, this dispatch) - skip them so hole pixels never adopt other
     // hole pixels' fill as real geometry (that ordering race would shimmer).
     if (central) {
+        // Depth-aware: at thin-object reveals (plant fronds, railings) the
+        // FIRST covered texel along the walk is often the NEXT occluder
+        // strand - foreground, not the background the reveal exposes -
+        // and first-hit fill paints the band with occluder color ("no
+        // filling" look). Census up to three DISTINCT surfaces (hopping a
+        // few px past each hit so a strand's run counts once) and keep the
+        // FARTHEST (smallest reversed-Z key): reveals expose background by
+        // definition.
+        int i = 1;
+        int hits = 0;
         [loop]
-        for (int i = 1; i <= kMaxSearch; i += (i < kFineSearch) ? 1 : kCoarseStep) {
+        while (i <= kMaxSearch) {
             int x = (int)dtid.x + dir * i;
             if (x < 0 || x >= (int)synth_width) break;
             uint k = g_scatterKey[uint2(x, dtid.y)];
-            if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { bx = x; bkey = k; break; }
+            if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) {
+                if (bx < 0 || asfloat(k) < asfloat(bkey)) { bx = x; bkey = k; }
+                if (++hits >= 3) break;
+                i += 6; // hop past this surface before the next census tap
+            } else {
+                i += (i < kFineSearch) ? 1 : kCoarseStep;
+            }
         }
     }
 

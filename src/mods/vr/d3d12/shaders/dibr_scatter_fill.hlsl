@@ -399,12 +399,28 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // threads, this dispatch) - skip them so hole pixels never adopt other
     // hole pixels' fill as real geometry (that ordering race would shimmer).
     if (central) {
+        // Depth-aware: at thin-object reveals (plant fronds, railings) the
+        // FIRST covered texel along the walk is often the NEXT occluder
+        // strand - foreground, not the background the reveal exposes -
+        // and first-hit fill paints the band with occluder color ("no
+        // filling" look). Census up to three DISTINCT surfaces (hopping a
+        // few px past each hit so a strand's run counts once) and keep the
+        // FARTHEST (smallest reversed-Z key): reveals expose background by
+        // definition.
+        int i = 1;
+        int hits = 0;
         [loop]
-        for (int i = 1; i <= kMaxSearch; i += (i < kFineSearch) ? 1 : kCoarseStep) {
+        while (i <= kMaxSearch) {
             int x = (int)dtid.x + dir * i;
             if (x < 0 || x >= (int)synth_width) break;
             uint k = g_scatterKey[uint2(x, dtid.y)];
-            if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { bx = x; bkey = k; break; }
+            if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) {
+                if (bx < 0 || asfloat(k) < asfloat(bkey)) { bx = x; bkey = k; }
+                if (++hits >= 3) break;
+                i += 6; // hop past this surface before the next census tap
+            } else {
+                i += (i < kFineSearch) ? 1 : kCoarseStep;
+            }
         }
     }
 
