@@ -326,19 +326,28 @@ float SynthEyeSign()
     return (mode_param0 < 0.5f) ? -1.0f : 1.0f;
 }
 
-// EXACT mirror of the depth pass's near-biased fetch: the key computed here
-// must match the key the depth pass committed bit-for-bit or the color
-// write misses its own texels (see the key == comparison below).
-float NearBiasedDepth(float2 uv)
+// EXACT mirror of the depth pass's near-biased fetch (same max over the same
+// taps - the key computed here must match the depth pass's bit-for-bit), but
+// also reports WHERE the winning depth came from: a pixel whose own depth is
+// far-field but which adopted a neighbor's near depth is the silhouette
+// DILATION ring, and its own color is BACKGROUND - writing that at the
+// object's parallax paints a faint background-tinted outline hugging every
+// edge. Ring pixels borrow the donor neighbor's color instead.
+float NearBiasedDepth(float2 uv, out float2 donorOff)
 {
     float2 px = float2(1.0f / (float)srcWidth, 1.0f / (float)srcHeight);
     float d = SampleRawDeviceDepth(uv);
+    donorOff = float2(0.0f, 0.0f);
     [unroll]
     for (int oy = -1; oy <= 1; ++oy) {
         [unroll]
         for (int ox = -1; ox <= 1; ++ox) {
             if (ox == 0 && oy == 0) continue;
-            d = max(d, SampleRawDeviceDepth(uv + float2(ox, oy) * px));
+            float nd = SampleRawDeviceDepth(uv + float2(ox, oy) * px);
+            if (nd > d) {
+                d = nd;
+                donorOff = float2(ox, oy) * px;
+            }
         }
     }
     return d;
@@ -351,14 +360,25 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // (true FOV - narrower than the overscan-grown source when RT growth is on).
     if (dtid.x >= srcWidth || dtid.y >= srcHeight) return;
     float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
-    float d = NearBiasedDepth(uv);
+    float2 donorOff;
+    float d = NearBiasedDepth(uv, donorOff);
+    // Dilation-ring pixel (adopted a significantly nearer neighbor's depth):
+    // sample the donor's color so the ring extends the OBJECT, not the
+    // background behind it.
+    float2 colorUv = uv;
+    {
+        float dRaw = SampleRawDeviceDepth(uv);
+        if (d > dRaw + max(0.10f * d, 1e-3f)) {
+            colorUv = uv + donorOff;
+        }
+    }
     float eyeSign = SynthEyeSign();
     float2 tUv = ReprojectSourceUv(uv, d, eyeSign);
     float tx = tUv.x * (float)synth_width - 0.5f;
     int ty = (int)round(tUv.y * (float)synth_height - 0.5f);
     if (ty < 0 || ty >= (int)synth_height) return;
     uint key = asuint(max(d, 1e-7f));
-    float4 c = g_colorTex.SampleLevel(g_linearSampler, uv, 0);
+    float4 c = g_colorTex.SampleLevel(g_linearSampler, colorUv, 0);
     int x0 = (int)floor(tx);
     // Mirror the depth pass's adaptive span exactly (same neighbor probe,
     // same depth agreement, same cap) so every texel whose key this sample
