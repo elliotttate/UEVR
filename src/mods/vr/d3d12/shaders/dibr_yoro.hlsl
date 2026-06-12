@@ -2611,7 +2611,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         // unwarped center near the screen edges (the synthesized eye's
         // outer band has no source data - same role as the gather path's
         // ScreenEdgeGuard disparity squeeze).
-        float edgeKeep = ScreenEdgeGuard(uv, searchDepth);
+        // AFW: the outer band IS sourced now (the fill recovers the eye's
+        // own previous real render there), so the edge guard's centerColor
+        // fade would REPLACE valid content with the other eye's image at the
+        // wrong parallax - the residual 15% the history blend can't recover
+        // is the half-rate ghost outline at the outward screen edge. Keep
+        // the guard only for the non-AFW scatter path.
+        float edgeKeep = (temporal_enabled > 1.5f) ? 1.0f : ScreenEdgeGuard(uv, searchDepth);
         rightColor = float4(lerp(centerColor.rgb, SampleScatterUpscaled(x, y), edgeKeep), centerColor.a);
         rightColor.rgb = ApplyAfwHistoryBlend(uint2(x, y), rightColor.rgb);
 #else
@@ -2644,7 +2650,9 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float2 leftUV = uv;
         float4 leftColor;
 #if SCATTER_COMPOSE
-        float edgeKeep = ScreenEdgeGuard(uv, searchDepth);
+        // See the right-eye branch: under AFW the edge guard must not fade
+        // the recovered band back to wrong-parallax centerColor.
+        float edgeKeep = (temporal_enabled > 1.5f) ? 1.0f : ScreenEdgeGuard(uv, searchDepth);
         leftColor = float4(lerp(centerColor.rgb, SampleScatterUpscaled(x, y), edgeKeep), centerColor.a);
         leftColor.rgb = ApplyAfwHistoryBlend(uint2(x, y), leftColor.rgb);
 #else
