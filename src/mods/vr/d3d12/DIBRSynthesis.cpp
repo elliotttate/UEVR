@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -142,7 +143,7 @@ bool compile_kernel(const std::string& source, const char* name, std::vector<uin
     return true;
 }
 
-// Guards against C++/HLSL layout drift across 243 fields: the compiled
+// Guards against C++/HLSL layout drift across 256 fields: the compiled
 // shader's own reflection of the StereoParams cbuffer must agree with the
 // C++ struct, otherwise every parameter after the drift point silently reads
 // its neighbor's value.
@@ -161,10 +162,11 @@ bool validate_cbuffer_layout(const std::vector<uint8_t>& bytecode, const char* n
         // Field count + the last field's offset pin the layout exactly and are
         // backend-independent (FXC reports the cbuffer size padded to 16 bytes,
         // DXC's DXIL reflection may not - so total size is only sanity-ranged).
-        // 250 scalars (incl. reproj/scatter/overscan/temporal flags + out dims)
-        // + three float4x4, which reflection counts as ONE variable each.
-        constexpr uint32_t expected_fields = 250u + 3u;
-        constexpr uint32_t expected_last_offset = offsetof(DIBRStereoParams, out_height);
+        // 256 scalars (incl. reproj/scatter/overscan/temporal flags, out dims
+        // and the CPU-resolved pre_* constants) + three float4x4, which
+        // reflection counts as ONE variable each.
+        constexpr uint32_t expected_fields = 256u + 3u;
+        constexpr uint32_t expected_last_offset = offsetof(DIBRStereoParams, pre_edge_comp_inv);
         constexpr uint32_t expected_size_min = sizeof(DIBRStereoParams);
         constexpr uint32_t expected_size_max = (sizeof(DIBRStereoParams) + 15u) & ~15u;
 
@@ -193,6 +195,32 @@ void transition(ID3D12GraphicsCommandList* cmd_list, ID3D12Resource* resource, D
     barrier.Transition.StateBefore = before;
     barrier.Transition.StateAfter = after;
     cmd_list->ResourceBarrier(1, &barrier);
+}
+
+// Per-pass GPU timing rides the same env the D3D12 hook instrumentation uses.
+bool gpu_timing_enabled() {
+    static const bool value = []() {
+        const char* env = std::getenv("UEVR_ENABLE_D3D12_GPU_TIMESTAMPS");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return value;
+}
+
+// Thread-group edge for every DIBR kernel ([numthreads(DIBR_TG, DIBR_TG, 1)]).
+// UEVR_DIBR_TG=8|16|32 overrides for occupancy A/B runs; the define is baked
+// into each kernel's source (so the bytecode cache keys on it) and the C++
+// dispatch math uses the same value.
+uint32_t dibr_thread_group() {
+    static const uint32_t value = []() -> uint32_t {
+        const char* env = std::getenv("UEVR_DIBR_TG");
+        const int tg = (env != nullptr && env[0] != '\0') ? std::atoi(env) : 16;
+        if (tg == 8 || tg == 16 || tg == 32) {
+            return static_cast<uint32_t>(tg);
+        }
+        SPDLOG_WARN("[DIBR] UEVR_DIBR_TG={} unsupported (8/16/32); using 16", tg);
+        return 16u;
+    }();
+    return value;
 }
 } // namespace
 
@@ -272,18 +300,17 @@ void DIBRSynthesis::build_async(Microsoft::WRL::ComPtr<ID3D12Device> device, uin
 }
 
 bool DIBRSynthesis::create_root_signature(ID3D12Device* device, DeviceObjects& objs) {
-    // Mirrors vrmod-stereo's layout: one table with SRV t0..t1 (offset 0) and
-    // UAV u0 (offset 2), a root CBV at b0, and static samplers s0 (linear
-    // clamp) / s1 (point clamp).
+    // One table with SRV t0..t3 (offset 0) and UAV u0..u5 (offset 4), a root
+    // CBV at b0, and static samplers s0 (linear clamp) / s1 (point clamp).
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 2;
+    ranges[0].NumDescriptors = 4; // t0 color, t1 depth, t2 prepared depth, t3 history color
     ranges[0].BaseShaderRegister = 0;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 5; // u0 output, u1/u2 scatter key+color, u3/u4 history color+key
+    ranges[1].NumDescriptors = 6; // u0 output, u1/u2 scatter key+color, u3/u4 history color+key, u5 prep
     ranges[1].BaseShaderRegister = 0;
-    ranges[1].OffsetInDescriptorsFromTableStart = 2;
+    ranges[1].OffsetInDescriptorsFromTableStart = 4;
 
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -341,19 +368,33 @@ bool DIBRSynthesis::create_psos(ID3D12Device* device, DeviceObjects& objs) {
     };
     const Kernel kernels[] = {
         {"dibr_inverse.hlsl", "dibr_inverse.hlsl", &dibr_shaders::dibr_inverse_source, nullptr, &objs.pso_inverse},
+        // _lean variants: optional output features compiled out; picked by
+        // synthesize() whenever params_allow_lean() holds.
+        {"dibr_inverse_lean.hlsl", "dibr_inverse.hlsl", &dibr_shaders::dibr_inverse_source, "#define DIBR_LEAN 1\n", &objs.pso_inverse_lean},
         {"dibr_yoro.hlsl", "dibr_yoro.hlsl", &dibr_shaders::dibr_yoro_source, nullptr, &objs.pso_yoro},
+        {"dibr_yoro_lean.hlsl", "dibr_yoro.hlsl", &dibr_shaders::dibr_yoro_source, "#define DIBR_LEAN 1\n", &objs.pso_yoro_lean},
         // Same source, gather machinery compiled out - the scatter compose PSO.
         {"dibr_yoro_scatter.hlsl", "dibr_yoro.hlsl", &dibr_shaders::dibr_yoro_source, "#define SCATTER_COMPOSE 1\n", &objs.pso_yoro_scatter},
+        {"dibr_yoro_scatter_lean.hlsl", "dibr_yoro.hlsl", &dibr_shaders::dibr_yoro_source, "#define SCATTER_COMPOSE 1\n#define DIBR_LEAN 1\n", &objs.pso_yoro_scatter_lean},
         {"dibr_raymarch.hlsl", "dibr_raymarch.hlsl", &dibr_shaders::dibr_raymarch_source, nullptr, &objs.pso_raymarch},
-        {"dibr_scatter_clear.hlsl", "dibr_scatter_clear.hlsl", &dibr_shaders::dibr_scatter_clear_source, nullptr, &objs.pso_scatter_clear},
+        {"dibr_raymarch_lean.hlsl", "dibr_raymarch.hlsl", &dibr_shaders::dibr_raymarch_source, "#define DIBR_LEAN 1\n", &objs.pso_raymarch_lean},
         {"dibr_scatter_depth.hlsl", "dibr_scatter_depth.hlsl", &dibr_shaders::dibr_scatter_depth_source, nullptr, &objs.pso_scatter_depth},
         {"dibr_scatter_color.hlsl", "dibr_scatter_color.hlsl", &dibr_shaders::dibr_scatter_color_source, nullptr, &objs.pso_scatter_color},
         {"dibr_scatter_fill.hlsl", "dibr_scatter_fill.hlsl", &dibr_shaders::dibr_scatter_fill_source, nullptr, &objs.pso_scatter_fill},
         {"dibr_afw_stash.hlsl", "dibr_afw_stash.hlsl", &dibr_shaders::dibr_afw_stash_source, nullptr, &objs.pso_afw_stash},
+        // Depth conditioning prepass, one PSO per consuming kernel family.
+        {"dibr_depth_prep_inverse.hlsl", "dibr_depth_prep.hlsl", &dibr_shaders::dibr_depth_prep_source, "#define PREP_MODE 0\n", &objs.pso_prep_inverse},
+        {"dibr_depth_prep_raymarch.hlsl", "dibr_depth_prep.hlsl", &dibr_shaders::dibr_depth_prep_source, "#define PREP_MODE 1\n", &objs.pso_prep_raymarch},
+        {"dibr_depth_prep_yoro.hlsl", "dibr_depth_prep.hlsl", &dibr_shaders::dibr_depth_prep_source, "#define PREP_MODE 2\n", &objs.pso_prep_yoro},
     };
+
+    if (dibr_thread_group() != 16u) {
+        SPDLOG_INFO("[DIBR] thread group override: {0}x{0} (UEVR_DIBR_TG)", dibr_thread_group());
+    }
 
     for (const auto& k : kernels) {
         auto source = load_shader_source(k.file, k.embedded);
+        source.insert(0, fmt::format("#define DIBR_TG {}\n", dibr_thread_group()));
         if (k.prefix != nullptr) {
             source.insert(0, k.prefix);
         }
@@ -398,6 +439,16 @@ bool DIBRSynthesis::create_rings(ID3D12Device* device, DeviceObjects& objs) {
     const D3D12_RANGE no_read{0, 0};
     if (FAILED(objs.cbuffer->Map(0, &no_read, reinterpret_cast<void**>(&objs.cbuffer_ptr))) || objs.cbuffer_ptr == nullptr) {
         SPDLOG_ERROR("[DIBR] constant buffer ring map failed");
+        return false;
+    }
+
+    // CPU-only descriptors for ClearUnorderedAccessView* (the API requires a
+    // CPU handle from a NON-shader-visible heap alongside the GPU handle).
+    D3D12_DESCRIPTOR_HEAP_DESC clear_heap_desc{};
+    clear_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    clear_heap_desc.NumDescriptors = kRing * 2; // scatter key + color per ring slot
+    if (FAILED(device->CreateDescriptorHeap(&clear_heap_desc, IID_PPV_ARGS(&objs.clear_heap)))) {
+        SPDLOG_ERROR("[DIBR] clear descriptor heap creation failed");
         return false;
     }
 
@@ -446,6 +497,7 @@ bool DIBRSynthesis::ensure_output(ID3D12Device* device, uint32_t width, uint32_t
     m_output->SetName(L"DIBR Packed Stereo Output");
     m_output_width = width;
     m_output_height = height;
+    ++m_resource_generation;
     SPDLOG_INFO("[DIBR] packed output texture {}x{} (fmt {})", width, height, static_cast<int>(m_output_format));
     return true;
 }
@@ -507,6 +559,7 @@ bool DIBRSynthesis::ensure_scatter(ID3D12Device* device, uint32_t width, uint32_
 
     m_scatter_width = width;
     m_scatter_height = height;
+    ++m_resource_generation;
     SPDLOG_INFO("[DIBR] scatter buffers {}x{} (ping-pong pair)", width, height);
     return true;
 }
@@ -553,8 +606,194 @@ bool DIBRSynthesis::ensure_afw_history(ID3D12Device* device, uint32_t width, uin
     }
     m_afw_history_color->SetName(L"DIBR AFW History Color");
 
+    ++m_resource_generation;
     SPDLOG_INFO("[DIBR] AFW real-render history buffers {}x{}", width, height);
     return true;
+}
+
+bool DIBRSynthesis::ensure_prep(ID3D12Device* device, uint32_t width, uint32_t height) {
+    if (m_prep != nullptr && m_prep_width == width && m_prep_height == height) {
+        return true;
+    }
+
+    m_prep.Reset();
+    m_prep_is_srv = false;
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    // RGBA16F: guaranteed typed-UAV-store format on all D3D12 hardware (RG16F
+    // is an optional cap). Only .xy carry data (depth, gradient).
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_prep)))) {
+        SPDLOG_ERROR_ONCE("[DIBR] failed to create {}x{} prepared-depth texture", width, height);
+        return false;
+    }
+    m_prep->SetName(L"DIBR Prepared Depth");
+    m_prep_width = width;
+    m_prep_height = height;
+    ++m_resource_generation;
+    SPDLOG_INFO("[DIBR] prepared-depth texture {}x{}", width, height);
+    return true;
+}
+
+bool DIBRSynthesis::ensure_gpu_timing(ID3D12Device* device) {
+    if (m_ts_queue == nullptr) {
+        return false;
+    }
+    if (m_ts_frequency == 0 &&
+        (FAILED(m_ts_queue->GetTimestampFrequency(&m_ts_frequency)) || m_ts_frequency == 0)) {
+        m_ts_frequency = 0;
+        return false;
+    }
+    if (m_ts_heap != nullptr && m_ts_readback != nullptr && m_ts_mapped != nullptr) {
+        return true;
+    }
+
+    D3D12_QUERY_HEAP_DESC query_desc{};
+    query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query_desc.Count = kRing * kTsQueriesPerSlot;
+    if (FAILED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&m_ts_heap)))) {
+        SPDLOG_ERROR_ONCE("[DIBR] GPU timing query heap creation failed");
+        return false;
+    }
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buf_desc{};
+    buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buf_desc.Width = static_cast<uint64_t>(kRing) * kTsQueriesPerSlot * sizeof(uint64_t);
+    buf_desc.Height = 1;
+    buf_desc.DepthOrArraySize = 1;
+    buf_desc.MipLevels = 1;
+    buf_desc.SampleDesc.Count = 1;
+    buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &buf_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_ts_readback)))) {
+        SPDLOG_ERROR_ONCE("[DIBR] GPU timing readback buffer creation failed");
+        m_ts_heap.Reset();
+        return false;
+    }
+    const D3D12_RANGE full_read{0, static_cast<SIZE_T>(buf_desc.Width)};
+    if (FAILED(m_ts_readback->Map(0, &full_read, reinterpret_cast<void**>(&m_ts_mapped))) || m_ts_mapped == nullptr) {
+        SPDLOG_ERROR_ONCE("[DIBR] GPU timing readback map failed");
+        m_ts_heap.Reset();
+        m_ts_readback.Reset();
+        m_ts_mapped = nullptr;
+        return false;
+    }
+    std::memset(m_ts_mapped, 0, static_cast<size_t>(buf_desc.Width));
+    m_ts_slot_count.fill(0);
+    m_ts_last_log = std::chrono::steady_clock::now();
+    SPDLOG_INFO("[DIBR] per-pass GPU timing enabled (UEVR_ENABLE_D3D12_GPU_TIMESTAMPS)");
+    return true;
+}
+
+void DIBRSynthesis::drain_gpu_timing_slot(uint32_t slot) {
+    const uint32_t count = m_ts_slot_count[slot];
+    if (count == 0 || m_ts_mapped == nullptr || m_ts_frequency == 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < count && i < kTsMaxPasses; ++i) {
+        const size_t base = static_cast<size_t>(slot) * kTsQueriesPerSlot + i * 2;
+        const uint64_t begin = m_ts_mapped[base];
+        const uint64_t end = m_ts_mapped[base + 1];
+        m_ts_mapped[base] = 0;
+        m_ts_mapped[base + 1] = 0;
+        if (begin == 0 || end <= begin) {
+            continue;
+        }
+        const uint8_t pass = m_ts_slot_seq[slot][i];
+        if (pass < kTsMaxPasses) {
+            m_ts_sum_ms[pass] += static_cast<double>(end - begin) * 1000.0 / static_cast<double>(m_ts_frequency);
+            ++m_ts_count[pass];
+        }
+    }
+    m_ts_slot_count[slot] = 0;
+}
+
+void DIBRSynthesis::log_gpu_timing() {
+    const auto now = std::chrono::steady_clock::now();
+    if (m_ts_last_log.time_since_epoch().count() == 0) {
+        m_ts_last_log = now;
+        return;
+    }
+    if (now - m_ts_last_log < std::chrono::seconds(5)) {
+        return;
+    }
+    m_ts_last_log = now;
+
+    static constexpr const char* kPassNames[kTsMaxPasses] = {
+        "prep", "clear", "scatter_depth", "scatter_color", "fill", "compose", "stash", "?"};
+    std::string line{};
+    double total_avg = 0.0;
+    uint32_t frames = 0;
+    for (uint32_t i = 0; i < kTsMaxPasses; ++i) {
+        if (m_ts_count[i] == 0) {
+            continue;
+        }
+        const double avg = m_ts_sum_ms[i] / static_cast<double>(m_ts_count[i]);
+        line += fmt::format(" {}={:.3f}ms", kPassNames[i], avg);
+        total_avg += avg;
+        frames = (std::max)(frames, m_ts_count[i]);
+        m_ts_sum_ms[i] = 0.0;
+        m_ts_count[i] = 0;
+    }
+    if (!line.empty()) {
+        SPDLOG_INFO("[DIBR][gpu] per-pass avg over ~{} frames:{} total={:.3f}ms", frames, line, total_avg);
+    }
+}
+
+bool DIBRSynthesis::params_allow_lean(const DIBRStereoParams& p) {
+    // Must stay in lockstep with the DIBR_LEAN stubs in the kernels: lean is
+    // only picked when every compiled-out feature is at its pass-through
+    // default, so the two PSOs produce identical output.
+    return p.debug_view_mode < 0.5f &&
+        p.edge_compression == 0.0f &&
+        p.image_filter_sharpen_strength <= 0.0f &&
+        p.image_filter_aa_strength <= 0.0f &&
+        p.image_filter_deband_strength <= 0.0f &&
+        p.image_filter_deband_grain <= 0.0f &&
+        p.output_geometry_poly_strength <= 0.0f &&
+        p.output_distortion_grid < 0.5f &&
+        p.cursor_overlay_strength <= 0.0f &&
+        p.comfort_nose_strength <= 0.0f &&
+        p.output_matte_strength <= 0.0f &&
+        p.output_composition_mode < 0.5f &&
+        p.output_frame_marker_mode < 0.5f &&
+        p.output_alignment_marker_mode < 0.5f &&
+        p.output_saturation == 1.0f &&
+        p.output_vignette_strength <= 0.0f &&
+        p.output_hmd_vignette <= 0.0f &&
+        p.output_geometry_keystone_tilt == 0.0f &&
+        p.output_geometry_zoom == 1.0f &&
+        p.output_geometry_fov == 0.0f &&
+        p.output_geometry_scale_x == 1.0f &&
+        p.output_geometry_scale_y == 1.0f &&
+        p.output_geometry_offset_x == 0.0f &&
+        p.output_geometry_offset_y == 0.0f &&
+        p.output_geometry_barrel == 0.0f &&
+        p.output_geometry_radial_k2 == 0.0f &&
+        p.output_geometry_radial_k3 == 0.0f &&
+        p.output_geometry_left_offset_x == 0.0f &&
+        p.output_geometry_left_offset_y == 0.0f &&
+        p.output_geometry_right_offset_x == 0.0f &&
+        p.output_geometry_right_offset_y == 0.0f &&
+        p.output_geometry_left_rotation_deg == 0.0f &&
+        p.output_geometry_right_rotation_deg == 0.0f &&
+        p.output_geometry_ipd_offset == 0.0f &&
+        p.output_geometry_axis_swap < 0.5f &&
+        p.output_headset_profile < 0.5f;
 }
 
 ID3D12Resource* DIBRSynthesis::synthesize(
@@ -584,22 +823,32 @@ ID3D12Resource* DIBRSynthesis::synthesize(
         mode = Mode::Yoro;
     }
 
+    // When every optional output feature is at its pass-through default, the
+    // lean PSO (features compiled out -> smaller code, lower register
+    // pressure) is exactly equivalent to the full kernel.
+    const bool lean = params_allow_lean(params);
+
     ID3D12PipelineState* pso = nullptr;
+    ID3D12PipelineState* prep_pso = nullptr;
     switch (mode) {
     case Mode::InverseWarp:
-        pso = m_objs.pso_inverse.Get();
+        pso = (lean && m_objs.pso_inverse_lean != nullptr) ? m_objs.pso_inverse_lean.Get() : m_objs.pso_inverse.Get();
+        prep_pso = m_objs.pso_prep_inverse.Get();
         break;
     case Mode::Yoro:
-        pso = m_objs.pso_yoro.Get();
+        pso = (lean && m_objs.pso_yoro_lean != nullptr) ? m_objs.pso_yoro_lean.Get() : m_objs.pso_yoro.Get();
+        prep_pso = m_objs.pso_prep_yoro.Get();
         break;
     case Mode::Raymarch:
-        pso = m_objs.pso_raymarch.Get();
+        pso = (lean && m_objs.pso_raymarch_lean != nullptr) ? m_objs.pso_raymarch_lean.Get() : m_objs.pso_raymarch.Get();
+        prep_pso = m_objs.pso_prep_raymarch.Get();
         break;
     case Mode::YoroScatter:
         // Final compose runs through the SCATTER_COMPOSE=1 specialization of
-        // the yoro kernel (gather machinery compiled out for occupancy).
-        pso = m_objs.pso_yoro_scatter.Get();
-        if (pso == nullptr || m_objs.pso_scatter_clear == nullptr || m_objs.pso_scatter_depth == nullptr ||
+        // the yoro kernel (gather machinery compiled out for occupancy). The
+        // scatter chain consumes raw device depth, so no prepass is needed.
+        pso = (lean && m_objs.pso_yoro_scatter_lean != nullptr) ? m_objs.pso_yoro_scatter_lean.Get() : m_objs.pso_yoro_scatter.Get();
+        if (pso == nullptr || m_objs.pso_scatter_depth == nullptr ||
             m_objs.pso_scatter_color == nullptr || m_objs.pso_scatter_fill == nullptr ||
             (m_afw_mode && m_objs.pso_afw_stash == nullptr)) {
             pso = nullptr;
@@ -613,7 +862,7 @@ ID3D12Resource* DIBRSynthesis::synthesize(
         }
         break;
     }
-    if (pso == nullptr) {
+    if (pso == nullptr || (prep_pso == nullptr && mode != Mode::YoroScatter)) {
         return nullptr;
     }
 
@@ -622,6 +871,28 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     params.source_width = static_cast<uint32_t>(color_desc.Width);
     params.source_height = color_desc.Height;
     params.frame_index = m_frame_index;
+
+    // CPU-resolved constants: dispatch-uniform values every kernel used to
+    // recompute per pixel (effective convergence lerp, reciprocal source
+    // dims, the edge-compression atan/tan normalization).
+    {
+        const float zb = std::clamp(params.zpd_balance, 0.0f, 1.0f);
+        params.pre_effective_convergence = params.convergence + (0.5f - params.convergence) * zb;
+        params.pre_inv_src_width = 1.0f / static_cast<float>((std::max)(params.source_width, 1u));
+        params.pre_inv_src_height = 1.0f / static_cast<float>((std::max)(params.source_height, 1u));
+        if (params.edge_compression > 0.0f) {
+            params.pre_edge_comp_inv = 1.0f / std::atan(params.edge_compression * 3.0f);
+        } else if (params.edge_compression < 0.0f) {
+            params.pre_edge_comp_inv = 1.0f / std::tan(-params.edge_compression * 1.2f);
+        } else {
+            params.pre_edge_comp_inv = 1.0f;
+        }
+    }
+
+    // Conditioned-depth prepass target for the gather kernels (source-sized).
+    if (prep_pso != nullptr && !ensure_prep(device, params.source_width, params.source_height)) {
+        return nullptr;
+    }
 
     // Output (submit) eye size: callers set it when the overscan-grown render
     // target makes the source wider than the true-FOV output; everything else
@@ -632,13 +903,42 @@ ID3D12Resource* DIBRSynthesis::synthesize(
         params.out_height = params.source_height;
     }
 
-    // Scatter buffers (and the packed output) live in OUTPUT space.
-    if (!ensure_scatter(device, params.out_width, params.out_height)) {
+    // Synthesis resolution: the scatter chain (clear/depth/color/fill) and its
+    // ping-pong history run in this space; the compose pass bilinearly upscales
+    // the scatter colour to the full out dims. UEVR_DIBR_SYNTH_SCALE < 1.0
+    // trades a softer synthesized eye for ~1/scale^2 cheaper scatter passes.
+    // 1.0 (default) keeps synth == out, which is bit-identical to the historical
+    // full-res path. AFW (mode 6) is pinned to full res: its compose-side
+    // history blend reads history at OUT-space coords, so a half-res history
+    // would misregister.
+    static const float synth_scale = []() {
+        const char* v = std::getenv("UEVR_DIBR_SYNTH_SCALE");
+        if (v == nullptr || v[0] == '\0') {
+            return 1.0f;
+        }
+        float s = static_cast<float>(std::atof(v));
+        if (s < 0.25f) s = 0.25f;
+        if (s > 1.0f) s = 1.0f;
+        return s;
+    }();
+    const bool synth_full_res = (synth_scale >= 0.999f) || m_afw_mode;
+    params.synth_width = synth_full_res
+        ? params.out_width
+        : static_cast<uint32_t>(params.out_width * synth_scale + 0.5f);
+    params.synth_height = synth_full_res
+        ? params.out_height
+        : static_cast<uint32_t>(params.out_height * synth_scale + 0.5f);
+    if (params.synth_width < 16u) params.synth_width = 16u;
+    if (params.synth_height < 16u) params.synth_height = 16u;
+
+    // Scatter buffers (and history) live in SYNTHESIS space; the packed output
+    // texture below stays at the full out dims.
+    if (!ensure_scatter(device, params.synth_width, params.synth_height)) {
         return nullptr;
     }
 
     if (m_afw_mode && mode == Mode::YoroScatter &&
-        !ensure_afw_history(device, params.out_width, params.out_height)) {
+        !ensure_afw_history(device, params.synth_width, params.synth_height)) {
         return nullptr;
     }
 
@@ -652,49 +952,139 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     m_ring_index = (m_ring_index + 1) % kRing;
     std::memcpy(m_objs.cbuffer_ptr + static_cast<size_t>(slot) * kCbSlotSize, &params, sizeof(params));
 
+    // Per-pass GPU timing: read back what this slot recorded kRing frames ago
+    // (its GPU work is long retired) before the queries are overwritten below.
+    const bool ts_on = gpu_timing_enabled() && ensure_gpu_timing(device);
+    uint32_t ts_pass_count = 0;
+    if (ts_on) {
+        drain_gpu_timing_slot(slot);
+        log_gpu_timing();
+    }
+    const auto ts_begin = [&]() {
+        if (ts_on && ts_pass_count < kTsMaxPasses) {
+            cmd_list->EndQuery(m_ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * kTsQueriesPerSlot + ts_pass_count * 2);
+        }
+    };
+    const auto ts_end = [&](TsPass pass) {
+        if (ts_on && ts_pass_count < kTsMaxPasses) {
+            cmd_list->EndQuery(m_ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * kTsQueriesPerSlot + ts_pass_count * 2 + 1);
+            m_ts_slot_seq[slot][ts_pass_count] = static_cast<uint8_t>(pass);
+            ++ts_pass_count;
+        }
+    };
+
     const auto cpu_base = m_objs.heap->GetCPUDescriptorHandleForHeapStart();
     const size_t slot_offset = static_cast<size_t>(slot) * kDescriptorsPerSlot * m_objs.descriptor_stride;
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC color_srv{};
-    color_srv.Format = color_srv_format(color_desc.Format);
-    color_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    color_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    color_srv.Texture2D.MipLevels = 1;
-    device->CreateShaderResourceView(color, &color_srv, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset});
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv{};
-    depth_srv.Format = depth_srv_format(depth_desc.Format);
-    depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    depth_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    depth_srv.Texture2D.MipLevels = 1;
-    device->CreateShaderResourceView(depth, &depth_srv, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + m_objs.descriptor_stride});
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-    uav.Format = m_output_format;
-    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    device->CreateUnorderedAccessView(m_output.Get(), nullptr, &uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 2 * m_objs.descriptor_stride});
 
     const uint32_t cur = m_scatter_index;
     const uint32_t prev = cur ^ 1u;
 
-    D3D12_UNORDERED_ACCESS_VIEW_DESC key_uav{};
-    key_uav.Format = DXGI_FORMAT_R32_UINT;
-    key_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    device->CreateUnorderedAccessView(m_scatter_key[cur].Get(), nullptr, &key_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 3 * m_objs.descriptor_stride});
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC scol_uav{};
-    scol_uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    scol_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    device->CreateUnorderedAccessView(m_scatter_color[cur].Get(), nullptr, &scol_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 4 * m_objs.descriptor_stride});
-
     // History for the temporal hole fill: the previous frame's filled scatter
     // pair, or in AFW mode the real-render stash (which the stash pass then
-    // overwrites with THIS frame's source after the fill has read it).
+    // overwrites with THIS frame's source after the fill has read it). The
+    // color is additionally exposed as an SRV (t3): the fill and compose
+    // passes only READ it, and the SRV path gives the compose's history blend
+    // a filtered single-sample fetch. The resource is transitioned to a
+    // shader-readable state around those passes below.
     const bool afw_history = m_afw_mode && mode == Mode::YoroScatter && m_afw_history_color != nullptr;
     ID3D12Resource* history_color = afw_history ? m_afw_history_color.Get() : m_scatter_color[prev].Get();
     ID3D12Resource* history_key = afw_history ? m_afw_history_key.Get() : m_scatter_key[prev].Get();
-    device->CreateUnorderedAccessView(history_color, nullptr, &scol_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 5 * m_objs.descriptor_stride});
-    device->CreateUnorderedAccessView(history_key, nullptr, &key_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 6 * m_objs.descriptor_stride});
+
+    // Descriptor-churn guard: hash every input that shapes this slot's
+    // descriptor writes (the resource set only changes on mode flips,
+    // resolution changes or recreation - m_resource_generation covers
+    // pointer reuse), and skip the dozen Create*View calls when identical to
+    // what the slot already holds.
+    uint64_t desc_hash = 0xcbf29ce484222325ull;
+    const auto mix = [&desc_hash](uint64_t v) {
+        desc_hash ^= v;
+        desc_hash *= 0x100000001b3ull;
+    };
+    mix(reinterpret_cast<uintptr_t>(color));
+    mix(static_cast<uint64_t>(color_srv_format(color_desc.Format)));
+    mix(static_cast<uint64_t>(color_desc.Width));
+    mix(reinterpret_cast<uintptr_t>(depth));
+    mix(static_cast<uint64_t>(depth_srv_format(depth_desc.Format)));
+    mix(reinterpret_cast<uintptr_t>((prep_pso != nullptr) ? m_prep.Get() : nullptr));
+    mix(reinterpret_cast<uintptr_t>(m_output.Get()));
+    mix(static_cast<uint64_t>(m_output_format));
+    mix(reinterpret_cast<uintptr_t>(m_scatter_key[cur].Get()));
+    mix(reinterpret_cast<uintptr_t>(m_scatter_color[cur].Get()));
+    mix(reinterpret_cast<uintptr_t>(history_color));
+    mix(reinterpret_cast<uintptr_t>(history_key));
+    mix(static_cast<uint64_t>(mode == Mode::YoroScatter));
+    mix(m_resource_generation);
+
+    if (m_slot_desc_hash[slot] != desc_hash) {
+        m_slot_desc_hash[slot] = desc_hash;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC color_srv{};
+        color_srv.Format = color_srv_format(color_desc.Format);
+        color_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        color_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        color_srv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(color, &color_srv, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset});
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv{};
+        depth_srv.Format = depth_srv_format(depth_desc.Format);
+        depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        depth_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        depth_srv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(depth, &depth_srv, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + m_objs.descriptor_stride});
+
+        // t2: conditioned-depth prepass output (null descriptor when this mode
+        // has no prepass - the scatter compose never reads it).
+        D3D12_SHADER_RESOURCE_VIEW_DESC prep_srv{};
+        prep_srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        prep_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        prep_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        prep_srv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView((prep_pso != nullptr) ? m_prep.Get() : nullptr, &prep_srv,
+            D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 2 * m_objs.descriptor_stride});
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+        uav.Format = m_output_format;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device->CreateUnorderedAccessView(m_output.Get(), nullptr, &uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 4 * m_objs.descriptor_stride});
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC key_uav{};
+        key_uav.Format = DXGI_FORMAT_R32_UINT;
+        key_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device->CreateUnorderedAccessView(m_scatter_key[cur].Get(), nullptr, &key_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 5 * m_objs.descriptor_stride});
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC scol_uav{};
+        scol_uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        scol_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device->CreateUnorderedAccessView(m_scatter_color[cur].Get(), nullptr, &scol_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 6 * m_objs.descriptor_stride});
+
+        device->CreateUnorderedAccessView(history_color, nullptr, &scol_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 7 * m_objs.descriptor_stride});
+        device->CreateUnorderedAccessView(history_key, nullptr, &key_uav, D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 8 * m_objs.descriptor_stride});
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC hist_srv{};
+        hist_srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        hist_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        hist_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        hist_srv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView((mode == Mode::YoroScatter) ? history_color : nullptr, &hist_srv,
+            D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 3 * m_objs.descriptor_stride});
+
+        // u5: prepass write target (null when this mode has no prepass).
+        D3D12_UNORDERED_ACCESS_VIEW_DESC prep_uav{};
+        prep_uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        prep_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device->CreateUnorderedAccessView((prep_pso != nullptr) ? m_prep.Get() : nullptr, nullptr, &prep_uav,
+            D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 9 * m_objs.descriptor_stride});
+
+        // CPU-only twins of the scatter key/color UAVs for
+        // ClearUnorderedAccessView* (same inputs, so the same guard applies).
+        if (mode == Mode::YoroScatter) {
+            const auto clear_cpu_base = m_objs.clear_heap->GetCPUDescriptorHandleForHeapStart();
+            device->CreateUnorderedAccessView(m_scatter_key[cur].Get(), nullptr, &key_uav,
+                D3D12_CPU_DESCRIPTOR_HANDLE{clear_cpu_base.ptr + static_cast<size_t>(slot) * 2 * m_objs.descriptor_stride});
+            device->CreateUnorderedAccessView(m_scatter_color[cur].Get(), nullptr, &scol_uav,
+                D3D12_CPU_DESCRIPTOR_HANDLE{clear_cpu_base.ptr + (static_cast<size_t>(slot) * 2 + 1) * m_objs.descriptor_stride});
+        }
+    }
 
     // Read-combo states that already include NON_PIXEL_SHADER_RESOURCE (e.g.
     // UEVR's ENGINE_SRC_COLOR / ENGINE_SRC_DEPTH) are readable by compute
@@ -723,71 +1113,135 @@ ID3D12Resource* DIBRSynthesis::synthesize(
 
     // Source-space passes iterate rendered pixels; output-space passes cover
     // the (possibly narrower) true-FOV target.
-    const uint32_t gx_src = (params.source_width + 15) / 16;
-    const uint32_t gy_src = (params.source_height + 15) / 16;
-    const uint32_t gx_out = (params.out_width + 15) / 16;
-    const uint32_t gy_out = (params.out_height + 15) / 16;
+    const uint32_t tg = dibr_thread_group();
+    const auto groups = [tg](uint32_t v) { return (v + tg - 1) / tg; };
+    const uint32_t gx_src = groups(params.source_width);
+    const uint32_t gy_src = groups(params.source_height);
+    const uint32_t gx_out = groups(params.out_width);
+    const uint32_t gy_out = groups(params.out_height);
+    // Scatter-space passes (clear, fill) cover the synthesis buffers, which are
+    // synth_width x synth_height (== out dims at scale 1.0). The compose pass
+    // still covers the full out dims and upscales the scatter result.
+    const uint32_t gx_synth = groups(params.synth_width);
+    const uint32_t gy_synth = groups(params.synth_height);
+
+    // Batched UAV barriers: consecutive single-resource ResourceBarrier calls
+    // collapse into one call with an array.
+    const auto uav_barrier = [cmd_list](ID3D12Resource* r) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b.UAV.pResource = r;
+        cmd_list->ResourceBarrier(1, &b);
+    };
+    const auto uav_barrier_pair = [cmd_list](ID3D12Resource* a, ID3D12Resource* b) {
+        D3D12_RESOURCE_BARRIER bs[2]{};
+        bs[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        bs[0].UAV.pResource = a;
+        bs[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        bs[1].UAV.pResource = b;
+        cmd_list->ResourceBarrier(2, bs);
+    };
+
+    // Conditioned-depth prepass for the gather kernels: one dispatch over
+    // source pixels runs the multi-tap conditioning chain ONCE per pixel; the
+    // main kernel's search loops then read it back as single taps (t2). The
+    // state transitions double as the write->read barrier.
+    if (prep_pso != nullptr) {
+        ts_begin();
+        if (m_prep_is_srv) {
+            transition(cmd_list, m_prep.Get(), shader_read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        cmd_list->SetPipelineState(prep_pso);
+        cmd_list->Dispatch(gx_src, gy_src, 1);
+        transition(cmd_list, m_prep.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, shader_read);
+        m_prep_is_srv = true;
+        ts_end(TsPass::Prep);
+    }
 
     if (mode == Mode::YoroScatter) {
-        const auto uav_barrier = [cmd_list](ID3D12Resource* r) {
-            D3D12_RESOURCE_BARRIER b{};
-            b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            b.UAV.pResource = r;
-            cmd_list->ResourceBarrier(1, &b);
-        };
-
         const uint32_t cur = m_scatter_index;
 
-        // clear -> depth scatter (nearest wins) -> color resolve -> hole fill.
-        cmd_list->SetPipelineState(m_objs.pso_scatter_clear.Get());
-        cmd_list->Dispatch(gx_out, gy_out, 1);
-        uav_barrier(m_scatter_key[cur].Get());
-        uav_barrier(m_scatter_color[cur].Get());
+        // clear (fixed-function) -> depth scatter (nearest wins) -> color
+        // resolve -> hole fill. ClearUnorderedAccessView* replaces the old
+        // clear dispatch: it needs the shader-visible GPU handle (heap is
+        // bound above) plus a CPU handle from the non-shader-visible
+        // clear_heap (descriptors written under the churn guard above).
+        ts_begin();
+        const auto clear_cpu_base = m_objs.clear_heap->GetCPUDescriptorHandleForHeapStart();
+        const D3D12_CPU_DESCRIPTOR_HANDLE key_clear_cpu{clear_cpu_base.ptr + static_cast<size_t>(slot) * 2 * m_objs.descriptor_stride};
+        const D3D12_CPU_DESCRIPTOR_HANDLE color_clear_cpu{clear_cpu_base.ptr + (static_cast<size_t>(slot) * 2 + 1) * m_objs.descriptor_stride};
+        const D3D12_GPU_DESCRIPTOR_HANDLE key_gpu{gpu_base.ptr + slot_offset + 5 * m_objs.descriptor_stride};
+        const D3D12_GPU_DESCRIPTOR_HANDLE color_gpu{gpu_base.ptr + slot_offset + 6 * m_objs.descriptor_stride};
+        const UINT key_zero[4] = {0u, 0u, 0u, 0u}; // 0 = empty (farther than any reversed-Z depth)
+        const FLOAT color_zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        cmd_list->ClearUnorderedAccessViewUint(key_gpu, key_clear_cpu, m_scatter_key[cur].Get(), key_zero, 0, nullptr);
+        cmd_list->ClearUnorderedAccessViewFloat(color_gpu, color_clear_cpu, m_scatter_color[cur].Get(), color_zero, 0, nullptr);
+        uav_barrier_pair(m_scatter_key[cur].Get(), m_scatter_color[cur].Get());
+        ts_end(TsPass::Clear);
 
+        ts_begin();
         cmd_list->SetPipelineState(m_objs.pso_scatter_depth.Get());
         cmd_list->Dispatch(gx_src, gy_src, 1);
         uav_barrier(m_scatter_key[cur].Get());
+        ts_end(TsPass::ScatterDepth);
 
+        ts_begin();
         cmd_list->SetPipelineState(m_objs.pso_scatter_color.Get());
         cmd_list->Dispatch(gx_src, gy_src, 1);
         uav_barrier(m_scatter_color[cur].Get());
+        ts_end(TsPass::ScatterColor);
 
+        // The fill and the compose only READ the history color (t3 SRV);
+        // shader-readable state for both, back to UAV after the compose.
+        transition(cmd_list, history_color, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, shader_read);
+
+        ts_begin();
         cmd_list->SetPipelineState(m_objs.pso_scatter_fill.Get());
-        cmd_list->Dispatch(gx_out, gy_out, 1);
-        uav_barrier(m_scatter_color[cur].Get());
+        cmd_list->Dispatch(gx_synth, gy_synth, 1);
         // The fill pass also commits marker-bit keys; next frame reads this
         // buffer as g_historyKey, so its writes need ordering too.
-        uav_barrier(m_scatter_key[cur].Get());
+        uav_barrier_pair(m_scatter_color[cur].Get(), m_scatter_key[cur].Get());
+        ts_end(TsPass::Fill);
 
         // This frame's filled pair becomes the next frame's temporal history.
         m_scatter_index = cur ^ 1u;
         m_scatter_history_valid = true;
     }
 
+    ts_begin();
     cmd_list->SetPipelineState(pso);
 
     // One thread per OUTPUT pixel; each thread writes both eyes' output pixels.
     cmd_list->Dispatch(gx_out, gy_out, 1);
+    ts_end(TsPass::Compose);
+
+    if (mode == Mode::YoroScatter) {
+        // The compose was the last history reader; restore UNORDERED_ACCESS
+        // (the AFW stash writes it next, and every pass assumes UAV at entry).
+        transition(cmd_list, history_color, shader_read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
 
     if (mode == Mode::YoroScatter && afw_history) {
-        const auto uav_barrier = [cmd_list](ID3D12Resource* r) {
-            D3D12_RESOURCE_BARRIER b{};
-            b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            b.UAV.pResource = r;
-            cmd_list->ResourceBarrier(1, &b);
-        };
-
         // The fill AND the compose above have consumed the previous stash;
         // only now overwrite it with THIS frame's raw source render for the
         // next frame. The UAV barriers order the read-then-write on the
         // shared history pair.
-        uav_barrier(m_afw_history_color.Get());
-        uav_barrier(m_afw_history_key.Get());
+        ts_begin();
+        uav_barrier_pair(m_afw_history_color.Get(), m_afw_history_key.Get());
         cmd_list->SetPipelineState(m_objs.pso_afw_stash.Get());
         cmd_list->Dispatch(gx_out, gy_out, 1);
-        uav_barrier(m_afw_history_color.Get());
-        uav_barrier(m_afw_history_key.Get());
+        uav_barrier_pair(m_afw_history_color.Get(), m_afw_history_key.Get());
         m_afw_history_valid = true;
+        ts_end(TsPass::Stash);
+    }
+
+    // Resolve this frame's timestamp pairs into the readback slot; they are
+    // consumed when the ring wraps back around (kRing frames later).
+    if (ts_on && ts_pass_count > 0) {
+        cmd_list->ResolveQueryData(m_ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+            slot * kTsQueriesPerSlot, ts_pass_count * 2,
+            m_ts_readback.Get(), static_cast<uint64_t>(slot) * kTsQueriesPerSlot * sizeof(uint64_t));
+        m_ts_slot_count[slot] = static_cast<uint8_t>(ts_pass_count);
     }
 
     transition(cmd_list, m_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -826,6 +1280,20 @@ void DIBRSynthesis::reset() {
     m_afw_history_key.Reset();
     m_afw_history_color.Reset();
     m_afw_history_valid = false;
+    m_prep.Reset();
+    m_prep_width = 0;
+    m_prep_height = 0;
+    m_prep_is_srv = false;
+    if (m_ts_readback != nullptr && m_ts_mapped != nullptr) {
+        m_ts_readback->Unmap(0, nullptr);
+    }
+    m_ts_heap.Reset();
+    m_ts_readback.Reset();
+    m_ts_mapped = nullptr;
+    m_ts_queue = nullptr;
+    m_ts_frequency = 0;
+    m_ts_slot_count.fill(0);
+    m_slot_desc_hash.fill(0);
     m_ring_index = 0;
     m_state.store(State::NotStarted, std::memory_order_release);
 }

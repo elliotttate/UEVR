@@ -15,16 +15,35 @@
 #define SCATTER_COMPOSE 0
 #endif
 
+// DIBR_LEAN=1 (additional PSOs from this same source) compiles out the
+// optional output features; the CPU picks it whenever every gated parameter
+// is at its pass-through default (see DIBRSynthesis::params_allow_lean).
+#ifndef DIBR_LEAN
+#define DIBR_LEAN 0
+#endif
+
+// Thread-group edge (overridable via UEVR_DIBR_TG; the C++ dispatch math
+// uses the same value).
+#ifndef DIBR_TG
+#define DIBR_TG 16
+#endif
+
 Texture2D<float4> g_colorTex : register(t0);
 Texture2D<float>  g_depthTex : register(t1);
+// Conditioned search depth (dibr_depth_prep.hlsl PREP_MODE 2): the old
+// YoroSearchDepth chain evaluated once per source pixel. Gather path only.
+Texture2D<float2> g_prepDepth : register(t2);
+// SRV alias of the history color (same resource as u3, transitioned to a
+// shader-readable state for the passes that only READ it) so the AFW blend
+// can use one filtered sample instead of a manual 4-tap bilinear.
+Texture2D<float4> g_historyColorSrv : register(t3);
 RWTexture2D<float4> g_sbsOut : register(u0);
 // Scatter pipeline intermediates (see dibr_scatter_*.hlsl); only read when
 // scatter_compose > 0.5.
 RWTexture2D<uint> g_scatterKey : register(u1);
 RWTexture2D<float4> g_scatterColor : register(u2);
-// Temporal history (AFW: last frame's REAL render of the eye being
-// synthesized + its device-depth keys); only read when temporal_enabled > 1.5.
-RWTexture2D<float4> g_historyColor : register(u3);
+// Temporal history keys (AFW: last frame's REAL render of the eye being
+// synthesized, device-depth keys); only read when temporal_enabled > 1.5.
 RWTexture2D<uint> g_historyKey : register(u4);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
@@ -285,11 +304,19 @@ cbuffer StereoParams : register(b0) {
     // render target makes the source wider than the true-FOV output.
     uint  out_width;
     uint  out_height;
+    uint  synth_width;
+    uint  synth_height;
+    // CPU-resolved constants (stamped by DIBRSynthesis::synthesize each
+    // frame): dispatch-uniform values hoisted out of the per-pixel code.
+    float pre_effective_convergence;
+    float pre_inv_src_width;
+    float pre_inv_src_height;
+    float pre_edge_comp_inv;
 };
 
 float EffectiveConvergence()
 {
-    return lerp(convergence, 0.5f, saturate(zpd_balance));
+    return pre_effective_convergence;
 }
 
 float StereoDepthDelta(float depth)
@@ -637,6 +664,9 @@ float OutputMatteMask(float2 uv)
 
 float4 ApplyOutputMatte(float2 uv, float4 stereoColor, float4 centerColor)
 {
+#if DIBR_LEAN
+    return stereoColor;
+#endif
     float mask = OutputMatteMask(uv);
     if (mask <= 0.0f) {
         return stereoColor;
@@ -718,6 +748,9 @@ float CursorOverlayMask(float2 uv, float eyeSign)
 
 float4 ApplyCursorOverlay(float2 uv, float eyeSign, float4 color)
 {
+#if DIBR_LEAN
+    return color;
+#endif
     float mask = CursorOverlayMask(uv, eyeSign);
     if (mask <= 0.0f) {
         return color;
@@ -746,6 +779,9 @@ float ComfortNoseMask(float2 uv, float eyeSign)
 
 float4 ApplyComfortNose(float2 uv, float eyeSign, float4 color)
 {
+#if DIBR_LEAN
+    return color;
+#endif
     float mask = ComfortNoseMask(uv, eyeSign);
     if (mask <= 0.0f) {
         return color;
@@ -776,6 +812,9 @@ float ImageFilterNoise(float2 uv)
 
 float4 ApplyImageFilter(float2 sampleUv, float4 color)
 {
+#if DIBR_LEAN
+    return color;
+#endif
     float sharpenStrength = max(image_filter_sharpen_strength, 0.0f);
     float aaStrength = saturate(image_filter_aa_strength);
     float debandStrength = saturate(image_filter_deband_strength);
@@ -850,9 +889,11 @@ float4 OutputDistortionGridColor(float2 uv)
 
 float4 SampleOutputSource(float2 uv)
 {
+#if !DIBR_LEAN
     if (output_distortion_grid > 0.5f) {
         return OutputDistortionGridColor(uv);
     }
+#endif
     return g_colorTex.SampleLevel(g_linearSampler, uv, 0);
 }
 
@@ -941,6 +982,9 @@ float4 SampleOutputColor(float2 sampleUv)
 {
     float2 uv = saturate(sampleUv);
     float4 baseColor = SampleOutputSource(uv);
+#if DIBR_LEAN
+    return baseColor;
+#endif
     float strength = saturate(output_geometry_poly_strength);
     if (strength <= 0.0f) {
         return baseColor;
@@ -1231,6 +1275,9 @@ float3 FrameMarkerLineColor(uint parity, float layoutMode, bool frameAlternate)
 
 float4 ApplyFrameMarker(uint outX, uint outY, uint outWidth, uint outHeight, float4 color, uint parity, float layoutMode)
 {
+#if DIBR_LEAN
+    return color;
+#endif
     float mode = floor(output_frame_marker_mode + 0.5f);
     if (mode < 0.5f) {
         return color;
@@ -1285,6 +1332,9 @@ float AlignmentCrossMask(float2 markerUv)
 
 float4 ApplyAlignmentMarker(float2 outputUv, float2 sampleUv, float4 color)
 {
+#if DIBR_LEAN
+    return color;
+#endif
     float mode = floor(output_alignment_marker_mode + 0.5f);
     if (mode < 0.5f)
     {
@@ -1338,6 +1388,9 @@ float2 InterlaceGridCoord(uint x, uint y)
 
 float2 InterlaceSampleOffset(float eyeSign)
 {
+#if DIBR_LEAN
+    return float2(0.0f, 0.0f);
+#endif
     float mode = floor(output_composition_mode + 0.5f);
     float offset = max(output_interlace_sample_offset, 0.0f);
     if (mode >= 5.5f && mode < 6.5f) {
@@ -1432,6 +1485,9 @@ float2 RotateOutputEyeUv(float2 uv, float degreesValue)
 
 float2 ApplyOutputEyeAlignment(float2 uv, float eyeSign)
 {
+#if DIBR_LEAN
+    return uv;
+#endif
     float degreesValue = OutputHeadsetRotation(eyeSign);
     float2 alignedUv = ApplyOutputEyeKeystone(uv + OutputLensDependentIpdOffset(eyeSign), eyeSign);
     return RotateOutputEyeUv(alignedUv + OutputEyeAlignmentOffset(eyeSign), degreesValue);
@@ -1439,6 +1495,9 @@ float2 ApplyOutputEyeAlignment(float2 uv, float eyeSign)
 
 void ApplyStereoComposition(uint x, uint y, inout float4 leftColor, inout float4 rightColor)
 {
+#if DIBR_LEAN
+    return;
+#endif
     float mode = floor(output_composition_mode + 0.5f);
     if (mode < 0.5f) {
         return;
@@ -1541,6 +1600,9 @@ void WriteStereoPair(uint x, uint y, float4 leftColor, float4 rightColor)
 
 float4 ApplyPresentationColor(float2 uv, float4 color)
 {
+#if DIBR_LEAN
+    return color;
+#endif
     float sat = max(output_saturation, 0.0f);
     float luma = ImageFilterLuma(color.rgb);
     color.rgb = saturate(lerp(float3(luma, luma, luma), color.rgb, sat));
@@ -1566,6 +1628,9 @@ float4 ApplyPresentationColor(float2 uv, float4 color)
 
 float2 ApplyOutputGeometry(float2 uv)
 {
+#if DIBR_LEAN
+    return saturate(uv);
+#endif
     float2 d = uv - 0.5f;
     if (output_geometry_axis_swap > 0.5f) {
         d = d.yx;
@@ -1907,40 +1972,12 @@ float DepthArtifactGuardScale(float2 uv, float depth)
 
 #define YORO_MAX_SEARCH_STEPS 64
 
+// The conditioned search depth (5-tap smooth/protect + masks + range boost +
+// filter emulator) is built once per source pixel by dibr_depth_prep.hlsl
+// (PREP_MODE 2); every probe of the search reads it back as a single tap.
 float YoroSearchDepth(float2 uv)
 {
-    uv = saturate(uv);
-    float2 texel = float2(1.0f / max((float)srcWidth, 1.0f), 1.0f / max((float)srcHeight, 1.0f));
-
-    // Neighbors use the base sampler (no edge-mask recursion): keeps the
-    // inlined code size sane - SamplePreparedDepth expands to a 4-tap
-    // edge-mask chain per call, which blew DXC's compile time up when used
-    // for all five taps inside the search loop.
-    float d  = SamplePreparedDepthBase(uv);
-    float dl = SamplePreparedDepthBase(uv - float2(texel.x, 0.0f));
-    float dr = SamplePreparedDepthBase(uv + float2(texel.x, 0.0f));
-    float du = SamplePreparedDepthBase(uv - float2(0.0f, texel.y));
-    float dd = SamplePreparedDepthBase(uv + float2(0.0f, texel.y));
-
-    float minDepth = min(d, min(min(dl, dr), min(du, dd)));
-    float neighborAvg = (dl + dr + du + dd) * 0.25f;
-    float gradient = max(abs(dr - dl), abs(dd - du));
-
-    // Raymarch-kernel-style conditioning (Depth3D's always-on min-dilation):
-    // smooth flat areas, and on sharp edges pull depth toward the nearest
-    // local neighbor so thin foreground features (floating text, plant
-    // fronds) warp as one coherent block instead of shredding per pixel.
-    // Driven by the same live params as the raymarch kernel
-    // (range_smoothing 0.35 / foreground_protect 0.5 by default).
-    float edgeWeight = saturate(gradient * 24.0f);
-    float smoothWeight = saturate(range_smoothing) * (1.0f - edgeWeight);
-    float protectedWeight = edgeWeight * saturate(foreground_protect);
-    float depth = lerp(d, neighborAvg, smoothWeight);
-    depth = saturate(lerp(depth, minDepth, protectedWeight));
-
-    depth = ApplyUiAlphaDepthMask(uv, ApplyShapeDepthMask(uv, ApplyWeaponDepthMask(uv, ApplyRegionDepthMask(uv, depth))));
-    depth = ApplyDepthRangeBoost(depth);
-    return ApplyFilterEmulatorDepthControls(depth);
+    return g_prepDepth.SampleLevel(g_linearSampler, saturate(uv), 0).x;
 }
 
 // Signed UV shift of the synthesized eye (full disparity - the reference eye
@@ -1948,8 +1985,16 @@ float YoroSearchDepth(float2 uv)
 // the legacy fullLeft/RightOffset math. The two depth-gradient guards
 // (convergence boundary / artifact guard) are factored out into a
 // boundaryScale computed once at the output pixel, so the search loop does
-// not resample the depth gradient per probe.
-float YoroSynthShiftBase(float2 uv, float depth, float eyeSign)
+// not resample the depth gradient per probe - and the remaining mask-stack
+// guards below are likewise hoisted to the output pixel (they vary slowly
+// along the ray and are all 1.0 at default settings).
+float YoroSynthGuard(float2 uv, float depth, float eyeSign)
+{
+    return FilterEmulatorFocusScale(depth) * ScreenEdgeGuard(uv, depth)
+        * WeaponBoundaryScale(uv, depth) * FocusReductionScale(uv, depth, eyeSign);
+}
+
+float YoroSynthShiftGuarded(float depth, float guard, float eyeSign)
 {
     float delta = StereoDepthDelta(depth);
     // Same near-disparity clamp as the raymarch kernel's DepthToUvShiftBase:
@@ -1959,9 +2004,7 @@ float YoroSynthShiftBase(float2 uv, float depth, float eyeSign)
     if (nearLimit < 1.0f && delta < 0.0f) {
         delta = max(delta, -nearLimit);
     }
-    float guardedDisparity = divergence * delta * FilterEmulatorFocusScale(depth);
-    guardedDisparity *= ScreenEdgeGuard(uv, depth) * WeaponBoundaryScale(uv, depth) * FocusReductionScale(uv, depth, eyeSign);
-    return eyeSign * 2.0f * (guardedDisparity + perspective_shift) / max((float)srcWidth, 1.0f);
+    return eyeSign * 2.0f * (divergence * delta * guard + perspective_shift) * pre_inv_src_width;
 }
 
 int YoroSearchSteps(float2 uv, float requestedSteps)
@@ -2019,10 +2062,28 @@ float2 ReprojectSourceUv(float2 srcUv, float rawDepth, float eyeSign)
 // depth, so candidate source offsets span the shifts implied by the nearest
 // (device 1, reversed-Z) and farthest (device 0) depths; marching from the
 // near-implied end keeps nearest-surface-wins occlusion.
+// x component of ReprojectSourceUv with the scanline-invariant matrix terms
+// hoisted: every probe of a horizontal search shares ndc.y, so the 4x4
+// multiply collapses to two FMA pairs in ndc.x and depth (only t.x and t.w
+// matter for the horizontal hit test).
+float YoroReprojX(float srcUvX, float rawDepth, float3 coefX, float3 coefW)
+{
+    float ndcX = srcUvX * 2.0f - 1.0f;
+    float tx = coefX.x * ndcX + coefX.y * rawDepth + coefX.z;
+    float tw = coefW.x * ndcX + coefW.y * rawDepth + coefW.z;
+    float w = (abs(tw) > 1e-6f) ? tw : 1e-6f;
+    return (tx / w) * 0.5f + 0.5f;
+}
+
 float2 YoroMatrixSearchUv(float2 uv, float eyeSign)
 {
-    float fwdNear = ReprojectSourceUv(uv, 1.0f, eyeSign).x - uv.x;
-    float fwdFar = ReprojectSourceUv(uv, 0.0f, eyeSign).x - uv.x;
+    float4x4 M = (eyeSign > 0.0f) ? reproj_source_to_left : reproj_source_to_right;
+    float ndcY = 1.0f - uv.y * 2.0f;
+    float3 coefX = float3(M._m00, M._m02, M._m01 * ndcY + M._m03);
+    float3 coefW = float3(M._m30, M._m32, M._m31 * ndcY + M._m33);
+
+    float fwdNear = YoroReprojX(uv.x, 1.0f, coefX, coefW) - uv.x;
+    float fwdFar = YoroReprojX(uv.x, 0.0f, coefX, coefW) - uv.x;
 
     // A source pixel at uv.x + s with forward shift fwd(depth) lands at
     // uv.x + s + fwd; landing on this pixel needs s = -fwd(depth).
@@ -2043,15 +2104,11 @@ float2 YoroMatrixSearchUv(float2 uv, float eyeSign)
     float hitS = sFarEnd;
 
     [loop]
-    for (int i = 0; i <= YORO_MAX_SEARCH_STEPS; ++i) {
-        if (i > steps) {
-            break;
-        }
-
+    for (int i = 0; i <= steps; ++i) {
         float t = (float)i / (float)steps;
         float s = lerp(sNearEnd, sFarEnd, t);
         float2 probeUv = float2(uv.x + s, uv.y);
-        float f = ReprojectSourceUv(probeUv, SampleRawDeviceDepth(probeUv), eyeSign).x - uv.x;
+        float f = YoroReprojX(probeUv.x, SampleRawDeviceDepth(probeUv), coefX, coefW) - uv.x;
 
         if (havePrev && (f <= 0.0f) != (prevF <= 0.0f)) {
             // Bisect the bracket for sub-step precision.
@@ -2062,7 +2119,7 @@ float2 YoroMatrixSearchUv(float2 uv, float eyeSign)
             for (int r = 0; r < 4; ++r) {
                 float mid = 0.5f * (lo + hi);
                 float2 midUv = float2(uv.x + mid, uv.y);
-                float fMid = ReprojectSourceUv(midUv, SampleRawDeviceDepth(midUv), eyeSign).x - uv.x;
+                float fMid = YoroReprojX(midUv.x, SampleRawDeviceDepth(midUv), coefX, coefW) - uv.x;
                 if ((fMid <= 0.0f) == (fLo <= 0.0f)) {
                     lo = mid;
                     fLo = fMid;
@@ -2101,10 +2158,15 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
         return srcUv;
     }
 
-    float targetShift = YoroSynthShiftBase(uv, centerDepth, eyeSign) * boundaryScale * shiftScale;
+    // The mask-stack guard product is hoisted to the output pixel (it varies
+    // slowly along the ray and every factor is 1.0 at default settings); each
+    // probe is then one prep-texture tap plus a few ALU ops.
+    float guard = YoroSynthGuard(uv, centerDepth, eyeSign);
+    float outerScale = boundaryScale * shiftScale;
+    float targetShift = YoroSynthShiftGuarded(centerDepth, guard, eyeSign) * outerScale;
     float absTarget = abs(targetShift);
     float2 directUv = uv + StereoShift(targetShift);
-    if (absTarget <= (0.25f / max((float)srcWidth, 1.0f))) {
+    if (absTarget <= (0.25f * pre_inv_src_width)) {
         return directUv;
     }
 
@@ -2123,15 +2185,11 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
     float hitT = -1.0f;
 
     [loop]
-    for (int i = 1; i <= YORO_MAX_SEARCH_STEPS; ++i) {
-        if (i > steps) {
-            break;
-        }
-
+    for (int i = 1; i <= steps; ++i) {
         float t = (float)i / (float)steps;
         float2 probeUv = saturate(uv + StereoShift(direction * absTarget * t));
         float probeDepth = YoroSearchDepth(probeUv);
-        float f = abs(YoroSynthShiftBase(probeUv, probeDepth, eyeSign) * boundaryScale * shiftScale) - absTarget * t;
+        float f = abs(YoroSynthShiftGuarded(probeDepth, guard, eyeSign) * outerScale) - absTarget * t;
 
         if (f <= 0.0f) {
             // Bisect the bracket for sub-step precision (Depth3D-style).
@@ -2141,7 +2199,7 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
             for (int r = 0; r < 4; ++r) {
                 float mid = 0.5f * (lo + hi);
                 float2 midUv = saturate(uv + StereoShift(direction * absTarget * mid));
-                float fMid = abs(YoroSynthShiftBase(midUv, YoroSearchDepth(midUv), eyeSign) * boundaryScale * shiftScale) - absTarget * mid;
+                float fMid = abs(YoroSynthShiftGuarded(YoroSearchDepth(midUv), guard, eyeSign) * outerScale) - absTarget * mid;
                 if (fMid <= 0.0f) {
                     hi = mid;
                 } else {
@@ -2195,6 +2253,32 @@ float4 SampleSynthStereoColor(float2 sampleUv, float2 centerUv, float4 centerCol
 }
 
 #if SCATTER_COMPOSE
+// Read the synthesized eye from the scatter colour buffer, which lives in
+// SYNTHESIS space (synth_width x synth_height). When that's below the output
+// res (the half-res synth toggle) this bilinearly upscales; at scale 1.0
+// synth == out and it collapses to the exact 1:1 fetch (bit-identical).
+float3 SampleScatterUpscaled(uint ox, uint oy)
+{
+    if (synth_width == out_width && synth_height == out_height) {
+        return g_scatterColor[uint2(ox, oy)].rgb;
+    }
+    float fx = ((float)ox + 0.5f) * (float)synth_width / (float)out_width - 0.5f;
+    float fy = ((float)oy + 0.5f) * (float)synth_height / (float)out_height - 0.5f;
+    fx = clamp(fx, 0.0f, (float)synth_width - 1.0f);
+    fy = clamp(fy, 0.0f, (float)synth_height - 1.0f);
+    int x0 = (int)floor(fx);
+    int y0 = (int)floor(fy);
+    int x1 = min(x0 + 1, (int)synth_width - 1);
+    int y1 = min(y0 + 1, (int)synth_height - 1);
+    float wx = fx - (float)x0;
+    float wy = fy - (float)y0;
+    float3 c00 = g_scatterColor[uint2(x0, y0)].rgb;
+    float3 c10 = g_scatterColor[uint2(x1, y0)].rgb;
+    float3 c01 = g_scatterColor[uint2(x0, y1)].rgb;
+    float3 c11 = g_scatterColor[uint2(x1, y1)].rgb;
+    return lerp(lerp(c00, c10, wx), lerp(c01, c11, wx), wy);
+}
+
 // AFW CombinedWarping: pull the synthesized eye toward last frame's REAL
 // render of the same eye (reprojected through the exact camera delta and
 // depth-validated). The warp output and a native render of the same view
@@ -2225,24 +2309,19 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     // so a nearest-neighbor read snaps each sample by up to half a pixel in
     // a sawtooth pattern across the screen - blended at high weight that
     // reads as whole-screen micro-shake alternating with the real frames.
-    float fx = (pn.x * 0.5f + 0.5f) * (float)out_width - 0.5f;
-    float fy = (0.5f - pn.y * 0.5f) * (float)out_height - 0.5f;
+    // The filtering itself is one sampler op against the SRV alias of the
+    // history (it lives in a shader-readable state for this pass).
+    float2 histUv = float2(pn.x * 0.5f + 0.5f, 0.5f - pn.y * 0.5f);
+    float fx = histUv.x * (float)out_width - 0.5f;
+    float fy = histUv.y * (float)out_height - 0.5f;
     if (fx < 0.0f || fy < 0.0f || fx > (float)(out_width - 1u) || fy > (float)(out_height - 1u)) {
         return c;
     }
-    int x0 = (int)fx;
-    int y0 = (int)fy;
-    int x1 = min(x0 + 1, (int)out_width - 1);
-    int y1 = min(y0 + 1, (int)out_height - 1);
-    float wx = fx - (float)x0;
-    float wy = fy - (float)y0;
     // Depth-validate at the nearest tap (keys don't interpolate).
-    uint hk = g_historyKey[uint2((wx > 0.5f) ? x1 : x0, (wy > 0.5f) ? y1 : y0)] & 0x7FFFFFFFu;
+    uint hk = g_historyKey[uint2((uint)round(max(fx, 0.0f)), (uint)round(max(fy, 0.0f)))] & 0x7FFFFFFFu;
     const float tol = max(0.15f * estDepth, 2e-4f);
     if (hk != 0u && abs(asfloat(hk) - estDepth) <= tol) {
-        float3 h = lerp(
-            lerp(g_historyColor[uint2(x0, y0)].rgb, g_historyColor[uint2(x1, y0)].rgb, wx),
-            lerp(g_historyColor[uint2(x0, y1)].rgb, g_historyColor[uint2(x1, y1)].rgb, wx), wy);
+        float3 h = g_historyColorSrv.SampleLevel(g_linearSampler, histUv, 0).rgb;
         // Color-agreement gate: the blend exists to cancel the SUBTLE
         // real-vs-warp resampling difference, where history and warp agree
         // closely. Object-space animation (swaying plants, fish) moves under
@@ -2257,7 +2336,7 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
 }
 #endif
 
-[numthreads(16, 16, 1)]
+[numthreads(DIBR_TG, DIBR_TG, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
     uint x = dtid.x;
@@ -2269,22 +2348,23 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float2 uv = float2((x + 0.5f) / (float)out_width,
                         (y + 0.5f) / (float)out_height);
 
+#if !DIBR_LEAN
     if (edge_compression > 0.0f) {
         float2 s = (uv - 0.5f) * 2.0f;
         float c = edge_compression * 3.0f;
-        float inv_atan_c = 1.0f / atan(c);
-        float2 s_warp = float2(atan(s.x * c), atan(s.y * c)) * inv_atan_c;
+        float2 s_warp = float2(atan(s.x * c), atan(s.y * c)) * pre_edge_comp_inv;
         uv = s_warp * 0.5f + 0.5f;
     }
     else if (edge_compression < 0.0f) {
         float2 s = (uv - 0.5f) * 2.0f;
         float c = -edge_compression * 1.2f;
-        float inv_tan_c = 1.0f / tan(c);
-        float2 s_warp = float2(tan(s.x * c), tan(s.y * c)) * inv_tan_c;
+        float2 s_warp = float2(tan(s.x * c), tan(s.y * c)) * pre_edge_comp_inv;
         uv = s_warp * 0.5f + 0.5f;
     }
+#endif
     uv = ApplyOutputGeometry(uv);
 
+#if !DIBR_LEAN
     float debugMode = floor(debug_view_mode + 0.5f);
     if (debugMode >= 1.0f) {
         // Debug views are the only consumer of the fully conditioned depth and
@@ -2323,6 +2403,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         WriteStereoPair(x, y, debugColor, debugColor);
         return;
     }
+#endif
 
     float refEye = mode_param0;
     // SourceRemapUv crops the overscanned source render back to the true FOV
@@ -2359,7 +2440,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         // outer band has no source data - same role as the gather path's
         // ScreenEdgeGuard disparity squeeze).
         float edgeKeep = ScreenEdgeGuard(uv, searchDepth);
-        rightColor = float4(lerp(centerColor.rgb, g_scatterColor[uint2(x, y)].rgb, edgeKeep), centerColor.a);
+        rightColor = float4(lerp(centerColor.rgb, SampleScatterUpscaled(x, y), edgeKeep), centerColor.a);
         rightColor.rgb = ApplyAfwHistoryBlend(uint2(x, y), rightColor.rgb);
 #else
         float2 rightSearchUV = YoroSearchUv(uv, -1.0f, searchDepth, boundaryScale, 1.0f);
@@ -2392,7 +2473,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float4 leftColor;
 #if SCATTER_COMPOSE
         float edgeKeep = ScreenEdgeGuard(uv, searchDepth);
-        leftColor = float4(lerp(centerColor.rgb, g_scatterColor[uint2(x, y)].rgb, edgeKeep), centerColor.a);
+        leftColor = float4(lerp(centerColor.rgb, SampleScatterUpscaled(x, y), edgeKeep), centerColor.a);
         leftColor.rgb = ApplyAfwHistoryBlend(uint2(x, y), leftColor.rgb);
 #else
         float2 leftSearchUV = YoroSearchUv(uv, 1.0f, searchDepth, boundaryScale, 1.0f);

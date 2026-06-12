@@ -15,11 +15,11 @@ $shaders = @(
     @{ File = 'dibr_inverse.hlsl';       Name = 'dibr_inverse'       },
     @{ File = 'dibr_yoro.hlsl';          Name = 'dibr_yoro'          },
     @{ File = 'dibr_raymarch.hlsl';      Name = 'dibr_raymarch'      },
-    @{ File = 'dibr_scatter_clear.hlsl'; Name = 'dibr_scatter_clear' },
     @{ File = 'dibr_scatter_depth.hlsl'; Name = 'dibr_scatter_depth' },
     @{ File = 'dibr_scatter_color.hlsl'; Name = 'dibr_scatter_color' },
     @{ File = 'dibr_scatter_fill.hlsl';  Name = 'dibr_scatter_fill'  },
-    @{ File = 'dibr_afw_stash.hlsl';     Name = 'dibr_afw_stash'     }
+    @{ File = 'dibr_afw_stash.hlsl';     Name = 'dibr_afw_stash'     },
+    @{ File = 'dibr_depth_prep.hlsl';    Name = 'dibr_depth_prep'    }
 )
 
 $maxChunk = 12000

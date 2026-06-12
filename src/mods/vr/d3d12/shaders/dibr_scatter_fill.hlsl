@@ -1,14 +1,22 @@
 // AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
 
+// Thread-group edge (overridable via UEVR_DIBR_TG; the C++ dispatch math
+// uses the same value).
+#ifndef DIBR_TG
+#define DIBR_TG 16
+#endif
+
 Texture2D<float4> g_colorTex : register(t0);
 Texture2D<float>  g_depthTex : register(t1);
 RWTexture2D<float4> g_sbsOut : register(u0);
 RWTexture2D<uint> g_scatterKey : register(u1);
 RWTexture2D<float4> g_scatterColor : register(u2);
 // Last frame's FILLED synthesized eye + its depth keys (ping-ponged by
-// DIBRSynthesis) - the R3 temporal hole-fill source.
-RWTexture2D<float4> g_historyColor : register(u3);
+// DIBRSynthesis) - the R3 temporal hole-fill source. The color is bound as
+// an SRV (the fill only READS it; DIBRSynthesis transitions the resource to
+// a shader-readable state around the read-only passes).
+Texture2D<float4> g_historyColor : register(t3);
 RWTexture2D<uint> g_historyKey : register(u4);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
@@ -269,6 +277,14 @@ cbuffer StereoParams : register(b0) {
     // render target makes the source wider than the true-FOV output.
     uint  out_width;
     uint  out_height;
+    uint  synth_width;
+    uint  synth_height;
+    // CPU-resolved constants (stamped by DIBRSynthesis::synthesize each
+    // frame): dispatch-uniform values hoisted out of the per-pixel code.
+    float pre_effective_convergence;
+    float pre_inv_src_width;
+    float pre_inv_src_height;
+    float pre_edge_comp_inv;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -316,11 +332,40 @@ float SynthEyeSign()
     return (mode_param0 < 0.5f) ? -1.0f : 1.0f;
 }
 
-[numthreads(16, 16, 1)]
+// Average a short run of covered BACKGROUND pixels starting at a scanline
+// neighbour and stepping `dir` further AWAY from the hole (always into
+// already-covered territory). This dilutes the anti-aliased occluder-edge
+// pixel - the colour that otherwise smears across the reveal - and lowers the
+// per-row colour variance that reads as a "shredded" band. The run stops the
+// moment it hits an uncovered pixel, a fill-marked pixel, or a depth jump
+// toward the foreground, so the occluder is never averaged back in.
+float3 SampleBackgroundRun(int startX, int y, int dir, uint refKey)
+{
+    const int kRunTaps = 4;
+    float refDepth = asfloat(refKey);
+    float depthTol = max(0.05f * refDepth, 0.01f);
+    float3 acc = float3(0.0f, 0.0f, 0.0f);
+    float wsum = 0.0f;
+    [loop]
+    for (int t = 0; t < kRunTaps; ++t) {
+        int x = startX + dir * t;
+        if (x < 0 || x >= (int)synth_width) break;
+        uint k = g_scatterKey[uint2(x, y)];
+        if (k == 0u || (k & 0x80000000u) != 0u) break;        // uncovered / fill-marked
+        if (g_scatterColor[uint2(x, y)].a <= 0.5f) break;     // not covered
+        if (asfloat(k) > refDepth + depthTol) break;          // reversed-Z: jumped toward foreground
+        float w = 1.0f / (1.0f + (float)t);
+        acc += g_scatterColor[uint2(x, y)].rgb * w;
+        wsum += w;
+    }
+    return (wsum > 0.0f) ? (acc / wsum) : g_scatterColor[uint2(startX, y)].rgb;
+}
+
+[numthreads(DIBR_TG, DIBR_TG, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
-    // The fill pass runs entirely in OUTPUT (target eye) space.
-    if (dtid.x >= out_width || dtid.y >= out_height) return;
+    // The fill pass runs entirely in SYNTHESIS (target eye) space (== out at scale 1.0).
+    if (dtid.x >= synth_width || dtid.y >= synth_height) return;
     if (g_scatterColor[dtid.xy].a > 0.5f) return; // already covered
 
     // Disocclusion hole: extend the BACKGROUND side (the deeper of the two
@@ -349,27 +394,50 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     [loop]
     for (int i = 1; i <= kMaxSearch; i += (i < kFineSearch) ? 1 : kCoarseStep) {
         int x = (int)dtid.x + i;
-        if (x >= (int)out_width) break;
+        if (x >= (int)synth_width) break;
         uint k = g_scatterKey[uint2(x, dtid.y)];
         if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { rx = x; rkey = k; break; }
     }
 
     // Scanline fill candidate. Smaller key bits = farther (reversed-Z) = the
-    // background side of the reveal.
+    // background side of the reveal. Instead of copying the single hole-edge
+    // pixel (whose colour is the anti-aliased occluder boundary), average a
+    // short run a few pixels into the background; and when BOTH sides are at a
+    // similar background depth, inverse-distance blend them - that removes the
+    // hard per-row left/right pick that flips between scanlines and shreds the
+    // band. When the two sides differ in depth (one IS the occluder) the blend
+    // is skipped and we hard-pick the farther/background side, as before.
     float4 c;
     uint fillKey = 0u;
     if (lx >= 0 && rx >= 0) {
+        float ld = asfloat(lkey);
+        float rd = asfloat(rkey);
         bool useLeft = (lkey <= rkey);
-        c = useLeft ? g_scatterColor[uint2(lx, dtid.y)] : g_scatterColor[uint2(rx, dtid.y)];
+        if (max(ld, rd) <= min(ld, rd) * 1.10f) {
+            // Both sides genuinely background: blend the two runs by proximity
+            // so the seam where the pick would flip doesn't shred row-to-row.
+            float3 lc = SampleBackgroundRun(lx, (int)dtid.y, -1, lkey);
+            float3 rc = SampleBackgroundRun(rx, (int)dtid.y, +1, rkey);
+            float dl = (float)((int)dtid.x - lx);
+            float dr = (float)(rx - (int)dtid.x);
+            float wl = dr / max(dl + dr, 1.0f); // nearer neighbour weighs more
+            c = float4(lerp(rc, lc, saturate(wl)), 1.0f);
+        } else {
+            // One side IS the occluder (large depth gap): take only the
+            // farther/background run - skips the wasted second background run.
+            c = useLeft
+                ? float4(SampleBackgroundRun(lx, (int)dtid.y, -1, lkey), 1.0f)
+                : float4(SampleBackgroundRun(rx, (int)dtid.y, +1, rkey), 1.0f);
+        }
         fillKey = useLeft ? lkey : rkey;
     } else if (lx >= 0) {
-        c = g_scatterColor[uint2(lx, dtid.y)];
+        c = float4(SampleBackgroundRun(lx, (int)dtid.y, -1, lkey), 1.0f);
         fillKey = lkey;
     } else if (rx >= 0) {
-        c = g_scatterColor[uint2(rx, dtid.y)];
+        c = float4(SampleBackgroundRun(rx, (int)dtid.y, +1, rkey), 1.0f);
         fillKey = rkey;
     } else {
-        float2 uv = float2((dtid.x + 0.5f) / (float)out_width, (dtid.y + 0.5f) / (float)out_height);
+        float2 uv = float2((dtid.x + 0.5f) / (float)synth_width, (dtid.y + 0.5f) / (float)synth_height);
         if (overscan_x > 1.0f) {
             uv.x = 0.5f + (uv.x - 0.5f) / overscan_x; // crop overscanned source to true FOV
         }
@@ -387,14 +455,14 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // converging in a few frames so animated content doesn't freeze stale.
     if (temporal_enabled > 0.5f && fillKey != 0u) {
         float estDepth = asfloat(fillKey);
-        float2 uv = float2((dtid.x + 0.5f) / (float)out_width, (dtid.y + 0.5f) / (float)out_height);
+        float2 uv = float2((dtid.x + 0.5f) / (float)synth_width, (dtid.y + 0.5f) / (float)synth_height);
         float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
         float4 prev = mul(reproj_target_to_prev, float4(ndc, estDepth, 1.0f));
         float w = (abs(prev.w) > 1e-6f) ? prev.w : 1e-6f;
         float2 pn = prev.xy / w;
-        int px = (int)((pn.x * 0.5f + 0.5f) * (float)out_width);
-        int py = (int)((0.5f - pn.y * 0.5f) * (float)out_height);
-        if (px >= 0 && px < (int)out_width && py >= 0 && py < (int)out_height) {
+        int px = (int)((pn.x * 0.5f + 0.5f) * (float)synth_width);
+        int py = (int)((0.5f - pn.y * 0.5f) * (float)synth_height);
+        if (px >= 0 && px < (int)synth_width && py >= 0 && py < (int)synth_height) {
             const float tol = max(0.15f * estDepth, 2e-4f);
             float4 h = g_historyColor[uint2(px, py)];
             uint hk = g_historyKey[uint2(px, py)] & 0x7FFFFFFFu; // strip fill marker
@@ -410,7 +478,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 for (int n = 0; n < 8; ++n) {
                     int nx = px + kRing[n].x;
                     int ny = py + kRing[n].y;
-                    if (nx < 0 || nx >= (int)out_width || ny < 0 || ny >= (int)out_height) continue;
+                    if (nx < 0 || nx >= (int)synth_width || ny < 0 || ny >= (int)synth_height) continue;
                     float4 nh = g_historyColor[uint2(nx, ny)];
                     uint nk = g_historyKey[uint2(nx, ny)] & 0x7FFFFFFFu;
                     if (nh.a > 0.5f && nk != 0u && abs(asfloat(nk) - estDepth) <= tol) {

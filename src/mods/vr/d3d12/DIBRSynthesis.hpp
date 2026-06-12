@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -13,8 +15,8 @@
 
 namespace vrmod {
 // 1:1 mirror of the `StereoParams` cbuffer shared by shaders/dibr_inverse.hlsl,
-// dibr_yoro.hlsl and dibr_raymarch.hlsl (243 x 4-byte scalars, field order is
-// load-bearing). Every field is 4 bytes, so HLSL cbuffer packing (which only
+// dibr_yoro.hlsl, dibr_raymarch.hlsl and the scatter/prep kernels (4-byte scalars,
+// field order is load-bearing). Every field is 4 bytes, so HLSL cbuffer packing (which only
 // inserts padding when a field would straddle a 16-byte register boundary)
 // degenerates to a flat, tightly packed layout identical to this struct; it is
 // memcpy'd into the upload constant buffer verbatim.
@@ -307,9 +309,27 @@ struct DIBRStereoParams {
     // output. synthesize() defaults these to the source dims when zero.
     uint32_t out_width{0};
     uint32_t out_height{0};
+    // Synthesis (scatter-buffer) resolution. Defaults to the out dims, where
+    // synth_scale 1.0 reproduces the historical full-res path bit-for-bit. The
+    // half-res toggle (UEVR_DIBR_SYNTH_SCALE) drops these below the out dims:
+    // the scatter clear/depth/color/fill passes work in this space and the
+    // compose pass bilinearly upscales the scatter colour when reading it.
+    // These two uints fill the .z/.w padding of out_width/out_height's cbuffer
+    // row, so the struct stays 16-byte aligned with no new register.
+    uint32_t synth_width{0};
+    uint32_t synth_height{0};
+    // CPU-resolved constants, stamped by synthesize() right before upload:
+    // dispatch-uniform values hoisted out of the per-pixel shader code.
+    // pre_effective_convergence = lerp(convergence, 0.5, saturate(zpd_balance));
+    // pre_inv_src_* = 1 / source dims; pre_edge_comp_inv = the 1/atan / 1/tan
+    // normalization of the edge-compression projection (1 when off).
+    float pre_effective_convergence{0.5f};
+    float pre_inv_src_width{1.0f / 1920.0f};
+    float pre_inv_src_height{1.0f / 1080.0f};
+    float pre_edge_comp_inv{1.0f};
 };
 
-static_assert(sizeof(DIBRStereoParams) == 250 * 4 + 3 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + 5 flags/pads + three float4x4 + out dims)");
+static_assert(sizeof(DIBRStereoParams) == 256 * 4 + 3 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + 5 flags/pads + three float4x4 + out/synth dims + 4 CPU-resolved constants)");
 static_assert(offsetof(DIBRStereoParams, reproj_target_to_prev) % 16 == 0, "temporal reprojection matrix must be 16-byte aligned");
 static_assert(offsetof(DIBRStereoParams, reproj_source_to_left) % 16 == 0, "reprojection matrices must be 16-byte aligned to match HLSL cbuffer packing");
 
@@ -392,6 +412,13 @@ public:
     // REAL render of the eye being synthesized next frame.
     void set_alternate_history(bool enabled) { m_afw_mode = enabled; }
 
+    // Per-pass GPU timing (env UEVR_ENABLE_D3D12_GPU_TIMESTAMPS): the caller
+    // provides the queue the recorded command list executes on (needed for
+    // GetTimestampFrequency); synthesize() then brackets each DIBR pass with
+    // timestamp queries, reads them back kRing frames later and logs per-pass
+    // averages every few seconds ([DIBR][gpu]). No-op when the env is unset.
+    void set_gpu_timing_queue(ID3D12CommandQueue* queue) { m_ts_queue = queue; }
+
     // Output texture format. Default R8G8B8A8_UNORM (guaranteed typed UAV
     // store support). Changing it forces the output texture to be recreated;
     // the caller is responsible for picking a UAV-capable format.
@@ -420,15 +447,25 @@ private:
     struct DeviceObjects {
         Microsoft::WRL::ComPtr<ID3D12RootSignature> root_sig{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_inverse{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_inverse_lean{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_yoro{};
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_yoro_scatter{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_yoro_lean{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_yoro_scatter{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_yoro_scatter_lean{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_raymarch{};
-        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_clear{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_raymarch_lean{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_depth{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_color{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_scatter_fill{};
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_afw_stash{};
+        // Depth conditioning prepasses (dibr_depth_prep.hlsl, one PREP_MODE each).
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_prep_inverse{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_prep_raymarch{};
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_prep_yoro{};
         Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap{};
+        // Non-shader-visible UAV descriptors for ClearUnorderedAccessView*
+        // (the API needs a CPU handle from a non-shader-visible heap).
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> clear_heap{};
         uint32_t descriptor_stride{0};
         Microsoft::WRL::ComPtr<ID3D12Resource> cbuffer{};
         uint8_t* cbuffer_ptr{nullptr};
@@ -441,7 +478,13 @@ private:
     bool ensure_output(ID3D12Device* device, uint32_t width, uint32_t height);
     bool ensure_scatter(ID3D12Device* device, uint32_t width, uint32_t height);
     bool ensure_afw_history(ID3D12Device* device, uint32_t width, uint32_t height);
+    bool ensure_prep(ID3D12Device* device, uint32_t width, uint32_t height);
     void join_worker();
+
+    // True when every parameter gated behind DIBR_LEAN is at its pass-through
+    // default, so the lean PSO (optional output features compiled out) is
+    // exactly equivalent to the full kernel.
+    static bool params_allow_lean(const DIBRStereoParams& p);
 
     static DXGI_FORMAT color_srv_format(DXGI_FORMAT f);
     static DXGI_FORMAT depth_srv_format(DXGI_FORMAT f);
@@ -453,7 +496,9 @@ private:
     // descriptor triplets rotate through a ring sized well past UEVR's frame
     // queue depth.
     static constexpr uint32_t kRing = 8;
-    static constexpr uint32_t kDescriptorsPerSlot = 7; // t0 color, t1 depth, u0 output, u1/u2 scatter key+color, u3/u4 history color+key
+    // t0 color, t1 depth, t2 prepared depth (SRV), t3 history color (SRV),
+    // u0 output, u1/u2 scatter key+color, u3/u4 history color+key, u5 prep UAV.
+    static constexpr uint32_t kDescriptorsPerSlot = 10;
     // Derived, not hardcoded: a fixed value overran the upload buffer when the
     // struct grew (the reprojection matrices pushed it past the old 1024).
     static constexpr uint32_t kCbSlotSize = (sizeof(DIBRStereoParams) + 255u) & ~255u;
@@ -489,6 +534,44 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_afw_history_color{};
     bool m_afw_history_valid{false};
     bool m_afw_mode{false};
+
+    // Conditioned-depth prepass target (source-sized; written by the
+    // depth-prep PSO each frame, then read by the gather kernels as t2).
+    // m_prep_is_srv tracks which state the texture was left in.
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_prep{};
+    uint32_t m_prep_width{0};
+    uint32_t m_prep_height{0};
+    bool m_prep_is_srv{false};
+
+    // --- Per-pass GPU timing (see set_gpu_timing_queue) ---
+    enum class TsPass : uint8_t { Prep = 0, Clear, ScatterDepth, ScatterColor, Fill, Compose, Stash, Count };
+    static constexpr uint32_t kTsMaxPasses = 8; // >= (uint)TsPass::Count
+    static constexpr uint32_t kTsQueriesPerSlot = kTsMaxPasses * 2;
+    bool ensure_gpu_timing(ID3D12Device* device);
+    void drain_gpu_timing_slot(uint32_t slot);
+    void log_gpu_timing();
+
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> m_ts_heap{};
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_ts_readback{};
+    uint64_t* m_ts_mapped{nullptr};
+    ID3D12CommandQueue* m_ts_queue{nullptr}; // weak, refreshed by the caller each frame
+    uint64_t m_ts_frequency{0};
+    // Per ring slot: which passes were bracketed, in recording order. The
+    // slot is drained (kRing frames later, safely past the frame queue depth
+    // - same in-flight assumption the cbuffer ring makes) before reuse.
+    std::array<std::array<uint8_t, kTsMaxPasses>, kRing> m_ts_slot_seq{};
+    std::array<uint8_t, kRing> m_ts_slot_count{};
+    // Aggregates per pass since the last [DIBR][gpu] log line.
+    std::array<double, kTsMaxPasses> m_ts_sum_ms{};
+    std::array<uint32_t, kTsMaxPasses> m_ts_count{};
+    std::chrono::steady_clock::time_point m_ts_last_log{};
+
+    // Descriptor-churn guard: per ring slot, a hash of every input that feeds
+    // the slot's descriptor writes; when unchanged the 10+ Create*View calls
+    // are skipped. m_resource_generation invalidates on any internal
+    // recreate (so a new texture at a recycled pointer can't alias a hash).
+    std::array<uint64_t, kRing> m_slot_desc_hash{};
+    uint32_t m_resource_generation{0};
 
     uint32_t m_ring_index{0};
     uint32_t m_frame_index{0};

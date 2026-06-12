@@ -1,6 +1,12 @@
 // AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
 
+// Thread-group edge (overridable via UEVR_DIBR_TG; the C++ dispatch math
+// uses the same value).
+#ifndef DIBR_TG
+#define DIBR_TG 16
+#endif
+
 Texture2D<float4> g_colorTex : register(t0);
 Texture2D<float>  g_depthTex : register(t1);
 RWTexture2D<float4> g_sbsOut : register(u0);
@@ -265,6 +271,14 @@ cbuffer StereoParams : register(b0) {
     // render target makes the source wider than the true-FOV output.
     uint  out_width;
     uint  out_height;
+    uint  synth_width;
+    uint  synth_height;
+    // CPU-resolved constants (stamped by DIBRSynthesis::synthesize each
+    // frame): dispatch-uniform values hoisted out of the per-pixel code.
+    float pre_effective_convergence;
+    float pre_inv_src_width;
+    float pre_inv_src_height;
+    float pre_edge_comp_inv;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -312,7 +326,7 @@ float SynthEyeSign()
     return (mode_param0 < 0.5f) ? -1.0f : 1.0f;
 }
 
-[numthreads(16, 16, 1)]
+[numthreads(DIBR_TG, DIBR_TG, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
     // Iterate SOURCE pixels; the scatter target buffers live in OUTPUT space
@@ -322,16 +336,16 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float d = SampleRawDeviceDepth(uv);
     float eyeSign = SynthEyeSign();
     float2 tUv = ReprojectSourceUv(uv, d, eyeSign);
-    float tx = tUv.x * (float)out_width - 0.5f;
-    int ty = (int)round(tUv.y * (float)out_height - 0.5f);
-    if (ty < 0 || ty >= (int)out_height) return;
+    float tx = tUv.x * (float)synth_width - 0.5f;
+    int ty = (int)round(tUv.y * (float)synth_height - 0.5f);
+    if (ty < 0 || ty >= (int)synth_height) return;
     uint key = asuint(max(d, 1e-7f));
     float4 c = g_colorTex.SampleLevel(g_linearSampler, uv, 0);
     int x0 = (int)floor(tx);
     [unroll]
     for (int k = 0; k < 2; ++k) {
         int x = x0 + k;
-        if (x >= 0 && x < (int)out_width) {
+        if (x >= 0 && x < (int)synth_width) {
             if (g_scatterKey[uint2(x, ty)] == key) {
                 g_scatterColor[uint2(x, ty)] = float4(c.rgb, 1.0f);
             }

@@ -4,9 +4,32 @@
 // buffer. It does not reproduce true hidden geometry, but it searches the
 // prepared depth field before sampling color so object edges behave better
 // than a single inverse-warp tap.
+//
+// The depth conditioning chain (shaping, auto-balance, reconstruct, masks)
+// runs once per source pixel in dibr_depth_prep.hlsl (PREP_MODE 1) and lands
+// in g_prepDepth; every probe of the march reads it back as a single tap
+// instead of re-running the multi-tap chain per step.
+//
+// DIBR_LEAN=1 (a second PSO from this same source) compiles out the optional
+// output features (image filter, chromatic distortion, overlays, markers,
+// composition modes); the CPU picks it whenever every gated parameter is at
+// its pass-through default (see DIBRSynthesis::params_allow_lean).
+
+#ifndef DIBR_LEAN
+#define DIBR_LEAN 0
+#endif
+
+// Thread-group edge (overridable via UEVR_DIBR_TG; the C++ dispatch math
+// uses the same value).
+#ifndef DIBR_TG
+#define DIBR_TG 16
+#endif
 
 Texture2D<float4> g_colorTex : register(t0);
 Texture2D<float>  g_depthTex : register(t1);
+// x = fully conditioned depth (the old SamplePreparedDepthWithGradient
+// result), y = the source depth gradient at that pixel.
+Texture2D<float2> g_prepDepth : register(t2);
 RWTexture2D<float4> g_sbsOut : register(u0);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
@@ -267,13 +290,21 @@ cbuffer StereoParams : register(b0) {
     // render target makes the source wider than the true-FOV output.
     uint  out_width;
     uint  out_height;
+    uint  synth_width;
+    uint  synth_height;
+    // CPU-resolved constants (stamped by DIBRSynthesis::synthesize each
+    // frame): dispatch-uniform values hoisted out of the per-pixel code.
+    float pre_effective_convergence;
+    float pre_inv_src_width;
+    float pre_inv_src_height;
+    float pre_edge_comp_inv;
 };
 
 static const int MAX_STEPS = 48;
 
 float EffectiveConvergence()
 {
-    return lerp(convergence, 0.5f, saturate(zpd_balance));
+    return pre_effective_convergence;
 }
 
 float StereoDepthDelta(float depth)
@@ -303,37 +334,21 @@ float FilterEmulatorFocusScale(float depth)
     return scale;
 }
 
-float ApplyFilterEmulatorDepthControls(float depth)
-{
-    if (FilterEmulatorMask() <= 0.0f) {
-        return depth;
-    }
-
-    float adjusted = depth;
-    float farMask = saturate(adjusted * 0.5f);
-    adjusted = lerp(adjusted, min(adjusted, saturate(filter_emulator_max_depth)), farMask);
-
-    float focus = EffectiveConvergence();
-    float nearMask = saturate((focus - adjusted) / max(focus, 0.0001f));
-    adjusted = lerp(adjusted, lerp(adjusted, focus, 0.25f), nearMask * saturate(filter_emulator_near_reduction));
-    return saturate(adjusted);
-}
-
 float2 ApplyEdgeProjection(float2 uv)
 {
+#if !DIBR_LEAN
     if (edge_compression > 0.0f) {
         float2 s = (uv - 0.5f) * 2.0f;
         float c = edge_compression * 3.0f;
-        float invAtanC = 1.0f / atan(c);
-        float2 warped = float2(atan(s.x * c), atan(s.y * c)) * invAtanC;
+        float2 warped = float2(atan(s.x * c), atan(s.y * c)) * pre_edge_comp_inv;
         uv = warped * 0.5f + 0.5f;
     } else if (edge_compression < 0.0f) {
         float2 s = (uv - 0.5f) * 2.0f;
         float c = -edge_compression * 1.2f;
-        float invTanC = 1.0f / tan(c);
-        float2 warped = float2(tan(s.x * c), tan(s.y * c)) * invTanC;
+        float2 warped = float2(tan(s.x * c), tan(s.y * c)) * pre_edge_comp_inv;
         uv = warped * 0.5f + 0.5f;
     }
+#endif
     return saturate(uv);
 }
 
@@ -343,6 +358,9 @@ float OutputHeadsetFov();
 
 float2 ApplyOutputGeometry(float2 uv)
 {
+#if DIBR_LEAN
+    return saturate(uv);
+#endif
     float2 d = uv - 0.5f;
     if (output_geometry_axis_swap > 0.5f) {
         d = d.yx;
@@ -371,81 +389,6 @@ float2 ApplyOutputGeometry(float2 uv)
 float2 StereoShift(float shift)
 {
     return (stereo_axis_mode > 0.5f) ? float2(0.0f, shift) : float2(shift, 0.0f);
-}
-
-float LinearizeProjectionDepth(float depth)
-{
-    float strength = saturate(depth_linearize_strength);
-    if (strength <= 0.0f) {
-        return depth;
-    }
-
-    float nearZ = max(depth_linearize_near, 0.0001f);
-    float farZ = max(depth_linearize_far, nearZ + 0.0001f);
-    float d = saturate(depth);
-    float reversedMode = step(0.5f, floor(depth_linearize_mode + 0.5f));
-    float standardDenom = farZ - d * (farZ - nearZ);
-    float reversedDenom = nearZ + d * (farZ - nearZ);
-    float denom = max(lerp(standardDenom, reversedDenom, reversedMode), 0.0001f);
-    float eyeZ = (nearZ * farZ) / denom;
-    float linearDepth = saturate((eyeZ - nearZ) / (farZ - nearZ));
-    return lerp(depth, linearDepth, strength);
-}
-
-float CanonicalDepth(float rawDepth)
-{
-    float depth = rawDepth;
-    if (reverse_depth > 0.5f) {
-        depth = 1.0f - depth;
-    }
-    if (depth_value_flip > 0.5f) {
-        depth = 1.0f - depth;
-    }
-    return LinearizeProjectionDepth(depth);
-}
-
-float DepthDitherNoise(float2 uv)
-{
-    float2 pixel = uv * float2((float)srcWidth, (float)srcHeight);
-    return frac(sin(dot(pixel, float2(12.9898f, 78.233f))) * 43758.5453f);
-}
-
-float ApplyDepthDither(float2 uv, float depth)
-{
-    float strength = saturate(depth_dither_strength);
-    if (strength <= 0.0f) {
-        return depth;
-    }
-    float bits = clamp(depth_dither_bits, 1.0f, 15.0f);
-    float stepSize = 1.0f / max(pow(2.0f, bits) - 1.0f, 1.0f);
-    float noise = DepthDitherNoise(uv) - 0.5f;
-    return saturate(depth + noise * stepSize * strength);
-}
-
-float2 TransformDepthUv(float2 uv)
-{
-    float2 scale = max(float2(depth_uv_scale_x, depth_uv_scale_y), float2(0.0001f, 0.0001f));
-    float2 offset = float2(depth_uv_offset_x, depth_uv_offset_y);
-    float anchor = floor(depth_uv_anchor + 0.5f);
-    float2 mapped = (anchor < 0.5f)
-        ? (uv - 0.5f) / scale + 0.5f
-        : ((anchor < 1.5f) ? uv / scale : 1.0f - ((1.0f - uv) / scale));
-    mapped += offset;
-    if (depth_uv_flip_x > 0.5f) {
-        mapped.x = 1.0f - mapped.x;
-    }
-    if (depth_uv_flip_y > 0.5f) {
-        mapped.y = 1.0f - mapped.y;
-    }
-    return saturate(mapped);
-}
-
-float SampleDepthTexture(float2 uv)
-{
-    float mode = floor(depth_sample_mode + 0.5f);
-    return (mode >= 1.0f)
-        ? g_depthTex.SampleLevel(g_pointSampler, uv, 0)
-        : g_depthTex.SampleLevel(g_linearSampler, uv, 0);
 }
 
 float LetterboxAutoMask(float2 uv)
@@ -481,11 +424,6 @@ float LetterboxMask(float2 uv)
     return saturate(max(manualMask, LetterboxAutoMask(uv)));
 }
 
-float ApplyLetterboxDepthMask(float2 uv, float depth)
-{
-    return lerp(depth, EffectiveConvergence(), LetterboxMask(uv));
-}
-
 float RegionDepthMask(float2 uv, float depth)
 {
     float strength = saturate(region_mask_strength);
@@ -511,11 +449,6 @@ float RegionDepthMask(float2 uv, float depth)
         ? 1.0f - smoothstep(gate, min(gate + feather, 1.0f), depth)
         : 1.0f;
     return saturate(xMask * yMask * depthMask * strength);
-}
-
-float ApplyRegionDepthMask(float2 uv, float depth)
-{
-    return lerp(depth, saturate(region_mask_target_depth), RegionDepthMask(uv, depth));
 }
 
 float WeaponDepthMask(float2 uv, float depth)
@@ -631,14 +564,6 @@ float FocusReductionScale(float2 uv, float depth, float eyeSign)
     return lerp(1.0f, FocusReductionBaseScale(uv, depth), FocusReductionEyeGate(eyeSign));
 }
 
-float ApplyWeaponDepthMask(float2 uv, float depth)
-{
-    float manualMask = WeaponDepthMask(uv, depth);
-    float autoMask = AutoWeaponDepthMask(uv, depth);
-    float maskedDepth = lerp(depth, saturate(weapon_mask_target_depth), manualMask);
-    return lerp(maskedDepth, saturate(weapon_auto_mask_target_depth), autoMask);
-}
-
 float RectShapeMask(float2 uv, float left, float top, float right, float bottom, float feather)
 {
     float xMask = smoothstep(left, min(left + feather, right), uv.x)
@@ -690,11 +615,6 @@ float ShapeDepthMask(float2 uv, float depth)
     return saturate(shape * depthMask * strength);
 }
 
-float ApplyShapeDepthMask(float2 uv, float depth)
-{
-    return lerp(depth, saturate(shape_mask_target_depth), ShapeDepthMask(uv, depth));
-}
-
 float OutputMatteMask(float2 uv)
 {
     float strength = saturate(output_matte_strength);
@@ -720,6 +640,9 @@ float OutputMatteMask(float2 uv)
 
 float4 ApplyOutputMatte(float2 uv, float4 stereoColor, float4 centerColor)
 {
+#if DIBR_LEAN
+    return stereoColor;
+#endif
     float mask = OutputMatteMask(uv);
     if (mask <= 0.0f) {
         return stereoColor;
@@ -801,6 +724,9 @@ float CursorOverlayMask(float2 uv, float eyeSign)
 
 float4 ApplyCursorOverlay(float2 uv, float eyeSign, float4 color)
 {
+#if DIBR_LEAN
+    return color;
+#endif
     float mask = CursorOverlayMask(uv, eyeSign);
     if (mask <= 0.0f) {
         return color;
@@ -829,6 +755,9 @@ float ComfortNoseMask(float2 uv, float eyeSign)
 
 float4 ApplyComfortNose(float2 uv, float eyeSign, float4 color)
 {
+#if DIBR_LEAN
+    return color;
+#endif
     float mask = ComfortNoseMask(uv, eyeSign);
     if (mask <= 0.0f) {
         return color;
@@ -859,6 +788,9 @@ float ImageFilterNoise(float2 uv)
 
 float4 ApplyImageFilter(float2 sampleUv, float4 color)
 {
+#if DIBR_LEAN
+    return color;
+#endif
     float sharpenStrength = max(image_filter_sharpen_strength, 0.0f);
     float aaStrength = saturate(image_filter_aa_strength);
     float debandStrength = saturate(image_filter_deband_strength);
@@ -933,9 +865,11 @@ float4 OutputDistortionGridColor(float2 uv)
 
 float4 SampleOutputSource(float2 uv)
 {
+#if !DIBR_LEAN
     if (output_distortion_grid > 0.5f) {
         return OutputDistortionGridColor(uv);
     }
+#endif
     return g_colorTex.SampleLevel(g_linearSampler, uv, 0);
 }
 
@@ -1024,6 +958,9 @@ float4 SampleOutputColor(float2 sampleUv)
 {
     float2 uv = saturate(sampleUv);
     float4 baseColor = SampleOutputSource(uv);
+#if DIBR_LEAN
+    return baseColor;
+#endif
     float strength = saturate(output_geometry_poly_strength);
     if (strength <= 0.0f) {
         return baseColor;
@@ -1299,6 +1236,9 @@ float3 FrameMarkerLineColor(uint parity, float layoutMode, bool frameAlternate)
 
 float4 ApplyFrameMarker(uint outX, uint outY, uint outWidth, uint outHeight, float4 color, uint parity, float layoutMode)
 {
+#if DIBR_LEAN
+    return color;
+#endif
     float mode = floor(output_frame_marker_mode + 0.5f);
     if (mode < 0.5f) {
         return color;
@@ -1353,6 +1293,9 @@ float AlignmentCrossMask(float2 markerUv)
 
 float4 ApplyAlignmentMarker(float2 outputUv, float2 sampleUv, float4 color)
 {
+#if DIBR_LEAN
+    return color;
+#endif
     float mode = floor(output_alignment_marker_mode + 0.5f);
     if (mode < 0.5f)
     {
@@ -1406,6 +1349,9 @@ float2 InterlaceGridCoord(uint x, uint y)
 
 float2 InterlaceSampleOffset(float eyeSign)
 {
+#if DIBR_LEAN
+    return float2(0.0f, 0.0f);
+#endif
     float mode = floor(output_composition_mode + 0.5f);
     float offset = max(output_interlace_sample_offset, 0.0f);
     if (mode >= 5.5f && mode < 6.5f) {
@@ -1500,6 +1446,9 @@ float2 RotateOutputEyeUv(float2 uv, float degreesValue)
 
 float2 ApplyOutputEyeAlignment(float2 uv, float eyeSign)
 {
+#if DIBR_LEAN
+    return uv;
+#endif
     float degreesValue = OutputHeadsetRotation(eyeSign);
     float2 alignedUv = ApplyOutputEyeKeystone(uv + OutputLensDependentIpdOffset(eyeSign), eyeSign);
     return RotateOutputEyeUv(alignedUv + OutputEyeAlignmentOffset(eyeSign), degreesValue);
@@ -1507,6 +1456,9 @@ float2 ApplyOutputEyeAlignment(float2 uv, float eyeSign)
 
 void ApplyStereoComposition(uint x, uint y, inout float4 leftColor, inout float4 rightColor)
 {
+#if DIBR_LEAN
+    return;
+#endif
     float mode = floor(output_composition_mode + 0.5f);
     if (mode < 0.5f) {
         return;
@@ -1607,6 +1559,9 @@ void WriteStereoPair(uint x, uint y, float4 leftColor, float4 rightColor)
 
 float4 ApplyPresentationColor(float2 uv, float4 color)
 {
+#if DIBR_LEAN
+    return color;
+#endif
     float sat = max(output_saturation, 0.0f);
     float luma = ImageFilterLuma(color.rgb);
     color.rgb = saturate(lerp(float3(luma, luma, luma), color.rgb, sat));
@@ -1665,15 +1620,6 @@ float UiAlphaMask(float2 uv)
     return saturate(max(UiAlphaMaskFromColor(sampleColor), UiAutoMaskFromColor(sampleColor)));
 }
 
-float ApplyUiAlphaDepthMask(float2 uv, float depth)
-{
-    float4 sampleColor = g_colorTex.SampleLevel(g_linearSampler, saturate(uv), 0);
-    float alphaMask = UiAlphaMaskFromColor(sampleColor);
-    float autoMask = UiAutoMaskFromColor(sampleColor);
-    depth = lerp(depth, saturate(ui_alpha_mask_target_depth), alphaMask);
-    return lerp(depth, saturate(ui_auto_mask_target_depth), autoMask);
-}
-
 float DebugDepthValue(float depth)
 {
     float nearValue = saturate(debug_view_near);
@@ -1727,201 +1673,21 @@ float4 DibrAlignmentGridColor(float2 uv, float depth, float mode)
     return float4(saturate(color), baseColor.a);
 }
 
-float ApplyDepthRangeBoost(float depth)
-{
-    float strength = saturate(depth_range_boost_strength);
-    if (strength <= 0.0f) {
-        return depth;
-    }
-
-    float center = saturate(depth_range_boost_center);
-    float width = max(depth_range_boost_width, 0.0001f);
-    float band = 1.0f - smoothstep(width, width * 2.0f, abs(saturate(depth) - center));
-    float scale = lerp(1.0f, max(depth_range_boost_scale, 1.0f), band * strength);
-    float focus = EffectiveConvergence();
-    return saturate(focus + (depth - focus) * scale);
-}
-
-float ApplyNearFieldFlattening(float depth)
-{
-    float strength = saturate(near_field_strength);
-    if (strength <= 0.0f) {
-        return depth;
-    }
-
-    float startDepth = saturate(near_field_start);
-    float endDepth = max(saturate(near_field_end), startDepth + 0.0001f);
-    float mask = 1.0f - smoothstep(startDepth, endDepth, depth);
-    float target = saturate(near_field_target);
-    return lerp(depth, target, mask * strength);
-}
-
-float ShapeDepthBase(float depth)
-{
-    float shaped = saturate(depth);
-    float floorValue = saturate(depth_floor);
-    float ceilingValue = max(saturate(depth_ceiling), floorValue + 0.0001f);
-    shaped = saturate((shaped - floorValue) / (ceilingValue - floorValue));
-    shaped = pow(shaped, max(depth_curve, 0.01f));
-    float focus = EffectiveConvergence();
-    shaped = focus + (shaped - focus) * max(depth_gain, 0.0f);
-    shaped = ApplyDepthRangeBoost(shaped);
-
-    float nearLimit = max(popout_limit, 0.0f);
-    if (nearLimit < 1.0f) {
-        shaped = max(shaped, focus - nearLimit);
-    }
-
-    shaped = ApplyNearFieldFlattening(shaped);
-    return saturate(ApplyFilterEmulatorDepthControls(shaped));
-}
-
-float SampleCanonicalDepth(float2 uv);
-
-float SampleShapedDepthBase(float2 uv)
-{
-    return ShapeDepthBase(SampleCanonicalDepth(uv));
-}
-
-float AutoBalanceDepth(float depth, float2 uv)
-{
-    float strength = saturate(auto_depth_strength);
-    if (strength <= 0.0f) {
-        return depth;
-    }
-
-    float aspect = max((float)srcHeight, 1.0f) / max((float)srcWidth, 1.0f);
-    float radius = max(auto_depth_radius, 0.0f);
-    float2 rx = float2(radius * aspect, 0.0f);
-    float2 ry = float2(0.0f, radius);
-
-    float d0 = depth;
-    float d1 = SampleShapedDepthBase(uv + rx);
-    float d2 = SampleShapedDepthBase(uv - rx);
-    float d3 = SampleShapedDepthBase(uv + ry);
-    float d4 = SampleShapedDepthBase(uv - ry);
-    float d5 = SampleShapedDepthBase(uv + rx + ry);
-    float d6 = SampleShapedDepthBase(uv + rx - ry);
-    float d7 = SampleShapedDepthBase(uv - rx + ry);
-    float d8 = SampleShapedDepthBase(uv - rx - ry);
-
-    float localMin = min(d0, min(min(d1, d2), min(min(d3, d4), min(min(d5, d6), min(d7, d8)))));
-    float localMax = max(d0, max(max(d1, d2), max(max(d3, d4), max(max(d5, d6), max(d7, d8)))));
-    float range = max(localMax - localMin, max(auto_depth_min_range, 0.0001f));
-    float localNorm = saturate((depth - localMin) / range);
-    float balanced = saturate(EffectiveConvergence() + (localNorm - 0.5f) * max(auto_depth_contrast, 0.0f));
-    return saturate(lerp(depth, balanced, strength));
-}
-
-float ShapeDepth(float depth, float2 uv)
-{
-    return AutoBalanceDepth(ShapeDepthBase(depth), uv);
-}
-
-float SampleCanonicalDepth(float2 uv)
-{
-    float depth = CanonicalDepth(SampleDepthTexture(TransformDepthUv(uv)));
-    depth = ApplyDepthDither(uv, depth);
-    return saturate(ApplyLetterboxDepthMask(uv, depth));
-}
-
-float ReconstructDepth(float2 uv, float depth)
-{
-    float strength = saturate(depth_reconstruct_strength);
-    if (strength <= 0.0f) {
-        return depth;
-    }
-
-    float radius = max(depth_reconstruct_radius, 0.0f);
-    float2 texel = float2(1.0f / max((float)srcWidth, 1.0f), 1.0f / max((float)srcHeight, 1.0f)) * radius;
-    float dl = SampleShapedDepthBase(uv - float2(texel.x, 0.0f));
-    float dr = SampleShapedDepthBase(uv + float2(texel.x, 0.0f));
-    float du = SampleShapedDepthBase(uv - float2(0.0f, texel.y));
-    float dd = SampleShapedDepthBase(uv + float2(0.0f, texel.y));
-    float dlu = SampleShapedDepthBase(uv - texel);
-    float dru = SampleShapedDepthBase(uv + float2(texel.x, -texel.y));
-    float dld = SampleShapedDepthBase(uv + float2(-texel.x, texel.y));
-    float drd = SampleShapedDepthBase(uv + texel);
-
-    float localMin = min(depth, min(min(dl, dr), min(min(du, dd), min(min(dlu, dru), min(dld, drd)))));
-    float avg = (dl + dr + du + dd + dlu + dru + dld + drd) * 0.125f;
-    float gradient = max(abs(dr - dl), abs(dd - du));
-    float threshold = max(depth_reconstruct_edge_threshold, 0.0001f);
-    float edgeMask = smoothstep(threshold, threshold * 2.0f, gradient);
-    float target = lerp(avg, localMin, saturate(depth_reconstruct_near_bias) * edgeMask);
-    return saturate(lerp(depth, target, strength));
-}
-
-float ApplyDepthEdgeMaskFromGradient(float depth, float neighborAvg, float gradient)
-{
-    float strength = clamp(depth_edge_mask_strength, -1.0f, 1.0f);
-    if (abs(strength) <= 0.0f) {
-        return depth;
-    }
-
-    float threshold = max(depth_edge_mask_threshold, 0.0f);
-    float feather = max(depth_edge_mask_feather, 0.0001f);
-    float edgeMask = smoothstep(threshold, threshold + feather, gradient);
-    float target = (strength >= 0.0f) ? neighborAvg : 1.0f;
-    return saturate(lerp(depth, target, edgeMask * abs(strength)));
-}
-
+// The full conditioning chain (canonical depth -> shaping -> auto balance ->
+// edge mask / expand / smooth+protect -> reconstruct -> region/weapon/shape/UI
+// masks) runs once per source pixel in dibr_depth_prep.hlsl (PREP_MODE 1).
+// Reading it back is a single bilinear tap, which is what makes the march
+// loop below cheap.
 float SamplePreparedDepthWithGradient(float2 uv, out float sourceGradient)
 {
-    uv = saturate(uv);
-
-    float invW = 1.0f / max((float)srcWidth, 1.0f);
-    float invH = 1.0f / max((float)srcHeight, 1.0f);
-    float expandStrength = saturate(depth_expand_strength);
-    float sampleRadius = (expandStrength > 0.0f) ? max(depth_expand_radius, 0.0f) : 1.0f;
-    if (abs(clamp(depth_edge_mask_strength, -1.0f, 1.0f)) > 0.0f) {
-        sampleRadius = max(sampleRadius, max(depth_edge_mask_radius, 0.0f));
-    }
-    float2 texel = float2(invW, invH) * sampleRadius;
-
-    float2 uvL = uv - float2(texel.x, 0.0f);
-    float2 uvR = uv + float2(texel.x, 0.0f);
-    float2 uvU = uv - float2(0.0f, texel.y);
-    float2 uvD = uv + float2(0.0f, texel.y);
-
-    float d = ShapeDepth(SampleCanonicalDepth(uv), uv);
-    float dl = ShapeDepth(SampleCanonicalDepth(uvL), uvL);
-    float dr = ShapeDepth(SampleCanonicalDepth(uvR), uvR);
-    float du = ShapeDepth(SampleCanonicalDepth(uvU), uvU);
-    float dd = ShapeDepth(SampleCanonicalDepth(uvD), uvD);
-
-    float minDepth = min(d, min(min(dl, dr), min(du, dd)));
-    float neighborAvg = (dl + dr + du + dd) * 0.25f;
-    float gradient = max(abs(dr - dl), abs(dd - du));
-    sourceGradient = gradient;
-
-    d = ApplyDepthEdgeMaskFromGradient(d, neighborAvg, gradient);
-    minDepth = min(d, min(min(dl, dr), min(du, dd)));
-
-    if (expandStrength > 0.0f) {
-        float expandThreshold = max(depth_expand_edge_threshold, 0.0001f);
-        float expandMask = smoothstep(expandThreshold, expandThreshold * 2.0f, gradient) * expandStrength;
-        float expandTarget = lerp(neighborAvg, minDepth, saturate(depth_expand_near_bias));
-        d = saturate(lerp(d, expandTarget, expandMask));
-        minDepth = min(d, min(min(dl, dr), min(du, dd)));
-    }
-
-    float edgeWeight = saturate(gradient * 24.0f);
-    float smoothWeight = saturate(range_smoothing) * (1.0f - edgeWeight);
-    float protectedWeight = edgeWeight * saturate(foreground_protect);
-
-    float smoothedDepth = lerp(d, neighborAvg, smoothWeight);
-
-    // Bias toward the nearest local depth on sharp transitions. This reduces
-    // background bleeding around foreground silhouettes during the ray search.
-    float prepared = saturate(lerp(smoothedDepth, minDepth, protectedWeight));
-    return ApplyUiAlphaDepthMask(uv, ApplyShapeDepthMask(uv, ApplyWeaponDepthMask(uv, ApplyRegionDepthMask(uv, ReconstructDepth(uv, prepared)))));
+    float2 prepared = g_prepDepth.SampleLevel(g_linearSampler, saturate(uv), 0);
+    sourceGradient = prepared.y;
+    return prepared.x;
 }
 
 float SamplePreparedDepth(float2 uv)
 {
-    float sourceGradient = 0.0f;
-    return SamplePreparedDepthWithGradient(uv, sourceGradient);
+    return g_prepDepth.SampleLevel(g_linearSampler, saturate(uv), 0).x;
 }
 
 float ScreenEdgeGuard(float2 uv, float depth)
@@ -1969,17 +1735,34 @@ float DepthArtifactGuardScaleFromGradient(float gradient)
     return lerp(1.0f, saturate(depth_artifact_guard_scale), mask);
 }
 
-float DepthToUvShiftBase(float2 uv, float depth, float eyeSign)
+// The guard product varies slowly across a disparity ray (and every factor is
+// 1.0 at default settings), so the march evaluates it ONCE at the output
+// pixel and reuses it for every probe instead of re-running four mask stacks
+// per step.
+float DepthShiftGuard(float2 uv, float depth, float eyeSign)
 {
-    float axisSize = (stereo_axis_mode > 0.5f) ? (float)srcHeight : (float)srcWidth;
-    float invAxis = 1.0f / max(axisSize, 1.0f);
+    return FilterEmulatorFocusScale(depth) * ScreenEdgeGuard(uv, depth)
+        * WeaponBoundaryScale(uv, depth) * FocusReductionScale(uv, depth, eyeSign);
+}
+
+float StereoInvAxis()
+{
+    return (stereo_axis_mode > 0.5f) ? pre_inv_src_height : pre_inv_src_width;
+}
+
+float DepthToUvShiftGuarded(float depth, float guard, float eyeSign, float invAxis)
+{
     float delta = StereoDepthDelta(depth);
     float nearLimit = max(popout_limit, 0.0f);
     if (nearLimit < 1.0f && delta < 0.0f) {
         delta = max(delta, -nearLimit);
     }
-    float guardedShift = divergence * delta * FilterEmulatorFocusScale(depth) * ScreenEdgeGuard(uv, depth) * WeaponBoundaryScale(uv, depth) * FocusReductionScale(uv, depth, eyeSign);
-    return eyeSign * (guardedShift + perspective_shift) * invAxis;
+    return eyeSign * (divergence * delta * guard + perspective_shift) * invAxis;
+}
+
+float DepthToUvShiftBase(float2 uv, float depth, float eyeSign)
+{
+    return DepthToUvShiftGuarded(depth, DepthShiftGuard(uv, depth, eyeSign), eyeSign, StereoInvAxis());
 }
 
 int EffectiveRaymarchSteps(float2 uv, float requestedSteps)
@@ -2000,15 +1783,15 @@ int EffectiveRaymarchSteps(float2 uv, float requestedSteps)
     return (int)clamp(round(steps), 4.0f, (float)MAX_STEPS);
 }
 
-float4 SampleStereoColor(float2 sampleUv, float2 centerUv, float centerDepth)
+// centerColor is passed in (CSMain already paid for it) instead of being
+// re-filtered per eye.
+float4 SampleStereoColor(float2 sampleUv, float4 centerColor, float centerDepth)
 {
     float outside = (sampleUv.x < 0.0f || sampleUv.x > 1.0f ||
                      sampleUv.y < 0.0f || sampleUv.y > 1.0f) ? 1.0f : 0.0f;
     float mode = floor(edge_fill_mode + 0.5f);
     float2 edgeUv = (mode < 0.5f) ? MirrorEdgeUv(sampleUv) : saturate(sampleUv);
-    float2 clampedCenterUv = saturate(centerUv);
     float4 sampleColor = SampleFilteredOutputColor(edgeUv);
-    float4 centerColor = SampleFilteredOutputColor(clampedCenterUv);
     if (outside >= 0.5f) {
         float4 blackColor = float4(0.0f, 0.0f, 0.0f, centerColor.a);
         float4 fillColor = (mode >= 0.5f && mode < 1.5f) ? blackColor : sampleColor;
@@ -2038,15 +1821,19 @@ float4 SampleReducedStereoColor(float2 sampleUv, float4 centerColor)
     return sampleColor;
 }
 
-float2 RaymarchUv(float2 uv, float eyeSign)
+// centerDepth and the gradient-guard product are computed once by CSMain and
+// passed in (the old version re-ran the full prepared-depth evaluation here,
+// duplicating CSMain's work per eye). The slowly-varying guard product is
+// hoisted to the center pixel; every probe is one prep-texture tap plus a
+// few ALU ops.
+float2 RaymarchUv(float2 uv, float eyeSign, float centerDepth, float boundaryScale)
 {
-    float boundaryGradient = 0.0f;
-    float centerDepth = SamplePreparedDepthWithGradient(uv, boundaryGradient);
-    float boundaryScale = ConvergenceBoundaryScaleFromGradient(boundaryGradient) * DepthArtifactGuardScaleFromGradient(boundaryGradient);
-    float targetShift = DepthToUvShiftBase(uv, centerDepth, eyeSign) * boundaryScale;
+    float invAxis = StereoInvAxis();
+    float guard = DepthShiftGuard(uv, centerDepth, eyeSign) * boundaryScale;
+    float targetShift = DepthToUvShiftGuarded(centerDepth, guard, eyeSign, invAxis);
     float absTarget = abs(targetShift);
 
-    if (absTarget <= (0.25f / max((float)srcWidth, 1.0f))) {
+    if (absTarget <= (0.25f * pre_inv_src_width)) {
         return uv;
     }
 
@@ -2060,16 +1847,12 @@ float2 RaymarchUv(float2 uv, float eyeSign)
     float previousDepth = centerDepth;
 
     [loop]
-    for (int i = 1; i <= MAX_STEPS; ++i) {
-        if (i > steps) {
-            break;
-        }
-
+    for (int i = 1; i <= steps; ++i) {
         float t = (float)i / (float)steps;
         float2 probeUv = saturate(uv + StereoShift(direction * absTarget * t));
         float probeDepth = SamplePreparedDepth(probeUv);
         float expectedTravel = absTarget * t;
-        float observedTravel = abs(DepthToUvShiftBase(probeUv, probeDepth, eyeSign) * boundaryScale);
+        float observedTravel = abs(DepthToUvShiftGuarded(probeDepth, guard, eyeSign, invAxis));
         float depthStep = abs(probeDepth - previousDepth);
         float error = abs(observedTravel - expectedTravel) + depthStep * absTarget * 2.0f;
 
@@ -2079,7 +1862,7 @@ float2 RaymarchUv(float2 uv, float eyeSign)
         }
 
         // Early out after crossing a sharp foreground/background boundary.
-        if (depthStep > 0.08f && observedTravel + (1.5f / max((float)srcWidth, 1.0f)) < expectedTravel) {
+        if (depthStep > 0.08f && observedTravel + (1.5f * pre_inv_src_width) < expectedTravel) {
             break;
         }
 
@@ -2090,7 +1873,7 @@ float2 RaymarchUv(float2 uv, float eyeSign)
     return lerp(directUv, bestUv, confidence);
 }
 
-[numthreads(16, 16, 1)]
+[numthreads(DIBR_TG, DIBR_TG, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
     uint x = dtid.x;
@@ -2103,11 +1886,11 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     float centerGradient = 0.0f;
     float centerDepth = SamplePreparedDepthWithGradient(uv, centerGradient);
+    float boundaryScale = ConvergenceBoundaryScaleFromGradient(centerGradient) * DepthArtifactGuardScaleFromGradient(centerGradient);
+#if !DIBR_LEAN
     float debugMode = floor(debug_view_mode + 0.5f);
     if (debugMode >= 1.0f) {
-        float shift = DepthToUvShiftBase(uv, centerDepth, 1.0f)
-            * ConvergenceBoundaryScaleFromGradient(centerGradient)
-            * DepthArtifactGuardScaleFromGradient(centerGradient);
+        float shift = DepthToUvShiftBase(uv, centerDepth, 1.0f) * boundaryScale;
         float depthValue = DebugDepthValue(centerDepth);
         if (debugMode >= 5.5f) {
             float4 debugColor = DibrAlignmentGridColor(uv, centerDepth, debugMode);
@@ -2127,16 +1910,17 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         WriteStereoPair(x, y, debugColor, debugColor);
         return;
     }
+#endif
 
     float2 leftInterlaceOffset = InterlaceSampleOffset(1.0f);
     float2 rightInterlaceOffset = InterlaceSampleOffset(-1.0f);
-    float2 leftRaymarchUV = RaymarchUv(uv, 1.0f);
-    float2 rightRaymarchUV = RaymarchUv(uv, -1.0f);
+    float2 leftRaymarchUV = RaymarchUv(uv, 1.0f, centerDepth, boundaryScale);
+    float2 rightRaymarchUV = RaymarchUv(uv, -1.0f, centerDepth, boundaryScale);
     float2 leftUV = ApplyOutputEyeAlignment(leftRaymarchUV + leftInterlaceOffset, 1.0f);
     float2 rightUV = ApplyOutputEyeAlignment(rightRaymarchUV + rightInterlaceOffset, -1.0f);
     float4 centerColor = SampleFilteredOutputColor(uv);
-    float4 leftColor = SampleStereoColor(leftUV, uv, centerDepth);
-    float4 rightColor = SampleStereoColor(rightUV, uv, centerDepth);
+    float4 leftColor = SampleStereoColor(leftUV, centerColor, centerDepth);
+    float4 rightColor = SampleStereoColor(rightUV, centerColor, centerDepth);
 
     float4 outLeft = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftColor, centerColor))));
     float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightColor, centerColor))));
