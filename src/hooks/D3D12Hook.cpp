@@ -17942,14 +17942,33 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
         return;
     }
 
+    // Cached: a live GetEnvironmentVariableA here costs a PEB lock + an env
+    // block scan on EVERY PSO bind across all recording threads.
+    static const bool forensics_bind_only_record_pso =
+        env_flag_enabled_a("UEVR_STEREO_FORENSICS_BIND_ONLY_RECORD_PSO");
+    const bool record_forensics_pso_bind =
+        enable_d3d12_diagnostic_command_list_hooks() || forensics_bind_only_record_pso;
+
+    auto& shader_registry = render::ShaderOverrideRegistry::get();
+
+    // DEFAULT FAST-PATH: no pipeline tracking, no diagnostic/forensics
+    // recording, not SN2 — forward directly. This skips the per-bind
+    // cmdlist-state bookkeeping (two g_cmdlist_state_mutex acquisitions and a
+    // multi-KB CommandListCorrelationState copy) plus the RenderDoc bound-PSO
+    // note: every reader of that state lives in detours that only install (or
+    // only run) under the conditions checked here, so nothing consumes it in
+    // this configuration. should_track_d3d12_pipelines() is re-checked per
+    // call, so flipping inspector tracking / the Shader Hunter on at runtime
+    // re-engages the bookkeeping on the next bind.
+    if (!record_forensics_pso_bind && !is_subnautica2_process() &&
+        !shader_registry.should_track_d3d12_pipelines()) {
+        original(command_list, pipeline_state);
+        return;
+    }
+
     update_cmdlist_pso(command_list, pipeline_state);
     const auto pso_state = read_cmdlist_state(command_list);
     const auto eye_bucket = cmdlist_eye_bucket(pso_state);
-    const bool record_forensics_pso_bind =
-        enable_d3d12_diagnostic_command_list_hooks() ||
-        env_flag_enabled_a("UEVR_STEREO_FORENSICS_BIND_ONLY_RECORD_PSO");
-
-    auto& shader_registry = render::ShaderOverrideRegistry::get();
     if (!shader_registry.should_track_d3d12_pipelines()) {
         uevr::renderdoc_capture::note_object(
             uevr::renderdoc_capture::ObjectKind::BoundD3D12PipelineState,
@@ -32092,15 +32111,17 @@ void WINAPI D3D12Hook::om_set_render_targets(
     auto* hook = d3d12 != nullptr ? d3d12->find_command_list_diagnostic_hook(slot) : nullptr;
     auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::om_set_render_targets)*>() : nullptr;
 
-    // DIBR depth liveness (always-on; the hook is installed unconditionally):
-    // mark the bound DSV's resource as used this frame so the depth tracker
-    // never selects a stale depth target. Cheap descriptor-map probe.
+    // DIBR depth liveness (the hook is installed unconditionally): mark the
+    // bound DSV's resource as used this frame so the depth tracker never
+    // selects a stale depth target. One relaxed atomic load until a DIBR
+    // consumer arms liveness; a mutex-guarded map probe after that.
     if (depth_stencil_descriptor != nullptr) {
         dibr_depth_tracker::record_dsv_bind(*depth_stencil_descriptor);
     }
 
-    // Bind census (no-op unless UEVR_DIBR_BIND_CENSUS armed a window).
-    {
+    // Bind census / probe / AFW / velocity capture: one combined armed check
+    // so the default path pays a couple of cached loads, not four calls.
+    if (dibr_depth_tracker::bind_capture_armed()) {
         SIZE_T census_rtvs[8]{};
         const UINT census_n = std::min<UINT>(num_render_target_descriptors, 8u);
         if (render_target_descriptors != nullptr) {
@@ -32185,8 +32206,9 @@ void WINAPI D3D12Hook::begin_render_pass(
         dibr_depth_tracker::record_dsv_bind(depth_stencil->cpuDescriptor);
     }
 
-    // Bind census (no-op unless UEVR_DIBR_BIND_CENSUS armed a window).
-    {
+    // Bind census / probe / AFW / velocity capture: one combined armed check
+    // so the default path pays a couple of cached loads, not four calls.
+    if (dibr_depth_tracker::bind_capture_armed()) {
         SIZE_T census_rtvs[8]{};
         const UINT census_n = std::min<UINT>(num_render_targets, 8u);
         if (render_targets != nullptr) {
