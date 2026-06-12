@@ -747,6 +747,30 @@ bool sn2_hooks_disabled_by_env() {
     return disabled;
 }
 
+// Master opt-in for the SN2 fog-investigation device hooks (same gate as
+// FFakeStereoRenderingHook's subnautica2_render_hooks_enabled): default OFF.
+// The CBV/SRV/UAV creation + CopyDescriptors hooks exist to feed the fog
+// bindless slot maps / capture-truth tooling; on a plain default launch they
+// were costing a global mutex + map work PER DESCRIPTOR COPY across all RHI
+// threads (UE5 stages thousands per frame).
+bool sn2_render_hooks_requested() {
+    static const bool enabled = env_flag_enabled_a("UEVR_SN2_RENDER_HOOKS");
+    return enabled;
+}
+
+// Creation-time D3D12Diagnostics registration (root-signature decode, RTV/DSV
+// descriptor maps) feeds the render-inspection tooling. Default launches get
+// no value from it - just mutex+map+deserialize churn on every creation call
+// - so it arms only when a tooling consumer is plausibly present.
+bool enable_d3d12_diagnostic_command_list_hooks(); // defined below
+bool creation_diagnostics_enabled() {
+    static const bool enabled = enable_d3d12_diagnostic_command_list_hooks() ||
+        sn2_render_hooks_requested() ||
+        env_flag_enabled_a("UEVR_STEREO_FORENSICS") ||
+        uevr::renderdoc_capture::env_truthy_w(L"UEVR_RENDERDOC_BOOTSTRAP");
+    return enabled;
+}
+
 bool is_subnautica2_process();
 
 bool sn2_fog_producer_viewrect_tag_default_enabled() {
@@ -3003,7 +3027,11 @@ bool D3D12Hook::hook() {
         std::unordered_set<uintptr_t> unordered_access_view_slots{};
         std::unordered_set<uintptr_t> copy_descriptors_simple_slots{};
         std::unordered_set<uintptr_t> copy_descriptors_slots{};
-        const bool sn2_hooks_enabled = is_subnautica2_process();
+        // 2026-06-12: descriptor-copy/view hooks are part of the SN2 fog
+        // investigation tooling, not core rendering - install them only when
+        // that work is opted in (UEVR_SN2_RENDER_HOOKS=1) or another consumer
+        // (resource lineage) asks. Plain SN2 launches skip them entirely.
+        const bool sn2_hooks_enabled = is_subnautica2_process() && sn2_render_hooks_requested();
         const bool resource_lineage_enabled = enable_d3d12_resource_lineage_hook();
 
         add_unique_pointer_hook(
@@ -3329,13 +3357,12 @@ bool D3D12Hook::hook() {
                 read("UEVR_SHADER_HUNTER_SKIP_RIGHT_ONLY"),
                 read("UEVR_SN2_SKYATMOS_CB_REDIRECT"),
                 read("UEVR_SN2_SKYATMOS_CB_REDIRECT_ROOTS"));
-            spdlog::info("[D3D12] SN2 visual baseline env: UEVR_SN2_RIGHT_EYE_COLOR_TRANSFER={} | UEVR_SN2_ALLOW_SKYATMOS_DIAGNOSTICS={} | UEVR_SN2_SKYATMOS_SKIP_RIGHT={} | UEVR_SN2_RIGHT_SKIP_CRCS={} | UEVR_SN2_SKY_ATMOS_INLINE_FIX={} | UEVR_SN2_DESKTOP_MIRROR_SBS={} | UEVR_SN2_TRACE_NATIVE_SOURCE={} | UEVR_SN2_TRACE_NATIVE_SOURCE_W={} | UEVR_SN2_TRACE_NATIVE_SOURCE_H={} | UEVR_SN2_TRACE_NATIVE_SOURCE_FMT={} | UEVR_SN2_TRACE_NATIVE_SOURCE_RESOURCE={}",
+            spdlog::info("[D3D12] SN2 visual baseline env: UEVR_SN2_RIGHT_EYE_COLOR_TRANSFER={} | UEVR_SN2_ALLOW_SKYATMOS_DIAGNOSTICS={} | UEVR_SN2_SKYATMOS_SKIP_RIGHT={} | UEVR_SN2_RIGHT_SKIP_CRCS={} | UEVR_SN2_SKY_ATMOS_INLINE_FIX={} | UEVR_SN2_TRACE_NATIVE_SOURCE={} | UEVR_SN2_TRACE_NATIVE_SOURCE_W={} | UEVR_SN2_TRACE_NATIVE_SOURCE_H={} | UEVR_SN2_TRACE_NATIVE_SOURCE_FMT={} | UEVR_SN2_TRACE_NATIVE_SOURCE_RESOURCE={}",
                 read("UEVR_SN2_RIGHT_EYE_COLOR_TRANSFER"),
                 read("UEVR_SN2_ALLOW_SKYATMOS_DIAGNOSTICS"),
                 read("UEVR_SN2_SKYATMOS_SKIP_RIGHT"),
                 read("UEVR_SN2_RIGHT_SKIP_CRCS"),
                 read("UEVR_SN2_SKY_ATMOS_INLINE_FIX"),
-                read("UEVR_SN2_DESKTOP_MIRROR_SBS"),
                 read("UEVR_SN2_TRACE_NATIVE_SOURCE"),
                 read("UEVR_SN2_TRACE_NATIVE_SOURCE_W"),
                 read("UEVR_SN2_TRACE_NATIVE_SOURCE_H"),
@@ -6366,11 +6393,13 @@ HRESULT WINAPI D3D12Hook::create_root_signature(
         Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature_iface{};
         auto* unknown = reinterpret_cast<IUnknown*>(*root_signature);
         if (unknown != nullptr && SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&root_signature_iface)))) {
-            render::D3D12Diagnostics::get().register_root_signature(
-                "D3D12Hook::CreateRootSignature",
-                root_signature_iface.Get(),
-                blob,
-                static_cast<size_t>(blob_length_in_bytes));
+            if (creation_diagnostics_enabled()) {
+                render::D3D12Diagnostics::get().register_root_signature(
+                    "D3D12Hook::CreateRootSignature",
+                    root_signature_iface.Get(),
+                    blob,
+                    static_cast<size_t>(blob_length_in_bytes));
+            }
             // RenderDoc/PIX/Nsight legibility: SetName as
             // "SN2_RootSig|params=<N>|<blob hash>". Gated by UEVR_SN2_RDOC_TAGS(_NAMES).
             sn2_rdoc_tags::name_root_signature(
@@ -6423,7 +6452,9 @@ void WINAPI D3D12Hook::create_render_target_view(
         original(device, resource, desc, descriptor);
     }
 
-    render::D3D12Diagnostics::get().register_rtv_descriptor("D3D12Hook::CreateRenderTargetView", resource, descriptor);
+    if (creation_diagnostics_enabled()) {
+        render::D3D12Diagnostics::get().register_rtv_descriptor("D3D12Hook::CreateRenderTargetView", resource, descriptor);
+    }
     render::StereoForensics::get().record_rtv_descriptor(
         "D3D12Hook::CreateRenderTargetView",
         resource,
@@ -6431,6 +6462,8 @@ void WINAPI D3D12Hook::create_render_target_view(
         descriptor);
     sn2_rt_snapshot::record_rtv(static_cast<uint64_t>(descriptor.ptr), resource);
     ::sn2_capture_truth::record_descriptor_view("rtv", resource, descriptor);
+    // DIBR depth/RTV tracking must stay unconditional: the depth selection and
+    // AFW bind-signature machinery key off views observed at creation time.
     dibr_depth_tracker::record_rtv(resource, descriptor);
 }
 
@@ -11405,13 +11438,17 @@ void WINAPI D3D12Hook::create_depth_stencil_view(
         original(device, resource, desc, descriptor);
     }
 
-    render::D3D12Diagnostics::get().register_dsv_descriptor("D3D12Hook::CreateDepthStencilView", resource, descriptor);
+    if (creation_diagnostics_enabled()) {
+        render::D3D12Diagnostics::get().register_dsv_descriptor("D3D12Hook::CreateDepthStencilView", resource, descriptor);
+    }
     render::StereoForensics::get().record_dsv_descriptor(
         "D3D12Hook::CreateDepthStencilView",
         resource,
         desc,
         descriptor);
     ::sn2_capture_truth::record_descriptor_view("dsv", resource, descriptor);
+    // DIBR depth tracking must stay unconditional: scene-depth selection and
+    // the AFW machinery key off DSVs observed at creation time.
     dibr_depth_tracker::record_dsv(resource, descriptor, desc);
 }
 
@@ -17952,15 +17989,31 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
     auto& shader_registry = render::ShaderOverrideRegistry::get();
 
     // DEFAULT FAST-PATH: no pipeline tracking, no diagnostic/forensics
-    // recording, not SN2 — forward directly. This skips the per-bind
-    // cmdlist-state bookkeeping (two g_cmdlist_state_mutex acquisitions and a
-    // multi-KB CommandListCorrelationState copy) plus the RenderDoc bound-PSO
-    // note: every reader of that state lives in detours that only install (or
-    // only run) under the conditions checked here, so nothing consumes it in
-    // this configuration. should_track_d3d12_pipelines() is re-checked per
-    // call, so flipping inspector tracking / the Shader Hunter on at runtime
-    // re-engages the bookkeeping on the next bind.
-    if (!record_forensics_pso_bind && !is_subnautica2_process() &&
+    // recording, no SN2-specific state consumer — forward directly. This skips
+    // the per-bind cmdlist-state bookkeeping (two g_cmdlist_state_mutex
+    // acquisitions and a multi-KB CommandListCorrelationState copy) plus the
+    // RenderDoc bound-PSO note: every reader of that state lives in detours
+    // that only install (or only run) under the conditions checked here, so
+    // nothing consumes it in this configuration. should_track_d3d12_pipelines()
+    // is re-checked per call, so flipping inspector tracking / the Shader
+    // Hunter on at runtime re-engages the bookkeeping on the next bind.
+    //
+    // 2026-06-12: the old blanket !is_subnautica2_process() carve-out funneled
+    // EVERY SN2 PSO bind on EVERY RHI worker through g_cmdlist_state_mutex even
+    // at default settings — a lock convoy that stalls the engine with idle
+    // CPU+GPU. The SN2 features that genuinely consume this state either force
+    // enable_d3d12_diagnostic_command_list_hooks() on themselves (underwater
+    // fix, fog snapshot) or are gated by the explicit envs below; a plain
+    // default SN2 launch now takes the same fast path as every other title.
+    static const bool sn2_cmdlist_state_consumers = is_subnautica2_process() && (
+        env_flag_enabled_a("UEVR_SN2_RDOC_TAGS") ||
+        env_flag_enabled_a("UEVR_SN2_RDOC_TAGS_NAMES") ||
+        env_flag_enabled_a("UEVR_SN2_CAPTURE_TRUTH") ||
+        env_flag_enabled_a("UEVR_SN2_RESOURCE_LINEAGE") ||
+        env_flag_enabled_a("UEVR_SN2_PROBE_POINTS") ||
+        uevr::renderdoc_capture::env_truthy_w(L"UEVR_RENDERDOC_BOOTSTRAP"));
+
+    if (!record_forensics_pso_bind && !sn2_cmdlist_state_consumers &&
         !shader_registry.should_track_d3d12_pipelines()) {
         original(command_list, pipeline_state);
         return;

@@ -2064,7 +2064,14 @@ static int dibr_env_requested_mode() {
         if (m == "afw" || m == "alternate") {
             return 6;
         }
-        return 1; // yoro / synth_right / unrecognized
+        if (m == "1" || m == "yoro" || m == "synth_right") {
+            return 1;
+        }
+        // Fail closed: a typo'd UEVR_DIBR must not silently engage the
+        // single-view pipeline (it also loosens the Native Stereo gate).
+        spdlog::warn("[DIBR] Unrecognized UEVR_DIBR value '{}'; DIBR stays disabled "
+                     "(expected off|yoro|synth_right|yoro_left|synth_left|inverse|raymarch|scatter|afw)", m);
+        return 0;
     }();
     return env_mode;
 }

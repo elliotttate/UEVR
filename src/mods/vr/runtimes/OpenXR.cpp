@@ -38,11 +38,8 @@ constexpr auto READY_STATE_STUCK_LOG_INTERVAL = std::chrono::seconds(2);
 constexpr auto VALID_POSE_PROBE_LOG_INTERVAL = std::chrono::seconds(2);
 constexpr auto FRAME_TIMING_LOG_INTERVAL = std::chrono::seconds(5);
 constexpr auto LONG_WAIT_LOG_INTERVAL = std::chrono::seconds(2);
-constexpr auto STALE_POSE_SUBMIT_LOG_INTERVAL = std::chrono::seconds(2);
-constexpr auto STALE_POSE_SKIP_SUMMARY_INTERVAL = std::chrono::minutes(1);
 constexpr auto SLOW_POSE_UPDATE_LOG_INTERVAL = std::chrono::seconds(2);
 constexpr auto SLOW_POSE_UPDATE_LOG_THRESHOLD_MS = 10.0;
-constexpr auto STALE_POSE_REFRESH_MIN_AGE_MS = 50LL;
 
 bool env_truthy(const char* name) {
     char value[32]{};
@@ -353,7 +350,6 @@ void OpenXR::on_draw_ui() {
             this->debug_skip_scene_copy->draw("Skip Scene Copy");
             this->debug_skip_ui_copy->draw("Skip UI Copy");
             this->debug_disable_depth_submit->draw("Disable Depth Submit");
-            this->refresh_stale_pose_before_submit_enabled->draw("Refresh Stale Pose Before Submit");
             ImGui::TreePop();
         }
         
@@ -547,115 +543,6 @@ void OpenXR::clear_frame_synced(const char* reason) {
         this->frame_state.predictedDisplayTime,
         this->frame_state.predictedDisplayPeriod
     );
-}
-
-VRRuntime::Error OpenXR::refresh_stale_pose_before_submit(uint32_t frame_count, const char* caller) {
-    if (!this->refresh_stale_pose_before_submit_enabled->value()) {
-        return VRRuntime::Error::SUCCESS;
-    }
-
-    if (!this->can_run_frame_loop() || this->session_state != XR_SESSION_STATE_FOCUSED ||
-        !this->frame_synced || !this->frame_began || !this->got_first_poses)
-    {
-        return VRRuntime::Error::SUCCESS;
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    const auto pose_age_ms = this->get_pose_update_age_ms(now);
-    const auto predicted_period_ms = this->frame_state.predictedDisplayPeriod > 0
-        ? static_cast<int64_t>(this->frame_state.predictedDisplayPeriod / 1000000)
-        : 0LL;
-    const auto stale_threshold_ms = std::max<int64_t>(STALE_POSE_REFRESH_MIN_AGE_MS, predicted_period_ms * 3);
-
-    if (pose_age_ms >= 0 && pose_age_ms < stale_threshold_ms) {
-        return VRRuntime::Error::SUCCESS;
-    }
-
-    uint32_t current_internal_frame_count{};
-    {
-        std::scoped_lock _{this->sync_assignment_mtx};
-        current_internal_frame_count = this->internal_frame_count;
-    }
-
-    if (is_older_frame_count(frame_count, current_internal_frame_count)) {
-        const auto first_log = this->last_stale_pose_skip_log.time_since_epoch().count() == 0;
-
-        if (first_log) {
-            this->last_stale_pose_skip_log = now;
-            spdlog::warn(
-                "[OpenXR][stale-pose] skipped refresh for older submit frame to avoid internal frame regression caller={} frame_count={} internal_frame_count={} pose_age_ms={} threshold_ms={} session={} shouldRender={}",
-                caller != nullptr ? caller : "unknown",
-                frame_count,
-                current_internal_frame_count,
-                pose_age_ms,
-                stale_threshold_ms,
-                this->get_session_state_string(this->session_state),
-                this->frame_state.shouldRender
-            );
-        } else {
-            ++this->stale_pose_skip_suppressed_count;
-
-            if (now - this->last_stale_pose_skip_log >= STALE_POSE_SKIP_SUMMARY_INTERVAL) {
-                spdlog::warn(
-                    "[OpenXR][stale-pose] suppressed repeated older-frame refresh skips count={} caller={} frame_count={} internal_frame_count={} pose_age_ms={} threshold_ms={} session={} shouldRender={}",
-                    this->stale_pose_skip_suppressed_count,
-                    caller != nullptr ? caller : "unknown",
-                    frame_count,
-                    current_internal_frame_count,
-                    pose_age_ms,
-                    stale_threshold_ms,
-                    this->get_session_state_string(this->session_state),
-                    this->frame_state.shouldRender
-                );
-
-                this->last_stale_pose_skip_log = now;
-                this->stale_pose_skip_suppressed_count = 0;
-            }
-        }
-
-        return VRRuntime::Error::SUCCESS;
-    }
-
-    ++this->stale_pose_refresh_attempt_count;
-
-    const auto wait_age_ms = elapsed_ms_since(now, this->last_successful_wait_frame);
-    const auto begin_age_ms = elapsed_ms_since(now, this->last_successful_begin_frame);
-    const auto end_age_ms = elapsed_ms_since(now, this->last_successful_end_frame);
-    const auto result = this->update_poses(false, frame_count);
-    const auto after = std::chrono::steady_clock::now();
-    const auto pose_age_after_ms = this->get_pose_update_age_ms(after);
-
-    if (result == VRRuntime::Error::SUCCESS) {
-        ++this->stale_pose_refresh_success_count;
-    } else {
-        ++this->stale_pose_refresh_failed_count;
-    }
-
-    if (result != VRRuntime::Error::SUCCESS ||
-        this->last_stale_pose_submit_log.time_since_epoch().count() == 0 ||
-        after - this->last_stale_pose_submit_log >= STALE_POSE_SUBMIT_LOG_INTERVAL)
-    {
-        this->last_stale_pose_submit_log = after;
-        spdlog::warn(
-            "[OpenXR][stale-pose] submit refresh caller={} frame_count={} result={} pose_age_before_ms={} pose_age_after_ms={} threshold_ms={} session={} shouldRender={} wait_age_ms={} begin_age_ms={} end_age_ms={} attempts={} success={} failed={}",
-            caller != nullptr ? caller : "unknown",
-            frame_count,
-            static_cast<int64_t>(result),
-            pose_age_ms,
-            pose_age_after_ms,
-            stale_threshold_ms,
-            this->get_session_state_string(this->session_state),
-            this->frame_state.shouldRender,
-            wait_age_ms,
-            begin_age_ms,
-            end_age_ms,
-            this->stale_pose_refresh_attempt_count,
-            this->stale_pose_refresh_success_count,
-            this->stale_pose_refresh_failed_count
-        );
-    }
-
-    return result;
 }
 
 bool OpenXR::recover_focused_stale_frame_loop(const char* caller) {
@@ -3225,7 +3112,7 @@ void OpenXR::log_frame_timing_stats_if_needed() {
     const auto pose_age_ms = this->get_pose_update_age_ms(now);
 
     spdlog::info(
-        "[OpenXR][frame-profiler] wait avg={:.2f}ms max={:.2f}ms n={} wait_fix avg={:.2f}ms max={:.2f}ms n={} wait_early avg={:.2f}ms max={:.2f}ms n={} wait_late avg={:.2f}ms max={:.2f}ms n={} wait_post_present_initial avg={:.2f}ms max={:.2f}ms n={} wait_very_late avg={:.2f}ms max={:.2f}ms n={} wait_session_ready avg={:.2f}ms max={:.2f}ms n={} wait_recovery avg={:.2f}ms max={:.2f}ms n={} begin avg={:.2f}ms max={:.2f}ms n={} end avg={:.2f}ms max={:.2f}ms n={} pose_update avg={:.2f}ms max={:.2f}ms n={} pose_age_ms={} pose_calls={} pose_view_ext={} pose_runtime={} stale_refresh={}/{}/{} last_pose_src={} last_pose_frame={} last_pose_result={} last_pose_ms={:.2f} view_locate_ms={:.2f} stage_locate_ms={:.2f} space_locate_ms={:.2f} session={} ready={} synced={} began={} first_poses={} valid_poses={} relaxed_startup={} stale_refresh_enabled={} dbg_empty={} dbg_skip_scene={} dbg_skip_ui={} dbg_no_depth={}",
+        "[OpenXR][frame-profiler] wait avg={:.2f}ms max={:.2f}ms n={} wait_fix avg={:.2f}ms max={:.2f}ms n={} wait_early avg={:.2f}ms max={:.2f}ms n={} wait_late avg={:.2f}ms max={:.2f}ms n={} wait_post_present_initial avg={:.2f}ms max={:.2f}ms n={} wait_very_late avg={:.2f}ms max={:.2f}ms n={} wait_session_ready avg={:.2f}ms max={:.2f}ms n={} wait_recovery avg={:.2f}ms max={:.2f}ms n={} begin avg={:.2f}ms max={:.2f}ms n={} end avg={:.2f}ms max={:.2f}ms n={} pose_update avg={:.2f}ms max={:.2f}ms n={} pose_age_ms={} pose_calls={} pose_view_ext={} pose_runtime={} last_pose_src={} last_pose_frame={} last_pose_result={} last_pose_ms={:.2f} view_locate_ms={:.2f} stage_locate_ms={:.2f} space_locate_ms={:.2f} session={} ready={} synced={} began={} first_poses={} valid_poses={} relaxed_startup={} dbg_empty={} dbg_skip_scene={} dbg_skip_ui={} dbg_no_depth={}",
         this->wait_frame_timing.avg(),
         this->wait_frame_timing.max_ms,
         this->wait_frame_timing.count,
@@ -3263,9 +3150,6 @@ void OpenXR::log_frame_timing_stats_if_needed() {
         this->pose_update_call_count,
         this->pose_update_view_extension_count,
         this->pose_update_non_view_extension_count,
-        this->stale_pose_refresh_attempt_count,
-        this->stale_pose_refresh_success_count,
-        this->stale_pose_refresh_failed_count,
         this->last_pose_update_from_view_extensions ? "view_extension" : "runtime",
         this->last_pose_update_frame_count,
         this->last_pose_update_result,
@@ -3280,7 +3164,6 @@ void OpenXR::log_frame_timing_stats_if_needed() {
         this->got_first_poses,
         this->got_first_valid_poses,
         this->accepted_relaxed_startup_poses,
-        this->refresh_stale_pose_before_submit_enabled->value(),
         this->debug_submit_empty_frame->value(),
         this->debug_skip_scene_copy->value(),
         this->debug_skip_ui_copy->value(),

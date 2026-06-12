@@ -167,7 +167,6 @@ public:
     void clear_frame_synced(const char* reason);
     bool should_trace_frame_flow() const;
     int64_t get_pose_update_age_ms(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
-    VRRuntime::Error refresh_stale_pose_before_submit(uint32_t frame_count, const char* caller);
 
     void begin_profile() {
         if (!this->profile_calls) {
@@ -371,7 +370,6 @@ public:
     const ModToggle::Ptr debug_skip_scene_copy{ ModToggle::create("OpenXR_DebugSkipSceneCopy", false) };
     const ModToggle::Ptr debug_skip_ui_copy{ ModToggle::create("OpenXR_DebugSkipUICopy", false) };
     const ModToggle::Ptr debug_disable_depth_submit{ ModToggle::create("OpenXR_DebugDisableDepthSubmit", false) };
-    const ModToggle::Ptr refresh_stale_pose_before_submit_enabled{ ModToggle::create("OpenXR_RefreshStalePoseBeforeSubmit", true) };
     bool resolution_scale_reconfigure_pending{false};
     bool resolution_scale_live_apply_deferred{false};
     float last_applied_resolution_scale{1.0f};
@@ -407,8 +405,6 @@ public:
     std::chrono::steady_clock::time_point last_frame_timing_log{};
     std::chrono::steady_clock::time_point last_long_wait_log{};
     std::chrono::steady_clock::time_point last_slow_pose_update_log{};
-    std::chrono::steady_clock::time_point last_stale_pose_skip_log{};
-    std::chrono::steady_clock::time_point last_stale_pose_submit_log{};
     FrameTimingStats wait_frame_timing{};
     FrameTimingStats begin_frame_timing{};
     FrameTimingStats end_frame_timing{};
@@ -417,10 +413,6 @@ public:
     uint64_t pose_update_call_count{};
     uint64_t pose_update_view_extension_count{};
     uint64_t pose_update_non_view_extension_count{};
-    uint64_t stale_pose_skip_suppressed_count{};
-    uint64_t stale_pose_refresh_attempt_count{};
-    uint64_t stale_pose_refresh_success_count{};
-    uint64_t stale_pose_refresh_failed_count{};
     uint64_t long_wait_suppressed_count{};
     double long_wait_max_suppressed_ms{};
     uint32_t last_pose_update_frame_count{};
@@ -439,7 +431,6 @@ public:
         *debug_skip_scene_copy,
         *debug_skip_ui_copy,
         *debug_disable_depth_submit,
-        *refresh_stale_pose_before_submit_enabled,
     };
 
     enum class SwapchainIndex {

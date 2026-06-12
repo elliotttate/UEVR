@@ -1,0 +1,15 @@
+Windows Registry Editor Version 5.00
+
+; Re-registers the NVIDIA Vulkan ICD that is missing from this machine's registry.
+; Root cause of MetaXR Simulator XR_ERROR_RUNTIME_FAILURE: the Vulkan loader had no
+; registered driver, so vkCreateInstance returned VK_ERROR_INCOMPATIBLE_DRIVER (-9).
+; Double-click this file (accept the UAC + import prompts) to apply machine-wide.
+; NOTE: the driver-store hash path (nv_dispi.inf_amd64_b7cca8360c0d57e9) changes on
+; NVIDIA driver updates. The cleanest permanent fix is a clean reinstall of the NVIDIA
+; driver, which re-creates these keys automatically.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\Drivers]
+"C:\\Windows\\System32\\DriverStore\\FileRepository\\nv_dispi.inf_amd64_b7cca8360c0d57e9\\nv-vk64.json"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers]
+"C:\\Windows\\System32\\DriverStore\\FileRepository\\nv_dispi.inf_amd64_b7cca8360c0d57e9\\nv-vk32.json"=dword:00000000

@@ -1352,10 +1352,24 @@ bool ShaderOverrideRegistry::should_track_d3d12_pipelines() const {
     // record only holds PSOs that were created AFTER recording started, so PSOs created during
     // early scene load (e.g. the SkyAtmosphere pass) never resolve at draw-time and the skip
     // can't match them. Cached once (env is read-only at runtime).
-    static const bool skip_configured =
-        GetEnvironmentVariableA("UEVR_SHADER_HUNTER_SKIP_RIGHT_ONLY", nullptr, 0) > 0 ||
-        GetEnvironmentVariableA("UEVR_SHADER_HUNTER_SKIP_LEFT_ONLY", nullptr, 0) > 0 ||
-        GetEnvironmentVariableA("UEVR_SHADER_HUNTER_SUPPRESS", nullptr, 0) > 0;
+    //
+    // VALUE-aware, not presence-aware: launchers scrub inherited diagnostics by
+    // setting these to "0", which a presence check would read as "enabled" and
+    // silently re-engage the SetPipelineState slow tracking path on every bind.
+    static const bool skip_configured = []() {
+        const auto truthy = [](const char* name) {
+            char buf[32]{};
+            const auto len = GetEnvironmentVariableA(name, buf, sizeof(buf));
+            if (len == 0 || len >= sizeof(buf)) {
+                return false;
+            }
+            const std::string_view v{buf, len};
+            return !v.empty() && v != "0" && v != "false" && v != "FALSE" && v != "off" && v != "OFF";
+        };
+        return truthy("UEVR_SHADER_HUNTER_SKIP_RIGHT_ONLY") ||
+               truthy("UEVR_SHADER_HUNTER_SKIP_LEFT_ONLY") ||
+               truthy("UEVR_SHADER_HUNTER_SUPPRESS");
+    }();
     return m_has_active_d3d12_overrides.load(std::memory_order_relaxed) ||
         m_inspector_tracking_enabled.load(std::memory_order_relaxed) ||
         m_hunter_active.load(std::memory_order_relaxed) ||

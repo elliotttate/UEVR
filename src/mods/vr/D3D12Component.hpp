@@ -461,6 +461,7 @@ private:
     uint32_t m_backbuffer_size[2]{};
 
     uint32_t m_last_rendered_frame{0};
+
     bool m_force_reset{true};
     bool m_last_afr_state{false};
     bool m_submitted_left_eye{false};

@@ -340,6 +340,11 @@ void note_override_applied(uint32_t ps_crc, int eye_bucket, const char* kind) {
 void note_create_graphics_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
                               ID3D12PipelineState* pso) {
     if (desc == nullptr || pso == nullptr) return;
+    // Callers assume this is free when the feature is off; without this gate
+    // every graphics PSO's full shader bytecode (VS/PS/GS/HS/DS) was being
+    // deep-copied and retained for the lifetime of the process on every SN2
+    // launch (thousands of PSOs = O(100MB) + creation-time cost).
+    if (!env_enabled()) return;
     auto& s = storage();
     Storage::OriginalDesc od{};
     od.desc = *desc;

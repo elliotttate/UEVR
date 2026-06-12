@@ -256,12 +256,17 @@ void CommandContext::wait(uint32_t ms) {
     std::scoped_lock _{this->mtx};
 
 	if (this->fence_event && this->waiting_for_fence) {
-        const auto completed_before = this->fence != nullptr ? this->fence->GetCompletedValue() : 0;
-        const auto wait_start = std::chrono::steady_clock::now();
-        const auto wait_result = WaitForSingleObject(this->fence_event, ms);
-        const auto wait_duration = std::chrono::steady_clock::now() - wait_start;
-        const auto completed_after = this->fence != nullptr ? this->fence->GetCompletedValue() : 0;
-        record_fence_wait(wait_duration, ms, wait_result, this->fence_value, completed_before, completed_after, this->internal_name);
+        if (fence_profiler_log_enabled()) {
+            const auto completed_before = this->fence != nullptr ? this->fence->GetCompletedValue() : 0;
+            const auto wait_start = std::chrono::steady_clock::now();
+            const auto wait_result = WaitForSingleObject(this->fence_event, ms);
+            const auto wait_duration = std::chrono::steady_clock::now() - wait_start;
+            const auto completed_after = this->fence != nullptr ? this->fence->GetCompletedValue() : 0;
+            record_fence_wait(wait_duration, ms, wait_result, this->fence_value, completed_before, completed_after, this->internal_name);
+        } else {
+            WaitForSingleObject(this->fence_event, ms);
+        }
+
         ResetEvent(this->fence_event);
         this->waiting_for_fence = false;
         if (FAILED(this->cmd_allocator->Reset())) {
@@ -556,16 +561,23 @@ void CommandContext::execute() {
         
         auto command_queue = g_framework->get_d3d12_hook()->get_command_queue();
         ID3D12CommandList* const cmd_lists[] = {this->cmd_list.Get()};
-        const auto execute_start = std::chrono::steady_clock::now();
-        command_queue->ExecuteCommandLists(1, cmd_lists);
-        command_queue->Signal(this->fence.Get(), ++this->fence_value);
-        this->fence->SetEventOnCompletion(this->fence_value, this->fence_event);
-        record_fence_execute_signal(
-            std::chrono::steady_clock::now() - execute_start,
-            this->fence_value,
-            this->fence != nullptr ? this->fence->GetCompletedValue() : 0,
-            this->internal_name
-        );
+        if (fence_profiler_log_enabled()) {
+            const auto execute_start = std::chrono::steady_clock::now();
+            command_queue->ExecuteCommandLists(1, cmd_lists);
+            command_queue->Signal(this->fence.Get(), ++this->fence_value);
+            this->fence->SetEventOnCompletion(this->fence_value, this->fence_event);
+            record_fence_execute_signal(
+                std::chrono::steady_clock::now() - execute_start,
+                this->fence_value,
+                this->fence != nullptr ? this->fence->GetCompletedValue() : 0,
+                this->internal_name
+            );
+        } else {
+            command_queue->ExecuteCommandLists(1, cmd_lists);
+            command_queue->Signal(this->fence.Get(), ++this->fence_value);
+            this->fence->SetEventOnCompletion(this->fence_value, this->fence_event);
+        }
+
         this->waiting_for_fence = true;
         this->has_commands = false;
     }

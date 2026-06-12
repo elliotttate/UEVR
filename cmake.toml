@@ -63,7 +63,11 @@ tag = "70db095765ab2066dd88dfb7bbcc42259ed167c5"
 
 [fetch-content.kananlib]
 git = "https://github.com/cursey/kananlib"
-tag = "7a99a94cea3dbcbd46b54885bd3d04f1d242e21a"
+# 2026-06-12: bumped 7a99a94 -> 49fdf2d to match joeyhodge/ue57performance@01f71ca.
+# Brings scan perf fixes (noaccess-region pattern scan, exhaustive_decode), the
+# "patterns returning start even if not actually matched" correctness fix, and
+# the find_function_start_with_call cycling fix.
+tag = "49fdf2d3b1db350e370beacb607d5721bc2911ad"
 
 [fetch-content.sdkgenny]
 git = "https://github.com/cursey/sdkgenny"

@@ -19369,11 +19369,18 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         index_starts_from_one = false;
     }
 
+    // UE5 uses zero-based 0/1 eye indices; a genuine mono pass arrives as
+    // INDEX_NONE above. Do not misclassify the left eye as a full pass when no
+    // -1/2 call preceded it (ported from joeyhodge 2e26c54, based on
+    // praydog/UEVR PR #422). Restores per-eye callbacks on UE5.5+ LWC builds
+    // that only emit 0/1 stereo indices - including SN2 Steam launches without
+    // -emulatestereo, whose right eye previously stayed black.
     const auto is_full_pass =
         !subnautica2_explicit_view_zero_is_eye &&
         view_index == 0 &&
         !index_was_ever_two &&
-        !index_was_ever_negative;
+        !index_was_ever_negative &&
+        !g_hook->m_has_double_precision;
 
     auto true_index = subnautica2_native_stereo_explicit_view_indices
         ? (view_index <= 0 ? 0 : 1)

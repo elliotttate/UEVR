@@ -2571,6 +2571,16 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
     const auto is_actually_afr = vr->is_using_afr();
     const auto is_afr = !is_same_frame && vr->is_using_afr();
+
+    // Eye routing keys off the authoritative engine frame counter - the SAME
+    // parity source the pose/sync/projection decisions use in VR::on_present /
+    // VR::on_post_present (m_render_frame_count % 2). Deriving a second,
+    // independent key here desyncs the submitted eye image from the poses the
+    // frame was rendered with, which the compositor then reprojects into the
+    // per-frame lateral "flashing" - worst in Synchronized Sequential, whose
+    // forced double-draw cadence (frame advances 2 then 0) is NOT jitter. AFW
+    // (SYNTHETIC_AFW) is not is_using_afr(); it does its own per-frame keying in
+    // run_dibr_synthesis, so it never relied on anything but this counter here.
     const auto is_left_eye_frame = is_afr && vr->m_render_frame_count % 2 == vr->m_left_eye_interval;
     const auto is_right_eye_frame = !is_afr || vr->m_render_frame_count % 2 == vr->m_right_eye_interval;
 
@@ -2590,11 +2600,6 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             runtime->fix_frame();
         }
     }
-
-    // [DIBR][timing] mark post-sync. A render-thread stall between here and the
-    // first OpenXR copy leaves frame_synced set without frame_began, wedging the
-    // OpenXR submit so the recovery feeds MetaXR empty/black frames.
-    const auto onf_post_sync_time = std::chrono::steady_clock::now();
 
     const auto& ffsr = VR::get()->m_fake_stereo_hook;
     const auto ui_target = ffsr->get_render_target_manager()->get_ui_target();
@@ -3186,6 +3191,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     }*/
 
     ComPtr<ID3D12Resource> scene_depth_tex{};
+    bool native_stereo_array_submit_active = false;
 
     if (vr->is_depth_enabled() && runtime->is_depth_allowed()) {
         auto& rt_pool = vr->get_render_target_pool_hook();
@@ -3244,13 +3250,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     // with depth-synthesized stereo before the per-eye copies consume it. Env-gated via
     // UEVR_DIBR; no-op otherwise. scene_depth_tex may have been suppressed above (mono
     // expansion / debug toggles) - run_dibr_synthesis re-resolves SceneDepthZ itself.
-    const auto dibr_pre_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - onf_post_sync_time).count();
-    const auto dibr_synth_t0 = std::chrono::steady_clock::now();
     run_dibr_synthesis(vr, backbuffer.Get(), scene_source_state, scene_depth_tex.Get());
-    const auto dibr_synth_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dibr_synth_t0).count();
-    if (dibr_pre_ms >= 5.0 || dibr_synth_ms >= 5.0) {
-        SPDLOG_WARNING_EVERY_N_SEC(1, "[DIBR][timing] on_frame stall: post_sync->pre_dibr={:.1f}ms run_dibr_synthesis={:.1f}ms (>=5ms can wedge the OpenXR submit -> MetaXR black/freeze)", dibr_pre_ms, dibr_synth_ms);
-    }
 
     // If m_frame_count is even, we're rendering the left eye.
     if (is_left_eye_frame) {
@@ -3420,6 +3420,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         vr->m_openxr->swapchains.contains(native_stereo_array_swapchain);
 
                     if (use_native_split_submit || use_native_array_submit) {
+                        native_stereo_array_submit_active = use_native_array_submit;
+
                         // DIBR overscan growth resizes the engine render target
                         // mid-session; the scene swapchains must follow or the
                         // eye-sized box copies below become invalid (black eyes).
@@ -3442,24 +3444,6 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                             m_backbuffer_size[1],
                             (uint32_t)scene_source_state,
                             use_native_split_submit ? "per-eye" : "array");
-                        {
-                            static std::atomic<uint64_t> native_submit_seq{0};
-                            const auto nsn = native_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-                            if (nsn <= 32 || (nsn % 600) == 0) {
-                                SPDLOG_INFO("[NativeStereoDebug] Split submit#{} source=0x{:x} size={}x{} fmt={} flags=0x{:x} configured={}x{} state={} mode={}",
-                                    nsn,
-                                    reinterpret_cast<uintptr_t>(backbuffer.Get()),
-                                    backbuffer_desc.Width,
-                                    backbuffer_desc.Height,
-                                    static_cast<unsigned>(backbuffer_desc.Format),
-                                    static_cast<unsigned>(backbuffer_desc.Flags),
-                                    m_backbuffer_size[0],
-                                    m_backbuffer_size[1],
-                                    static_cast<unsigned>(scene_source_state),
-                                    use_native_split_submit ? "per-eye" : "array");
-                            }
-                        }
-
                         D3D12_BOX left_src_box{};
                         left_src_box.left = 0;
                         left_src_box.top = 0;
@@ -3624,7 +3608,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, nullptr, pre_render, std::nullopt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
                     }
 
-                    if (scene_depth_tex != nullptr) {
+                    if (scene_depth_tex != nullptr && !native_stereo_array_submit_active) {
                         m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DEPTH, scene_depth_tex.Get(), ENGINE_SRC_DEPTH, nullptr);
                     }
                 }
@@ -3734,8 +3718,6 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 }
             }
 
-            vr->m_openxr->refresh_stale_pose_before_submit(frame_count, "d3d12_submit");
-
             std::vector<XrCompositionLayerBaseHeader*> quad_layers{};
 
             auto& openxr_overlay = vr->get_overlay_component().get_openxr();
@@ -3775,7 +3757,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 }
             }
 
-            auto result = vr->m_openxr->end_frame(quad_layers, scene_depth_tex.Get() != nullptr);
+            const auto submit_depth_layer = scene_depth_tex.Get() != nullptr && !native_stereo_array_submit_active;
+            auto result = vr->m_openxr->end_frame(quad_layers, submit_depth_layer);
 
             if (result == XR_ERROR_LAYER_INVALID) {
                 spdlog::info("[VR] Attempting to correct invalid layer");
@@ -4384,23 +4367,8 @@ void D3D12Component::draw_spectator_view(ID3D12GraphicsCommandList* command_list
     // only show one half of the double wide texture (right side)
     RECT source_rect{};
 
-    const bool force_sbs_desktop_mirror =
-        vr->is_native_stereo_fix_enabled() &&
-        sn2_openxr_array_diag::env_on("UEVR_SN2_DESKTOP_MIRROR_SBS");
-
-    // Show the full SBS source for SN2 diagnostics when requested. Normally
-    // UEVR mirrors a single eye to the desktop once OpenXR/native-stereo is
-    // active, which hides desktop-only fixes from the visible game window.
-    if (force_sbs_desktop_mirror) {
-        source_rect.left = 0;
-        source_rect.top = 0;
-        source_rect.right = m_backbuffer_size[0];
-        source_rect.bottom = m_backbuffer_size[1];
-        SPDLOG_INFO_ONCE(
-            "[SN2-DesktopMirror] UEVR_SN2_DESKTOP_MIRROR_SBS=1: desktop spectator shows full SBS source while OpenXR native stereo is active");
-    }
     // Show left side when using AFR or native stereo fix
-    else if (vr->is_using_afr() || vr->is_native_stereo_fix_enabled()) {
+    if (vr->is_using_afr() || vr->is_native_stereo_fix_enabled()) {
         source_rect.left = 0;
         source_rect.top = 0;
         source_rect.right = m_backbuffer_size[0] / 2;
@@ -4413,20 +4381,16 @@ void D3D12Component::draw_spectator_view(ID3D12GraphicsCommandList* command_list
     }
 
     // Correct left/top/right/bottom to match the aspect ratio of the game.
-    // The SBS diagnostic mirror intentionally uses the whole source texture and
-    // should not be cropped as if it were a single eye.
-    if (!force_sbs_desktop_mirror) {
-        if (eye_aspect_ratio > aspect_ratio) {
-            const auto new_width = eye_height * aspect_ratio;
-            const auto new_centerw = new_width / 2.0f;
-            source_rect.left = (LONG)(original_centerw - new_centerw);
-            source_rect.right = (LONG)(original_centerw + new_centerw);
-        } else {
-            const auto new_height = eye_width / aspect_ratio;
-            const auto new_centerh = new_height / 2.0f;
-            source_rect.top = (LONG)(original_centerh - new_centerh);
-            source_rect.bottom = (LONG)(original_centerh + new_centerh);
-        }
+    if (eye_aspect_ratio > aspect_ratio) {
+        const auto new_width = eye_height * aspect_ratio;
+        const auto new_centerw = new_width / 2.0f;
+        source_rect.left = (LONG)(original_centerw - new_centerw);
+        source_rect.right = (LONG)(original_centerw + new_centerw);
+    } else {
+        const auto new_height = eye_width / aspect_ratio;
+        const auto new_centerh = new_height / 2.0f;
+        source_rect.top = (LONG)(original_centerh - new_centerh);
+        source_rect.bottom = (LONG)(original_centerh + new_centerh);
     }
 
     // Set descriptor heaps
@@ -4630,7 +4594,13 @@ const Config& get() {
             c.mode = DIBRSynthesis::Mode::YoroScatter;
             c.afw = true;
         } else {
-            SPDLOG_WARN("[DIBR] unrecognized UEVR_DIBR value '{}', defaulting to yoro (synthesize right eye)", mode);
+            // Fail closed (must mirror VR.cpp dibr_env_requested_mode): a
+            // typo'd UEVR_DIBR silently enabling the single-view pipeline
+            // also desyncs this config from the engine-side gate.
+            SPDLOG_WARN("[DIBR] unrecognized UEVR_DIBR value '{}'; DIBR stays disabled "
+                        "(expected off|yoro|synth_right|yoro_left|synth_left|inverse|raymarch|scatter|afw)", mode);
+            c.enabled = false;
+            return c;
         }
 
         SPDLOG_INFO("[DIBR] enabled via env: mode={} yoro_ref={} divergence={} convergence={} reverse_depth={}",

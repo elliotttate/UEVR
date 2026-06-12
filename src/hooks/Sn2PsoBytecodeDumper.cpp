@@ -75,10 +75,19 @@ uint32_t pso_crc32(const void* data, size_t size) {
 }
 
 // ---- Gate: either the bytecode-dump dir or the rdoc-tags flag enables us. --
+// VALUE-aware: launchers scrub inherited toggles by setting them to "0"; a
+// presence check would keep populating the stream-PSO CRC map + sidecar path
+// on every clean run.
 bool gate_active() {
     static const bool v = []() {
-        return GetEnvironmentVariableW(L"UEVR_SN2_PSO_BYTECODE_DIR", nullptr, 0) > 0 ||
-               GetEnvironmentVariableW(L"UEVR_SN2_RDOC_TAGS",        nullptr, 0) > 0;
+        wchar_t dir[8]{};
+        const auto dir_len = GetEnvironmentVariableW(L"UEVR_SN2_PSO_BYTECODE_DIR", dir, (DWORD)std::size(dir));
+        const bool dir_set = dir_len > 0; // a path (any non-empty value, may exceed buf)
+        wchar_t tags[32]{};
+        const auto tags_len = GetEnvironmentVariableW(L"UEVR_SN2_RDOC_TAGS", tags, (DWORD)std::size(tags));
+        const std::wstring_view tv{tags, std::min<DWORD>(tags_len, (DWORD)std::size(tags) - 1)};
+        const bool tags_on = tags_len > 0 && !tv.empty() && tv != L"0" && tv != L"false" && tv != L"off";
+        return dir_set || tags_on;
     }();
     return v;
 }

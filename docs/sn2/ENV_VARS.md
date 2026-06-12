@@ -45,7 +45,6 @@ Wrapper fallback behavior:
 
 | Env Var | Type | Purpose |
 |---|---|---|
-| `UEVR_SN2_DESKTOP_MIRROR_SBS` | bool | SN2 diagnostic spectator mode. When OpenXR native stereo is active, keep the desktop window showing the full SBS source instead of UEVR's normal single-eye spectator mirror. Canonical SN2 launchers default this to `1`; use `-NoDesktopSbsMirror` to disable. |
 | `UEVR_SN2_BINDING_ANALYZER_JSON` | path | Output path for binding analyzer |
 | `UEVR_SN2_CB_DUMP_DIR` | path | Output dir for CB dumps |
 | `UEVR_SN2_CB_DUMP_PSOS` | csv | PS CRCs to dump |
