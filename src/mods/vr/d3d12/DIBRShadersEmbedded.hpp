@@ -7378,7 +7378,7 @@ inline std::string dibr_scatter_color_source() {
     return out;
 }
 
-// dibr_scatter_fill.hlsl (33811 bytes, 3 chunks)
+// dibr_scatter_fill.hlsl (36073 bytes, 4 chunks)
 inline const char* const g_dibr_scatter_fill_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7786,6 +7786,49 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
     // The fill pass runs entirely in SYNTHESIS (target eye) space (== out at scale 1.0).
     if (dtid.x >= synth_width || dtid.y >= synth_height) return;
+
+    // Interleave repair, BEFORE every other path: a magnifying silhouette
+    // flank scatters the object as isolated columns, and background (far)
+    // samples win the texels between them - "see-through" striping that no
+    // HOLE machinery can reach because those texels are COVERED. A texel
+    // whose own coverage is far-field but which is flanked by NEAR-depth
+    // coverage within 2px on BOTH sides sits INSIDE the object's span: it
+    // is the object's missing column. Same for holes in that zone (their
+    // sparse columns also fail the solidity gate below by construction).
+    {
+        const bool selfCovered = g_scatterColor[dtid.xy].a > 0.5f;
+        const uint selfRaw = g_scatterKey[dtid.xy];
+        const float selfD = selfCovered ? asfloat(selfRaw & 0x7FFFFFFFu) : 0.0f;
+        uint nearL = 0u;
+        uint nearR = 0u;
+        int nearLx = 0;
+        int nearRx = 0;
+        [unroll]
+        for (int o = 1; o <= 2; ++o) {
+            int xn = (int)dtid.x - o;
+            int xp = (int)dtid.x + o;
+            if (nearL == 0u && xn >= 0) {
+                uint k = g_scatterKey[uint2(xn, dtid.y)];
+                if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(xn, dtid.y)].a > 0.5f &&
+                    asfloat(k) > selfD + max(0.10f * asfloat(k), 1e-3f)) { nearL = k; nearLx = xn; }
+            }
+            if (nearR == 0u && xp < (int)synth_width) {
+                uint k = g_scatterKey[uint2(xp, dtid.y)];
+                if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(xp, dtid.y)].a > 0.5f &&
+                    asfloat(k) > selfD + max(0.10f * asfloat(k), 1e-3f)) { nearR = k; nearRx = xp; }
+            }
+        }
+        if (nearL != 0u && nearR != 0u &&
+            abs(asfloat(nearL) - asfloat(nearR)) <= max(0.10f * max(asfloat(nearL), asfloat(nearR)), 1e-3f)) {
+            // Same near surface on both flanks: adopt the nearer column.
+            const bool takeL = asfloat(nearL) >= asfloat(nearR);
+            const int sx = takeL ? nearLx : nearRx;
+            g_scatterColor[dtid.xy] = float4(g_scatterColor[uint2(sx, dtid.y)].rgb, 1.0f);
+            g_scatterKey[dtid.xy] = (((takeL ? nearL : nearR) & ~0x3u) | 0x1u) | 0x80000000u;
+            return;
+        }
+    }
+
     if (g_scatterColor[dtid.xy].a > 0.5f) return; // already covered
 
     // Interior stretch gap vs true reveal: a near surface that MAGNIFIES in
@@ -7919,7 +7962,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // steps cover the common narrow reveals; coarse 4-px strides extend the
     // reach to very-near-object holes (a stride can skip a thin valid run and
     // land slightly farther out - fine for background extension). No hit
-    // (image edge, peripheral gate) falls back to the source color at this
+)DIBR",
+R"DIBR(    // (image edge, peripheral gate) falls back to the source color at this
     // position (flat mono fill, real content where the temporal gate passes).
     const int kFineSearch = 8;
     const int kCoarseStep = 4;
@@ -7964,8 +8008,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         }
     }
 
-)DIBR",
-R"DIBR(    if (!haveFallback) {
+    if (!haveFallback) {
         if (bx >= 0) {
             // Average a short run a few pixels INTO the background (stepping
             // away from the hole) instead of copying the single hole-edge
@@ -8140,7 +8183,8 @@ R"DIBR(    if (!haveFallback) {
         // Commit the adopted background key so next frame's temporal gate can
         // validate this band. Device depths are positive floats, so the MSB is
         // free to mark "filled, not scattered" for the search masks above;
-        // the low 2 bits carry the provenance for debug view 9.
+)DIBR",
+R"DIBR(        // the low 2 bits carry the provenance for debug view 9.
         g_scatterKey[dtid.xy] = ((fillKey & ~0x3u) | (prov & 0x3u)) | 0x80000000u;
     }
 })DIBR",
