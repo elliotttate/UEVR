@@ -335,8 +335,14 @@ float SynthEyeSign()
 // edge. Ring pixels borrow the donor neighbor's color instead.
 float NearBiasedDepth(float2 uv, out float2 donorOff)
 {
+    // Bit-identical logic to the depth pass (>= 4 of 8 nearer neighbors =
+    // dither hole; see that file for why), additionally reporting which
+    // neighbor donated the winning depth for the color redirect.
     float2 px = float2(1.0f / (float)srcWidth, 1.0f / (float)srcHeight);
     float d = SampleRawDeviceDepth(uv);
+    const float tol = max(0.10f * d, 1e-3f);
+    float dmax = d;
+    int nearCount = 0;
     donorOff = float2(0.0f, 0.0f);
     [unroll]
     for (int oy = -1; oy <= 1; ++oy) {
@@ -344,12 +350,19 @@ float NearBiasedDepth(float2 uv, out float2 donorOff)
         for (int ox = -1; ox <= 1; ++ox) {
             if (ox == 0 && oy == 0) continue;
             float nd = SampleRawDeviceDepth(uv + float2(ox, oy) * px);
-            if (nd > d) {
-                d = nd;
-                donorOff = float2(ox, oy) * px;
+            if (nd > d + tol) {
+                ++nearCount;
+                if (nd > dmax) {
+                    dmax = nd;
+                    donorOff = float2(ox, oy) * px;
+                }
             }
         }
     }
+    if (nearCount >= 4) {
+        return dmax;
+    }
+    donorOff = float2(0.0f, 0.0f);
     return d;
 }
 

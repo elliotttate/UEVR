@@ -6650,7 +6650,7 @@ inline std::string dibr_raymarch_source() {
     return out;
 }
 
-// dibr_scatter_depth.hlsl (14013 bytes, 2 chunks)
+// dibr_scatter_depth.hlsl (14602 bytes, 2 chunks)
 inline const char* const g_dibr_scatter_depth_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -6989,20 +6989,32 @@ float SynthEyeSign()
 // anti-aliased edge already spans.
 float NearBiasedDepth(float2 uv)
 {
-    float2 px = float2(1.0f / (float)srcWidth, 1.0f / (float)srcHeight);
+    // Adopt a nearer neighborhood depth ONLY when the center is a DITHER
+    // HOLE - surrounded by the nearer surface (>= 4 of 8 neighbors agree).
+    // An unconditional max also captured pixels merely ADJACENT to thin
+    // 1px geometry (the wispy strands), inflating each strand into a 3px
+    // band at its parallax - a ghost outline tracing every wisp.
+)DIBR",
+R"DIBR(    float2 px = float2(1.0f / (float)srcWidth, 1.0f / (float)srcHeight);
     float d = SampleRawDeviceDepth(uv);
+    const float tol = max(0.10f * d, 1e-3f);
+    float dmax = d;
+    int nearCount = 0;
     [unroll]
     for (int oy = -1; oy <= 1; ++oy) {
         [unroll]
         for (int ox = -1; ox <= 1; ++ox) {
             if (ox == 0 && oy == 0) continue;
-            d = max(d, SampleRawDeviceDepth(uv + float2(ox, oy) * px));
+            float nd = SampleRawDeviceDepth(uv + float2(ox, oy) * px);
+            if (nd > d + tol) {
+                ++nearCount;
+                dmax = max(dmax, nd);
+            }
         }
     }
-    return d;
+    return (nearCount >= 4) ? dmax : d;
 }
-)DIBR",
-R"DIBR(
+
 [numthreads(DIBR_TG, DIBR_TG, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
@@ -7053,7 +7065,7 @@ inline std::string dibr_scatter_depth_source() {
     return out;
 }
 
-// dibr_scatter_color.hlsl (14404 bytes, 2 chunks)
+// dibr_scatter_color.hlsl (14891 bytes, 2 chunks)
 inline const char* const g_dibr_scatter_color_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7392,22 +7404,35 @@ float SynthEyeSign()
 // edge. Ring pixels borrow the donor neighbor's color instead.
 float NearBiasedDepth(float2 uv, out float2 donorOff)
 {
+    // Bit-identical logic to the depth pass (>= 4 of 8 nearer neighbors =
+    // dither hole; see that file for why), additionally reporting which
+    // neighbor donated the winning depth for the color redirect.
     float2 px = float2(1.0f / (float)srcWidth, 1.0f / (float)srcHeight);
-    float d = SampleRawDeviceDepth(uv);
+)DIBR",
+R"DIBR(    float d = SampleRawDeviceDepth(uv);
+    const float tol = max(0.10f * d, 1e-3f);
+    float dmax = d;
+    int nearCount = 0;
     donorOff = float2(0.0f, 0.0f);
     [unroll]
     for (int oy = -1; oy <= 1; ++oy) {
         [unroll]
         for (int ox = -1; ox <= 1; ++ox) {
             if (ox == 0 && oy == 0) continue;
-)DIBR",
-R"DIBR(            float nd = SampleRawDeviceDepth(uv + float2(ox, oy) * px);
-            if (nd > d) {
-                d = nd;
-                donorOff = float2(ox, oy) * px;
+            float nd = SampleRawDeviceDepth(uv + float2(ox, oy) * px);
+            if (nd > d + tol) {
+                ++nearCount;
+                if (nd > dmax) {
+                    dmax = nd;
+                    donorOff = float2(ox, oy) * px;
+                }
             }
         }
     }
+    if (nearCount >= 4) {
+        return dmax;
+    }
+    donorOff = float2(0.0f, 0.0f);
     return d;
 }
 
