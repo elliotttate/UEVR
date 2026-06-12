@@ -6,6 +6,7 @@ Every UEVR_SN2_* env var, what it does, where it's read.
 
 | Env Var | Type | Default | Purpose |
 |---|---|---|---|
+| `UEVR_RENDERING_METHOD` | enum | (none) | Pins the Rendering Method dropdown regardless of config.txt, applied on every config load. Use when the on-disk `VR_RenderingMethod` reverts to Native at launch. Values: `native`/`0`, `synced`/`synchronized`/`1`, `afr`/`alternating`/`2`, `dibr`/`synthetic`/`3`, `mono`/`4`, `afw`/`5`. Mirrors `UEVR_DIBR` |
 | `UEVR_ENABLE_D3D12_DIAGNOSTIC_COMMAND_LIST_HOOKS` | bool | `0` | Required for draw/dispatch/viewport/barrier tracing. Auto-enabled when `UEVR_STEREO_FORENSICS=1` unless bind-only opt-out is set; also auto-enabled by `UEVR_SN2_FIX_RIGHT_EYE_UNDERWATER=1` |
 | `UEVR_SN2_FIX_RIGHT_EYE_UNDERWATER` | bool | `0` | One-switch current candidate fix. Replays the missing left-only underwater draw (`0x13b00f0c`, shape `DrawIndexedInstanced` 76608/1) to the right viewport using a captured real right-eye View CB, defaulting the swap to root 4 |
 | `UEVR_SN2_DUP_CONFIG_FILE` | path | (none) | Path to dup_cfg JSON |

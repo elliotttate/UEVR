@@ -4,6 +4,7 @@
 #include <cmath>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstring>
 #include <cwctype>
 #include <filesystem>
@@ -2074,6 +2075,49 @@ static int dibr_env_requested_mode() {
         return 0;
     }();
     return env_mode;
+}
+
+// UEVR_RENDERING_METHOD env override: pins the Rendering Method dropdown
+// regardless of the persisted config. The on-disk config.txt value has been
+// observed reverting to Native(0) on some launches (an external pre-launch
+// writer / multi-instance race rewrites config.txt before the backend loads
+// it; the backend's own load->save preserves whatever the file holds). This
+// env is applied on every config load (see VR::on_config_load), so a launcher
+// can select e.g. Synchronized Sequential deterministically without fighting
+// that race. Mirrors the UEVR_DIBR override. Returns -1 when unset/unrecognized.
+static int rendering_method_env_override() {
+    static const int env_method = []() -> int {
+        const char* v = std::getenv("UEVR_RENDERING_METHOD");
+        if (v == nullptr || v[0] == '\0') {
+            return -1; // no override; config/UI drives
+        }
+        std::string m{v};
+        for (auto& c : m) {
+            c = (char)std::tolower((unsigned char)c);
+        }
+        if (m == "0" || m == "native" || m == "native_stereo") {
+            return VR::RenderingMethod::NATIVE_STEREO;
+        }
+        if (m == "1" || m == "synced" || m == "synchronized" || m == "synced_sequential" || m == "sequential") {
+            return VR::RenderingMethod::SYNCHRONIZED;
+        }
+        if (m == "2" || m == "afr" || m == "alternating" || m == "alternate") {
+            return VR::RenderingMethod::ALTERNATING;
+        }
+        if (m == "3" || m == "dibr" || m == "synthetic" || m == "synthetic_dibr") {
+            return VR::RenderingMethod::SYNTHETIC_DIBR;
+        }
+        if (m == "4" || m == "mono") {
+            return VR::RenderingMethod::MONO;
+        }
+        if (m == "5" || m == "afw") {
+            return VR::RenderingMethod::SYNTHETIC_AFW;
+        }
+        spdlog::warn("[VR] Unrecognized UEVR_RENDERING_METHOD value '{}'; ignoring "
+                     "(expected native|synced|afr|dibr|mono|afw)", m);
+        return -1;
+    }();
+    return env_method;
 }
 
 int32_t VR::get_dibr_requested_mode() const {
@@ -6175,6 +6219,18 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
         option.config_load(cfg, set_defaults);
     }
 
+    // UEVR_RENDERING_METHOD pins the mode after the (possibly stale/reverted)
+    // config is loaded, so the launcher selection is authoritative. Re-applied
+    // on every load - including a frontend-triggered RELOAD_CONFIG - so nothing
+    // can quietly drop it back to Native. See rendering_method_env_override.
+    if (const int forced = rendering_method_env_override(); forced >= 0) {
+        if (m_rendering_method->value() != forced) {
+            spdlog::info("[VR] UEVR_RENDERING_METHOD override: forcing Rendering Method {} (config had {})",
+                forced, m_rendering_method->value());
+        }
+        m_rendering_method->value() = forced;
+    }
+
     if (get_runtime() != nullptr && get_runtime()->loaded) {
         get_runtime()->on_config_load(cfg, set_defaults);
 
@@ -7206,6 +7262,9 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
     if (selected_page == PAGE_UNREAL) {
         m_rendering_method->draw("Rendering Method");
+        if (std::getenv("UEVR_RENDERING_METHOD") != nullptr && rendering_method_env_override() >= 0) {
+            ImGui::TextDisabled("UEVR_RENDERING_METHOD env var is pinning the Rendering Method");
+        }
         m_synced_afr_method->draw("Synced Sequential Method");
 
         m_world_scale->draw("World Scale");
