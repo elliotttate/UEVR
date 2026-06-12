@@ -380,7 +380,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     uint kl = 0u, kr = 0u;
     {
         [loop]
-        for (int s = 1; s <= 8 && (xl < 0 || xr < 0); ++s) {
+        for (int s = 1; s <= 12 && (xl < 0 || xr < 0); ++s) {
             if (xl < 0) {
                 int x = (int)dtid.x - s;
                 if (x >= 0) {

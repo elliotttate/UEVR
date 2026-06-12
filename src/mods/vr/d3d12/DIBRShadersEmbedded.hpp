@@ -7303,7 +7303,7 @@ inline std::string dibr_scatter_color_source() {
     return out;
 }
 
-// dibr_scatter_fill.hlsl (25519 bytes, 3 chunks)
+// dibr_scatter_fill.hlsl (25520 bytes, 3 chunks)
 inline const char* const g_dibr_scatter_fill_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7688,7 +7688,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     uint kl = 0u, kr = 0u;
     {
         [loop]
-        for (int s = 1; s <= 8 && (xl < 0 || xr < 0); ++s) {
+        for (int s = 1; s <= 12 && (xl < 0 || xr < 0); ++s) {
             if (xl < 0) {
                 int x = (int)dtid.x - s;
                 if (x >= 0) {
@@ -7910,7 +7910,7 @@ inline std::string dibr_scatter_fill_source() {
     return out;
 }
 
-// dibr_afw_stash.hlsl (12865 bytes, 2 chunks)
+// dibr_afw_stash.hlsl (14017 bytes, 2 chunks)
 inline const char* const g_dibr_afw_stash_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -8267,7 +8267,32 @@ R"DIBR(    // reproj_target_to_prev matrix, not by any UV remap here).
     // data" precisely over the background that disocclusion reveals expose -
     // the bands fell back to per-row scanline fill (the laddered artifact)
     // even though the stash held the true content.
-    g_historyKey[dtid.xy] = asuint(max(SampleRawDeviceDepth(uv), 1e-7f));
+    //
+    // Silhouette ring: the COLOR at an anti-aliased object edge is a
+    // fore/background blend, but the DEPTH buffer doesn't anti-alias - edge
+    // texels whose depth says "background" carry occluder-contaminated
+    // color. Validated at face value they paint a 1px ghost CONTOUR of last
+    // frame's silhouette into this frame's reveals (drifting into open
+    // water when the object sways). Key the whole 3x3 ring of any strong
+    // depth edge at the NEAREST depth so the consumers' depth gates reject
+    // the contaminated texels and fall back to the (clean) interpolated
+    // fill there.
+    float d = SampleRawDeviceDepth(uv);
+    float dmin = d;
+    float dmax = d;
+    const float2 texel = float2(1.0f / (float)out_width, 1.0f / (float)out_height);
+    [unroll]
+    for (int ny = -1; ny <= 1; ++ny) {
+        [unroll]
+        for (int nx = -1; nx <= 1; ++nx) {
+            if (nx == 0 && ny == 0) continue;
+            float nd = SampleRawDeviceDepth(uv + float2(nx, ny) * texel);
+            dmin = min(dmin, nd);
+            dmax = max(dmax, nd);
+        }
+    }
+    const bool edge = (dmax - dmin) > max(0.10f * dmax, 1e-3f);
+    g_historyKey[dtid.xy] = asuint(max(edge ? dmax : d, 1e-7f));
     g_historyColor[dtid.xy] = float4(g_colorTex.SampleLevel(g_pointSampler, uv, 0).rgb, 1.0f);
 })DIBR",
 };
