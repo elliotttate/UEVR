@@ -5,13 +5,14 @@ FOR /F "tokens=*" %%g IN ('git rev-parse HEAD') DO (SET UEVR_COMMIT_HASH=%%g)
 FOR /F "tokens=*" %%t IN ('git describe --tags --always --abbrev^=0') DO (SET UEVR_TAG=%%t)
 IF "%UEVR_TAG%"=="" (SET UEVR_TAG=no_tag)
 
-FOR /F "tokens=*" %%c IN ('git describe --tags --always --long') DO (
-FOR /F "tokens=1,2 delims=-" %%a IN ("%%c") DO (
-SET UEVR_TAG_LONG=%%a
-SET UEVR_COMMITS_PAST_TAG=%%b
-)
-)
+REM Do NOT parse 'git describe --long' by '-': the tag itself may contain '-'
+REM (e.g. release tags like dibr-afw-mv-1), which mis-assigns a tag fragment
+REM ('afw') as the commit count and emits a non-numeric UEVR_COMMITS_PAST_TAG
+REM that fails to compile. Count commits since the tag directly instead.
+SET UEVR_TAG_LONG=%UEVR_TAG%
 
+SET UEVR_COMMITS_PAST_TAG=
+FOR /F "tokens=*" %%c IN ('git rev-list --count "%UEVR_TAG%..HEAD" 2^>nul') DO (SET UEVR_COMMITS_PAST_TAG=%%c)
 IF "%UEVR_COMMITS_PAST_TAG%"=="" (SET UEVR_COMMITS_PAST_TAG=0)
 
 FOR /F "tokens=*" %%b IN ('git rev-parse --abbrev-ref HEAD') DO (SET UEVR_BRANCH=%%b)
