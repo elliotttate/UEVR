@@ -708,6 +708,14 @@ struct VelRetired {
 };
 std::vector<VelRetired> g_vel_graveyard{};
 std::atomic<void*> g_vel_source{nullptr};
+// Live-target memo: record_velocity_bind runs at the velocity RTV bind,
+// BEFORE the frame's velocity draws are recorded - a copy there captures the
+// PREVIOUS frame's content. The bind only remembers the qualifying resource;
+// copy_velocity_snapshot() records the actual copy later in the frame, at the
+// post-opaque depth-signature bind, yielding same-frame velocity (which is
+// what the consumer's reprojection matrices describe).
+void* g_vel_live{nullptr};
+uint32_t g_vel_live_frame{0xFFFFFFFFu};
 
 // Opt-in (UEVR_DIBR_VELOCITY=1): the snapshot copy mutates the game's command
 // stream every frame; keep the default path untouched until the consumers
@@ -755,35 +763,48 @@ void record_velocity_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint
         return;
     }
 
+    // Remember-only: the copy itself is recorded at the depth-signature bind
+    // (copy_velocity_snapshot), after the velocity pass's draws.
     std::scoped_lock _{g_vel_mtx};
+    const uint32_t frame = g_recording_frame.load(std::memory_order_acquire);
     const uint64_t area = static_cast<uint64_t>(info.width) * info.height;
-    if (area < g_vel_best_area) {
-        return;
+    if (frame == g_vel_live_frame && area < g_vel_best_area) {
+        return; // a larger qualifying target already won this frame
     }
     g_vel_best_area = area;
+    g_vel_live = info.resource;
+    g_vel_live_frame = frame;
+}
 
-    // One copy per recording frame (the pooled target also ping-pongs, so a
-    // frame's first qualifying bind is the previous frame's COMPLETED
-    // velocity - the bind precedes this frame's clear/write).
-    const uint32_t frame = g_recording_frame.load(std::memory_order_acquire);
-    if (frame != 0xFFFFFFFFu) {
-        if (g_vel_done_frame == frame) {
-            return;
-        }
-        g_vel_done_frame = frame;
-        // Retirees outlive any command list recorded around their release.
-        g_vel_graveyard.erase(
-            std::remove_if(g_vel_graveyard.begin(), g_vel_graveyard.end(),
-                [frame](const VelRetired& r) { return frame - r.retire_frame > 64; }),
-            g_vel_graveyard.end());
+namespace {
+// Records the in-list snapshot copy of the velocity target remembered by
+// record_velocity_bind. Invoked from record_afw_depth_bind's qualifying
+// SceneColor + read-only-DSV bind: recording order places that bind after
+// the velocity pass, so the copy executes on THIS frame's completed velocity.
+void copy_velocity_snapshot(ID3D12GraphicsCommandList* cmd_list, uint32_t frame) {
+    if (!velocity_snapshot_enabled()) {
+        return;
     }
+
+    std::scoped_lock _{g_vel_mtx};
+    // Only a same-frame memo qualifies; one copy per recording frame.
+    if (g_vel_live == nullptr || g_vel_live_frame != frame || g_vel_done_frame == frame) {
+        return;
+    }
+    g_vel_done_frame = frame;
+
+    // Retirees outlive any command list recorded around their release.
+    g_vel_graveyard.erase(
+        std::remove_if(g_vel_graveyard.begin(), g_vel_graveyard.end(),
+            [frame](const VelRetired& r) { return frame - r.retire_frame > 64; }),
+        g_vel_graveyard.end());
 
     Microsoft::WRL::ComPtr<ID3D12Device> device{};
     if (FAILED(cmd_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
         return;
     }
 
-    auto* src = static_cast<ID3D12Resource*>(info.resource);
+    auto* src = static_cast<ID3D12Resource*>(g_vel_live);
     const auto sdesc = src->GetDesc();
 
     if (g_vel_snapshot == nullptr || g_vel_width != sdesc.Width || g_vel_height != sdesc.Height) {
@@ -816,9 +837,11 @@ void record_velocity_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint
             sdesc.Width, sdesc.Height, static_cast<int>(sdesc.Format), static_cast<void*>(src));
     }
 
-    // The RTV is being bound for this frame's velocity pass, so the resource
-    // sits in RENDER_TARGET here; round-trip it through COPY_SOURCE around an
-    // in-list copy (same pattern as the AFW depth snapshot).
+    // Between the velocity pass's last draw and post-processing's first read
+    // RDG leaves the target in RENDER_TARGET (it batches the SRV transition
+    // immediately before the consuming pass, which is after this bind);
+    // round-trip it through COPY_SOURCE around an in-list copy (same pattern
+    // as the AFW depth snapshot).
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = src;
@@ -852,6 +875,7 @@ void record_velocity_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint
     std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
     cmd_list->ResourceBarrier(1, &barrier);
 }
+} // namespace
 
 Microsoft::WRL::ComPtr<ID3D12Resource> get_velocity_snapshot() {
     std::scoped_lock _{g_vel_mtx};
@@ -865,7 +889,9 @@ void* get_velocity_source() {
 void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint32_t rtv_count, SIZE_T dsv) {
     const bool snap_enabled = g_afw_depth_enabled.load(std::memory_order_relaxed);
     const bool seq_enabled = g_afw_seq_enabled.load(std::memory_order_relaxed);
-    if ((!snap_enabled && !seq_enabled) || cmd_list == nullptr || rtv0 == 0 || dsv == 0) {
+    // velocity_snapshot_enabled keeps the signature path alive outside AFW:
+    // the same-frame velocity copy is recorded at this bind too.
+    if ((!snap_enabled && !seq_enabled && !velocity_snapshot_enabled()) || cmd_list == nullptr || rtv0 == 0 || dsv == 0) {
         return;
     }
 
@@ -906,12 +932,16 @@ void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uin
         }
     }
 
-    if (!snap_enabled) {
+    const uint32_t frame = g_recording_frame.load(std::memory_order_acquire);
+    if (frame == 0xFFFFFFFFu) {
         return;
     }
 
-    const uint32_t frame = g_recording_frame.load(std::memory_order_acquire);
-    if (frame == 0xFFFFFFFFu) {
+    // The velocity pass was recorded before this bind: snapshot this frame's
+    // completed velocity now (no-op unless UEVR_DIBR_VELOCITY armed it).
+    copy_velocity_snapshot(cmd_list, frame);
+
+    if (!snap_enabled) {
         return;
     }
 

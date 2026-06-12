@@ -684,24 +684,30 @@ void DIBRSynthesis::record_velocity_calibration(ID3D12GraphicsCommandList* cmd_l
     meta.valid = false;
 
     const bool eligible = !m_vel_calibrated && m_velocity_tex != nullptr && params.temporal_enabled > 1.5f;
-
-    // The snapshot read during frame N holds the velocity of the N-1 -> N-2
-    // frame pair, so it is scored against the PREVIOUS call's matrix. Capture
-    // it before advancing the one-frame delay.
-    float pair_matrix[16]{};
-    const bool have_pair_matrix = m_vel_prev_matrix_valid;
-    if (have_pair_matrix) {
-        std::memcpy(pair_matrix, m_vel_prev_matrix, sizeof(pair_matrix));
-    }
-    if (params.temporal_enabled > 1.5f) {
-        std::memcpy(m_vel_prev_matrix, params.reproj_target_to_prev, sizeof(m_vel_prev_matrix));
-        m_vel_prev_matrix_valid = true;
-    } else {
-        m_vel_prev_matrix_valid = false;
-    }
-
-    if (!eligible || !have_pair_matrix) {
+    if (!eligible) {
         return;
+    }
+
+    // The snapshot is copied at the depth-signature bind, AFTER the frame's
+    // velocity pass, so it holds THIS call's frame pair. The texels live in
+    // the RENDERED (source) eye's screen space, but under AFW the previous
+    // frame's camera was the OTHER eye - so a static texel's predicted clip
+    // displacement composes the same-frame source -> target-eye hop with the
+    // target eye's current -> previous-frame reprojection:
+    //   M = reproj_target_to_prev * reproj_source_to_{target eye}
+    // mode_param0 < 0.5 means left is the reference (right is synthesized).
+    const float* src_to_target = (params.mode_param0 < 0.5f)
+        ? params.reproj_source_to_right
+        : params.reproj_source_to_left;
+    float pair_matrix[16]{};
+    for (int c = 0; c < 4; ++c) {
+        for (int r = 0; r < 4; ++r) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                sum += params.reproj_target_to_prev[k * 4 + r] * src_to_target[c * 4 + k];
+            }
+            pair_matrix[c * 4 + r] = sum;
+        }
     }
 
     if (m_vel_calib_readback == nullptr) {
@@ -1566,7 +1572,6 @@ void DIBRSynthesis::reset() {
     for (auto& s : m_vel_calib_slots) {
         s.valid = false;
     }
-    m_vel_prev_matrix_valid = false;
     m_velocity_tex = nullptr;
     m_slot_desc_hash.fill(0);
     m_ring_index = 0;

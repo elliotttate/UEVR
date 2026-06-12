@@ -2321,6 +2321,54 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     // The filtering itself is one sampler op against the SRV alias of the
     // history (it lives in a shader-readable state for this pass).
     float2 histUv = float2(pn.x * 0.5f + 0.5f, 0.5f - pn.y * 0.5f);
+    // MV advection: the reprojection above is camera-only, so object-space
+    // animation (swaying plants, fish) lands the fetch on the object's OLD
+    // position - the color gate then rejects it and the pixel shimmers at
+    // half rate. The velocity buffer lives in the rendered (source) eye's
+    // screen space, and under AFW its prev-frame camera IS the target eye:
+    // subtracting the in-shader static prediction from the decoded velocity
+    // isolates the object-motion residual, which advects the history fetch
+    // onto the object's true previous position. Misses (wrong texel via the
+    // disparity-blind lookup) still fail the depth/color gates below - the
+    // failure mode is the status quo, not a new artifact.
+    {
+        uint vw, vh;
+        g_velocityTex.GetDimensions(vw, vh);
+        if (vw != 0u) {
+            float2 srcUv = SourceRemapUv(uvRaw);
+            float2 vUv = srcUv;
+            if (vw >= srcWidth * 2u) {
+                vUv.x *= 0.5f; // double-wide family target; lone view in the left half
+            }
+            float4 enc = g_velocityTex.SampleLevel(g_pointSampler, vUv, 0);
+            if (any(enc.xy != 0.0f)) { // zero texel = unwritten sentinel (static)
+                const float invDiv = 1.0f / (0.499f * 0.5f);
+                float2 linV = enc.xy * invDiv - (32767.0f / 65535.0f) * invDiv;
+                float2 v = (linV * abs(linV)) * 0.5f; // VELOCITY_ENCODE_GAMMA (SM5+)
+                // 4-channel velocity packs prev device depth in zw; the
+                // 2-channel format reads zero there - keep the scatter key.
+                float vdepth = estDepth;
+                if (enc.z != 0.0f || enc.w != 0.0f) {
+                    uint hi = (uint)round(enc.z * 65535.0f) << 16;
+                    uint lo = (uint)round(enc.w * 65535.0f) & 0xFFFEu;
+                    vdepth = asfloat(hi | lo);
+                }
+                // Static prediction for the source texel: source -> target
+                // eye (same frame), then target -> previous frame. Clip
+                // vectors compose without intermediate w-divides (homogeneous
+                // scale cancels in the final divide).
+                float2 srcNdc = float2(srcUv.x * 2.0f - 1.0f, 1.0f - srcUv.y * 2.0f);
+                float4 sclip = float4(srcNdc, vdepth, 1.0f);
+                float4 t = (mode_param0 < 0.5f) ? mul(reproj_source_to_right, sclip)
+                                                : mul(reproj_source_to_left, sclip);
+                float4 ps = mul(reproj_target_to_prev, t);
+                float pw = (abs(ps.w) > 1e-6f) ? ps.w : 1e-6f;
+                float2 camV = srcNdc - ps.xy / pw;
+                float2 objV = v - camV;
+                histUv -= objV * float2(0.5f, -0.5f);
+            }
+        }
+    }
     float fx = histUv.x * (float)out_width - 0.5f;
     float fy = histUv.y * (float)out_height - 0.5f;
     if (fx < 0.0f || fy < 0.0f || fx > (float)(out_width - 1u) || fy > (float)(out_height - 1u)) {
@@ -2333,10 +2381,12 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
         float3 h = g_historyColorSrv.SampleLevel(g_linearSampler, histUv, 0).rgb;
         // Color-agreement gate: the blend exists to cancel the SUBTLE
         // real-vs-warp resampling difference, where history and warp agree
-        // closely. Object-space animation (swaying plants, fish) moves under
-        // a camera-only reprojection while its depth still validates -
-        // blending that paints a displaced double image. Large color deltas
-        // therefore reject history instead (the warp result stands alone).
+        // closely. Object-space animation that the MV advection above missed
+        // (no velocity texel, disparity-blind lookup) still arrives displaced
+        // while its depth validates - blending that paints a double image.
+        // Large color deltas therefore reject history instead (the warp
+        // result stands alone). Correctly-advected fetches agree in color and
+        // pass naturally.
         // EXCEPT in fill bands: there the warp side is synthetic fill and the
         // depth-validated history is the actual render of the reveal, so a
         // disagreement is precisely the case where history must win.
@@ -2380,9 +2430,9 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float debugMode = floor(debug_view_mode + 0.5f);
     if (debugMode >= 7.5f) {
         // Debug view 8: SceneVelocity wiring proof (select/bind/sample). The
-        // snapshot is the previous frame's completed velocity GBuffer; UE only
-        // writes OBJECT motion by default, so static world keeps the zero
-        // clear texel. Dark green = static, heat = decoded |V| (Common.ush:
+        // snapshot is this frame's completed velocity GBuffer (copied at the
+        // post-opaque bind); UE only writes OBJECT motion by default, so
+        // static world keeps the zero clear texel. Dark green = static, heat = decoded |V| (Common.ush:
         // linear decode then the SM5+ gamma square), black = no data.
         uint vw, vh;
         g_velocityTex.GetDimensions(vw, vh);

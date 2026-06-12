@@ -589,8 +589,6 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_vel_calib_readback{};
     uint8_t* m_vel_calib_mapped{nullptr};
     std::array<VelCalibSlot, kRing> m_vel_calib_slots{};
-    float m_vel_prev_matrix[16]{};
-    bool m_vel_prev_matrix_valid{false};
     std::vector<float> m_vel_err_gamma{};
     std::vector<float> m_vel_err_linear{};
     uint64_t m_vel_zero_texels{0};

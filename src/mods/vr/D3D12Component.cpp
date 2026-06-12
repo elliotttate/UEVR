@@ -5614,9 +5614,9 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     // Per-pass GPU timing needs the queue this list executes on (the same one
     // CommandContext::execute submits to) for GetTimestampFrequency.
     m_dibr.set_gpu_timing_queue(g_framework->get_d3d12_hook()->get_command_queue());
-    // SceneVelocity snapshot (previous frame's completed velocity, copied at
-    // its bind site); same-queue stream order makes it valid by the time the
-    // synthesis dispatches execute.
+    // SceneVelocity snapshot (THIS frame's completed velocity, copied at the
+    // post-opaque depth-signature bind); same-queue stream order makes it
+    // valid by the time the synthesis dispatches execute.
     m_dibr.set_velocity_texture(dibr_depth_tracker::get_velocity_snapshot().Get());
 
     // Velocity discovery Layer 2 (confirmatory vote only): probe the pool

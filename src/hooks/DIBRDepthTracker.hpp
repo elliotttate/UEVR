@@ -80,12 +80,14 @@ std::string describe_candidates();
 // Lumen/ray-tracing platforms like SN2; object-motion-only by default, zero
 // texel = "not written" sentinel, gamma-encoded xy on SM5+, prev device depth
 // packed in zw). The pool hook's signature scan does not fire on SN2, so the
-// target is identified at its RTV BIND by format + largest non-square extent,
-// and the PREVIOUS frame's completed content (the bind precedes this frame's
-// clear/write) is CopyResource'd into a private texture inside the game's
-// command list - deterministic in stream order, immune to the next frame's
-// DLSS/TSR pass overwriting the pooled texture before present-time use
-// (PureDark's MV-backup failure class). The snapshot is left in
+// target is identified at its RTV BIND by format + largest non-square extent.
+// The bind itself precedes the frame's velocity draws, so it only REMEMBERS
+// the resource; the CopyResource into a private texture is recorded at the
+// later post-opaque depth-signature bind (record_afw_depth_bind), capturing
+// THIS frame's completed velocity inside the game's command list -
+// deterministic in stream order, immune to the next frame's DLSS/TSR pass
+// overwriting the pooled texture before present-time use (PureDark's
+// MV-backup failure class). The snapshot is left in
 // NON_PIXEL_SHADER_RESOURCE for the synthesis to sample directly.
 void record_velocity_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint32_t rtv_count);
 Microsoft::WRL::ComPtr<ID3D12Resource> get_velocity_snapshot();
