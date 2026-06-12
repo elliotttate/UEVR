@@ -22,6 +22,15 @@ RWTexture2D<float4> g_scatterColor : register(u2);
 // Written here, read by next frame's fill pass.
 RWTexture2D<float4> g_historyColor : register(u3);
 RWTexture2D<uint> g_historyKey : register(u4);
+// Persistent background layer: read half = last frame's update (other eye's
+// space, one frame ago; null until the first update), write half refreshed
+// here. Remembers the FARTHEST surface seen per pixel across frames so
+// reveals can fill with real background even while an occluder has covered
+// it in every recent render.
+Texture2D<float4> g_bgColorPrev : register(t5);
+Texture2D<uint>   g_bgKeyPrev   : register(t6);
+RWTexture2D<float4> g_bgColor : register(u6);
+RWTexture2D<uint>   g_bgKey   : register(u7);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
 
@@ -377,6 +386,55 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         }
     }
     const bool edge = (dmax - dmin) > max(0.10f * dmax, 1e-3f);
-    g_historyKey[dtid.xy] = asuint(max(edge ? dmax : d, 1e-7f));
-    g_historyColor[dtid.xy] = float4(g_colorTex.SampleLevel(g_pointSampler, uv, 0).rgb, 1.0f);
+    const float keyD = max(edge ? dmax : d, 1e-7f);
+    const float3 realCol = g_colorTex.SampleLevel(g_pointSampler, uv, 0).rgb;
+    g_historyKey[dtid.xy] = asuint(keyD);
+    g_historyColor[dtid.xy] = float4(realCol, 1.0f);
+
+    // Persistent background layer update. Default: refresh with this frame's
+    // real render (we SEE this pixel's content). Carry the remembered
+    // background forward instead when the current content is significantly
+    // NEARER than what this pixel remembered - an occluder has moved in
+    // front, and overwriting would forget the background a future reveal
+    // needs. The previous layer lives in LAST frame's real eye's space (the
+    // other eye, one frame back): same-frame source->target hop composed
+    // with target->prev, the velocity-advection matrix. The carry lookup
+    // iterates once at the REMEMBERED depth: background parallax, not the
+    // occluder's.
+    float3 bgCol = realCol;
+    float bgD = keyD;
+    uint bw, bh;
+    g_bgKeyPrev.GetDimensions(bw, bh);
+    if (bw != 0u) {
+        float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+        float lookupD = keyD;
+        int2 pc = int2(-1, -1);
+        uint pk = 0u;
+        [unroll]
+        for (int it = 0; it < 2; ++it) {
+            float4 sclip = float4(ndc, lookupD, 1.0f);
+            float4 t = (mode_param0 < 0.5f) ? mul(reproj_source_to_right, sclip)
+                                            : mul(reproj_source_to_left, sclip);
+            float4 pp = mul(reproj_target_to_prev, t);
+            float w = (abs(pp.w) > 1e-6f) ? pp.w : 1e-6f;
+            float2 pn = pp.xy / w;
+            pc = int2((int)((pn.x * 0.5f + 0.5f) * (float)out_width),
+                      (int)((0.5f - pn.y * 0.5f) * (float)out_height));
+            if (pc.x < 0 || pc.x >= (int)out_width || pc.y < 0 || pc.y >= (int)out_height) {
+                pk = 0u;
+                break;
+            }
+            pk = g_bgKeyPrev.Load(int3(pc, 0));
+            if (pk == 0u || abs(asfloat(pk) - lookupD) <= max(0.05f * lookupD, 5e-4f)) {
+                break; // converged (or nothing remembered)
+            }
+            lookupD = asfloat(pk);
+        }
+        if (pk != 0u && keyD > asfloat(pk) + max(0.10f * keyD, 1e-3f)) {
+            bgCol = g_bgColorPrev.Load(int3(pc, 0)).rgb;
+            bgD = asfloat(pk);
+        }
+    }
+    g_bgColor[dtid.xy] = float4(bgCol, 1.0f);
+    g_bgKey[dtid.xy] = asuint(bgD);
 }

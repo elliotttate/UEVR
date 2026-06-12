@@ -304,7 +304,7 @@ bool DIBRSynthesis::create_root_signature(ID3D12Device* device, DeviceObjects& o
     // (offset 10 - appended as its own range so the earlier offsets never
     // move), a root CBV at b0, and static samplers s0 (linear clamp) / s1
     // (point clamp).
-    D3D12_DESCRIPTOR_RANGE ranges[3]{};
+    D3D12_DESCRIPTOR_RANGE ranges[5]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 4; // t0 color, t1 depth, t2 prepared depth, t3 history color
     ranges[0].BaseShaderRegister = 0;
@@ -317,10 +317,18 @@ bool DIBRSynthesis::create_root_signature(ID3D12Device* device, DeviceObjects& o
     ranges[2].NumDescriptors = 1; // t4 SceneVelocity snapshot
     ranges[2].BaseShaderRegister = 4;
     ranges[2].OffsetInDescriptorsFromTableStart = 10;
+    ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[3].NumDescriptors = 2; // t5/t6 AFW background layer color+key (read half)
+    ranges[3].BaseShaderRegister = 5;
+    ranges[3].OffsetInDescriptorsFromTableStart = 11;
+    ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[4].NumDescriptors = 2; // u6/u7 AFW background layer color+key (write half)
+    ranges[4].BaseShaderRegister = 6;
+    ranges[4].OffsetInDescriptorsFromTableStart = 13;
 
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[0].DescriptorTable.NumDescriptorRanges = 3;
+    params[0].DescriptorTable.NumDescriptorRanges = 5;
     params[0].DescriptorTable.pDescriptorRanges = ranges;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -614,6 +622,61 @@ bool DIBRSynthesis::ensure_afw_history(ID3D12Device* device, uint32_t width, uin
 
     ++m_resource_generation;
     SPDLOG_INFO("[DIBR] AFW real-render history buffers {}x{}", width, height);
+    return true;
+}
+
+bool DIBRSynthesis::ensure_afw_bg(ID3D12Device* device, uint32_t width, uint32_t height) {
+    // Persistent background layer (ping-pong pair): per-pixel memory of the
+    // FARTHEST surface seen, carried forward when an occluder moves in front
+    // of it. The one-frame stash cannot serve a reveal while the occluder
+    // still covered it last frame; this layer remembers the background
+    // across arbitrarily many frames. Same space/dims as the stash.
+    if (m_afw_bg_width == width && m_afw_bg_height == height && m_afw_bg_color[0] != nullptr) {
+        return true;
+    }
+
+    for (auto& r : m_afw_bg_color) r.Reset();
+    for (auto& r : m_afw_bg_key) r.Reset();
+    m_afw_bg_valid = false;
+    m_afw_bg_index = 0;
+    m_afw_bg_is_srv[0] = false;
+    m_afw_bg_is_srv[1] = false;
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    for (uint32_t i = 0; i < 2; ++i) {
+        desc.Format = DXGI_FORMAT_R32_UINT;
+        if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_afw_bg_key[i])))) {
+            SPDLOG_ERROR_ONCE("[DIBR] failed to create {}x{} AFW background key texture", width, height);
+            return false;
+        }
+        m_afw_bg_key[i]->SetName(i == 0 ? L"DIBR AFW Background Key A" : L"DIBR AFW Background Key B");
+
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_afw_bg_color[i])))) {
+            SPDLOG_ERROR_ONCE("[DIBR] failed to create {}x{} AFW background color texture", width, height);
+            m_afw_bg_key[i].Reset();
+            return false;
+        }
+        m_afw_bg_color[i]->SetName(i == 0 ? L"DIBR AFW Background Color A" : L"DIBR AFW Background Color B");
+    }
+
+    m_afw_bg_width = width;
+    m_afw_bg_height = height;
+    ++m_resource_generation;
+    SPDLOG_INFO("[DIBR] AFW persistent background layer {}x{} (ping-pong pair)", width, height);
     return true;
 }
 
@@ -1190,7 +1253,8 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     }
 
     if (m_afw_mode && mode == Mode::YoroScatter &&
-        !ensure_afw_history(device, params.synth_width, params.synth_height)) {
+        (!ensure_afw_history(device, params.synth_width, params.synth_height) ||
+         !ensure_afw_bg(device, params.synth_width, params.synth_height))) {
         return nullptr;
     }
 
@@ -1269,6 +1333,11 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     mix(reinterpret_cast<uintptr_t>(history_key));
     mix(reinterpret_cast<uintptr_t>(m_velocity_tex));
     mix(static_cast<uint64_t>(mode == Mode::YoroScatter));
+    // The background layer's read/write halves swap every frame, and the
+    // read half is null-bound until its first update has executed.
+    const bool afw_bg = m_afw_mode && mode == Mode::YoroScatter && m_afw_bg_color[0] != nullptr;
+    mix(static_cast<uint64_t>(afw_bg ? (m_afw_bg_index + 1u) : 0u));
+    mix(static_cast<uint64_t>(afw_bg && m_afw_bg_valid));
     mix(m_resource_generation);
 
     if (m_slot_desc_hash[slot] != desc_hash) {
@@ -1340,6 +1409,31 @@ ID3D12Resource* DIBRSynthesis::synthesize(
         vel_srv.Texture2D.MipLevels = 1;
         device->CreateShaderResourceView(m_velocity_tex, &vel_srv,
             D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 10 * m_objs.descriptor_stride});
+
+        // t5/t6 + u6/u7: AFW persistent background layer. Read half = the
+        // half the LAST frame's update wrote (null until the first update
+        // has executed - the shaders gate on GetDimensions); write half =
+        // m_afw_bg_index, refreshed by this frame's stash pass.
+        {
+            ID3D12Resource* bg_read_color = (afw_bg && m_afw_bg_valid) ? m_afw_bg_color[m_afw_bg_index ^ 1u].Get() : nullptr;
+            ID3D12Resource* bg_read_key = (afw_bg && m_afw_bg_valid) ? m_afw_bg_key[m_afw_bg_index ^ 1u].Get() : nullptr;
+            ID3D12Resource* bg_write_color = afw_bg ? m_afw_bg_color[m_afw_bg_index].Get() : nullptr;
+            ID3D12Resource* bg_write_key = afw_bg ? m_afw_bg_key[m_afw_bg_index].Get() : nullptr;
+
+            device->CreateShaderResourceView(bg_read_color, &hist_srv,
+                D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 11 * m_objs.descriptor_stride});
+            D3D12_SHADER_RESOURCE_VIEW_DESC bgkey_srv{};
+            bgkey_srv.Format = DXGI_FORMAT_R32_UINT;
+            bgkey_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            bgkey_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            bgkey_srv.Texture2D.MipLevels = 1;
+            device->CreateShaderResourceView(bg_read_key, &bgkey_srv,
+                D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 12 * m_objs.descriptor_stride});
+            device->CreateUnorderedAccessView(bg_write_color, nullptr, &scol_uav,
+                D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 13 * m_objs.descriptor_stride});
+            device->CreateUnorderedAccessView(bg_write_key, nullptr, &key_uav,
+                D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 14 * m_objs.descriptor_stride});
+        }
 
         // CPU-only twins of the scatter key/color UAVs for
         // ClearUnorderedAccessView* (same inputs, so the same guard applies).
@@ -1461,6 +1555,25 @@ ID3D12Resource* DIBRSynthesis::synthesize(
         // shader-readable state for both, back to UAV after the compose.
         transition(cmd_list, history_color, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, shader_read);
 
+        // Background layer halves: read half (last frame's update) must sit
+        // in shader_read for the fill; write half in UAV for the stash-side
+        // update. Lazy per-half state tracking - halves swap roles each
+        // frame.
+        if (afw_bg) {
+            const uint32_t bgw = m_afw_bg_index;
+            const uint32_t bgr = bgw ^ 1u;
+            if (m_afw_bg_is_srv[bgw]) {
+                transition(cmd_list, m_afw_bg_color[bgw].Get(), shader_read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                transition(cmd_list, m_afw_bg_key[bgw].Get(), shader_read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                m_afw_bg_is_srv[bgw] = false;
+            }
+            if (!m_afw_bg_is_srv[bgr] && m_afw_bg_valid) {
+                transition(cmd_list, m_afw_bg_color[bgr].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, shader_read);
+                transition(cmd_list, m_afw_bg_key[bgr].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, shader_read);
+                m_afw_bg_is_srv[bgr] = true;
+            }
+        }
+
         ts_begin();
         cmd_list->SetPipelineState(m_objs.pso_scatter_fill.Get());
         cmd_list->Dispatch(gx_synth, gy_synth, 1);
@@ -1498,6 +1611,13 @@ ID3D12Resource* DIBRSynthesis::synthesize(
         cmd_list->Dispatch(gx_out, gy_out, 1);
         uav_barrier_pair(m_afw_history_color.Get(), m_afw_history_key.Get());
         m_afw_history_valid = true;
+        if (afw_bg) {
+            // The stash pass also refreshed the background layer's write
+            // half; it becomes the read half next frame.
+            uav_barrier_pair(m_afw_bg_color[m_afw_bg_index].Get(), m_afw_bg_key[m_afw_bg_index].Get());
+            m_afw_bg_index ^= 1u;
+            m_afw_bg_valid = true;
+        }
         ts_end(TsPass::Stash);
     }
 
@@ -1551,6 +1671,14 @@ void DIBRSynthesis::reset() {
     m_afw_history_key.Reset();
     m_afw_history_color.Reset();
     m_afw_history_valid = false;
+    for (auto& r : m_afw_bg_color) r.Reset();
+    for (auto& r : m_afw_bg_key) r.Reset();
+    m_afw_bg_index = 0;
+    m_afw_bg_width = 0;
+    m_afw_bg_height = 0;
+    m_afw_bg_valid = false;
+    m_afw_bg_is_srv[0] = false;
+    m_afw_bg_is_srv[1] = false;
     m_prep.Reset();
     m_prep_width = 0;
     m_prep_height = 0;

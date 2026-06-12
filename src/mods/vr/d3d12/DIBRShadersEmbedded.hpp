@@ -7303,7 +7303,7 @@ inline std::string dibr_scatter_color_source() {
     return out;
 }
 
-// dibr_scatter_fill.hlsl (25520 bytes, 3 chunks)
+// dibr_scatter_fill.hlsl (28113 bytes, 3 chunks)
 inline const char* const g_dibr_scatter_fill_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7325,6 +7325,13 @@ RWTexture2D<float4> g_scatterColor : register(u2);
 // a shader-readable state around the read-only passes).
 Texture2D<float4> g_historyColor : register(t3);
 RWTexture2D<uint> g_historyKey : register(u4);
+// Persistent background layer (last frame's update, this eye's space one
+// frame back - same reprojection convention as the stash). Holds the
+// FARTHEST surface remembered per pixel across frames: the reveal source of
+// last resort when the one-frame stash still had the occluder covering the
+// hole. Null until the first update has run.
+Texture2D<float4> g_bgColorPrev : register(t5);
+Texture2D<uint>   g_bgKeyPrev   : register(t6);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
 
@@ -7640,13 +7647,13 @@ float SynthEyeSign()
 }
 
 // Average a short run of covered BACKGROUND pixels starting at a scanline
-// neighbour and stepping `dir` further AWAY from the hole (always into
+)DIBR",
+R"DIBR(// neighbour and stepping `dir` further AWAY from the hole (always into
 // already-covered territory). This dilutes the anti-aliased occluder-edge
 // pixel - the colour that otherwise smears across the reveal - and lowers the
 // per-row colour variance that reads as a "shredded" band. The run stops the
 // moment it hits an uncovered pixel, a fill-marked pixel, or a depth jump
-)DIBR",
-R"DIBR(// toward the foreground, so the occluder is never averaged back in.
+// toward the foreground, so the occluder is never averaged back in.
 float3 SampleBackgroundRun(int startX, int y, int dir, uint refKey)
 {
     const int kRunTaps = 4;
@@ -7858,7 +7865,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     if (nx < 0 || nx >= (int)synth_width || ny < 0 || ny >= (int)synth_height) continue;
                     float4 nh = g_historyColor[uint2(nx, ny)];
                     uint nk = g_historyKey[uint2(nx, ny)] & 0x7FFFFFFFu;
-                    bool nOk = (temporal_enabled > 1.5f)
+)DIBR",
+R"DIBR(                    bool nOk = (temporal_enabled > 1.5f)
                         ? (occluderDepth <= 0.0f || asfloat(nk) <= acceptCeil)
                         : (abs(asfloat(nk) - estDepth) <= tol);
                     if (nh.a > 0.5f && nk != 0u && nOk) {
@@ -7866,8 +7874,46 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                         hk = nk;
                         validHistory = true;
                         break;
-)DIBR",
-R"DIBR(                    }
+                    }
+                }
+            }
+            // Background-layer fallback: when the one-frame stash has nothing
+            // valid (the occluder covered this reveal in the LAST frame too -
+            // exactly what happens mid-sway), consult the persistent
+            // background memory. It accumulates the farthest-seen surface per
+            // pixel across many frames, so the reveal's true background is
+            // usually remembered even when no recent render saw it. The
+            // lookup iterates once at the remembered depth (background
+            // parallax, not the adopted key's).
+            if (!validHistory && temporal_enabled > 1.5f) {
+                uint bw, bh;
+                g_bgKeyPrev.GetDimensions(bw, bh);
+                if (bw != 0u) {
+                    float lookupD = estDepth;
+                    int2 pc = int2(-1, -1);
+                    uint bk = 0u;
+                    [unroll]
+                    for (int it = 0; it < 2; ++it) {
+                        float4 bprev = mul(reproj_target_to_prev, float4(ndc, lookupD, 1.0f));
+                        float bw2 = (abs(bprev.w) > 1e-6f) ? bprev.w : 1e-6f;
+                        float2 bpn = bprev.xy / bw2;
+                        pc = int2((int)((bpn.x * 0.5f + 0.5f) * (float)synth_width),
+                                  (int)((0.5f - bpn.y * 0.5f) * (float)synth_height));
+                        if (pc.x < 0 || pc.x >= (int)synth_width || pc.y < 0 || pc.y >= (int)synth_height) {
+                            bk = 0u;
+                            break;
+                        }
+                        bk = g_bgKeyPrev.Load(int3(pc, 0));
+                        if (bk == 0u || abs(asfloat(bk) - lookupD) <= max(0.05f * lookupD, 5e-4f)) {
+                            break;
+                        }
+                        lookupD = asfloat(bk);
+                    }
+                    if (bk != 0u && (occluderDepth <= 0.0f || asfloat(bk) <= acceptCeil)) {
+                        h = float4(g_bgColorPrev.Load(int3(pc, 0)).rgb, 1.0f);
+                        hk = bk;
+                        validHistory = true;
+                    }
                 }
             }
             if (validHistory) {
@@ -7910,7 +7956,7 @@ inline std::string dibr_scatter_fill_source() {
     return out;
 }
 
-// dibr_afw_stash.hlsl (14017 bytes, 2 chunks)
+// dibr_afw_stash.hlsl (16807 bytes, 2 chunks)
 inline const char* const g_dibr_afw_stash_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7936,6 +7982,15 @@ RWTexture2D<float4> g_scatterColor : register(u2);
 // Written here, read by next frame's fill pass.
 RWTexture2D<float4> g_historyColor : register(u3);
 RWTexture2D<uint> g_historyKey : register(u4);
+// Persistent background layer: read half = last frame's update (other eye's
+// space, one frame ago; null until the first update), write half refreshed
+// here. Remembers the FARTHEST surface seen per pixel across frames so
+// reveals can fill with real background even while an occluder has covered
+// it in every recent render.
+Texture2D<float4> g_bgColorPrev : register(t5);
+Texture2D<uint>   g_bgKeyPrev   : register(t6);
+RWTexture2D<float4> g_bgColor : register(u6);
+RWTexture2D<uint>   g_bgKey   : register(u7);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
 
@@ -8240,7 +8295,8 @@ float2 ReprojectSourceUv(float2 srcUv, float rawDepth, float eyeSign)
     float4 clip = float4(ndc, rawDepth, 1.0f);
     float4 t = (eyeSign > 0.0f) ? mul(reproj_source_to_left, clip) : mul(reproj_source_to_right, clip);
     float w = (abs(t.w) > 1e-6f) ? t.w : 1e-6f;
-    float2 tNdc = t.xy / w;
+)DIBR",
+R"DIBR(    float2 tNdc = t.xy / w;
     return float2(tNdc.x * 0.5f + 0.5f, 0.5f - tNdc.y * 0.5f);
 }
 
@@ -8255,8 +8311,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
     // History lives in the source render's own pixel space (== output dims;
     // the overscanned projection is accounted for by the C++-built
-)DIBR",
-R"DIBR(    // reproj_target_to_prev matrix, not by any UV remap here).
+    // reproj_target_to_prev matrix, not by any UV remap here).
     if (dtid.x >= out_width || dtid.y >= out_height) return;
     float2 uv = float2((dtid.x + 0.5f) / (float)out_width,
                        (dtid.y + 0.5f) / (float)out_height);
@@ -8292,8 +8347,57 @@ R"DIBR(    // reproj_target_to_prev matrix, not by any UV remap here).
         }
     }
     const bool edge = (dmax - dmin) > max(0.10f * dmax, 1e-3f);
-    g_historyKey[dtid.xy] = asuint(max(edge ? dmax : d, 1e-7f));
-    g_historyColor[dtid.xy] = float4(g_colorTex.SampleLevel(g_pointSampler, uv, 0).rgb, 1.0f);
+    const float keyD = max(edge ? dmax : d, 1e-7f);
+    const float3 realCol = g_colorTex.SampleLevel(g_pointSampler, uv, 0).rgb;
+    g_historyKey[dtid.xy] = asuint(keyD);
+    g_historyColor[dtid.xy] = float4(realCol, 1.0f);
+
+    // Persistent background layer update. Default: refresh with this frame's
+    // real render (we SEE this pixel's content). Carry the remembered
+    // background forward instead when the current content is significantly
+    // NEARER than what this pixel remembered - an occluder has moved in
+    // front, and overwriting would forget the background a future reveal
+    // needs. The previous layer lives in LAST frame's real eye's space (the
+    // other eye, one frame back): same-frame source->target hop composed
+    // with target->prev, the velocity-advection matrix. The carry lookup
+    // iterates once at the REMEMBERED depth: background parallax, not the
+    // occluder's.
+    float3 bgCol = realCol;
+    float bgD = keyD;
+    uint bw, bh;
+    g_bgKeyPrev.GetDimensions(bw, bh);
+    if (bw != 0u) {
+        float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+        float lookupD = keyD;
+        int2 pc = int2(-1, -1);
+        uint pk = 0u;
+        [unroll]
+        for (int it = 0; it < 2; ++it) {
+            float4 sclip = float4(ndc, lookupD, 1.0f);
+            float4 t = (mode_param0 < 0.5f) ? mul(reproj_source_to_right, sclip)
+                                            : mul(reproj_source_to_left, sclip);
+            float4 pp = mul(reproj_target_to_prev, t);
+            float w = (abs(pp.w) > 1e-6f) ? pp.w : 1e-6f;
+            float2 pn = pp.xy / w;
+            pc = int2((int)((pn.x * 0.5f + 0.5f) * (float)out_width),
+                      (int)((0.5f - pn.y * 0.5f) * (float)out_height));
+            if (pc.x < 0 || pc.x >= (int)out_width || pc.y < 0 || pc.y >= (int)out_height) {
+                pk = 0u;
+                break;
+            }
+            pk = g_bgKeyPrev.Load(int3(pc, 0));
+            if (pk == 0u || abs(asfloat(pk) - lookupD) <= max(0.05f * lookupD, 5e-4f)) {
+                break; // converged (or nothing remembered)
+            }
+            lookupD = asfloat(pk);
+        }
+        if (pk != 0u && keyD > asfloat(pk) + max(0.10f * keyD, 1e-3f)) {
+            bgCol = g_bgColorPrev.Load(int3(pc, 0)).rgb;
+            bgD = asfloat(pk);
+        }
+    }
+    g_bgColor[dtid.xy] = float4(bgCol, 1.0f);
+    g_bgKey[dtid.xy] = asuint(bgD);
 })DIBR",
 };
 

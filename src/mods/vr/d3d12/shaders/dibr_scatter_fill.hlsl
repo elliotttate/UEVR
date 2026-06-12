@@ -18,6 +18,13 @@ RWTexture2D<float4> g_scatterColor : register(u2);
 // a shader-readable state around the read-only passes).
 Texture2D<float4> g_historyColor : register(t3);
 RWTexture2D<uint> g_historyKey : register(u4);
+// Persistent background layer (last frame's update, this eye's space one
+// frame back - same reprojection convention as the stash). Holds the
+// FARTHEST surface remembered per pixel across frames: the reveal source of
+// last resort when the one-frame stash still had the occluder covering the
+// hole. Null until the first update has run.
+Texture2D<float4> g_bgColorPrev : register(t5);
+Texture2D<uint>   g_bgKeyPrev   : register(t6);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
 
@@ -558,6 +565,45 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                         hk = nk;
                         validHistory = true;
                         break;
+                    }
+                }
+            }
+            // Background-layer fallback: when the one-frame stash has nothing
+            // valid (the occluder covered this reveal in the LAST frame too -
+            // exactly what happens mid-sway), consult the persistent
+            // background memory. It accumulates the farthest-seen surface per
+            // pixel across many frames, so the reveal's true background is
+            // usually remembered even when no recent render saw it. The
+            // lookup iterates once at the remembered depth (background
+            // parallax, not the adopted key's).
+            if (!validHistory && temporal_enabled > 1.5f) {
+                uint bw, bh;
+                g_bgKeyPrev.GetDimensions(bw, bh);
+                if (bw != 0u) {
+                    float lookupD = estDepth;
+                    int2 pc = int2(-1, -1);
+                    uint bk = 0u;
+                    [unroll]
+                    for (int it = 0; it < 2; ++it) {
+                        float4 bprev = mul(reproj_target_to_prev, float4(ndc, lookupD, 1.0f));
+                        float bw2 = (abs(bprev.w) > 1e-6f) ? bprev.w : 1e-6f;
+                        float2 bpn = bprev.xy / bw2;
+                        pc = int2((int)((bpn.x * 0.5f + 0.5f) * (float)synth_width),
+                                  (int)((0.5f - bpn.y * 0.5f) * (float)synth_height));
+                        if (pc.x < 0 || pc.x >= (int)synth_width || pc.y < 0 || pc.y >= (int)synth_height) {
+                            bk = 0u;
+                            break;
+                        }
+                        bk = g_bgKeyPrev.Load(int3(pc, 0));
+                        if (bk == 0u || abs(asfloat(bk) - lookupD) <= max(0.05f * lookupD, 5e-4f)) {
+                            break;
+                        }
+                        lookupD = asfloat(bk);
+                    }
+                    if (bk != 0u && (occluderDepth <= 0.0f || asfloat(bk) <= acceptCeil)) {
+                        h = float4(g_bgColorPrev.Load(int3(pc, 0)).rgb, 1.0f);
+                        hk = bk;
+                        validHistory = true;
                     }
                 }
             }

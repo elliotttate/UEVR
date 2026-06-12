@@ -485,6 +485,7 @@ private:
     bool ensure_output(ID3D12Device* device, uint32_t width, uint32_t height);
     bool ensure_scatter(ID3D12Device* device, uint32_t width, uint32_t height);
     bool ensure_afw_history(ID3D12Device* device, uint32_t width, uint32_t height);
+    bool ensure_afw_bg(ID3D12Device* device, uint32_t width, uint32_t height);
     bool ensure_prep(ID3D12Device* device, uint32_t width, uint32_t height);
     void join_worker();
 
@@ -505,8 +506,10 @@ private:
     static constexpr uint32_t kRing = 8;
     // t0 color, t1 depth, t2 prepared depth (SRV), t3 history color (SRV),
     // u0 output, u1/u2 scatter key+color, u3/u4 history color+key, u5 prep
-    // UAV, t4 velocity snapshot (SRV, table offset 10 via its own range).
-    static constexpr uint32_t kDescriptorsPerSlot = 11;
+    // UAV, t4 velocity snapshot (SRV, table offset 10 via its own range),
+    // t5/t6 AFW background layer read half (SRVs, offsets 11-12), u6/u7
+    // background layer write half (UAVs, offsets 13-14).
+    static constexpr uint32_t kDescriptorsPerSlot = 15;
     // Derived, not hardcoded: a fixed value overran the upload buffer when the
     // struct grew (the reprojection matrices pushed it past the old 1024).
     static constexpr uint32_t kCbSlotSize = (sizeof(DIBRStereoParams) + 255u) & ~255u;
@@ -542,6 +545,18 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_afw_history_color{};
     bool m_afw_history_valid{false};
     bool m_afw_mode{false};
+
+    // AFW persistent background layer (see ensure_afw_bg): ping-pong pair,
+    // write half = m_afw_bg_index, read half = index ^ 1. m_afw_bg_is_srv
+    // tracks each half's resource state lazily (read half lives in
+    // NON_PIXEL_SHADER_RESOURCE during the chain, write half in UAV).
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> m_afw_bg_color{};
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> m_afw_bg_key{};
+    uint32_t m_afw_bg_index{0};
+    uint32_t m_afw_bg_width{0};
+    uint32_t m_afw_bg_height{0};
+    bool m_afw_bg_valid{false};
+    bool m_afw_bg_is_srv[2]{false, false};
 
     // Conditioned-depth prepass target (source-sized; written by the
     // depth-prep PSO each frame, then read by the gather kernels as t2).
