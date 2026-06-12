@@ -1985,7 +1985,7 @@ inline std::string dibr_inverse_source() {
     return out;
 }
 
-// dibr_yoro.hlsl (100811 bytes, 9 chunks)
+// dibr_yoro.hlsl (102971 bytes, 9 chunks)
 inline const char* const g_dibr_yoro_chunks[] = {
 R"DIBR(// dibr_yoro.hlsl — YORO / Meta-style asymmetric inverse-warp DIBR
 //
@@ -2034,6 +2034,11 @@ RWTexture2D<float4> g_scatterColor : register(u2);
 // Temporal history keys (AFW: last frame's REAL render of the eye being
 // synthesized, device-depth keys); only read when temporal_enabled > 1.5.
 RWTexture2D<uint> g_historyKey : register(u4);
+// SceneVelocity snapshot (UE PF_A16B16G16R16: xy = gamma-encoded screen-space
+// object motion, zero texel = static / not written, zw = packed previous
+// device depth). Null descriptor when no snapshot exists; currently consumed
+// by debug view 8 (the select/bind/sample wiring proof).
+Texture2D<float4> g_velocityTex : register(t4);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
 
@@ -2326,14 +2331,14 @@ float FilterEmulatorFocusScale(float depth)
         return 1.0f;
     }
 
-    float focusValue = clamp(filter_emulator_focus, 0.0f, 1.5f);
+)DIBR",
+R"DIBR(    float focusValue = clamp(filter_emulator_focus, 0.0f, 1.5f);
     float scale = max(0.0f, lerp(0.25f, 0.75f, 1.0f - focusValue));
     if (filter_emulator_auto_focus > 0.5f) {
         float focusDistance = abs(depth - EffectiveConvergence());
         scale *= lerp(0.75f, 1.0f, saturate(smoothstep(0.0f, 0.13f, focusDistance)));
     }
-)DIBR",
-R"DIBR(    return scale;
+    return scale;
 }
 
 float ApplyFilterEmulatorDepthControls(float depth)
@@ -2644,13 +2649,13 @@ float OutputMatteMask(float2 uv)
         return 0.0f;
     }
 
-    float feather = max(output_matte_feather, 0.0001f);
+)DIBR",
+R"DIBR(    float feather = max(output_matte_feather, 0.0001f);
     float xMask = smoothstep(left, min(left + feather, right), uv.x)
         * (1.0f - smoothstep(max(right - feather, left), right, uv.x));
     float yMask = smoothstep(top, min(top + feather, bottom), uv.y)
         * (1.0f - smoothstep(max(bottom - feather, top), bottom, uv.y));
-)DIBR",
-R"DIBR(    return saturate(xMask * yMask * strength);
+    return saturate(xMask * yMask * strength);
 }
 
 float4 ApplyOutputMatte(float2 uv, float4 stereoColor, float4 centerColor)
@@ -2958,7 +2963,8 @@ float3 OutputHeadsetPolyK1()
     if (OutputHeadsetProfileEnabled()) {
         return float3(0.22f, 0.22f, 0.22f);
     }
-    return float3(output_geometry_poly_k1_r, output_geometry_poly_k1_g, output_geometry_poly_k1_b);
+)DIBR",
+R"DIBR(    return float3(output_geometry_poly_k1_r, output_geometry_poly_k1_g, output_geometry_poly_k1_b);
 }
 
 float3 OutputHeadsetPolyK2()
@@ -2971,8 +2977,7 @@ float3 OutputHeadsetPolyK2()
 
 float4 SampleOutputColor(float2 sampleUv)
 {
-)DIBR",
-R"DIBR(    float2 uv = saturate(sampleUv);
+    float2 uv = saturate(sampleUv);
     float4 baseColor = SampleOutputSource(uv);
 #if DIBR_LEAN
     return baseColor;
@@ -3270,7 +3275,8 @@ float4 ApplyFrameMarker(uint outX, uint outY, uint outWidth, uint outHeight, flo
 #if DIBR_LEAN
     return color;
 #endif
-    float mode = floor(output_frame_marker_mode + 0.5f);
+)DIBR",
+R"DIBR(    float mode = floor(output_frame_marker_mode + 0.5f);
     if (mode < 0.5f) {
         return color;
     }
@@ -3278,8 +3284,7 @@ float4 ApplyFrameMarker(uint outX, uint outY, uint outWidth, uint outHeight, flo
     uint rows = max(1u, (uint)round(max(output_frame_marker_thickness, 0.0001f) * (float)outHeight));
     rows = min(rows, outHeight);
     uint cols = max(1u, (uint)round(max(output_frame_marker_thickness, 0.0001f) * (float)outWidth));
-)DIBR",
-R"DIBR(    cols = min(cols, outWidth);
+    cols = min(cols, outWidth);
 
     if (mode >= 2.5f) {
         bool inCorner = outX < cols && outY < rows;
@@ -3580,14 +3585,14 @@ void WriteStereoViews(uint x, uint y, float4 leftFullColor, float4 leftReducedCo
         g_sbsOut[uint2(x, y + out_height)] = ApplyFrameMarker(x, y + out_height, outWidth, outHeight, secondColor, markerParity, layoutMode);
         return;
     }
-    uint outWidth = out_width * 2u;
+)DIBR",
+R"DIBR(    uint outWidth = out_width * 2u;
     uint outHeight = out_height;
     g_sbsOut[uint2(x, y)] = ApplyFrameMarker(x, y, outWidth, outHeight, firstColor, markerParity, layoutMode);
     g_sbsOut[uint2(x + out_width, y)] = ApplyFrameMarker(x + out_width, y, outWidth, outHeight, secondColor, markerParity, layoutMode);
 }
 
-)DIBR",
-R"DIBR(void WriteStereoPair(uint x, uint y, float4 leftColor, float4 rightColor)
+void WriteStereoPair(uint x, uint y, float4 leftColor, float4 rightColor)
 {
     WriteStereoViews(x, y, leftColor, lerp(leftColor, rightColor, 0.33333334f), lerp(leftColor, rightColor, 0.66666669f), rightColor);
 }
@@ -3882,15 +3887,15 @@ float ReconstructDepth(float2 uv, float depth)
     float2 texel = float2(1.0f / max((float)srcWidth, 1.0f), 1.0f / max((float)srcHeight, 1.0f)) * radius;
     float dl = SamplePreparedDepth(uv - float2(texel.x, 0.0f));
     float dr = SamplePreparedDepth(uv + float2(texel.x, 0.0f));
-    float du = SamplePreparedDepth(uv - float2(0.0f, texel.y));
+)DIBR",
+R"DIBR(    float du = SamplePreparedDepth(uv - float2(0.0f, texel.y));
     float dd = SamplePreparedDepth(uv + float2(0.0f, texel.y));
     float dlu = SamplePreparedDepth(uv - texel);
     float dru = SamplePreparedDepth(uv + float2(texel.x, -texel.y));
     float dld = SamplePreparedDepth(uv + float2(-texel.x, texel.y));
     float drd = SamplePreparedDepth(uv + texel);
 
-)DIBR",
-R"DIBR(    float localMin = min(depth, min(min(dl, dr), min(min(du, dd), min(min(dlu, dru), min(dld, drd)))));
+    float localMin = min(depth, min(min(dl, dr), min(min(du, dd), min(min(dlu, dru), min(dld, drd)))));
     float avg = (dl + dr + du + dd + dlu + dru + dld + drd) * 0.125f;
     float gradient = max(abs(dr - dl), abs(dd - du));
     float threshold = max(depth_reconstruct_edge_threshold, 0.0001f);
@@ -4160,7 +4165,8 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
     float outerScale = boundaryScale * shiftScale;
     float targetShift = YoroSynthShiftGuarded(centerDepth, guard, eyeSign) * outerScale;
     float absTarget = abs(targetShift);
-    float2 directUv = uv + StereoShift(targetShift);
+)DIBR",
+R"DIBR(    float2 directUv = uv + StereoShift(targetShift);
     if (absTarget <= (0.25f * pre_inv_src_width)) {
         return directUv;
     }
@@ -4168,8 +4174,7 @@ float2 YoroSearchUv(float2 uv, float eyeSign, float centerDepth, float boundaryS
     float defaultSteps = clamp(abs(divergence) * 0.75f, 8.0f, (float)YORO_MAX_SEARCH_STEPS);
     float requestedSteps = (raymarch_steps > 0.0f) ? raymarch_steps : defaultSteps;
     int steps = YoroSearchSteps(uv, requestedSteps);
-)DIBR",
-R"DIBR(    float direction = (targetShift >= 0.0f) ? 1.0f : -1.0f;
+    float direction = (targetShift >= 0.0f) ? 1.0f : -1.0f;
 
     // March until the ray CROSSES the depth surface. f(t) = the travel the
     // probe's own depth asks for, minus the travel needed to land on this
@@ -4289,10 +4294,14 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     if (temporal_enabled < 1.5f) {
         return c;
     }
-    uint sk = g_scatterKey[px] & 0x7FFFFFFFu; // strip the fill's marker bit
+    uint skRaw = g_scatterKey[px];
+    uint sk = skRaw & 0x7FFFFFFFu; // strip the fill's marker bit
     if (sk == 0u) {
         return c; // sky / no geometry: nothing to validate against
     }
+    // Marker bit set = this pixel is a fill band: its warp-side color is
+    // synthetic, so the color-agreement gate below must not protect it.
+    const bool wasFilled = (skRaw & 0x80000000u) != 0u;
     float estDepth = asfloat(sk);
     float2 uvRaw = float2((px.x + 0.5f) / (float)out_width,
                           (px.y + 0.5f) / (float)out_height);
@@ -4324,8 +4333,11 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
         // a camera-only reprojection while its depth still validates -
         // blending that paints a displaced double image. Large color deltas
         // therefore reject history instead (the warp result stands alone).
+        // EXCEPT in fill bands: there the warp side is synthetic fill and the
+        // depth-validated history is the actual render of the reveal, so a
+        // disagreement is precisely the case where history must win.
         float lumDiff = dot(abs(h - c), float3(0.299f, 0.587f, 0.114f));
-        float gate = saturate(1.0f - lumDiff * 8.0f);
+        float gate = wasFilled ? 1.0f : saturate(1.0f - lumDiff * 8.0f);
         c = lerp(c, h, saturate(temporal_blend) * gate);
     }
     return c;
@@ -4362,6 +4374,34 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
 #if !DIBR_LEAN
     float debugMode = floor(debug_view_mode + 0.5f);
+    if (debugMode >= 7.5f) {
+        // Debug view 8: SceneVelocity wiring proof (select/bind/sample). The
+        // snapshot is the previous frame's completed velocity GBuffer; UE only
+        // writes OBJECT motion by default, so static world keeps the zero
+        // clear texel. Dark green = static, heat = decoded |V| (Common.ush:
+        // linear decode then the SM5+ gamma square), black = no data.
+        uint vw, vh;
+        g_velocityTex.GetDimensions(vw, vh);
+        float3 col = float3(0.0f, 0.0f, 0.0f);
+        if (vw != 0u) {
+            float2 vUv = uv;
+            if (vw >= srcWidth * 2u) {
+                vUv.x *= 0.5f; // double-wide family target; the lone view fills the left half
+            }
+            float4 enc = g_velocityTex.SampleLevel(g_pointSampler, vUv, 0);
+            if (any(enc.xy != 0.0f)) {
+                const float invDiv = 1.0f / (0.499f * 0.5f);
+                float2 lin = enc.xy * invDiv - (32767.0f / 65535.0f) * invDiv;
+                float2 v = (lin * abs(lin)) * 0.5f; // VELOCITY_ENCODE_GAMMA (SM5+)
+                col = DebugHeat(saturate(length(v) * max(debug_view_scale, 0.0f) * 30.0f));
+            } else {
+                col = float3(0.0f, 0.07f, 0.0f);
+            }
+        }
+        float4 dbg = float4(col, 1.0f);
+        WriteStereoPair(x, y, dbg, dbg);
+        return;
+    }
     if (debugMode >= 1.0f) {
         // Debug views are the only consumer of the fully conditioned depth and
         // the guarded disparity (the gather path searches on YoroSearchDepth,
@@ -4375,7 +4415,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         depth = ApplyFilterEmulatorDepthControls(depth);
 
         float guardedDisparity = divergence * StereoDepthDelta(depth) * FilterEmulatorFocusScale(depth);
-        guardedDisparity *= ScreenEdgeGuard(uv, depth) * ConvergenceBoundaryScale(uv, depth) * DepthArtifactGuardScale(uv, depth) * WeaponBoundaryScale(uv, depth);
+)DIBR",
+R"DIBR(        guardedDisparity *= ScreenEdgeGuard(uv, depth) * ConvergenceBoundaryScale(uv, depth) * DepthArtifactGuardScale(uv, depth) * WeaponBoundaryScale(uv, depth);
         float leftScale = FocusReductionScale(uv, depth, 1.0f);
         float rightScale = FocusReductionScale(uv, depth, -1.0f);
         float offset = (guardedDisparity * 0.5f * (leftScale + rightScale) + perspective_shift) / (float)srcWidth;
@@ -4421,8 +4462,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 #endif
 
     if (refEye < 0.5f) {
-)DIBR",
-R"DIBR(        // Left reference: pristine left, synthesize right at full disparity.
+        // Left reference: pristine left, synthesize right at full disparity.
         float2 leftRefUV = ApplyOutputEyeAlignment(uv + leftInterlaceOffset, 1.0f);
         float4 leftRefColor = SampleFilteredOutputColor(SourceRemapUv(leftRefUV));
         float4 outLeft = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftRefColor, centerColor))));
@@ -7197,7 +7237,7 @@ inline std::string dibr_scatter_color_source() {
     return out;
 }
 
-// dibr_scatter_fill.hlsl (20502 bytes, 2 chunks)
+// dibr_scatter_fill.hlsl (21087 bytes, 2 chunks)
 inline const char* const g_dibr_scatter_fill_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7570,80 +7610,60 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (dtid.x >= synth_width || dtid.y >= synth_height) return;
     if (g_scatterColor[dtid.xy].a > 0.5f) return; // already covered
 
-    // Disocclusion hole: extend the BACKGROUND side (the deeper of the two
-    // nearest valid scanline neighbors), never the occluder - YORO-paper
-    // doctrine. Fine 1-px steps cover the common narrow reveals; coarse 4-px
-    // strides extend the reach to very-near-object holes (a stride can skip a
-    // thin valid run and land slightly farther out - fine for background
-    // extension). Anything wider falls back to the source color at this
-    // position (flat mono fill).
+    // Disocclusion hole: a reveal opens on the side of a foreground object
+    // OPPOSITE its warp direction, so the background that belongs in it lies
+    // on ONE known side - along the eye baseline, +x when synthesizing the
+    // RIGHT eye and -x for the LEFT. Searching only that side can never adopt
+    // the occluder's color; the old bidirectional search depth-picked (and on
+    // near-equal keys BLENDED) both sides, and whenever the occluder side won
+    // it painted an object-colored ghost band that swapped sides with the AFW
+    // eye alternation. PureDark's fill is likewise directional. Fine 1-px
+    // steps cover the common narrow reveals; coarse 4-px strides extend the
+    // reach to very-near-object holes (a stride can skip a thin valid run and
+    // land slightly farther out - fine for background extension). No hit
+    // (image edge, peripheral gate) falls back to the source color at this
+    // position (flat mono fill, real content where the temporal gate passes).
     const int kFineSearch = 8;
     const int kCoarseStep = 4;
     const int kMaxSearch = 96;
-    int lx = -1; uint lkey = 0u;
-    int rx = -1; uint rkey = 0u;
+    const int dir = (SynthEyeSign() < 0.0f) ? 1 : -1; // toward the background side
+    int bx = -1; uint bkey = 0u;
+
+    // Peripheral gate (PD doctrine): reveals far from the view center sit in
+    // the lens periphery where the compose's edge guard already compresses
+    // the result; the flat source fill is indistinguishable there. Saves the
+    // walk and avoids stretching background across the synthesized eye's
+    // no-source outer band.
+    float2 holeUv = float2((dtid.x + 0.5f) / (float)synth_width, (dtid.y + 0.5f) / (float)synth_height);
+    const bool central = length(holeUv - 0.5f) <= 0.65f;
 
     // Keys with the MSB marker were committed by this fill pass itself (other
     // threads, this dispatch) - skip them so hole pixels never adopt other
     // hole pixels' fill as real geometry (that ordering race would shimmer).
-    [loop]
-    for (int i = 1; i <= kMaxSearch; i += (i < kFineSearch) ? 1 : kCoarseStep) {
-        int x = (int)dtid.x - i;
-        if (x < 0) break;
-        uint k = g_scatterKey[uint2(x, dtid.y)];
-        if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { lx = x; lkey = k; break; }
-    }
-    [loop]
-    for (int i = 1; i <= kMaxSearch; i += (i < kFineSearch) ? 1 : kCoarseStep) {
-        int x = (int)dtid.x + i;
-        if (x >= (int)synth_width) break;
-        uint k = g_scatterKey[uint2(x, dtid.y)];
-        if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { rx = x; rkey = k; break; }
+    if (central) {
+        [loop]
+        for (int i = 1; i <= kMaxSearch; i += (i < kFineSearch) ? 1 : kCoarseStep) {
+            int x = (int)dtid.x + dir * i;
+            if (x < 0 || x >= (int)synth_width) break;
+            uint k = g_scatterKey[uint2(x, dtid.y)];
+            if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { bx = x; bkey = k; break; }
+        }
     }
 
-    // Scanline fill candidate. Smaller key bits = farther (reversed-Z) = the
-    // background side of the reveal. Instead of copying the single hole-edge
-    // pixel (whose colour is the anti-aliased occluder boundary), average a
-    // short run a few pixels into the background; and when BOTH sides are at a
-    // similar background depth, inverse-distance blend them - that removes the
-    // hard per-row left/right pick that flips between scanlines and shreds the
-    // band. When the two sides differ in depth (one IS the occluder) the blend
-    // is skipped and we hard-pick the farther/background side, as before.
     float4 c;
     uint fillKey = 0u;
-    if (lx >= 0 && rx >= 0) {
-        float ld = asfloat(lkey);
-        float rd = asfloat(rkey);
-        bool useLeft = (lkey <= rkey);
-        if (max(ld, rd) <= min(ld, rd) * 1.10f) {
-            // Both sides genuinely background: blend the two runs by proximity
-            // so the seam where the pick would flip doesn't shred row-to-row.
-            float3 lc = SampleBackgroundRun(lx, (int)dtid.y, -1, lkey);
-            float3 rc = SampleBackgroundRun(rx, (int)dtid.y, +1, rkey);
-            float dl = (float)((int)dtid.x - lx);
-            float dr = (float)(rx - (int)dtid.x);
-            float wl = dr / max(dl + dr, 1.0f); // nearer neighbour weighs more
-            c = float4(lerp(rc, lc, saturate(wl)), 1.0f);
-        } else {
-            // One side IS the occluder (large depth gap): take only the
-            // farther/background run - skips the wasted second background run.
-            c = useLeft
-                ? float4(SampleBackgroundRun(lx, (int)dtid.y, -1, lkey), 1.0f)
-                : float4(SampleBackgroundRun(rx, (int)dtid.y, +1, rkey), 1.0f);
-        }
-        fillKey = useLeft ? lkey : rkey;
-    } else if (lx >= 0) {
-        c = float4(SampleBackgroundRun(lx, (int)dtid.y, -1, lkey), 1.0f);
-        fillKey = lkey;
-    } else if (rx >= 0) {
-        c = float4(SampleBackgroundRun(rx, (int)dtid.y, +1, rkey), 1.0f);
-        fillKey = rkey;
+    if (bx >= 0) {
+        // Average a short run a few pixels INTO the background (stepping away
+        // from the hole) instead of copying the single hole-edge pixel, whose
+        // color is the anti-aliased boundary.
+        c = float4(SampleBackgroundRun(bx, (int)dtid.y, dir, bkey), 1.0f);
+        fillKey = bkey;
     } else {
-        float2 uv = float2((dtid.x + 0.5f) / (float)synth_width, (dtid.y + 0.5f) / (float)synth_height);
+        float2 srcUv = holeUv;
         if (overscan_x > 1.0f) {
-            uv.x = 0.5f + (uv.x - 0.5f) / overscan_x; // crop overscanned source to true FOV
+            srcUv.x = 0.5f + (srcUv.x - 0.5f) / overscan_x; // crop overscanned source to true FOV
         }
-        c = float4(g_colorTex.SampleLevel(g_linearSampler, uv, 0).rgb, 1.0f);
+        c = float4(g_colorTex.SampleLevel(g_linearSampler, srcUv, 0).rgb, 1.0f);
     }
 
     // R3 temporal reuse: reproject this hole into LAST frame's synthesized eye
@@ -7655,8 +7675,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // the camera-delta matrix can't explain (engine-side locomotion, animated
     // content); the 0.85 blend damps per-frame scanline boil ~7x while still
     // converging in a few frames so animated content doesn't freeze stale.
-    if (temporal_enabled > 0.5f && fillKey != 0u) {
-        float estDepth = asfloat(fillKey);
+    if (temporal_enabled > 0.5f) {
+        // Reproject at the adopted background depth, or at the far plane
+        // (device 0, reversed-Z) when the directional search missed - for a
+        // one-frame camera delta the reprojection offset barely depends on
+        // depth, and a reveal's true content is background by definition.
+        const bool haveKey = (fillKey != 0u);
+        float estDepth = haveKey ? asfloat(fillKey) : 0.0f;
         float2 uv = float2((dtid.x + 0.5f) / (float)synth_width, (dtid.y + 0.5f) / (float)synth_height);
         float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
         float4 prev = mul(reproj_target_to_prev, float4(ndc, estDepth, 1.0f));
@@ -7668,8 +7693,12 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             const float tol = max(0.15f * estDepth, 2e-4f);
             float4 h = g_historyColor[uint2(px, py)];
             uint hk = g_historyKey[uint2(px, py)] & 0x7FFFFFFFu; // strip fill marker
-            bool validHistory = (h.a > 0.5f && hk != 0u && abs(asfloat(hk) - estDepth) <= tol);
-            if (!validHistory) {
+            // With a background key: depth-validate against it. Without one
+            // (search miss): any real geometry in history beats the flat
+            // source fallback - require only that history exists there.
+            bool validHistory = (h.a > 0.5f && hk != 0u &&
+                (!haveKey || abs(asfloat(hk) - estDepth) <= tol));
+            if (!validHistory && haveKey) {
                 // Rotation rounding often lands one texel off a valid history
                 // pixel; probe the 3x3 ring before giving up on history.
                 const int2 kRing[8] = {
@@ -7685,15 +7714,32 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     uint nk = g_historyKey[uint2(nx, ny)] & 0x7FFFFFFFu;
                     if (nh.a > 0.5f && nk != 0u && abs(asfloat(nk) - estDepth) <= tol) {
                         h = nh;
+                        hk = nk;
                         validHistory = true;
                         break;
                     }
                 }
             }
             if (validHistory) {
-                // temporal_blend is pre-scaled by the caller against the
-                // per-frame pose delta: fast motion favors fresh fill.
-                c.rgb = lerp(c.rgb, h.rgb, saturate(temporal_blend));
+                if (temporal_enabled > 1.5f) {
+                    // AFW: the history is last frame's REAL render of THIS
+                    // eye - the reveal was actually rendered there one frame
+                    // ago, through an exact full-camera-delta matrix. Real
+                    // content REPLACES the synthetic scanline fill outright
+                    // (PD CombinedWarping doctrine); there is no feedback
+                    // risk because the stash never contains fill output.
+                    c.rgb = h.rgb;
+                } else {
+                    // Plain scatter: history is the previous fill output -
+                    // EMA blend (caller pre-scales temporal_blend against the
+                    // pose delta so fast motion favors fresh fill).
+                    c.rgb = lerp(c.rgb, h.rgb, saturate(temporal_blend));
+                }
+                if (!haveKey) {
+                    // Adopt the history's real depth as this band's key so
+                    // next frame's gates can validate it.
+                    fillKey = hk;
+                }
             }
         }
     }

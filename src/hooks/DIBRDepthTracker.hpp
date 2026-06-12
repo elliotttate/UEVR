@@ -75,6 +75,26 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, u
 // for periodic logging by the consumer.
 std::string describe_candidates();
 
+// === Motion-vector (velocity GBuffer) snapshot ===
+// Select/bind/sample wiring for UE's SceneVelocity (PF_A16B16G16R16 on
+// Lumen/ray-tracing platforms like SN2; object-motion-only by default, zero
+// texel = "not written" sentinel, gamma-encoded xy on SM5+, prev device depth
+// packed in zw). The pool hook's signature scan does not fire on SN2, so the
+// target is identified at its RTV BIND by format + largest non-square extent,
+// and the PREVIOUS frame's completed content (the bind precedes this frame's
+// clear/write) is CopyResource'd into a private texture inside the game's
+// command list - deterministic in stream order, immune to the next frame's
+// DLSS/TSR pass overwriting the pooled texture before present-time use
+// (PureDark's MV-backup failure class). The snapshot is left in
+// NON_PIXEL_SHADER_RESOURCE for the synthesis to sample directly.
+void record_velocity_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint32_t rtv_count);
+Microsoft::WRL::ComPtr<ID3D12Resource> get_velocity_snapshot();
+
+// The last qualifying SOURCE resource the shape tracker selected (raw pointer
+// for the pool-name confirmatory vote / logging only - do NOT dereference;
+// pooled targets ping-pong and may be released by the engine).
+void* get_velocity_source();
+
 // === AFW per-frame depth snapshots ===
 // Under AFW the engine's eye alternates per frame, so a depth that is off by
 // ONE frame in either direction belongs to the OTHER eye - the present-time

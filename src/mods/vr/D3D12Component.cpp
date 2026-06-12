@@ -5614,6 +5614,43 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     // Per-pass GPU timing needs the queue this list executes on (the same one
     // CommandContext::execute submits to) for GetTimestampFrequency.
     m_dibr.set_gpu_timing_queue(g_framework->get_d3d12_hook()->get_command_queue());
+    // SceneVelocity snapshot (previous frame's completed velocity, copied at
+    // its bind site); same-queue stream order makes it valid by the time the
+    // synthesis dispatches execute.
+    m_dibr.set_velocity_texture(dibr_depth_tracker::get_velocity_snapshot().Get());
+
+    // Velocity discovery Layer 2 (confirmatory vote only): probe the pool
+    // hook for every name the buffer has carried across engine versions -
+    // SceneVelocity (UE5), GBufferVelocity (UE4 base-pass velocity),
+    // Velocity (UE4 separate pass). A pointer match confirms the Layer-1
+    // shape tracker's pick; a MISS means nothing (4.26's separate-pass
+    // texture allocates through FindFreeElementForRDG, bypassing the hooked
+    // path entirely, and on SN2 the hook never installs), and a mismatch is
+    // usually just the pooled ping-pong twin.
+    if (void* vel_src = dibr_depth_tracker::get_velocity_source(); vel_src != nullptr) {
+        static bool s_vel_pool_vote_done = false;
+        if (!s_vel_pool_vote_done) {
+            s_vel_pool_vote_done = true;
+            if (auto& rt_pool = vr->get_render_target_pool_hook(); rt_pool != nullptr) {
+                rt_pool->activate();
+                static constexpr const wchar_t* kVelNames[] = {L"SceneVelocity", L"GBufferVelocity", L"Velocity"};
+                bool any_hit = false;
+                for (const auto* name : kVelNames) {
+                    if (auto pooled = rt_pool->get_texture<ID3D12Resource>(name); pooled != nullptr) {
+                        any_hit = true;
+                        SPDLOG_INFO("[DIBR][velocity] pool-name vote: '{}' = {:p} vs shape-tracker pick {:p} ({})",
+                            utility::narrow(name), static_cast<void*>(pooled.Get()), vel_src,
+                            pooled.Get() == vel_src ? "CONFIRMED" : "pointer differs (ping-pong twin or different buffer)");
+                    }
+                }
+                if (!any_hit) {
+                    SPDLOG_INFO("[DIBR][velocity] pool-name vote: no velocity name resolves (expected on SN2 / UE4.26 RDG paths); shape tracker stands alone");
+                }
+            } else {
+                SPDLOG_INFO("[DIBR][velocity] pool-name vote: pool hook not installed; shape tracker stands alone");
+            }
+        }
+    }
 
     // 3) Synthesize the packed SBS pair (records into the same command list).
     auto* output = m_dibr.synthesize(device, cmd_list, mode,

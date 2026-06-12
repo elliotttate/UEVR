@@ -32120,6 +32120,8 @@ void WINAPI D3D12Hook::om_set_render_targets(
         // AFW exact-phase depth snapshot (no-op unless AFW is active).
         dibr_depth_tracker::record_afw_depth_bind(command_list, census_rtvs[0], num_render_target_descriptors,
             depth_stencil_descriptor != nullptr ? depth_stencil_descriptor->ptr : 0);
+        // SceneVelocity snapshot at its own bind (no-op unless tracking armed).
+        dibr_depth_tracker::record_velocity_bind(command_list, census_rtvs[0], num_render_target_descriptors);
     }
 
     if (is_stereo_trace_enabled()) {
@@ -32201,6 +32203,8 @@ void WINAPI D3D12Hook::begin_render_pass(
         // AFW exact-phase depth snapshot (no-op unless AFW is active).
         dibr_depth_tracker::record_afw_depth_bind(command_list, census_rtvs[0], num_render_targets,
             depth_stencil != nullptr ? depth_stencil->cpuDescriptor.ptr : 0);
+        // SceneVelocity snapshot at its own bind (no-op unless tracking armed).
+        dibr_depth_tracker::record_velocity_bind(command_list, census_rtvs[0], num_render_targets);
     }
 
     if (original != nullptr) {

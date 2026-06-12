@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <d3d12.h>
 #include <dxgi.h>
@@ -419,6 +420,12 @@ public:
     // averages every few seconds ([DIBR][gpu]). No-op when the env is unset.
     void set_gpu_timing_queue(ID3D12CommandQueue* queue) { m_ts_queue = queue; }
 
+    // SceneVelocity snapshot (dibr_depth_tracker::get_velocity_snapshot),
+    // refreshed by the caller each frame; bound as t4 in NON_PIXEL_SHADER_
+    // RESOURCE state (the tracker leaves it there). Null descriptor when
+    // absent. Consumed by the velocity debug view; temporal gates next.
+    void set_velocity_texture(ID3D12Resource* texture) { m_velocity_tex = texture; }
+
     // Output texture format. Default R8G8B8A8_UNORM (guaranteed typed UAV
     // store support). Changing it forces the output texture to be recreated;
     // the caller is responsible for picking a UAV-capable format.
@@ -497,8 +504,9 @@ private:
     // queue depth.
     static constexpr uint32_t kRing = 8;
     // t0 color, t1 depth, t2 prepared depth (SRV), t3 history color (SRV),
-    // u0 output, u1/u2 scatter key+color, u3/u4 history color+key, u5 prep UAV.
-    static constexpr uint32_t kDescriptorsPerSlot = 10;
+    // u0 output, u1/u2 scatter key+color, u3/u4 history color+key, u5 prep
+    // UAV, t4 velocity snapshot (SRV, table offset 10 via its own range).
+    static constexpr uint32_t kDescriptorsPerSlot = 11;
     // Derived, not hardcoded: a fixed value overran the upload buffer when the
     // struct grew (the reprojection matrices pushed it past the old 1024).
     static constexpr uint32_t kCbSlotSize = (sizeof(DIBRStereoParams) + 255u) & ~255u;
@@ -550,6 +558,45 @@ private:
     bool ensure_gpu_timing(ID3D12Device* device);
     void drain_gpu_timing_slot(uint32_t slot);
     void log_gpu_timing();
+
+    // Weak SceneVelocity snapshot pointer (see set_velocity_texture).
+    ID3D12Resource* m_velocity_tex{nullptr};
+
+    // --- Velocity behavioral calibration (discovery Layer 3) ---
+    // Reads back a few velocity texels per frame, decodes them under BOTH
+    // encode flavors (linear = UE4.26/4.27, gamma = UE5.5+; the transition
+    // point is unbracketed and licensee forks deviate), scores each against
+    // the displacement the AFW frame-pair matrix predicts from the velocity's
+    // own packed depth, and picks the flavor empirically. Engine-version
+    // knowledge only orders the default, never skips the trial.
+    void record_velocity_calibration(ID3D12GraphicsCommandList* cmd_list, uint32_t slot, const DIBRStereoParams& params);
+    void drain_velocity_calibration(uint32_t slot);
+    void velocity_calibration_verdict();
+
+    struct VelCalibSlot {
+        bool valid{false};
+        float matrix[16]{};   // reproj for the frame pair the sampled velocity spans
+        uint32_t vel_width{0};
+        uint32_t vel_height{0};
+        uint32_t view_w{0};   // the lone view's width within the velocity target
+        uint32_t strip_x{0};
+        uint32_t strip_y[2]{};
+    };
+    static constexpr uint32_t kVelStripTexels = 16;
+    static constexpr uint32_t kVelStrips = 2;
+    static constexpr uint32_t kVelRowBytes = 256; // 16 texels x 8B padded to placed-footprint alignment
+    static constexpr uint32_t kVelSlotBytes = kVelStrips * kVelRowBytes;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_vel_calib_readback{};
+    uint8_t* m_vel_calib_mapped{nullptr};
+    std::array<VelCalibSlot, kRing> m_vel_calib_slots{};
+    float m_vel_prev_matrix[16]{};
+    bool m_vel_prev_matrix_valid{false};
+    std::vector<float> m_vel_err_gamma{};
+    std::vector<float> m_vel_err_linear{};
+    uint64_t m_vel_zero_texels{0};
+    uint64_t m_vel_total_texels{0};
+    bool m_vel_calibrated{false};
+    std::chrono::steady_clock::time_point m_vel_calib_last_log{};
 
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> m_ts_heap{};
     Microsoft::WRL::ComPtr<ID3D12Resource> m_ts_readback{};

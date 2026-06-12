@@ -45,6 +45,11 @@ RWTexture2D<float4> g_scatterColor : register(u2);
 // Temporal history keys (AFW: last frame's REAL render of the eye being
 // synthesized, device-depth keys); only read when temporal_enabled > 1.5.
 RWTexture2D<uint> g_historyKey : register(u4);
+// SceneVelocity snapshot (UE PF_A16B16G16R16: xy = gamma-encoded screen-space
+// object motion, zero texel = static / not written, zw = packed previous
+// device depth). Null descriptor when no snapshot exists; currently consumed
+// by debug view 8 (the select/bind/sample wiring proof).
+Texture2D<float4> g_velocityTex : register(t4);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
 
@@ -2293,10 +2298,14 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     if (temporal_enabled < 1.5f) {
         return c;
     }
-    uint sk = g_scatterKey[px] & 0x7FFFFFFFu; // strip the fill's marker bit
+    uint skRaw = g_scatterKey[px];
+    uint sk = skRaw & 0x7FFFFFFFu; // strip the fill's marker bit
     if (sk == 0u) {
         return c; // sky / no geometry: nothing to validate against
     }
+    // Marker bit set = this pixel is a fill band: its warp-side color is
+    // synthetic, so the color-agreement gate below must not protect it.
+    const bool wasFilled = (skRaw & 0x80000000u) != 0u;
     float estDepth = asfloat(sk);
     float2 uvRaw = float2((px.x + 0.5f) / (float)out_width,
                           (px.y + 0.5f) / (float)out_height);
@@ -2328,8 +2337,11 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
         // a camera-only reprojection while its depth still validates -
         // blending that paints a displaced double image. Large color deltas
         // therefore reject history instead (the warp result stands alone).
+        // EXCEPT in fill bands: there the warp side is synthetic fill and the
+        // depth-validated history is the actual render of the reveal, so a
+        // disagreement is precisely the case where history must win.
         float lumDiff = dot(abs(h - c), float3(0.299f, 0.587f, 0.114f));
-        float gate = saturate(1.0f - lumDiff * 8.0f);
+        float gate = wasFilled ? 1.0f : saturate(1.0f - lumDiff * 8.0f);
         c = lerp(c, h, saturate(temporal_blend) * gate);
     }
     return c;
@@ -2366,6 +2378,34 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
 #if !DIBR_LEAN
     float debugMode = floor(debug_view_mode + 0.5f);
+    if (debugMode >= 7.5f) {
+        // Debug view 8: SceneVelocity wiring proof (select/bind/sample). The
+        // snapshot is the previous frame's completed velocity GBuffer; UE only
+        // writes OBJECT motion by default, so static world keeps the zero
+        // clear texel. Dark green = static, heat = decoded |V| (Common.ush:
+        // linear decode then the SM5+ gamma square), black = no data.
+        uint vw, vh;
+        g_velocityTex.GetDimensions(vw, vh);
+        float3 col = float3(0.0f, 0.0f, 0.0f);
+        if (vw != 0u) {
+            float2 vUv = uv;
+            if (vw >= srcWidth * 2u) {
+                vUv.x *= 0.5f; // double-wide family target; the lone view fills the left half
+            }
+            float4 enc = g_velocityTex.SampleLevel(g_pointSampler, vUv, 0);
+            if (any(enc.xy != 0.0f)) {
+                const float invDiv = 1.0f / (0.499f * 0.5f);
+                float2 lin = enc.xy * invDiv - (32767.0f / 65535.0f) * invDiv;
+                float2 v = (lin * abs(lin)) * 0.5f; // VELOCITY_ENCODE_GAMMA (SM5+)
+                col = DebugHeat(saturate(length(v) * max(debug_view_scale, 0.0f) * 30.0f));
+            } else {
+                col = float3(0.0f, 0.07f, 0.0f);
+            }
+        }
+        float4 dbg = float4(col, 1.0f);
+        WriteStereoPair(x, y, dbg, dbg);
+        return;
+    }
     if (debugMode >= 1.0f) {
         // Debug views are the only consumer of the fully conditioned depth and
         // the guarded disparity (the gather path searches on YoroSearchDepth,

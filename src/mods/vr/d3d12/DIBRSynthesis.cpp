@@ -300,9 +300,11 @@ void DIBRSynthesis::build_async(Microsoft::WRL::ComPtr<ID3D12Device> device, uin
 }
 
 bool DIBRSynthesis::create_root_signature(ID3D12Device* device, DeviceObjects& objs) {
-    // One table with SRV t0..t3 (offset 0) and UAV u0..u5 (offset 4), a root
-    // CBV at b0, and static samplers s0 (linear clamp) / s1 (point clamp).
-    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    // One table with SRV t0..t3 (offset 0), UAV u0..u5 (offset 4) and SRV t4
+    // (offset 10 - appended as its own range so the earlier offsets never
+    // move), a root CBV at b0, and static samplers s0 (linear clamp) / s1
+    // (point clamp).
+    D3D12_DESCRIPTOR_RANGE ranges[3]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 4; // t0 color, t1 depth, t2 prepared depth, t3 history color
     ranges[0].BaseShaderRegister = 0;
@@ -311,10 +313,14 @@ bool DIBRSynthesis::create_root_signature(ID3D12Device* device, DeviceObjects& o
     ranges[1].NumDescriptors = 6; // u0 output, u1/u2 scatter key+color, u3/u4 history color+key, u5 prep
     ranges[1].BaseShaderRegister = 0;
     ranges[1].OffsetInDescriptorsFromTableStart = 4;
+    ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[2].NumDescriptors = 1; // t4 SceneVelocity snapshot
+    ranges[2].BaseShaderRegister = 4;
+    ranges[2].OffsetInDescriptorsFromTableStart = 10;
 
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[0].DescriptorTable.NumDescriptorRanges = 2;
+    params[0].DescriptorTable.NumDescriptorRanges = 3;
     params[0].DescriptorTable.pDescriptorRanges = ranges;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -647,6 +653,246 @@ bool DIBRSynthesis::ensure_prep(ID3D12Device* device, uint32_t width, uint32_t h
     return true;
 }
 
+namespace {
+// CPU twins of Common.ush's velocity decode. Encoded channels are UNORM16
+// already normalized to [0,1] here.
+float vel_decode_linear(float e) {
+    constexpr float inv_div = 1.0f / (0.499f * 0.5f);
+    return e * inv_div - (32767.0f / 65535.0f) * inv_div;
+}
+float vel_decode_gamma_post(float lin) {
+    return lin * std::fabs(lin) * 0.5f; // VELOCITY_ENCODE_GAMMA: sign-preserving square
+}
+float vel_decode_depth(float ez, float ew) {
+    const uint32_t hi = static_cast<uint32_t>(std::lround(ez * 65535.0f)) << 16;
+    const uint32_t lo = static_cast<uint32_t>(std::lround(ew * 65535.0f)) & 0xFFFEu;
+    const uint32_t bits = hi | lo;
+    float depth;
+    std::memcpy(&depth, &bits, sizeof(depth));
+    return depth;
+}
+// Column-major 4x4 (glm memcpy layout) times (x, y, z, 1).
+void vel_mat_mul(const float m[16], float x, float y, float z, float out[4]) {
+    for (int row = 0; row < 4; ++row) {
+        out[row] = m[0 * 4 + row] * x + m[1 * 4 + row] * y + m[2 * 4 + row] * z + m[3 * 4 + row];
+    }
+}
+} // namespace
+
+void DIBRSynthesis::record_velocity_calibration(ID3D12GraphicsCommandList* cmd_list, uint32_t slot, const DIBRStereoParams& params) {
+    auto& meta = m_vel_calib_slots[slot];
+    meta.valid = false;
+
+    const bool eligible = !m_vel_calibrated && m_velocity_tex != nullptr && params.temporal_enabled > 1.5f;
+
+    // The snapshot read during frame N holds the velocity of the N-1 -> N-2
+    // frame pair, so it is scored against the PREVIOUS call's matrix. Capture
+    // it before advancing the one-frame delay.
+    float pair_matrix[16]{};
+    const bool have_pair_matrix = m_vel_prev_matrix_valid;
+    if (have_pair_matrix) {
+        std::memcpy(pair_matrix, m_vel_prev_matrix, sizeof(pair_matrix));
+    }
+    if (params.temporal_enabled > 1.5f) {
+        std::memcpy(m_vel_prev_matrix, params.reproj_target_to_prev, sizeof(m_vel_prev_matrix));
+        m_vel_prev_matrix_valid = true;
+    } else {
+        m_vel_prev_matrix_valid = false;
+    }
+
+    if (!eligible || !have_pair_matrix) {
+        return;
+    }
+
+    if (m_vel_calib_readback == nullptr) {
+        ComPtr<ID3D12Device> device{};
+        if (FAILED(cmd_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
+            return;
+        }
+        D3D12_HEAP_PROPERTIES heap_props{};
+        heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buf_desc{};
+        buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buf_desc.Width = static_cast<uint64_t>(kRing) * kVelSlotBytes;
+        buf_desc.Height = 1;
+        buf_desc.DepthOrArraySize = 1;
+        buf_desc.MipLevels = 1;
+        buf_desc.SampleDesc.Count = 1;
+        buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &buf_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_vel_calib_readback)))) {
+            return;
+        }
+        const D3D12_RANGE full_read{0, static_cast<SIZE_T>(buf_desc.Width)};
+        if (FAILED(m_vel_calib_readback->Map(0, &full_read, reinterpret_cast<void**>(&m_vel_calib_mapped))) ||
+            m_vel_calib_mapped == nullptr) {
+            m_vel_calib_readback.Reset();
+            m_vel_calib_mapped = nullptr;
+            return;
+        }
+        m_vel_calib_last_log = std::chrono::steady_clock::now();
+    }
+
+    const auto vdesc = m_velocity_tex->GetDesc();
+    if (vdesc.Format != DXGI_FORMAT_R16G16B16A16_UNORM) {
+        // Two-channel platforms carry no packed depth: no displacement
+        // prediction is possible, so the version-ordered default stands.
+        SPDLOG_INFO_ONCE("[DIBR][velocity] calibration skipped: 2-channel velocity (no packed depth); using version-default decode");
+        m_vel_calibrated = true;
+        return;
+    }
+
+    const uint32_t vel_w = static_cast<uint32_t>(vdesc.Width);
+    const uint32_t vel_h = vdesc.Height;
+    // The lone view occupies the left half when the target is the double-wide
+    // family texture; otherwise it covers the full extent.
+    const uint32_t view_w = (vel_w >= params.source_width * 2) ? vel_w / 2 : vel_w;
+    if (view_w < kVelStripTexels * 4 || vel_h < 8) {
+        return;
+    }
+
+    std::memcpy(meta.matrix, pair_matrix, sizeof(meta.matrix));
+    meta.vel_width = vel_w;
+    meta.vel_height = vel_h;
+    meta.view_w = view_w;
+    meta.strip_x = view_w / 2 - kVelStripTexels / 2;
+    meta.strip_y[0] = vel_h / 3;
+    meta.strip_y[1] = (vel_h * 2) / 3;
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = m_velocity_tex;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cmd_list->ResourceBarrier(1, &barrier);
+
+    for (uint32_t s = 0; s < kVelStrips; ++s) {
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = m_velocity_tex;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = m_vel_calib_readback.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = static_cast<uint64_t>(slot) * kVelSlotBytes + s * kVelRowBytes;
+        dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+        dst.PlacedFootprint.Footprint.Width = kVelStripTexels;
+        dst.PlacedFootprint.Footprint.Height = 1;
+        dst.PlacedFootprint.Footprint.Depth = 1;
+        dst.PlacedFootprint.Footprint.RowPitch = kVelRowBytes;
+        D3D12_BOX box{};
+        box.left = meta.strip_x;
+        box.right = meta.strip_x + kVelStripTexels;
+        box.top = meta.strip_y[s];
+        box.bottom = meta.strip_y[s] + 1;
+        box.back = 1;
+        cmd_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    }
+
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    cmd_list->ResourceBarrier(1, &barrier);
+
+    meta.valid = true;
+}
+
+void DIBRSynthesis::drain_velocity_calibration(uint32_t slot) {
+    auto& meta = m_vel_calib_slots[slot];
+    if (!meta.valid || m_vel_calib_mapped == nullptr || m_vel_calibrated) {
+        meta.valid = false;
+        return;
+    }
+    meta.valid = false;
+
+    const uint32_t lone_view_w = (meta.view_w != 0) ? meta.view_w : meta.vel_width;
+
+    for (uint32_t s = 0; s < kVelStrips; ++s) {
+        const auto* texels = reinterpret_cast<const uint16_t*>(
+            m_vel_calib_mapped + static_cast<size_t>(slot) * kVelSlotBytes + s * kVelRowBytes);
+        for (uint32_t i = 0; i < kVelStripTexels; ++i) {
+            const float ex = texels[i * 4 + 0] / 65535.0f;
+            const float ey = texels[i * 4 + 1] / 65535.0f;
+            const float ez = texels[i * 4 + 2] / 65535.0f;
+            const float ew = texels[i * 4 + 3] / 65535.0f;
+            ++m_vel_total_texels;
+            if (texels[i * 4 + 0] == 0 && texels[i * 4 + 1] == 0) {
+                ++m_vel_zero_texels;
+                continue; // zero sentinel: surface wrote no velocity
+            }
+
+            // Predicted screen displacement of this surface across the frame
+            // pair, from the velocity's own packed previous depth.
+            const float depth = vel_decode_depth(ez, ew);
+            if (!(depth > 0.0f) || depth > 1.0f) {
+                continue;
+            }
+            const uint32_t px = meta.strip_x + i;
+            const uint32_t py = meta.strip_y[s];
+            const float ndc_x = ((px + 0.5f) / static_cast<float>(lone_view_w)) * 2.0f - 1.0f;
+            const float ndc_y = 1.0f - ((py + 0.5f) / static_cast<float>(meta.vel_height)) * 2.0f;
+            float prev[4]{};
+            vel_mat_mul(meta.matrix, ndc_x, ndc_y, depth, prev);
+            const float w = (std::fabs(prev[3]) > 1e-6f) ? prev[3] : 1e-6f;
+            const float pred_x = ndc_x - prev[0] / w;
+            const float pred_y = ndc_y - prev[1] / w;
+            const float pred_len = std::sqrt(pred_x * pred_x + pred_y * pred_y);
+            if (pred_len < 1.5e-3f || pred_len > 0.25f) {
+                continue; // needs head motion, and excludes teleports
+            }
+
+            const float lin_x = vel_decode_linear(ex);
+            const float lin_y = vel_decode_linear(ey);
+            const float gam_x = vel_decode_gamma_post(lin_x);
+            const float gam_y = vel_decode_gamma_post(lin_y);
+            const float err_lin = std::sqrt((lin_x - pred_x) * (lin_x - pred_x) + (lin_y - pred_y) * (lin_y - pred_y)) / pred_len;
+            const float err_gam = std::sqrt((gam_x - pred_x) * (gam_x - pred_x) + (gam_y - pred_y) * (gam_y - pred_y)) / pred_len;
+            if (m_vel_err_linear.size() < 4096) {
+                m_vel_err_linear.push_back(err_lin);
+                m_vel_err_gamma.push_back(err_gam);
+            }
+        }
+    }
+
+    velocity_calibration_verdict();
+}
+
+void DIBRSynthesis::velocity_calibration_verdict() {
+    constexpr size_t kNeeded = 128;
+    if (m_vel_err_gamma.size() < kNeeded) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_vel_calib_last_log >= std::chrono::seconds(10)) {
+            m_vel_calib_last_log = now;
+            SPDLOG_INFO("[DIBR][velocity] calibrating: {} qualifying samples of {} needed (requires head motion + animated/velocity-writing pixels; zero-sentinel fraction {:.2f})",
+                m_vel_err_gamma.size(), kNeeded,
+                m_vel_total_texels > 0 ? static_cast<double>(m_vel_zero_texels) / static_cast<double>(m_vel_total_texels) : 0.0);
+        }
+        return;
+    }
+
+    auto median = [](std::vector<float> v) {
+        const size_t mid = v.size() / 2;
+        std::nth_element(v.begin(), v.begin() + mid, v.end());
+        return v[mid];
+    };
+    const float med_gamma = median(m_vel_err_gamma);
+    const float med_linear = median(m_vel_err_linear);
+    m_vel_calibrated = true;
+
+    if ((std::min)(med_gamma, med_linear) > 0.75f) {
+        // Neither flavor tracks the camera prediction: the sampled pixels are
+        // object-motion dominated, or the buffer is a frame stale. Fall back
+        // to the version-ordered default (gamma for the UE5 family).
+        SPDLOG_WARN("[DIBR][velocity] calibration INCONCLUSIVE (median rel-err gamma={:.3f} linear={:.3f}, n={}); defaulting to gamma decode",
+            med_gamma, med_linear, m_vel_err_gamma.size());
+    } else {
+        SPDLOG_INFO("[DIBR][velocity] calibration verdict: flavor={} (median rel-err gamma={:.3f} linear={:.3f}, n={}, zero-sentinel fraction {:.2f})",
+            med_gamma <= med_linear ? "gamma" : "linear", med_gamma, med_linear, m_vel_err_gamma.size(),
+            m_vel_total_texels > 0 ? static_cast<double>(m_vel_zero_texels) / static_cast<double>(m_vel_total_texels) : 0.0);
+    }
+    m_vel_err_gamma.clear();
+    m_vel_err_linear.clear();
+}
+
 bool DIBRSynthesis::ensure_gpu_timing(ID3D12Device* device) {
     if (m_ts_queue == nullptr) {
         return false;
@@ -960,6 +1206,9 @@ ID3D12Resource* DIBRSynthesis::synthesize(
         drain_gpu_timing_slot(slot);
         log_gpu_timing();
     }
+    // Velocity discovery Layer 3: consume what this slot sampled kRing
+    // frames ago before its readback region is overwritten below.
+    drain_velocity_calibration(slot);
     const auto ts_begin = [&]() {
         if (ts_on && ts_pass_count < kTsMaxPasses) {
             cmd_list->EndQuery(m_ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * kTsQueriesPerSlot + ts_pass_count * 2);
@@ -1012,6 +1261,7 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     mix(reinterpret_cast<uintptr_t>(m_scatter_color[cur].Get()));
     mix(reinterpret_cast<uintptr_t>(history_color));
     mix(reinterpret_cast<uintptr_t>(history_key));
+    mix(reinterpret_cast<uintptr_t>(m_velocity_tex));
     mix(static_cast<uint64_t>(mode == Mode::YoroScatter));
     mix(m_resource_generation);
 
@@ -1074,6 +1324,16 @@ ID3D12Resource* DIBRSynthesis::synthesize(
         prep_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         device->CreateUnorderedAccessView((prep_pso != nullptr) ? m_prep.Get() : nullptr, nullptr, &prep_uav,
             D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 9 * m_objs.descriptor_stride});
+
+        // t4: SceneVelocity snapshot (tracker leaves it in NON_PIXEL_SHADER_
+        // RESOURCE; null descriptor when no snapshot exists yet).
+        D3D12_SHADER_RESOURCE_VIEW_DESC vel_srv{};
+        vel_srv.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+        vel_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        vel_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        vel_srv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(m_velocity_tex, &vel_srv,
+            D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 10 * m_objs.descriptor_stride});
 
         // CPU-only twins of the scatter key/color UAVs for
         // ClearUnorderedAccessView* (same inputs, so the same guard applies).
@@ -1235,6 +1495,11 @@ ID3D12Resource* DIBRSynthesis::synthesize(
         ts_end(TsPass::Stash);
     }
 
+    // Velocity discovery Layer 3: sample a few texels of the snapshot for
+    // the behavioral decode calibration (no-op once calibrated or when the
+    // velocity example is not armed).
+    record_velocity_calibration(cmd_list, slot, params);
+
     // Resolve this frame's timestamp pairs into the readback slot; they are
     // consumed when the ring wraps back around (kRing frames later).
     if (ts_on && ts_pass_count > 0) {
@@ -1293,6 +1558,16 @@ void DIBRSynthesis::reset() {
     m_ts_queue = nullptr;
     m_ts_frequency = 0;
     m_ts_slot_count.fill(0);
+    if (m_vel_calib_readback != nullptr && m_vel_calib_mapped != nullptr) {
+        m_vel_calib_readback->Unmap(0, nullptr);
+    }
+    m_vel_calib_readback.Reset();
+    m_vel_calib_mapped = nullptr;
+    for (auto& s : m_vel_calib_slots) {
+        s.valid = false;
+    }
+    m_vel_prev_matrix_valid = false;
+    m_velocity_tex = nullptr;
     m_slot_desc_hash.fill(0);
     m_ring_index = 0;
     m_state.store(State::NotStarted, std::memory_order_release);

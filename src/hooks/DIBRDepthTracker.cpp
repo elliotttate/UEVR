@@ -8,7 +8,10 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
+#include <spdlog/spdlog.h>
 
 #include "DIBRDepthTracker.hpp"
 
@@ -229,6 +232,28 @@ void record_rtv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE descriptor
     }
 
     const auto desc = resource->GetDesc();
+
+    // Motion-vector discovery probe: UE renders object motion into a velocity
+    // GBuffer - FVelocityRendering::GetFormat: PF_A16B16G16R16
+    // (R16G16B16A16_UNORM, velocity-depth in zw) on Lumen/ray-tracing
+    // platforms like SN2, PF_G16R16 (R16G16_UNORM) otherwise. Encoding
+    // (Common.ush EncodeVelocityToTexture): xy = V.xy * 0.2495 + 32767/65535,
+    // and pixels with NO object motion keep the CLEAR value (0,0) - so a
+    // binary "animated?" gate needs no decode. Log each velocity-shaped
+    // render target ONCE so the AFW temporal gates can be wired to the real
+    // buffer identity (PureDark gates his temporal blend on |MV| ~0.005;
+    // ours currently has no MV input at all).
+    if ((desc.Format == DXGI_FORMAT_R16G16B16A16_UNORM || desc.Format == DXGI_FORMAT_R16G16_UNORM ||
+            desc.Format == DXGI_FORMAT_R16G16_FLOAT || desc.Format == DXGI_FORMAT_R32G32_FLOAT) &&
+        desc.Width >= 256 && desc.Height >= 256 && desc.SampleDesc.Count == 1) {
+        static std::mutex s_vel_mtx{};
+        static std::unordered_set<ID3D12Resource*> s_vel_seen{};
+        std::scoped_lock _{s_vel_mtx};
+        if (s_vel_seen.size() < 64 && s_vel_seen.insert(resource).second) {
+            spdlog::info("[DIBR] velocity-shaped RTV observed: {:p} {}x{} fmt {}",
+                static_cast<void*>(resource), desc.Width, desc.Height, static_cast<int>(desc.Format));
+        }
+    }
 
     std::scoped_lock _{g_mtx};
     if (g_rtv_views.size() >= kMaxViewMappings) {
@@ -663,6 +688,178 @@ void set_afw_depth_snapshot_enabled(bool enabled) {
 
 void set_recording_frame(uint32_t engine_frame) {
     g_recording_frame.store(engine_frame, std::memory_order_release);
+}
+
+namespace {
+std::mutex g_vel_mtx{};
+Microsoft::WRL::ComPtr<ID3D12Resource> g_vel_snapshot{};
+uint64_t g_vel_width{0};
+uint32_t g_vel_height{0};
+uint64_t g_vel_best_area{0};
+uint32_t g_vel_done_frame{0xFFFFFFFFu};
+bool g_vel_snapshot_readable{false}; // false = COPY_DEST, true = NON_PIXEL_SHADER_RESOURCE
+// Deferred-release graveyard: a recreated snapshot's predecessor may still be
+// referenced by recorded-but-unexecuted command lists (the copy + barriers);
+// releasing it live is a use-after-free the GPU sees - keep retirees alive
+// for a generous frame budget instead.
+struct VelRetired {
+    Microsoft::WRL::ComPtr<ID3D12Resource> texture{};
+    uint32_t retire_frame{};
+};
+std::vector<VelRetired> g_vel_graveyard{};
+std::atomic<void*> g_vel_source{nullptr};
+
+// Opt-in (UEVR_DIBR_VELOCITY=1): the snapshot copy mutates the game's command
+// stream every frame; keep the default path untouched until the consumers
+// (temporal MV gates) ship.
+bool velocity_snapshot_enabled() {
+    static const bool value = []() {
+        const char* env = std::getenv("UEVR_DIBR_VELOCITY");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return value;
+}
+} // namespace
+
+void record_velocity_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint32_t rtv_count) {
+    if (!velocity_snapshot_enabled() || !view_tracking_enabled() || cmd_list == nullptr || rtv0 == 0 || rtv_count == 0) {
+        return;
+    }
+
+    ViewInfo info{};
+    bool extent_matches_depth = false;
+    {
+        std::scoped_lock _{g_mtx};
+        const auto it = g_rtv_views.find(rtv0);
+        if (it == g_rtv_views.end()) {
+            return;
+        }
+        info = it->second;
+        // Version-invariant identity (verified 4.26 -> 5.6): the velocity
+        // target's extent exactly equals a scene depth extent. Names and
+        // allocation paths churned across engine versions; this did not.
+        for (const auto& c : g_candidates) {
+            if (c.width == info.width && c.height == info.height) {
+                extent_matches_depth = true;
+                break;
+            }
+        }
+    }
+
+    // SceneVelocity invariants (UE 4.26 -> 5.6): exactly one of two formats
+    // (R16G16B16A16_UNORM on RT/Lumen platforms, R16G16_UNORM otherwise),
+    // scene-scale, non-square, non-MSAA, extent == SceneDepthZ's.
+    if ((info.format != DXGI_FORMAT_R16G16B16A16_UNORM && info.format != DXGI_FORMAT_R16G16_UNORM) ||
+        info.resource == nullptr || !extent_matches_depth ||
+        info.width < 1024 || info.height < 256 || info.width == info.height) {
+        return;
+    }
+
+    std::scoped_lock _{g_vel_mtx};
+    const uint64_t area = static_cast<uint64_t>(info.width) * info.height;
+    if (area < g_vel_best_area) {
+        return;
+    }
+    g_vel_best_area = area;
+
+    // One copy per recording frame (the pooled target also ping-pongs, so a
+    // frame's first qualifying bind is the previous frame's COMPLETED
+    // velocity - the bind precedes this frame's clear/write).
+    const uint32_t frame = g_recording_frame.load(std::memory_order_acquire);
+    if (frame != 0xFFFFFFFFu) {
+        if (g_vel_done_frame == frame) {
+            return;
+        }
+        g_vel_done_frame = frame;
+        // Retirees outlive any command list recorded around their release.
+        g_vel_graveyard.erase(
+            std::remove_if(g_vel_graveyard.begin(), g_vel_graveyard.end(),
+                [frame](const VelRetired& r) { return frame - r.retire_frame > 64; }),
+            g_vel_graveyard.end());
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12Device> device{};
+    if (FAILED(cmd_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
+        return;
+    }
+
+    auto* src = static_cast<ID3D12Resource*>(info.resource);
+    const auto sdesc = src->GetDesc();
+
+    if (g_vel_snapshot == nullptr || g_vel_width != sdesc.Width || g_vel_height != sdesc.Height) {
+        // Retire (never live-release) the previous snapshot: recorded command
+        // lists from in-flight frames may still hold copies/barriers on it.
+        if (g_vel_snapshot != nullptr) {
+            g_vel_graveyard.push_back(VelRetired{std::move(g_vel_snapshot), frame});
+            g_vel_snapshot = nullptr;
+        }
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = sdesc.Width;
+        desc.Height = sdesc.Height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = sdesc.Format;
+        desc.SampleDesc.Count = 1;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(g_vel_snapshot.ReleaseAndGetAddressOf())))) {
+            g_vel_snapshot.Reset();
+            return;
+        }
+        g_vel_snapshot->SetName(L"DIBR Velocity Snapshot");
+        g_vel_width = sdesc.Width;
+        g_vel_height = sdesc.Height;
+        g_vel_snapshot_readable = false;
+        spdlog::info("[DIBR] velocity snapshot active: {}x{} fmt {} (SceneVelocity {:p})",
+            sdesc.Width, sdesc.Height, static_cast<int>(sdesc.Format), static_cast<void*>(src));
+    }
+
+    // The RTV is being bound for this frame's velocity pass, so the resource
+    // sits in RENDER_TARGET here; round-trip it through COPY_SOURCE around an
+    // in-list copy (same pattern as the AFW depth snapshot).
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = src;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cmd_list->ResourceBarrier(1, &barrier);
+
+    if (g_vel_snapshot_readable) {
+        D3D12_RESOURCE_BARRIER snap{};
+        snap.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        snap.Transition.pResource = g_vel_snapshot.Get();
+        snap.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        snap.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        snap.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        cmd_list->ResourceBarrier(1, &snap);
+    }
+
+    cmd_list->CopyResource(g_vel_snapshot.Get(), src);
+    g_vel_source.store(src, std::memory_order_relaxed);
+
+    D3D12_RESOURCE_BARRIER snap_read{};
+    snap_read.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    snap_read.Transition.pResource = g_vel_snapshot.Get();
+    snap_read.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    snap_read.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    snap_read.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    cmd_list->ResourceBarrier(1, &snap_read);
+    g_vel_snapshot_readable = true;
+
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    cmd_list->ResourceBarrier(1, &barrier);
+}
+
+Microsoft::WRL::ComPtr<ID3D12Resource> get_velocity_snapshot() {
+    std::scoped_lock _{g_vel_mtx};
+    return g_vel_snapshot_readable ? g_vel_snapshot : nullptr;
+}
+
+void* get_velocity_source() {
+    return g_vel_source.load(std::memory_order_relaxed);
 }
 
 void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uint32_t rtv_count, SIZE_T dsv) {
