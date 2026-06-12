@@ -426,6 +426,27 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             g_scatterKey[dtid.xy] = ((((dl < dr) ? kl : kr) & ~0x3u) | 0x1u) | 0x80000000u;
             return;
         }
+        // Which side is the FAR surface on? A true disocclusion's background
+        // lies along the warp direction (the reveal opens opposite the
+        // occluder's shift); finding it on the WRONG side means the gap is
+        // interior to a THIN occluder crossed horizontally (a frond) - its
+        // content is the OBJECT. Routing those through the reveal machinery
+        // painted the water/logo behind the frond INTO it: the teal specks
+        // that bloom while turning the head (rotation thins the scatter
+        // coverage of thin geometry, multiplying these gaps).
+        {
+            const int revealDir = (SynthEyeSign() < 0.0f) ? 1 : -1;
+            const bool farIsRight = (dr < dl); // reversed-Z: smaller = farther
+            const bool farAlongDir = (revealDir > 0) ? farIsRight : !farIsRight;
+            if (!farAlongDir) {
+                const bool leftNear = (dl > dr);
+                float3 nearCol = leftNear ? g_scatterColor[uint2(xl, dtid.y)].rgb
+                                          : g_scatterColor[uint2(xr, dtid.y)].rgb;
+                g_scatterColor[dtid.xy] = float4(nearCol, 1.0f);
+                g_scatterKey[dtid.xy] = (((leftNear ? kl : kr) & ~0x3u) | 0x1u) | 0x80000000u;
+                return;
+            }
+        }
         // Mixed-depth edge gap: a REVEAL band. The provenance view showed the
         // interpolated gradient claiming virtually every reveal (the early
         // return here starved the stash/background paths) - and a synthetic
@@ -437,6 +458,49 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         fillKey = (dl < dr) ? kl : kr; // farther side = the reveal's content
         prov = 1u;
         haveFallback = true;
+    }
+
+    if (!haveFallback && (xl < 0 || xr < 0)) {
+        // Thin VERTICAL geometry (fronds, coral stalks) drops sparse texels
+        // under head rotation: horizontally the gap sees one side or none,
+        // and the reveal machinery would paint the background from BEHIND
+        // the object into it - the teal specks that bloom while turning.
+        // The structure is vertical, so probe for same-surface coverage
+        // above and below and repair from the object itself. True reveal
+        // bands extend vertically too, so their vertical probes land on
+        // holes and fail harmlessly through to the reveal path.
+        int yu = -1, yd = -1;
+        uint ku = 0u, kd = 0u;
+        [loop]
+        for (int s = 1; s <= 8 && (yu < 0 || yd < 0); ++s) {
+            if (yu < 0) {
+                int yy = (int)dtid.y - s;
+                if (yy >= 0) {
+                    uint k = g_scatterKey[uint2(dtid.x, yy)];
+                    if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(dtid.x, yy)].a > 0.5f) { yu = yy; ku = k; }
+                }
+            }
+            if (yd < 0) {
+                int yy = (int)dtid.y + s;
+                if (yy < (int)synth_height) {
+                    uint k = g_scatterKey[uint2(dtid.x, yy)];
+                    if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(dtid.x, yy)].a > 0.5f) { yd = yy; kd = k; }
+                }
+            }
+        }
+        if (yu >= 0 && yd >= 0) {
+            float du = asfloat(ku);
+            float dd = asfloat(kd);
+            if (abs(du - dd) <= max(0.10f * max(du, dd), 1e-3f)) {
+                float wu = (float)(yd - (int)dtid.y);
+                float wd = (float)((int)dtid.y - yu);
+                float3 vcol = (g_scatterColor[uint2(dtid.x, yu)].rgb * wu +
+                               g_scatterColor[uint2(dtid.x, yd)].rgb * wd) / max(wu + wd, 1.0f);
+                g_scatterColor[dtid.xy] = float4(vcol, 1.0f);
+                g_scatterKey[dtid.xy] = ((((du < dd) ? ku : kd) & ~0x3u) | 0x1u) | 0x80000000u;
+                return;
+            }
+        }
     }
 
     // Disocclusion hole: a reveal opens on the side of a foreground object
