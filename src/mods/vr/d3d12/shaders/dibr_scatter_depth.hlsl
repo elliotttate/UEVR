@@ -326,6 +326,28 @@ float SynthEyeSign()
     return (mode_param0 < 0.5f) ? -1.0f : 1.0f;
 }
 
+// Dithered-opacity foliage (masked materials under TAA) writes depth on only
+// PART of its pixels; the rest read the BACKGROUND through the dither holes.
+// Scattering raw depth shreds such objects into interleaved near/far dashes
+// (the glowing fronds against open water). Near-biased 3x3 fetch: dither
+// holes adopt their object's depth so the object scatters SOLID at its own
+// parallax; true silhouettes dilate by one source pixel, which the
+// anti-aliased edge already spans.
+float NearBiasedDepth(float2 uv)
+{
+    float2 px = float2(1.0f / (float)srcWidth, 1.0f / (float)srcHeight);
+    float d = SampleRawDeviceDepth(uv);
+    [unroll]
+    for (int oy = -1; oy <= 1; ++oy) {
+        [unroll]
+        for (int ox = -1; ox <= 1; ++ox) {
+            if (ox == 0 && oy == 0) continue;
+            d = max(d, SampleRawDeviceDepth(uv + float2(ox, oy) * px));
+        }
+    }
+    return d;
+}
+
 [numthreads(DIBR_TG, DIBR_TG, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
@@ -333,7 +355,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // (true FOV - narrower than the overscan-grown source when RT growth is on).
     if (dtid.x >= srcWidth || dtid.y >= srcHeight) return;
     float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
-    float d = SampleRawDeviceDepth(uv);
+    float d = NearBiasedDepth(uv);
     float eyeSign = SynthEyeSign();
     float2 tUv = ReprojectSourceUv(uv, d, eyeSign);
     float tx = tUv.x * (float)synth_width - 0.5f;

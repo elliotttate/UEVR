@@ -6650,7 +6650,7 @@ inline std::string dibr_raymarch_source() {
     return out;
 }
 
-// dibr_scatter_depth.hlsl (13120 bytes, 2 chunks)
+// dibr_scatter_depth.hlsl (14013 bytes, 2 chunks)
 inline const char* const g_dibr_scatter_depth_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -6980,6 +6980,29 @@ float SynthEyeSign()
     return (mode_param0 < 0.5f) ? -1.0f : 1.0f;
 }
 
+// Dithered-opacity foliage (masked materials under TAA) writes depth on only
+// PART of its pixels; the rest read the BACKGROUND through the dither holes.
+// Scattering raw depth shreds such objects into interleaved near/far dashes
+// (the glowing fronds against open water). Near-biased 3x3 fetch: dither
+// holes adopt their object's depth so the object scatters SOLID at its own
+// parallax; true silhouettes dilate by one source pixel, which the
+// anti-aliased edge already spans.
+float NearBiasedDepth(float2 uv)
+{
+    float2 px = float2(1.0f / (float)srcWidth, 1.0f / (float)srcHeight);
+    float d = SampleRawDeviceDepth(uv);
+    [unroll]
+    for (int oy = -1; oy <= 1; ++oy) {
+        [unroll]
+        for (int ox = -1; ox <= 1; ++ox) {
+            if (ox == 0 && oy == 0) continue;
+            d = max(d, SampleRawDeviceDepth(uv + float2(ox, oy) * px));
+        }
+    }
+    return d;
+}
+)DIBR",
+R"DIBR(
 [numthreads(DIBR_TG, DIBR_TG, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
@@ -6987,7 +7010,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // (true FOV - narrower than the overscan-grown source when RT growth is on).
     if (dtid.x >= srcWidth || dtid.y >= srcHeight) return;
     float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
-    float d = SampleRawDeviceDepth(uv);
+    float d = NearBiasedDepth(uv);
     float eyeSign = SynthEyeSign();
     float2 tUv = ReprojectSourceUv(uv, d, eyeSign);
     float tx = tUv.x * (float)synth_width - 0.5f;
@@ -6996,8 +7019,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     uint key = asuint(max(d, 1e-7f)); // strictly > 0 so 0 stays "empty"
     int x0 = (int)floor(tx);
     // Adaptive span splat: when the SAME surface continues at the next
-)DIBR",
-R"DIBR(    // source column, fill the full stretched span between the two targets.
+    // source column, fill the full stretched span between the two targets.
     // A fixed 2-wide splat leaves gaps wherever a magnifying silhouette
     // flank stretches neighbors more than 2px apart - background then wins
     // the in-between texels and the object turns into see-through dashes at
@@ -7031,7 +7053,7 @@ inline std::string dibr_scatter_depth_source() {
     return out;
 }
 
-// dibr_scatter_color.hlsl (12918 bytes, 2 chunks)
+// dibr_scatter_color.hlsl (13539 bytes, 2 chunks)
 inline const char* const g_dibr_scatter_color_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7361,14 +7383,33 @@ float SynthEyeSign()
     return (mode_param0 < 0.5f) ? -1.0f : 1.0f;
 }
 
+// EXACT mirror of the depth pass's near-biased fetch: the key computed here
+// must match the key the depth pass committed bit-for-bit or the color
+// write misses its own texels (see the key == comparison below).
+float NearBiasedDepth(float2 uv)
+{
+    float2 px = float2(1.0f / (float)srcWidth, 1.0f / (float)srcHeight);
+    float d = SampleRawDeviceDepth(uv);
+    [unroll]
+    for (int oy = -1; oy <= 1; ++oy) {
+        [unroll]
+        for (int ox = -1; ox <= 1; ++ox) {
+            if (ox == 0 && oy == 0) continue;
+            d = max(d, SampleRawDeviceDepth(uv + float2(ox, oy) * px));
+        }
+    }
+    return d;
+}
+
 [numthreads(DIBR_TG, DIBR_TG, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
     // Iterate SOURCE pixels; the scatter target buffers live in OUTPUT space
     // (true FOV - narrower than the overscan-grown source when RT growth is on).
-    if (dtid.x >= srcWidth || dtid.y >= srcHeight) return;
+)DIBR",
+R"DIBR(    if (dtid.x >= srcWidth || dtid.y >= srcHeight) return;
     float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
-    float d = SampleRawDeviceDepth(uv);
+    float d = NearBiasedDepth(uv);
     float eyeSign = SynthEyeSign();
     float2 tUv = ReprojectSourceUv(uv, d, eyeSign);
     float tx = tUv.x * (float)synth_width - 0.5f;
@@ -7378,8 +7419,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float4 c = g_colorTex.SampleLevel(g_linearSampler, uv, 0);
     int x0 = (int)floor(tx);
     // Mirror the depth pass's adaptive span exactly (same neighbor probe,
-)DIBR",
-R"DIBR(    // same depth agreement, same cap) so every texel whose key this sample
+    // same depth agreement, same cap) so every texel whose key this sample
     // won also receives its color - a key without color reads as covered-
     // without-content downstream.
     int span = 2;
