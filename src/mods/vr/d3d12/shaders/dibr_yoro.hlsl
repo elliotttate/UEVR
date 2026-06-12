@@ -2391,9 +2391,17 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     // (open water at device ~1e-4, reversed-Z), where a relative tolerance
     // collapses below the rock-vs-water separation and rejects the real
     // reveal content the blend exists to deliver.
+    //
+    // SOFT confidence, not a binary accept: under 6DOF motion the
+    // reprojection error grows smoothly, and a hard threshold makes pixels
+    // TOGGLE between history and warp frame-to-frame - half-rate shimmer
+    // that only exists while moving. Full weight inside half the tolerance,
+    // fading to zero at twice it; at rest (error ~0) identical to before.
     uint hk = g_historyKey[uint2((uint)round(max(fx, 0.0f)), (uint)round(max(fy, 0.0f)))] & 0x7FFFFFFFu;
     const float tol = max(0.15f * estDepth, wasFilled ? 2e-3f : 2e-4f);
-    if (hk != 0u && abs(asfloat(hk) - estDepth) <= tol) {
+    const float depthErr = abs(asfloat(hk) - estDepth);
+    const float depthConf = saturate((2.0f * tol - depthErr) / (1.5f * tol));
+    if (hk != 0u && depthConf > 0.0f) {
         float3 h = g_historyColorSrv.SampleLevel(g_linearSampler, histUv, 0).rgb;
         // Color-agreement gate: the blend exists to cancel the SUBTLE
         // real-vs-warp resampling difference, where history and warp agree
@@ -2408,7 +2416,7 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
         // disagreement is precisely the case where history must win.
         float lumDiff = dot(abs(h - c), float3(0.299f, 0.587f, 0.114f));
         float gate = wasFilled ? 1.0f : saturate(1.0f - lumDiff * 8.0f);
-        c = lerp(c, h, saturate(temporal_blend) * gate);
+        c = lerp(c, h, saturate(temporal_blend) * gate * depthConf);
     }
     return c;
 }

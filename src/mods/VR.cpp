@@ -4355,6 +4355,24 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     // created before injection's hooks landed and so can never be resolved
     // at bind time. Requested by the present-side watchdog; capped per
     // session; runs here because cvar writes belong on the game thread.
+    // UEVR_DIBR_FORCE_VELOCITY=1: make every opaque draw write velocity
+    // (camera + object motion both) instead of UE's default object-motion-
+    // only writes. Gives the AFW advection a full-screen motion field for
+    // 6DOF A/B testing; costs the engine a fatter velocity pass.
+    static const bool dibr_force_velocity = []() {
+        const char* v = std::getenv("UEVR_DIBR_FORCE_VELOCITY");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (dibr_force_velocity) {
+        static bool s_velocity_forced = false;
+        if (!s_velocity_forced && get_dibr_requested_mode() > 0) {
+            s_velocity_forced = true;
+            const bool ok = sdk::set_cvar_int(L"Renderer", L"r.Velocity.ForceOutput", 1) ||
+                            sdk::set_cvar_int(L"Renderer", L"r.BasePassForceOutputsVelocity", 1);
+            spdlog::info("[DIBR] r.Velocity.ForceOutput requested ({})", ok ? "set" : "cvar not found");
+        }
+    }
+
     if (m_dibr_rt_recreate_state == 1) {
         if (--m_dibr_rt_recreate_ticks <= 0) {
             sdk::set_cvar_float(L"Renderer", L"r.ScreenPercentage", m_dibr_rt_recreate_saved);

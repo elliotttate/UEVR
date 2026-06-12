@@ -1985,7 +1985,7 @@ inline std::string dibr_inverse_source() {
     return out;
 }
 
-// dibr_yoro.hlsl (108365 bytes, 10 chunks)
+// dibr_yoro.hlsl (108869 bytes, 10 chunks)
 inline const char* const g_dibr_yoro_chunks[] = {
 R"DIBR(// dibr_yoro.hlsl — YORO / Meta-style asymmetric inverse-warp DIBR
 //
@@ -4387,13 +4387,21 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     // (open water at device ~1e-4, reversed-Z), where a relative tolerance
     // collapses below the rock-vs-water separation and rejects the real
     // reveal content the blend exists to deliver.
-    uint hk = g_historyKey[uint2((uint)round(max(fx, 0.0f)), (uint)round(max(fy, 0.0f)))] & 0x7FFFFFFFu;
+    //
+    // SOFT confidence, not a binary accept: under 6DOF motion the
+    // reprojection error grows smoothly, and a hard threshold makes pixels
+    // TOGGLE between history and warp frame-to-frame - half-rate shimmer
+    // that only exists while moving. Full weight inside half the tolerance,
+    // fading to zero at twice it; at rest (error ~0) identical to before.
+)DIBR",
+R"DIBR(    uint hk = g_historyKey[uint2((uint)round(max(fx, 0.0f)), (uint)round(max(fy, 0.0f)))] & 0x7FFFFFFFu;
     const float tol = max(0.15f * estDepth, wasFilled ? 2e-3f : 2e-4f);
-    if (hk != 0u && abs(asfloat(hk) - estDepth) <= tol) {
+    const float depthErr = abs(asfloat(hk) - estDepth);
+    const float depthConf = saturate((2.0f * tol - depthErr) / (1.5f * tol));
+    if (hk != 0u && depthConf > 0.0f) {
         float3 h = g_historyColorSrv.SampleLevel(g_linearSampler, histUv, 0).rgb;
         // Color-agreement gate: the blend exists to cancel the SUBTLE
-)DIBR",
-R"DIBR(        // real-vs-warp resampling difference, where history and warp agree
+        // real-vs-warp resampling difference, where history and warp agree
         // closely. Object-space animation that the MV advection above missed
         // (no velocity texel, disparity-blind lookup) still arrives displaced
         // while its depth validates - blending that paints a double image.
@@ -4405,7 +4413,7 @@ R"DIBR(        // real-vs-warp resampling difference, where history and warp agr
         // disagreement is precisely the case where history must win.
         float lumDiff = dot(abs(h - c), float3(0.299f, 0.587f, 0.114f));
         float gate = wasFilled ? 1.0f : saturate(1.0f - lumDiff * 8.0f);
-        c = lerp(c, h, saturate(temporal_blend) * gate);
+        c = lerp(c, h, saturate(temporal_blend) * gate * depthConf);
     }
     return c;
 }
@@ -4613,7 +4621,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
         float2 rightRefUV = ApplyOutputEyeAlignment(uv + rightInterlaceOffset, -1.0f);
         float4 rightRefColor = SampleFilteredOutputColor(SourceRemapUv(rightRefUV));
-        float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightRefColor, centerColor))));
+)DIBR",
+R"DIBR(        float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightRefColor, centerColor))));
         outRight = ApplyAlignmentMarker(uv, rightRefUV, outRight);
         if (floor(output_layout_mode + 0.5f) == 2.0f) {
 #if SCATTER_COMPOSE
@@ -4621,8 +4630,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 #else
             float2 leftReducedSearchUV = YoroSearchUv(uv, 1.0f, searchDepth, boundaryScale, 0.33333334f);
             float2 leftReducedUV = ApplyOutputEyeAlignment(leftReducedSearchUV + leftInterlaceOffset, 1.0f);
-)DIBR",
-R"DIBR(            float4 leftReducedColor = SampleSynthStereoColor(leftReducedUV, uv, centerColor, searchDepth);
+            float4 leftReducedColor = SampleSynthStereoColor(leftReducedUV, uv, centerColor, searchDepth);
             float4 outLeftReduced = ApplyCursorOverlay(uv, 1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, 1.0f, ApplyOutputMatte(uv, leftReducedColor, centerColor))));
             outLeftReduced = ApplyAlignmentMarker(uv, leftReducedUV, outLeftReduced);
 #endif
