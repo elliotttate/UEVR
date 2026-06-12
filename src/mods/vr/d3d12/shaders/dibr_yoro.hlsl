@@ -2300,9 +2300,6 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     }
     uint skRaw = g_scatterKey[px];
     uint sk = skRaw & 0x7FFFFFFFu; // strip the fill's marker bit
-    if (sk == 0u) {
-        return c; // sky / no geometry: nothing to validate against
-    }
     // Marker bit set = this pixel is a fill band: its warp-side color is
     // synthetic, so the color-agreement gate below must not protect it.
     const bool wasFilled = (skRaw & 0x80000000u) != 0u;
@@ -2310,6 +2307,42 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     float2 uvRaw = float2((px.x + 0.5f) / (float)out_width,
                           (px.y + 0.5f) / (float)out_height);
     float2 ndc = float2(uvRaw.x * 2.0f - 1.0f, 1.0f - uvRaw.y * 2.0f);
+    if (sk == 0u) {
+        // No warp data AT ALL: the outer no-source band (beyond the source
+        // eye's frustum on this eye's outward side) and unscattered sky. The
+        // caller's fallback is centerColor - the OTHER eye's content at the
+        // wrong parallax - which alternates against this eye's REAL render
+        // at half rate: the leftmost-of-left/rightmost-of-right edge
+        // flicker. But this eye rendered the band itself one frame ago:
+        // fetch the stash, iterating once at the FOUND depth so near
+        // content lands at its own parallax instead of the far plane's.
+        float lookupD = 0.0f;
+        float2 bandUv = float2(0.0f, 0.0f);
+        uint bandKey = 0u;
+        [unroll]
+        for (int it = 0; it < 2; ++it) {
+            float4 bp = mul(reproj_target_to_prev, float4(ndc, lookupD, 1.0f));
+            float bw = (abs(bp.w) > 1e-6f) ? bp.w : 1e-6f;
+            float2 bn = bp.xy / bw;
+            bandUv = float2(bn.x * 0.5f + 0.5f, 0.5f - bn.y * 0.5f);
+            int2 bpx = int2((int)(bandUv.x * (float)out_width), (int)(bandUv.y * (float)out_height));
+            if (bpx.x < 0 || bpx.x >= (int)out_width || bpx.y < 0 || bpx.y >= (int)out_height) {
+                bandKey = 0u;
+                break;
+            }
+            bandKey = g_historyKey[uint2(bpx)] & 0x7FFFFFFFu;
+            if (bandKey == 0u || abs(asfloat(bandKey) - lookupD) <= max(0.05f * lookupD, 5e-4f)) {
+                break;
+            }
+            lookupD = asfloat(bandKey);
+        }
+        if (bandKey != 0u) {
+            // The band's only alternative is wrong-parallax content: take
+            // the real render outright.
+            return g_historyColorSrv.SampleLevel(g_linearSampler, bandUv, 0).rgb;
+        }
+        return c; // never seen (fresh rotation into unviewed area)
+    }
     float4 prev = mul(reproj_target_to_prev, float4(ndc, estDepth, 1.0f));
     float w = (abs(prev.w) > 1e-6f) ? prev.w : 1e-6f;
     float2 pn = prev.xy / w;

@@ -529,11 +529,30 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float estDepth = haveKey ? asfloat(fillKey) : 0.0f;
         float2 uv = float2((dtid.x + 0.5f) / (float)synth_width, (dtid.y + 0.5f) / (float)synth_height);
         float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
-        float4 prev = mul(reproj_target_to_prev, float4(ndc, estDepth, 1.0f));
-        float w = (abs(prev.w) > 1e-6f) ? prev.w : 1e-6f;
-        float2 pn = prev.xy / w;
-        int px = (int)((pn.x * 0.5f + 0.5f) * (float)synth_width);
-        int py = (int)((0.5f - pn.y * 0.5f) * (float)synth_height);
+        // Keyless holes (outer no-source band, unscattered sky) iterate the
+        // fetch once at the FOUND stash depth: a single far-plane reproject
+        // misses near content by its full parallax, landing the fetch on
+        // unrelated background and painting it over the band (the eaten
+        // outer-edge geometry that alternates against the real frames).
+        float lookupD = estDepth;
+        int px = -1;
+        int py = -1;
+        [unroll]
+        for (int it = 0; it < 2; ++it) {
+            float4 prev = mul(reproj_target_to_prev, float4(ndc, lookupD, 1.0f));
+            float w = (abs(prev.w) > 1e-6f) ? prev.w : 1e-6f;
+            float2 pn = prev.xy / w;
+            px = (int)((pn.x * 0.5f + 0.5f) * (float)synth_width);
+            py = (int)((0.5f - pn.y * 0.5f) * (float)synth_height);
+            if (haveKey || px < 0 || px >= (int)synth_width || py < 0 || py >= (int)synth_height) {
+                break; // keyed fetches stay single-tap (estDepth is trusted)
+            }
+            uint ik = g_historyKey[uint2(px, py)] & 0x7FFFFFFFu;
+            if (ik == 0u || abs(asfloat(ik) - lookupD) <= max(0.05f * lookupD, 5e-4f)) {
+                break;
+            }
+            lookupD = asfloat(ik);
+        }
         if (px >= 0 && px < (int)synth_width && py >= 0 && py < (int)synth_height) {
             const float tol = max(0.15f * estDepth, 2e-4f);
             float4 h = g_historyColor[uint2(px, py)];

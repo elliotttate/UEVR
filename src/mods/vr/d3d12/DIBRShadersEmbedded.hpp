@@ -1985,7 +1985,7 @@ inline std::string dibr_inverse_source() {
     return out;
 }
 
-// dibr_yoro.hlsl (108869 bytes, 10 chunks)
+// dibr_yoro.hlsl (110616 bytes, 10 chunks)
 inline const char* const g_dibr_yoro_chunks[] = {
 R"DIBR(// dibr_yoro.hlsl — YORO / Meta-style asymmetric inverse-warp DIBR
 //
@@ -4296,9 +4296,6 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     }
     uint skRaw = g_scatterKey[px];
     uint sk = skRaw & 0x7FFFFFFFu; // strip the fill's marker bit
-    if (sk == 0u) {
-        return c; // sky / no geometry: nothing to validate against
-    }
     // Marker bit set = this pixel is a fill band: its warp-side color is
     // synthetic, so the color-agreement gate below must not protect it.
     const bool wasFilled = (skRaw & 0x80000000u) != 0u;
@@ -4306,6 +4303,42 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     float2 uvRaw = float2((px.x + 0.5f) / (float)out_width,
                           (px.y + 0.5f) / (float)out_height);
     float2 ndc = float2(uvRaw.x * 2.0f - 1.0f, 1.0f - uvRaw.y * 2.0f);
+    if (sk == 0u) {
+        // No warp data AT ALL: the outer no-source band (beyond the source
+        // eye's frustum on this eye's outward side) and unscattered sky. The
+        // caller's fallback is centerColor - the OTHER eye's content at the
+        // wrong parallax - which alternates against this eye's REAL render
+        // at half rate: the leftmost-of-left/rightmost-of-right edge
+        // flicker. But this eye rendered the band itself one frame ago:
+        // fetch the stash, iterating once at the FOUND depth so near
+        // content lands at its own parallax instead of the far plane's.
+        float lookupD = 0.0f;
+        float2 bandUv = float2(0.0f, 0.0f);
+        uint bandKey = 0u;
+        [unroll]
+        for (int it = 0; it < 2; ++it) {
+            float4 bp = mul(reproj_target_to_prev, float4(ndc, lookupD, 1.0f));
+            float bw = (abs(bp.w) > 1e-6f) ? bp.w : 1e-6f;
+            float2 bn = bp.xy / bw;
+            bandUv = float2(bn.x * 0.5f + 0.5f, 0.5f - bn.y * 0.5f);
+            int2 bpx = int2((int)(bandUv.x * (float)out_width), (int)(bandUv.y * (float)out_height));
+            if (bpx.x < 0 || bpx.x >= (int)out_width || bpx.y < 0 || bpx.y >= (int)out_height) {
+                bandKey = 0u;
+                break;
+            }
+            bandKey = g_historyKey[uint2(bpx)] & 0x7FFFFFFFu;
+            if (bandKey == 0u || abs(asfloat(bandKey) - lookupD) <= max(0.05f * lookupD, 5e-4f)) {
+                break;
+            }
+            lookupD = asfloat(bandKey);
+        }
+        if (bandKey != 0u) {
+            // The band's only alternative is wrong-parallax content: take
+            // the real render outright.
+            return g_historyColorSrv.SampleLevel(g_linearSampler, bandUv, 0).rgb;
+        }
+        return c; // never seen (fresh rotation into unviewed area)
+    }
     float4 prev = mul(reproj_target_to_prev, float4(ndc, estDepth, 1.0f));
     float w = (abs(prev.w) > 1e-6f) ? prev.w : 1e-6f;
     float2 pn = prev.xy / w;
@@ -4363,7 +4396,8 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
                     // Static prediction for the source texel: source ->
                     // target eye (same frame), then target -> previous
                     // frame. Clip vectors compose without intermediate
-                    // w-divides (homogeneous scale cancels in the divide).
+)DIBR",
+R"DIBR(                    // w-divides (homogeneous scale cancels in the divide).
                     float2 srcNdc = float2(srcUv.x * 2.0f - 1.0f, 1.0f - srcUv.y * 2.0f);
                     float4 sclip = float4(srcNdc, vdepth, 1.0f);
                     float4 t = (mode_param0 < 0.5f) ? mul(reproj_source_to_right, sclip)
@@ -4393,8 +4427,7 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     // TOGGLE between history and warp frame-to-frame - half-rate shimmer
     // that only exists while moving. Full weight inside half the tolerance,
     // fading to zero at twice it; at rest (error ~0) identical to before.
-)DIBR",
-R"DIBR(    uint hk = g_historyKey[uint2((uint)round(max(fx, 0.0f)), (uint)round(max(fy, 0.0f)))] & 0x7FFFFFFFu;
+    uint hk = g_historyKey[uint2((uint)round(max(fx, 0.0f)), (uint)round(max(fy, 0.0f)))] & 0x7FFFFFFFu;
     const float tol = max(0.15f * estDepth, wasFilled ? 2e-3f : 2e-4f);
     const float depthErr = abs(asfloat(hk) - estDepth);
     const float depthConf = saturate((2.0f * tol - depthErr) / (1.5f * tol));
@@ -4595,7 +4628,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 #else
             float2 rightReducedSearchUV = YoroSearchUv(uv, -1.0f, searchDepth, boundaryScale, 0.33333334f);
             float2 rightReducedUV = ApplyOutputEyeAlignment(rightReducedSearchUV + rightInterlaceOffset, -1.0f);
-            float4 rightReducedColor = SampleSynthStereoColor(rightReducedUV, uv, centerColor, searchDepth);
+)DIBR",
+R"DIBR(            float4 rightReducedColor = SampleSynthStereoColor(rightReducedUV, uv, centerColor, searchDepth);
             float4 outRightReduced = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightReducedColor, centerColor))));
             outRightReduced = ApplyAlignmentMarker(uv, rightReducedUV, outRightReduced);
 #endif
@@ -4621,8 +4655,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
         float2 rightRefUV = ApplyOutputEyeAlignment(uv + rightInterlaceOffset, -1.0f);
         float4 rightRefColor = SampleFilteredOutputColor(SourceRemapUv(rightRefUV));
-)DIBR",
-R"DIBR(        float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightRefColor, centerColor))));
+        float4 outRight = ApplyCursorOverlay(uv, -1.0f, ApplyPresentationColor(uv, ApplyComfortNose(uv, -1.0f, ApplyOutputMatte(uv, rightRefColor, centerColor))));
         outRight = ApplyAlignmentMarker(uv, rightRefUV, outRight);
         if (floor(output_layout_mode + 0.5f) == 2.0f) {
 #if SCATTER_COMPOSE
@@ -7337,7 +7370,7 @@ inline std::string dibr_scatter_color_source() {
     return out;
 }
 
-// dibr_scatter_fill.hlsl (28767 bytes, 3 chunks)
+// dibr_scatter_fill.hlsl (29714 bytes, 3 chunks)
 inline const char* const g_dibr_scatter_fill_chunks[] = {
 R"DIBR(// AUTO-PATTERNED from dibr_yoro.hlsl's declarations - keep the cbuffer block
 // byte-identical across every DIBR kernel (the runtime layout guard checks it).
@@ -7871,11 +7904,30 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float estDepth = haveKey ? asfloat(fillKey) : 0.0f;
         float2 uv = float2((dtid.x + 0.5f) / (float)synth_width, (dtid.y + 0.5f) / (float)synth_height);
         float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
-        float4 prev = mul(reproj_target_to_prev, float4(ndc, estDepth, 1.0f));
-        float w = (abs(prev.w) > 1e-6f) ? prev.w : 1e-6f;
-        float2 pn = prev.xy / w;
-        int px = (int)((pn.x * 0.5f + 0.5f) * (float)synth_width);
-        int py = (int)((0.5f - pn.y * 0.5f) * (float)synth_height);
+        // Keyless holes (outer no-source band, unscattered sky) iterate the
+        // fetch once at the FOUND stash depth: a single far-plane reproject
+        // misses near content by its full parallax, landing the fetch on
+        // unrelated background and painting it over the band (the eaten
+        // outer-edge geometry that alternates against the real frames).
+        float lookupD = estDepth;
+        int px = -1;
+        int py = -1;
+        [unroll]
+        for (int it = 0; it < 2; ++it) {
+            float4 prev = mul(reproj_target_to_prev, float4(ndc, lookupD, 1.0f));
+            float w = (abs(prev.w) > 1e-6f) ? prev.w : 1e-6f;
+            float2 pn = prev.xy / w;
+            px = (int)((pn.x * 0.5f + 0.5f) * (float)synth_width);
+            py = (int)((0.5f - pn.y * 0.5f) * (float)synth_height);
+            if (haveKey || px < 0 || px >= (int)synth_width || py < 0 || py >= (int)synth_height) {
+                break; // keyed fetches stay single-tap (estDepth is trusted)
+            }
+            uint ik = g_historyKey[uint2(px, py)] & 0x7FFFFFFFu;
+            if (ik == 0u || abs(asfloat(ik) - lookupD) <= max(0.05f * lookupD, 5e-4f)) {
+                break;
+            }
+            lookupD = asfloat(ik);
+        }
         if (px >= 0 && px < (int)synth_width && py >= 0 && py < (int)synth_height) {
             const float tol = max(0.15f * estDepth, 2e-4f);
             float4 h = g_historyColor[uint2(px, py)];
@@ -7887,7 +7939,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             // The symmetric |diff|<=tol gate kept rejecting real reveal
             // content: with a far-field adopted key the relative tolerance
             // collapses (open water at device ~1e-4 vs the rock arch at
-            // ~5e-3), so history lost to per-row scanline fill - the
+)DIBR",
+R"DIBR(            // ~5e-3), so history lost to per-row scanline fill - the
             // shredded ladder band.
             float occluderDepth = max((xl >= 0) ? asfloat(kl) : 0.0f,
                                       (xr >= 0) ? asfloat(kr) : 0.0f);
@@ -7904,8 +7957,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1)
                 };
                 [loop]
-)DIBR",
-R"DIBR(                for (int n = 0; n < 8; ++n) {
+                for (int n = 0; n < 8; ++n) {
                     int nx = px + kRing[n].x;
                     int ny = py + kRing[n].y;
                     if (nx < 0 || nx >= (int)synth_width || ny < 0 || ny >= (int)synth_height) continue;
