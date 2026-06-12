@@ -404,28 +404,39 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             }
         }
     }
+    // Fill provenance for debug view 9 (low 2 key bits): 0 = scanline /
+    // source fallback, 1 = two-sided interpolation, 2 = stash history,
+    // 3 = background layer.
+    uint prov = 0u;
+    float4 c = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    uint fillKey = 0u;
+    bool haveFallback = false;
+
     if (xl >= 0 && xr >= 0) {
-        // Coverage on BOTH sides within 8px: interpolate across the gap,
-        // whatever the depth relationship. Same-surface gaps (magnification)
-        // get their own surface back; mixed frond/background gaps - the
-        // sparse silhouette-stretch zone on an object's COMPRESSION side -
-        // get a smooth near-to-far gradient, which reads as a soft
-        // anti-aliased edge. Routing mixed gaps to the background machinery
-        // instead ate the silhouette stripe by stripe (the laddered band):
-        // depth-picking per row across a sloping edge is inherently
-        // row-incoherent. Commit at the FARTHER key so the compose-level
-        // history replace validates against background and can swap in last
-        // frame's real content. Only holes with NO coverage on one side
-        // (wide true reveals) fall through to the directional machinery.
         float dl = asfloat(kl);
         float dr = asfloat(kr);
         float wl = (float)(xr - (int)dtid.x);
         float wr = (float)((int)dtid.x - xl);
         float3 col = (g_scatterColor[uint2(xl, dtid.y)].rgb * wl +
                       g_scatterColor[uint2(xr, dtid.y)].rgb * wr) / max(wl + wr, 1.0f);
-        g_scatterColor[dtid.xy] = float4(col, 1.0f);
-        g_scatterKey[dtid.xy] = ((dl < dr) ? kl : kr) | 0x80000000u;
-        return;
+        if (abs(dl - dr) <= max(0.10f * max(dl, dr), 1e-3f)) {
+            // Same surface on both sides (magnification gap): repair from its
+            // own surface and stop - no disocclusion happened here.
+            g_scatterColor[dtid.xy] = float4(col, 1.0f);
+            g_scatterKey[dtid.xy] = ((((dl < dr) ? kl : kr) & ~0x3u) | 0x1u) | 0x80000000u;
+            return;
+        }
+        // Mixed-depth edge gap: a REVEAL band. The provenance view showed the
+        // interpolated gradient claiming virtually every reveal (the early
+        // return here starved the stash/background paths) - and a synthetic
+        // gradient on synth frames alternating against REAL content on real
+        // frames IS the half-rate band flicker. The gradient is demoted to
+        // the FALLBACK; the temporal block below tries last frame's real
+        // render first, then the accumulated background layer.
+        c = float4(col, 1.0f);
+        fillKey = (dl < dr) ? kl : kr; // farther side = the reveal's content
+        prov = 1u;
+        haveFallback = true;
     }
 
     // Disocclusion hole: a reveal opens on the side of a foreground object
@@ -458,7 +469,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // Keys with the MSB marker were committed by this fill pass itself (other
     // threads, this dispatch) - skip them so hole pixels never adopt other
     // hole pixels' fill as real geometry (that ordering race would shimmer).
-    if (central) {
+    if (central && !haveFallback) {
         // Depth-aware: at thin-object reveals (plant fronds, railings) the
         // FIRST covered texel along the walk is often the NEXT occluder
         // strand - foreground, not the background the reveal exposes -
@@ -484,20 +495,20 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         }
     }
 
-    float4 c;
-    uint fillKey = 0u;
-    if (bx >= 0) {
-        // Average a short run a few pixels INTO the background (stepping away
-        // from the hole) instead of copying the single hole-edge pixel, whose
-        // color is the anti-aliased boundary.
-        c = float4(SampleBackgroundRun(bx, (int)dtid.y, dir, bkey), 1.0f);
-        fillKey = bkey;
-    } else {
-        float2 srcUv = holeUv;
-        if (overscan_x > 1.0f) {
-            srcUv.x = 0.5f + (srcUv.x - 0.5f) / overscan_x; // crop overscanned source to true FOV
+    if (!haveFallback) {
+        if (bx >= 0) {
+            // Average a short run a few pixels INTO the background (stepping
+            // away from the hole) instead of copying the single hole-edge
+            // pixel, whose color is the anti-aliased boundary.
+            c = float4(SampleBackgroundRun(bx, (int)dtid.y, dir, bkey), 1.0f);
+            fillKey = bkey;
+        } else {
+            float2 srcUv = holeUv;
+            if (overscan_x > 1.0f) {
+                srcUv.x = 0.5f + (srcUv.x - 0.5f) / overscan_x; // crop overscanned source to true FOV
+            }
+            c = float4(g_colorTex.SampleLevel(g_linearSampler, srcUv, 0).rgb, 1.0f);
         }
-        c = float4(g_colorTex.SampleLevel(g_linearSampler, srcUv, 0).rgb, 1.0f);
     }
 
     // R3 temporal reuse: reproject this hole into LAST frame's synthesized eye
@@ -604,10 +615,14 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                         h = float4(g_bgColorPrev.Load(int3(pc, 0)).rgb, 1.0f);
                         hk = bk;
                         validHistory = true;
+                        prov = 3u;
                     }
                 }
             }
             if (validHistory) {
+                if (prov == 0u) {
+                    prov = 2u; // stash (direct or ring-probe) accepted
+                }
                 if (temporal_enabled > 1.5f) {
                     // AFW: the history is last frame's REAL render of THIS
                     // eye - the reveal was actually rendered there one frame
@@ -635,7 +650,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (fillKey != 0u) {
         // Commit the adopted background key so next frame's temporal gate can
         // validate this band. Device depths are positive floats, so the MSB is
-        // free to mark "filled, not scattered" for the search masks above.
-        g_scatterKey[dtid.xy] = fillKey | 0x80000000u;
+        // free to mark "filled, not scattered" for the search masks above;
+        // the low 2 bits carry the provenance for debug view 9.
+        g_scatterKey[dtid.xy] = ((fillKey & ~0x3u) | (prov & 0x3u)) | 0x80000000u;
     }
 }

@@ -2444,6 +2444,31 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
 #if !DIBR_LEAN
     float debugMode = floor(debug_view_mode + 0.5f);
+    if (debugMode >= 8.5f) {
+        // Debug view 9: fill provenance. Which source produced each pixel of
+        // the synthesized eye - the question every reveal-artifact hunt
+        // starts with. Gray = scattered geometry (luminance), red =
+        // scanline/source fallback, green = two-sided interpolation, blue =
+        // stash history accepted, cyan = persistent background layer.
+        uint skRawD = g_scatterKey[uint2(min(x, synth_width - 1u), min(y, synth_height - 1u))];
+        float3 col;
+        if (skRawD == 0u) {
+            col = float3(0.0f, 0.0f, 0.0f); // never covered, never filled
+        } else if ((skRawD & 0x80000000u) == 0u) {
+            float lum = dot(g_scatterColor[uint2(min(x, synth_width - 1u), min(y, synth_height - 1u))].rgb,
+                float3(0.299f, 0.587f, 0.114f));
+            col = float3(lum, lum, lum);
+        } else {
+            uint provD = skRawD & 0x3u;
+            col = (provD == 1u) ? float3(0.1f, 0.9f, 0.1f)
+                : (provD == 2u) ? float3(0.15f, 0.25f, 1.0f)
+                : (provD == 3u) ? float3(0.1f, 0.9f, 0.9f)
+                                : float3(1.0f, 0.15f, 0.1f);
+        }
+        float4 dbg = float4(col, 1.0f);
+        WriteStereoPair(x, y, dbg, dbg);
+        return;
+    }
     if (debugMode >= 7.5f) {
         // Debug view 8: SceneVelocity wiring proof (select/bind/sample). The
         // snapshot is this frame's completed velocity GBuffer (copied at the
