@@ -2036,8 +2036,10 @@ bool VR::should_force_native_stereo_fix_same_pass() const {
     return true;
 }
 
-int32_t VR::get_dibr_requested_mode() const {
-    // Mirrors dibr_config's UEVR_DIBR env override (D3D12Component.cpp).
+// UEVR_DIBR env override parse, shared by get_dibr_requested_mode and the
+// rendering-path gate (an explicit env request loosens the Native Stereo
+// block - see is_dibr_rendering_path_compatible).
+static int dibr_env_requested_mode() {
     static const int env_mode = []() -> int {
         const char* v = std::getenv("UEVR_DIBR");
         if (v == nullptr || v[0] == '\0') {
@@ -2064,7 +2066,12 @@ int32_t VR::get_dibr_requested_mode() const {
         }
         return 1; // yoro / synth_right / unrecognized
     }();
+    return env_mode;
+}
 
+int32_t VR::get_dibr_requested_mode() const {
+    // Mirrors dibr_config's UEVR_DIBR env override (D3D12Component.cpp).
+    const int env_mode = dibr_env_requested_mode();
     if (env_mode >= 0) {
         return env_mode;
     }
@@ -2101,15 +2108,21 @@ bool VR::is_dibr_rendering_path_compatible() const {
     // submits the full backbuffer per eye, and Mono is the explicit
     // no-synthesis baseline; run_dibr_synthesis skips all of them.
     if (m_rendering_method->value() == RenderingMethod::ALTERNATING ||
-        m_rendering_method->value() == RenderingMethod::NATIVE_STEREO ||
         m_rendering_method->value() == RenderingMethod::MONO ||
         m_extreme_compat_mode->value()) {
-        // Native Stereo renders both eyes itself - there is no single reference
-        // view to synthesize from, so DIBR/overscan must never engage here even
-        // if the DIBR panel combo is left on a synth mode. The Rendering Method
-        // dropdown is authoritative; otherwise the overscan inflates the
-        // swapchain (1884 vs the native 1680) and the unwritten edge band shows
-        // stale texture / forces endless swapchain recreation.
+        return false;
+    }
+
+    // Native Stereo renders both eyes itself - there is no single reference
+    // view to synthesize from, so a DIBR mode left on the PANEL combo must
+    // not engage (the Rendering Method dropdown is authoritative; otherwise
+    // the overscan inflates the swapchain (1884 vs the native 1680) and the
+    // unwritten edge band shows stale texture / forces endless swapchain
+    // recreation). An explicit UEVR_DIBR env override is different: it is an
+    // unambiguous scripted request, and the single-view machinery itself
+    // permits Native Stereo (it simply stops rendering the second view), so
+    // the env-driven path engages exactly like the Synthetic methods.
+    if (m_rendering_method->value() == RenderingMethod::NATIVE_STEREO && dibr_env_requested_mode() <= 0) {
         return false;
     }
 

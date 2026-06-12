@@ -4847,6 +4847,19 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         return;
     }
 
+    // Rendering paths where single-view can NEVER engage (Native Stereo
+    // renders both eyes itself, true AFR, extreme compat, flat 2D screen):
+    // running the synthesis here would overwrite valid native stereo with a
+    // redundant warp EVERY frame - an entire wasted scatter chain + compose -
+    // and garble the synthesized eye's outer band (no overscan). The env
+    // override used to bypass this; the Rendering Method dropdown is
+    // authoritative (mirrors is_dibr_single_view_active's own gate).
+    if (!vr->is_dibr_rendering_path_compatible()) {
+        SPDLOG_INFO_ONCE("[DIBR] rendering method incompatible with synthesis (e.g. Native Stereo renders both eyes); DIBR pass skipped");
+        fill_right_half_mono(false); // engine may still be mid-transition out of single-view
+        return;
+    }
+
     // Effective mode: the UEVR_DIBR env override (scripted testing) wins over
     // the persisted UI combo; otherwise the UI drives.
     const auto& env = dibr_config::get();
@@ -5598,6 +5611,9 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     // alternation that history IS the real render of the eye being
     // synthesized, so disocclusion holes fill with one-frame-old real pixels.
     m_dibr.set_alternate_history(afw);
+    // Per-pass GPU timing needs the queue this list executes on (the same one
+    // CommandContext::execute submits to) for GetTimestampFrequency.
+    m_dibr.set_gpu_timing_queue(g_framework->get_d3d12_hook()->get_command_queue());
 
     // 3) Synthesize the packed SBS pair (records into the same command list).
     auto* output = m_dibr.synthesize(device, cmd_list, mode,
