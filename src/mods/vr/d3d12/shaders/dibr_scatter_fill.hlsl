@@ -368,6 +368,59 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (dtid.x >= synth_width || dtid.y >= synth_height) return;
     if (g_scatterColor[dtid.xy].a > 0.5f) return; // already covered
 
+    // Interior stretch gap vs true reveal: a near surface that MAGNIFIES in
+    // the synthesized eye scatters its samples apart, leaving 1-8px gaps
+    // INSIDE the object with same-depth coverage on BOTH sides. Those gaps
+    // must be repaired from their own surface - routing them through the
+    // directional background machinery paints water/logo stripes inside
+    // foreground objects, and per-row one-sided picks shred into ladder
+    // bands. Only a genuine depth EDGE between the sides falls through to
+    // the reveal path below.
+    int xl = -1, xr = -1;
+    uint kl = 0u, kr = 0u;
+    {
+        [loop]
+        for (int s = 1; s <= 8 && (xl < 0 || xr < 0); ++s) {
+            if (xl < 0) {
+                int x = (int)dtid.x - s;
+                if (x >= 0) {
+                    uint k = g_scatterKey[uint2(x, dtid.y)];
+                    if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { xl = x; kl = k; }
+                }
+            }
+            if (xr < 0) {
+                int x = (int)dtid.x + s;
+                if (x < (int)synth_width) {
+                    uint k = g_scatterKey[uint2(x, dtid.y)];
+                    if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) { xr = x; kr = k; }
+                }
+            }
+        }
+    }
+    if (xl >= 0 && xr >= 0) {
+        // Coverage on BOTH sides within 8px: interpolate across the gap,
+        // whatever the depth relationship. Same-surface gaps (magnification)
+        // get their own surface back; mixed frond/background gaps - the
+        // sparse silhouette-stretch zone on an object's COMPRESSION side -
+        // get a smooth near-to-far gradient, which reads as a soft
+        // anti-aliased edge. Routing mixed gaps to the background machinery
+        // instead ate the silhouette stripe by stripe (the laddered band):
+        // depth-picking per row across a sloping edge is inherently
+        // row-incoherent. Commit at the FARTHER key so the compose-level
+        // history replace validates against background and can swap in last
+        // frame's real content. Only holes with NO coverage on one side
+        // (wide true reveals) fall through to the directional machinery.
+        float dl = asfloat(kl);
+        float dr = asfloat(kr);
+        float wl = (float)(xr - (int)dtid.x);
+        float wr = (float)((int)dtid.x - xl);
+        float3 col = (g_scatterColor[uint2(xl, dtid.y)].rgb * wl +
+                      g_scatterColor[uint2(xr, dtid.y)].rgb * wr) / max(wl + wr, 1.0f);
+        g_scatterColor[dtid.xy] = float4(col, 1.0f);
+        g_scatterKey[dtid.xy] = ((dl < dr) ? kl : kr) | 0x80000000u;
+        return;
+    }
+
     // Disocclusion hole: a reveal opens on the side of a foreground object
     // OPPOSITE its warp direction, so the background that belongs in it lies
     // on ONE known side - along the eye baseline, +x when synthesizing the
@@ -467,11 +520,22 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             const float tol = max(0.15f * estDepth, 2e-4f);
             float4 h = g_historyColor[uint2(px, py)];
             uint hk = g_historyKey[uint2(px, py)] & 0x7FFFFFFFu; // strip fill marker
-            // With a background key: depth-validate against it. Without one
-            // (search miss): any real geometry in history beats the flat
-            // source fallback - require only that history exists there.
-            bool validHistory = (h.a > 0.5f && hk != 0u &&
-                (!haveKey || abs(asfloat(hk) - estDepth) <= tol));
+            // AFW: the stash is a REAL render of this very eye, so the only
+            // wrong content it can offer at a reveal is the OCCLUDER at its
+            // old position - accept anything background-side of the
+            // occluder/background midpoint (reversed-Z: smaller = farther).
+            // The symmetric |diff|<=tol gate kept rejecting real reveal
+            // content: with a far-field adopted key the relative tolerance
+            // collapses (open water at device ~1e-4 vs the rock arch at
+            // ~5e-3), so history lost to per-row scanline fill - the
+            // shredded ladder band.
+            float occluderDepth = max((xl >= 0) ? asfloat(kl) : 0.0f,
+                                      (xr >= 0) ? asfloat(kr) : 0.0f);
+            float acceptCeil = 0.5f * (occluderDepth + estDepth);
+            bool depthOk = (temporal_enabled > 1.5f)
+                ? (occluderDepth <= 0.0f || asfloat(hk) <= acceptCeil)
+                : (!haveKey || abs(asfloat(hk) - estDepth) <= tol);
+            bool validHistory = (h.a > 0.5f && hk != 0u && depthOk);
             if (!validHistory && haveKey) {
                 // Rotation rounding often lands one texel off a valid history
                 // pixel; probe the 3x3 ring before giving up on history.
@@ -486,7 +550,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     if (nx < 0 || nx >= (int)synth_width || ny < 0 || ny >= (int)synth_height) continue;
                     float4 nh = g_historyColor[uint2(nx, ny)];
                     uint nk = g_historyKey[uint2(nx, ny)] & 0x7FFFFFFFu;
-                    if (nh.a > 0.5f && nk != 0u && abs(asfloat(nk) - estDepth) <= tol) {
+                    bool nOk = (temporal_enabled > 1.5f)
+                        ? (occluderDepth <= 0.0f || asfloat(nk) <= acceptCeil)
+                        : (abs(asfloat(nk) - estDepth) <= tol);
+                    if (nh.a > 0.5f && nk != 0u && nOk) {
                         h = nh;
                         hk = nk;
                         validHistory = true;

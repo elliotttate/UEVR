@@ -2331,14 +2331,7 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     // onto the object's true previous position. Misses (wrong texel via the
     // disparity-blind lookup) still fail the depth/color gates below - the
     // failure mode is the status quo, not a new artifact.
-    // NOT for fill bands: the disparity-blind velocity lookup at a reveal
-    // lands on the OCCLUDER (the plant that opened the hole), so the fetch
-    // gets advected by the occluder's motion onto unrelated background - and
-    // wasFilled bypasses the color gate below, so the misplaced content
-    // blends in unchecked (seen as a woven band of displaced logo/water).
-    // A reveal's true content is background, which rarely writes velocity;
-    // the camera-only reprojection is the right fetch there.
-    if (!wasFilled) {
+    {
         uint vw, vh;
         g_velocityTex.GetDimensions(vw, vh);
         if (vw != 0u) {
@@ -2360,19 +2353,31 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
                     uint lo = (uint)round(enc.w * 65535.0f) & 0xFFFEu;
                     vdepth = asfloat(hi | lo);
                 }
-                // Static prediction for the source texel: source -> target
-                // eye (same frame), then target -> previous frame. Clip
-                // vectors compose without intermediate w-divides (homogeneous
-                // scale cancels in the final divide).
-                float2 srcNdc = float2(srcUv.x * 2.0f - 1.0f, 1.0f - srcUv.y * 2.0f);
-                float4 sclip = float4(srcNdc, vdepth, 1.0f);
-                float4 t = (mode_param0 < 0.5f) ? mul(reproj_source_to_right, sclip)
-                                                : mul(reproj_source_to_left, sclip);
-                float4 ps = mul(reproj_target_to_prev, t);
-                float pw = (abs(ps.w) > 1e-6f) ? ps.w : 1e-6f;
-                float2 camV = srcNdc - ps.xy / pw;
-                float2 objV = v - camV;
-                histUv -= objV * float2(0.5f, -0.5f);
+                // The velocity texel must belong to THIS pixel's surface. At
+                // a disocclusion reveal the disparity-blind lookup lands on
+                // the OCCLUDER that opened the hole (near) while the band's
+                // committed content is background (far) - advecting by the
+                // occluder's motion drags unrelated background in, and
+                // wasFilled bypasses the color gate, so it shipped a woven
+                // band of displaced logo/water. Depth agreement keys the
+                // advection to same-surface motion only - which keeps it
+                // ACTIVE for interior stretch gaps on the moving object
+                // itself (their committed key IS the object's depth).
+                if (abs(vdepth - estDepth) <= max(0.2f * estDepth, 1e-3f)) {
+                    // Static prediction for the source texel: source ->
+                    // target eye (same frame), then target -> previous
+                    // frame. Clip vectors compose without intermediate
+                    // w-divides (homogeneous scale cancels in the divide).
+                    float2 srcNdc = float2(srcUv.x * 2.0f - 1.0f, 1.0f - srcUv.y * 2.0f);
+                    float4 sclip = float4(srcNdc, vdepth, 1.0f);
+                    float4 t = (mode_param0 < 0.5f) ? mul(reproj_source_to_right, sclip)
+                                                    : mul(reproj_source_to_left, sclip);
+                    float4 ps = mul(reproj_target_to_prev, t);
+                    float pw = (abs(ps.w) > 1e-6f) ? ps.w : 1e-6f;
+                    float2 camV = srcNdc - ps.xy / pw;
+                    float2 objV = v - camV;
+                    histUv -= objV * float2(0.5f, -0.5f);
+                }
             }
         }
     }
@@ -2381,9 +2386,13 @@ float3 ApplyAfwHistoryBlend(uint2 px, float3 c)
     if (fx < 0.0f || fy < 0.0f || fx > (float)(out_width - 1u) || fy > (float)(out_height - 1u)) {
         return c;
     }
-    // Depth-validate at the nearest tap (keys don't interpolate).
+    // Depth-validate at the nearest tap (keys don't interpolate). Fill bands
+    // get a looser ABSOLUTE floor: their committed key can be far-field
+    // (open water at device ~1e-4, reversed-Z), where a relative tolerance
+    // collapses below the rock-vs-water separation and rejects the real
+    // reveal content the blend exists to deliver.
     uint hk = g_historyKey[uint2((uint)round(max(fx, 0.0f)), (uint)round(max(fy, 0.0f)))] & 0x7FFFFFFFu;
-    const float tol = max(0.15f * estDepth, 2e-4f);
+    const float tol = max(0.15f * estDepth, wasFilled ? 2e-3f : 2e-4f);
     if (hk != 0u && abs(asfloat(hk) - estDepth) <= tol) {
         float3 h = g_historyColorSrv.SampleLevel(g_linearSampler, histUv, 0).rgb;
         // Color-agreement gate: the blend exists to cancel the SUBTLE

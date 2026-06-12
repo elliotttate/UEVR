@@ -345,9 +345,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (dtid.x >= out_width || dtid.y >= out_height) return;
     float2 uv = float2((dtid.x + 0.5f) / (float)out_width,
                        (dtid.y + 0.5f) / (float)out_height);
-    // Raw device depth (reversed-Z) as the validation key - the same
-    // convention the scatter keys use, so the fill's tolerance test works
-    // unchanged. Sky (depth 0) keys as 0 = "no history", scanline fallback.
-    g_historyKey[dtid.xy] = asuint(SampleRawDeviceDepth(uv));
+    // Raw device depth (reversed-Z) as the validation key, clamped strictly
+    // above zero EXACTLY like the scatter keys (dibr_scatter_depth): with
+    // reversed-Z, open water / sky sits AT device 0, and keying it 0 made
+    // every history consumer reject the previous frame's real render as "no
+    // data" precisely over the background that disocclusion reveals expose -
+    // the bands fell back to per-row scanline fill (the laddered artifact)
+    // even though the stash held the true content.
+    g_historyKey[dtid.xy] = asuint(max(SampleRawDeviceDepth(uv), 1e-7f));
     g_historyColor[dtid.xy] = float4(g_colorTex.SampleLevel(g_pointSampler, uv, 0).rgb, 1.0f);
 }
