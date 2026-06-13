@@ -745,6 +745,16 @@ AfwDepthSeqEntry g_afw_seq_ring[kAfwSeqWindow]{};
 uint64_t g_afw_seq_pushed{0};
 ID3D12Resource* g_afw_seq_last{nullptr};
 std::mutex g_afw_seq_mtx{};
+
+// AFW authoritative frame naming (see header): per-command-list frame tags set
+// at record time, drained in submission order at ECL. The map stays tiny (one
+// qualifying depth-bind list per frame, submitted promptly); a safety cap
+// guards against a tagged-but-never-submitted list leaking entries.
+std::atomic<bool> g_afw_naming_enabled{false};
+std::atomic<uint32_t> g_afw_submitted_frame{0xFFFFFFFFu};
+std::mutex g_afw_cl_tag_mtx{};
+std::unordered_map<ID3D12CommandList*, uint32_t> g_afw_cl_tags{};
+constexpr size_t kAfwClTagCap = 64;
 } // namespace
 
 void set_afw_depth_snapshot_enabled(bool enabled) {
@@ -969,7 +979,9 @@ void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uin
     const bool seq_enabled = g_afw_seq_enabled.load(std::memory_order_relaxed);
     // velocity_snapshot_enabled keeps the signature path alive outside AFW:
     // the same-frame velocity copy is recorded at this bind too.
-    if ((!snap_enabled && !seq_enabled && !velocity_snapshot_enabled()) || cmd_list == nullptr || rtv0 == 0 || dsv == 0) {
+    const bool naming_enabled = g_afw_naming_enabled.load(std::memory_order_relaxed);
+    if ((!snap_enabled && !seq_enabled && !velocity_snapshot_enabled() && !naming_enabled) ||
+        cmd_list == nullptr || rtv0 == 0 || dsv == 0) {
         return;
     }
 
@@ -1022,6 +1034,19 @@ void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uin
     const uint32_t frame = g_recording_frame.load(std::memory_order_acquire);
     if (frame == 0xFFFFFFFFu) {
         return;
+    }
+
+    // Authoritative frame naming: tag THIS command list with the frame it is
+    // recording. The ECL hook publishes it in submission order. Tag here (the
+    // qualifying scene-depth bind) so exactly one list per frame carries the
+    // name. cmd_list is the same pointer the queue submits (single-inheritance
+    // ID3D12GraphicsCommandList -> ID3D12CommandList).
+    if (naming_enabled) {
+        std::scoped_lock _{g_afw_cl_tag_mtx};
+        if (g_afw_cl_tags.size() > kAfwClTagCap) {
+            g_afw_cl_tags.clear(); // tagged-but-never-submitted leak guard
+        }
+        g_afw_cl_tags[static_cast<ID3D12CommandList*>(cmd_list)] = frame;
     }
 
     // The velocity pass was recorded before this bind: snapshot this frame's
@@ -1130,6 +1155,51 @@ std::vector<AfwDepthSeqEntry> get_afw_depth_sequence(uint64_t& total_pushed) {
         out.push_back(g_afw_seq_ring[i % kAfwSeqWindow]);
     }
     return out;
+}
+
+void set_afw_frame_naming_enabled(bool enabled) {
+    if (enabled) {
+        g_liveness_armed.store(true, std::memory_order_relaxed);
+    }
+    const bool was = g_afw_naming_enabled.exchange(enabled, std::memory_order_relaxed);
+    if (was && !enabled) {
+        std::scoped_lock _{g_afw_cl_tag_mtx};
+        g_afw_cl_tags.clear();
+        g_afw_submitted_frame.store(0xFFFFFFFFu, std::memory_order_release);
+    }
+}
+
+void on_command_lists_submitted(ID3D12CommandList* const* lists, uint32_t count) {
+    if (!g_afw_naming_enabled.load(std::memory_order_relaxed) || lists == nullptr || count == 0) {
+        return;
+    }
+    std::scoped_lock _{g_afw_cl_tag_mtx};
+    if (g_afw_cl_tags.empty()) {
+        return;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto it = g_afw_cl_tags.find(lists[i]);
+        if (it == g_afw_cl_tags.end()) {
+            continue;
+        }
+        const uint32_t frame = it->second;
+        g_afw_cl_tags.erase(it);
+        // A frame becomes the backbuffer content only once its rendering is
+        // submitted; frames advance monotonically. A large backwards jump is a
+        // counter reset (level reload) and is adopted.
+        const uint32_t prev = g_afw_submitted_frame.load(std::memory_order_relaxed);
+        if (prev == 0xFFFFFFFFu || frame > prev || (prev - frame) > 0x40000000u) {
+            g_afw_submitted_frame.store(frame, std::memory_order_release);
+        }
+    }
+}
+
+uint32_t get_afw_submitted_frame() {
+    return g_afw_submitted_frame.load(std::memory_order_acquire);
+}
+
+bool is_afw_frame_naming_enabled() {
+    return g_afw_naming_enabled.load(std::memory_order_acquire);
 }
 
 std::string probe_flush() {

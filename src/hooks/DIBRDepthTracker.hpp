@@ -175,4 +175,38 @@ void set_afw_depth_sequence_enabled(bool enabled);
 // Copy of the retained window, oldest first; total_pushed reports the
 // lifetime push count (== the seq the NEXT push will get).
 std::vector<AfwDepthSeqEntry> get_afw_depth_sequence(uint64_t& total_pushed);
+
+// === AFW authoritative frame naming (submission-order) ===
+// The present side must know which ViewFamily frame's render is in the
+// backbuffer it is about to synthesize from. Reconstructing it from
+// m_render_frame_count (a CPU render-thread counter that LEADS the GPU by the
+// pipeline depth, jitters cross-thread, and freezes on titles that don't drive
+// enqueue_render_poses) is why AFW needs the fusion / latest-1 / depth-seq /
+// parity-SAD machinery - all of it compensating for one un-named link.
+//
+// Instead, name the frame at its source: tag each frame's depth-bind command
+// list with its recording frame at RECORD time (render thread, where the frame
+// is known authoritatively), then publish that frame at SUBMIT time
+// (ExecuteCommandLists). Submission and Present run on the same serialized GPU
+// submission timeline - Present(F) is always issued after F's rendering ECLs
+// and before F+1's - so the value read in the present hook is exactly the
+// frame whose rendering was last submitted = the backbuffer content. No
+// counter lead, no vote, no per-launch nondeterminism.
+void set_afw_frame_naming_enabled(bool enabled);
+
+// Called from the ExecuteCommandLists hook AFTER the real submit. For any list
+// previously tagged at its depth bind, advances the published submitted frame
+// (monotonic) and clears the tag.
+void on_command_lists_submitted(ID3D12CommandList* const* lists, uint32_t count);
+
+// The ViewFamily frame whose rendering was most recently submitted to the GPU
+// queue; 0xFFFFFFFF until the first tagged submit. Authoritative present-side
+// key for AFW.
+uint32_t get_afw_submitted_frame();
+
+// True once AFW frame naming has been armed (set_afw_frame_naming_enabled).
+// The D3D12 present hook gates installation of its ExecuteCommandLists detour
+// on this (the detour is otherwise SN2-fog-only), so naming works on any AFW
+// title - not just when the fog ECL patch env happens to be set.
+bool is_afw_frame_naming_enabled();
 } // namespace dibr_depth_tracker

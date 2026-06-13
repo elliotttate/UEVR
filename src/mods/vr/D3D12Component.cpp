@@ -4975,6 +4975,43 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             SPDLOG_INFO_EVERY_N_SEC(10, "[DIBR][bindhealth] {}", dibr_depth_tracker::bind_health_report());
         }
 
+        // The fused/reconstructed fallback key (what the pre-naming pipeline
+        // used). Kept for the shadow comparison and as the fallback before the
+        // first tagged submit lands.
+        const uint32_t afw_fused_key = afw_presented_frame;
+
+        // Authoritative submission-order frame name as the PRIMARY key
+        // (default ON; UEVR_DIBR_AFW_NAME=0 falls back to the fused counter).
+        // The fusion above still runs every frame to keep its state warm as the
+        // pre-first-submit fallback; naming overrides it once a tagged submit
+        // has landed. The name comes from the ECL hook's per-list frame tag,
+        // read on the same serialized submission timeline as Present - the exact
+        // frame whose render is in the backbuffer, surviving the
+        // m_render_frame_count freeze/jitter the fused counter suffers.
+        // Validated sub-pixel-clean on AFW2 (consecutive-frame dumper). NOTE:
+        // naming fixes the frame NUMBER only - the per-launch eye-LABEL flip is
+        // still corrected by the parity anchor below (orthogonal). See the
+        // frame-naming section of DIBRDepthTracker.hpp.
+        static const bool name_primary = []() {
+            const char* v = std::getenv("UEVR_DIBR_AFW_NAME");
+            return v == nullptr || v[0] != '0';
+        }();
+        // Constant correction for the documented worker-thread race: the depth
+        // bind that carries the tag may be recorded on a parallel worker after
+        // the render thread already advanced g_recording_frame, so the name can
+        // sit a fixed offset off the true backbuffer frame. If the AFWNAME
+        // shadow delta is a stable nonzero constant, bake it here (no rebuild);
+        // if it is jittery, naming needs the recording-stream seq instead.
+        static const int32_t name_offset = []() {
+            const char* v = std::getenv("UEVR_DIBR_AFW_NAME_OFFSET");
+            return (v != nullptr && v[0] != '\0') ? std::atoi(v) : 0;
+        }();
+        const uint32_t afw_name_frame = dibr_depth_tracker::get_afw_submitted_frame();
+        const bool afw_name_ok = name_primary && afw_name_frame != 0xFFFFFFFFu;
+        if (afw_name_ok) {
+            afw_presented_frame = (uint32_t)((int32_t)afw_name_frame + name_offset);
+        }
+
         bool afw_ring_hit = vr->get_afw_view(afw_presented_frame, afw_eye_now, afw_rot_now, afw_loc_now, afw_other_loc_now);
         if (!afw_ring_hit) {
             const uint32_t latest = vr->get_afw_latest_frame();
@@ -4989,6 +5026,13 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             // NONDETERMINISTIC per launch (sync timing shifts the offset), so
             // the anchor is measured from the pixels each run. The env flip
             // remains as a manual override on top.
+            //
+            // Stage 4 (corrected 2026-06-13 after AFW2 oscillation): naming
+            // makes the FRAME NUMBER authoritative, but the per-launch eye-LABEL
+            // inversion the SAD anchor corrects is ORTHOGONAL - it is the
+            // present<->output eye-half mapping, which naming does not address.
+            // Disabling the XOR under naming inverted the eye every frame on
+            // anchor=1 launches => whole-image oscillation. Always apply it.
             if (m_afw_parity_anchor == 1) {
                 afw_eye_now ^= 1;
             }
@@ -5009,6 +5053,19 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                     (uint32_t)vr->get_runtime()->internal_frame_count, yoro_reference_eye,
                     afw_eye_now >= 0 ? "hit" : "MISS");
             }
+        }
+
+        // Naming health line (throttled): the authoritative submitted frame vs
+        // the fused fallback, and which one is driving. delta is the steady-state
+        // lead of the engine frame over UEVR's counter (a few frames); a sudden
+        // jump or primary flipping to "fused" for long stretches means the tag
+        // chain stalled (worth investigating).
+        if (single_view) {
+            const int64_t name_delta = afw_name_frame == 0xFFFFFFFFu
+                ? 0 : (int64_t)afw_name_frame - (int64_t)afw_fused_key;
+            SPDLOG_INFO_EVERY_N_SEC(10, "[DIBR][AFWNAME] submitted={} fused={} delta={} primary={} ring={}",
+                afw_name_frame, afw_fused_key, name_delta, afw_name_ok ? "name" : "fused",
+                afw_eye_now >= 0 ? "hit" : "MISS");
         }
 
         // Ring misses still get their own line - the fusion trace above only
@@ -5151,6 +5208,9 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         return v != nullptr && v[0] == '0';
     }();
     dibr_depth_tracker::set_afw_depth_sequence_enabled(afw && !afw_depth_seq_disabled);
+    // Authoritative submission-order frame naming runs whenever AFW is active
+    // (independent of the depth-seq toggle); the present-side key reads it.
+    dibr_depth_tracker::set_afw_frame_naming_enabled(afw);
     if (afw && !afw_depth_seq_disabled && depth != nullptr && depth_state == ENGINE_SRC_DEPTH) {
         const uint64_t present_idx = m_afw_depth_present_count++;
         uint64_t total_pushed = 0;
@@ -5867,6 +5927,19 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                     SPDLOG_INFO("[DIBR] AFW parity calibration: consecutive-frame half shifts L={} R={} -> anchor={} ({})",
                         s_left, s_right, m_afw_parity_anchor,
                         m_afw_parity_anchor == 1 ? "counter alignment INVERTED this run; flipping eye labels" : "aligned");
+                    // Stage 4 watchdog: under authoritative naming the eye comes
+                    // from record[name_F] and the SAD anchor is NOT applied. A
+                    // detected inversion here then indicts the naming itself (a
+                    // real bug to investigate - wrong NAME_OFFSET or a jittery
+                    // tag), not the expected per-launch counter nondeterminism.
+                    const bool naming_on = []() {
+                        const char* v = std::getenv("UEVR_DIBR_AFW_NAME");
+                        return v != nullptr && v[0] == '1';
+                    }() && dibr_depth_tracker::get_afw_submitted_frame() != 0xFFFFFFFFu;
+                    if (naming_on) {
+                        SPDLOG_INFO("[DIBR][AFWNAME] parity anchor={} applied under naming (eye-label correction is orthogonal to the frame name)",
+                            m_afw_parity_anchor);
+                    }
                     s_calib_rb[0]->Unmap(0, nullptr);
                     s_calib_rb[1]->Unmap(0, nullptr);
                 } else {

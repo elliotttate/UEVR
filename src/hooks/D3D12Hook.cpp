@@ -4538,7 +4538,13 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
             // hooking we verify the queue's CURRENT vtable[10] is NOT already our hook — otherwise a
             // re-hook would capture our own function as the "original" and recurse infinitely (crash).
             static std::atomic<uintptr_t> g_sn2_ecl_hooked_queue{0};
-            if (ecl_fix_enabled) {
+            // AFW authoritative frame naming also needs this detour (it publishes
+            // the per-list recording frame at submit time). Install it whenever
+            // naming is armed, independent of the SN2 fog patch env - otherwise
+            // naming silently no-ops on any title that isn't running the fog
+            // patch (the bug that left submitted_frame stuck at the sentinel).
+            const bool install_ecl = ecl_fix_enabled || dibr_depth_tracker::is_afw_frame_naming_enabled();
+            if (install_ecl) {
                 const uintptr_t qp = reinterpret_cast<uintptr_t>(d3d12->m_command_queue);
                 void** qvt = *reinterpret_cast<void***>(d3d12->m_command_queue);
                 const bool already_ours = (qvt != nullptr &&
@@ -4553,7 +4559,8 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
                     if (d3d12->m_command_queue_hook->hook_method(10, (uintptr_t)&D3D12Hook::execute_command_lists)) {
                         g_sn2_ecl_hooked_queue.store(qp, std::memory_order_release);
                         d3d12->m_command_queue_hooked = true;
-                        SPDLOG_WARN("[SN2-FogECL] hooked ExecuteCommandLists on present queue=0x{:x}", qp);
+                        SPDLOG_WARN("[SN2-FogECL] hooked ExecuteCommandLists on present queue=0x{:x} (fog_patch={} afw_naming={})",
+                            qp, ecl_fix_enabled, dibr_depth_tracker::is_afw_frame_naming_enabled());
                     } else {
                         SPDLOG_ERROR("[SN2-FogECL] FAILED to hook ExecuteCommandLists");
                         d3d12->m_command_queue_hook.reset();
@@ -4864,6 +4871,9 @@ void WINAPI D3D12Hook::execute_command_lists(ID3D12CommandQueue* queue, UINT num
     auto original = g_sn2_ecl_original.load(std::memory_order_acquire);
     if (original != nullptr) {
         original(queue, num_command_lists, lists);
+        // AFW authoritative frame naming: publish the recording frame carried
+        // by these just-submitted lists, in submission order (see header).
+        dibr_depth_tracker::on_command_lists_submitted(lists, num_command_lists);
         if (sn2_rt_snapshot::enabled() &&
             (sn2_capture_runtime_gate::active() || sn2_rt_snapshot::has_pending_work())) {
             sn2_rt_snapshot::signal_after_execute(queue);
@@ -4873,6 +4883,7 @@ void WINAPI D3D12Hook::execute_command_lists(ID3D12CommandQueue* queue, UINT num
     }
     // Should never happen; last-resort direct call.
     queue->ExecuteCommandLists(num_command_lists, lists);
+    dibr_depth_tracker::on_command_lists_submitted(lists, num_command_lists);
     if (sn2_rt_snapshot::enabled() &&
         (sn2_capture_runtime_gate::active() || sn2_rt_snapshot::has_pending_work())) {
         sn2_rt_snapshot::signal_after_execute(queue);
