@@ -129,6 +129,11 @@ void* get_velocity_source();
 // present-time synthesis reads it.
 void set_afw_depth_snapshot_enabled(bool enabled);
 
+// Arm the RTV/DSV view maps from the persisted config (every single-view DIBR/
+// AFW method) so config/UI-driven AFW records views from creation - WITHOUT
+// enabling the opt-in per-frame depth snapshot. Call from VR::on_config_load.
+void set_view_tracking_forced(bool enabled);
+
 // The engine frame whose views/passes are about to be recorded (game thread,
 // BeginRenderViewFamily - same source as the AFW view-record keying).
 void set_recording_frame(uint32_t engine_frame);

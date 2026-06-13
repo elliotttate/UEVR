@@ -147,6 +147,11 @@ bool probe_enabled() {
 // before the first present are captured when AFW is requested at launch).
 std::atomic<bool> g_afw_depth_enabled{false};
 
+// Armed from the PERSISTED CONFIG (not the env) so config/UI-driven AFW also
+// records the view maps from the first qualifying view creation. Distinct from
+// g_afw_depth_enabled so it does NOT enable the opt-in per-frame depth snapshot.
+std::atomic<bool> g_view_tracking_forced{false};
+
 bool afw_requested_via_env() {
     static const bool requested = []() {
         const char* v = std::getenv("UEVR_DIBR");
@@ -158,7 +163,8 @@ bool afw_requested_via_env() {
 // The view maps feed the census, the probe, and the AFW depth snapshots.
 bool view_tracking_enabled() {
     return census_enabled() || probe_enabled() || afw_requested_via_env() ||
-           g_afw_depth_enabled.load(std::memory_order_relaxed);
+           g_afw_depth_enabled.load(std::memory_order_relaxed) ||
+           g_view_tracking_forced.load(std::memory_order_relaxed);
 }
 
 long long now_ms() {
@@ -746,6 +752,13 @@ void set_afw_depth_snapshot_enabled(bool enabled) {
         g_liveness_armed.store(true, std::memory_order_relaxed);
     }
     g_afw_depth_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+void set_view_tracking_forced(bool enabled) {
+    if (enabled) {
+        g_liveness_armed.store(true, std::memory_order_relaxed);
+    }
+    g_view_tracking_forced.store(enabled, std::memory_order_relaxed);
 }
 
 void set_recording_frame(uint32_t engine_frame) {

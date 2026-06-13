@@ -48,6 +48,8 @@
 #include "UObjectHook.hpp"
 #include "GameSpecific.hpp"
 
+#include "hooks/DIBRDepthTracker.hpp"
+
 namespace {
 bool vr_env_truthy(const char* name) {
     char value[32]{};
@@ -6230,6 +6232,14 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
         }
         m_rendering_method->value() = forced;
     }
+
+    // Arm the DIBR depth view-tracking from the PERSISTED CONFIG (not just the
+    // UEVR_DIBR env). The RTV/DSV view maps populate only at resource-creation
+    // time; env-only arming meant config/UI-driven AFW never recorded views ->
+    // bind resolve_miss=100% -> depth-seq never anchors -> near-field
+    // oscillation. get_dibr_requested_mode()>0 covers every single-view DIBR/AFW
+    // config; re-applied on every (re)load so the panel/dropdown stays honored.
+    dibr_depth_tracker::set_view_tracking_forced(get_dibr_requested_mode() > 0);
 
     if (get_runtime() != nullptr && get_runtime()->loaded) {
         get_runtime()->on_config_load(cfg, set_defaults);
