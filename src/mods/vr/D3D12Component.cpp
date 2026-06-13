@@ -5880,15 +5880,22 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             }
         }
 
-        // AFW forensics (UEVR_DIBR_AFW_DUMP=1): grab 4 CONSECUTIVE presented
-        // frames (both eyes, post-synthesis) so per-parity geometry can be
-        // measured without slow camera sway confounding seconds-apart
-        // samples. Saved to %TEMP%\uevr_afw_dump_<i>_ref<eye>_rf<frame>.ppm.
-        static const bool afw_dump_enabled = []() {
-            const char* v = std::getenv("UEVR_DIBR_AFW_DUMP");
-            return v != nullptr && v[0] == '1';
+        // DIBR forensics (UEVR_DIBR_AFW_DUMP=1 or UEVR_DIBR_DUMP=1): grab 4
+        // CONSECUTIVE presented frames (both eyes, post-synthesis) so per-parity
+        // geometry can be measured without slow camera sway confounding
+        // seconds-apart samples. Works for ANY single-view DIBR mode (YORO /
+        // inverse / raymarch / scatter / AFW), not just AFW - a single static
+        // eye dump cannot see a frame-to-frame oscillation, so this is the
+        // verification instrument for every synthesis mode. Saved to
+        // %TEMP%\uevr_afw_dump_r<round>_<i>_ref<eye>_rf<frame>.ppm.
+        // Trigger: sustained head/camera motion (AFW path) OR on demand by
+        // touching %TEMP%\uevr_dibr_dump_now (all modes; bypasses the cooldown).
+        static const bool dump_enabled = []() {
+            const char* a = std::getenv("UEVR_DIBR_AFW_DUMP");
+            const char* b = std::getenv("UEVR_DIBR_DUMP");
+            return (a != nullptr && a[0] == '1') || (b != nullptr && b[0] == '1');
         }();
-        if (afw_dump_enabled && afw && single_view) {
+        if (dump_enabled && single_view) {
             constexpr uint32_t kDumpCount = 4;
             static uint32_t s_captured = 0;
             static Microsoft::WRL::ComPtr<ID3D12Resource> s_readback[kDumpCount];
@@ -5905,8 +5912,22 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             // 4-frame burst - the FIRST trigger of a run is the spawn settle
             // (a one-frame teleport spike followed by rest frames), never the
             // motion under test.
-            const bool triggered = m_afw_dump_motion_trigger.exchange(false, std::memory_order_relaxed);
-            if (!s_capturing && triggered && GetTickCount64() >= s_next_arm_ms) {
+            bool triggered = m_afw_dump_motion_trigger.exchange(false, std::memory_order_relaxed)
+                             && GetTickCount64() >= s_next_arm_ms;
+            // On-demand trigger (mode-independent, bypasses the motion cooldown):
+            // a test harness touches the sentinel file while holding a scripted
+            // yaw, so the 4-frame burst lands mid-motion in YORO/inverse/raymarch
+            // /scatter too (their motion trigger lives only on the AFW path).
+            if (!s_capturing && !triggered) {
+                char sentinel_dir[MAX_PATH]{};
+                GetTempPathA(MAX_PATH, sentinel_dir);
+                const std::string sentinel = std::string(sentinel_dir) + "uevr_dibr_dump_now";
+                if (GetFileAttributesA(sentinel.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    DeleteFileA(sentinel.c_str());
+                    triggered = true;
+                }
+            }
+            if (!s_capturing && triggered) {
                 s_capturing = true;
             }
 
@@ -5945,7 +5966,11 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                     cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
                     barrier(cmd_list, output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
                     s_ref[s_captured] = yoro_reference_eye;
-                    s_rframe[s_captured] = afw_presented_frame;
+                    // AFW labels by its parity-keyed present frame; other modes
+                    // have no such key, so stamp the engine present counter -
+                    // consecutive captures read N, N+1, N+2, N+3, proving adjacency.
+                    s_rframe[s_captured] = afw ? afw_presented_frame
+                        : (uint32_t)vr->get_runtime()->internal_frame_count;
                     ++s_captured;
                 }
             } else if (s_captured == kDumpCount) {
