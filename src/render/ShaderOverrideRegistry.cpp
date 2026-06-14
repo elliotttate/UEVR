@@ -1345,7 +1345,7 @@ bool ShaderOverrideRegistry::should_track_d3d11_shaders() const {
         m_inspector_tracking_enabled.load(std::memory_order_relaxed);
 }
 
-bool ShaderOverrideRegistry::should_track_d3d12_pipelines() const {
+bool ShaderOverrideRegistry::should_track_d3d12_pipelines_for_diagnostics() const {
     // When a headless per-eye skip is configured (UEVR_SHADER_HUNTER_SKIP_{LEFT,RIGHT}_ONLY),
     // enable full pipeline tracking so the bind-time collection records + hash-extracts the
     // actually-bound PSO each frame — exactly what active hunting does. Without this the
@@ -1370,12 +1370,19 @@ bool ShaderOverrideRegistry::should_track_d3d12_pipelines() const {
                truthy("UEVR_SHADER_HUNTER_SKIP_LEFT_ONLY") ||
                truthy("UEVR_SHADER_HUNTER_SUPPRESS");
     }();
-    return m_has_active_d3d12_overrides.load(std::memory_order_relaxed) ||
-        m_inspector_tracking_enabled.load(std::memory_order_relaxed) ||
+    return m_inspector_tracking_enabled.load(std::memory_order_relaxed) ||
         m_hunter_active.load(std::memory_order_relaxed) ||
         m_hunter_hide_marked.load(std::memory_order_relaxed) ||
         m_capture_next_d3d12_change_hot_path.load(std::memory_order_relaxed) ||
         skip_configured;
+}
+
+bool ShaderOverrideRegistry::should_track_d3d12_pipelines() const {
+    // Active overrides need resolve_* + creation registration (this gate), but
+    // not the per-bind diagnostic bookkeeping — the hot SetPipelineState hook
+    // splits those by checking should_track_d3d12_pipelines_for_diagnostics().
+    return m_has_active_d3d12_overrides.load(std::memory_order_relaxed) ||
+        should_track_d3d12_pipelines_for_diagnostics();
 }
 
 bool ShaderOverrideRegistry::should_record_d3d12_pipeline_creations() const {
@@ -4131,6 +4138,21 @@ void ShaderOverrideRegistry::update_d3d11_override_shader(D3D11ShaderRecord& rec
 }
 
 void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsPsoRecord& record) {
+    // PER-DRAW FAST PATH: resolve_d3d12_pipeline_state[_for_eye]() calls this for
+    // every tracked PSO on every draw (apply_per_eye_pso_variant). Once the
+    // override PSO for this record is built it is fully cached in the record, and
+    // applied_override_revision == m_override_revision marks that. Returning here
+    // BEFORE constructing the dozen override-key std::strings and running the
+    // dozen map lookups below removes that per-draw heap churn from the render
+    // thread. Any change that could alter the result (manifest rescan, hunter
+    // skip/highlight/cycle toggle) invalidates the affected records by resetting
+    // applied_override_revision to UINT64_MAX, so this fast path can never serve a
+    // stale substitution. (Previously this same guard sat ~290 lines down, after
+    // all the key-building, so that work ran every draw for nothing.)
+    if (record.applied_override_revision == m_override_revision) {
+        return;
+    }
+
     const auto vertex_key = record.vertex_hash.empty() ? std::string{} : make_override_key(Backend::D3D12, Stage::Vertex, record.vertex_hash);
     const auto pixel_key = record.pixel_hash.empty() ? std::string{} : make_override_key(Backend::D3D12, Stage::Pixel, record.pixel_hash);
     const auto geometry_key = record.geometry_hash.empty() ? std::string{} : make_override_key(Backend::D3D12, Stage::Geometry, record.geometry_hash);
@@ -4420,10 +4442,7 @@ void ShaderOverrideRegistry::update_d3d12_override_pipeline_state(D3D12GraphicsP
         return !payload.compiled_bytecode.empty();
     };
 
-    if (record.applied_override_revision == m_override_revision) {
-        return;
-    }
-
+    // (revision fast-path guard hoisted to the top of this function)
     ensure_patch_entry(vertex_entry, Stage::Vertex);
     ensure_patch_entry(pixel_entry, Stage::Pixel);
     ensure_patch_entry(geometry_entry, Stage::Geometry);

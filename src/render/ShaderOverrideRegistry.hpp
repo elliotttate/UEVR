@@ -400,6 +400,14 @@ public:
     void set_inspector_tracking_enabled(bool enabled);
     bool should_track_d3d11_shaders() const;
     bool should_track_d3d12_pipelines() const;
+    // The diagnostic-only subset of should_track_d3d12_pipelines(): true when an
+    // inspector / Shader Hunter / capture / headless-skip consumer needs the
+    // per-bind pipeline-pair + sample bookkeeping, but NOT merely because an
+    // override is active. Applying an override only needs resolve_*; the heavy
+    // note_d3d12_pipeline_state_bound() is pure diagnostics. Letting an active
+    // override take a lean apply-only bind path is the whole point of the split.
+    bool should_track_d3d12_pipelines_for_diagnostics() const;
+    bool has_active_d3d12_overrides() const { return m_has_active_d3d12_overrides.load(std::memory_order_relaxed); }
     bool should_record_d3d12_pipeline_creations() const;
     void request_reload();
     void set_runtime_overrides_enabled(bool enabled);

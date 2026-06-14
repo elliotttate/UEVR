@@ -18052,22 +18052,39 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
     update_cmdlist_pso(command_list, pipeline_state);
     const auto pso_state = read_cmdlist_state(command_list);
     const auto eye_bucket = cmdlist_eye_bucket(pso_state);
-    if (!shader_registry.should_track_d3d12_pipelines()) {
+
+    // LEAN APPLY PATH: an override is active (and/or forensics/sn2-consumers are
+    // recording) but no inspector / Shader Hunter / capture diagnostics need the
+    // per-bind pipeline-pair + sample bookkeeping. Apply the override substitution
+    // (a single map lookup; per-eye overrides apply later at draw time in
+    // apply_per_eye_pso_variant) and forward, skipping the heavy
+    // note_d3d12_pipeline_state_bound() (3x fill_info string copies + pair
+    // construction + sample recording under the registry mutex) and the hunter
+    // recording. For a per-eye-only fog override this bind-time bookkeeping was
+    // pure waste — the substitution it implies happens at draw time, not here.
+    if (!shader_registry.should_track_d3d12_pipelines_for_diagnostics()) {
+        auto* bound_pipeline_state = pipeline_state;
+        if (shader_registry.has_active_d3d12_overrides()) {
+            bound_pipeline_state = shader_registry.resolve_d3d12_pipeline_state(pipeline_state);
+        }
         uevr::renderdoc_capture::note_object(
             uevr::renderdoc_capture::ObjectKind::BoundD3D12PipelineState,
-            pipeline_state,
+            bound_pipeline_state,
             "D3D12Hook::SetPipelineState bound state");
         if (record_forensics_pso_bind) {
             render::StereoForensics::get().record_pso_bind(
                 "D3D12Hook::SetPipelineState",
                 reinterpret_cast<uintptr_t>(command_list),
                 reinterpret_cast<uintptr_t>(pipeline_state),
-                reinterpret_cast<uintptr_t>(pipeline_state),
+                reinterpret_cast<uintptr_t>(bound_pipeline_state),
                 pso_state.last_graphics_root_signature,
                 pso_state.last_compute_root_signature,
                 eye_bucket);
         }
-        original(command_list, pipeline_state);
+        original(command_list, bound_pipeline_state);
+        if (bound_pipeline_state != pipeline_state) {
+            update_cmdlist_effective_pso(command_list, bound_pipeline_state);
+        }
         return;
     }
 
