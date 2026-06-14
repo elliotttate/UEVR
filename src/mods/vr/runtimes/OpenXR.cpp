@@ -2828,6 +2828,11 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
         !has_native_stereo_array &&
         this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_LEFT_EYE) &&
         this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_RIGHT_EYE);
+    const auto mono_left_half_submit =
+        !is_afr &&
+        !has_native_stereo_array &&
+        !has_native_split_eye_swapchains &&
+        VR::get()->is_mono_rendering_active();
 
     if (is_afr || has_native_split_eye_swapchains || has_native_stereo_array) {
         if (!has_native_stereo_array && !has_native_split_eye_swapchains &&
@@ -2937,7 +2942,7 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
             int32_t offset_x = 0, offset_y = 0, extent_x = 0, extent_y = 0;
             // if we're working with a double-wide texture, use half the view bounds adjustment (as they apply to a single eye)
             int texture_area_width = (is_afr || has_native_split_eye_swapchains || has_native_stereo_array) ? swapchain->width : swapchain->width / 2;
-            if (is_afr || has_native_split_eye_swapchains || has_native_stereo_array || i == 0) {
+            if (is_afr || has_native_split_eye_swapchains || has_native_stereo_array || i == 0 || mono_left_half_submit) {
                 offset_x = view_bounds[i][0] * texture_area_width;
                 extent_x = view_bounds[i][1] * texture_area_width - offset_x;
             } else {

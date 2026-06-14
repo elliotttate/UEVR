@@ -3583,6 +3583,21 @@ void D3D12Hook::install_command_list_hooks_from_unknown(IUnknown* command_list) 
     }
 }
 
+// A/B perf gates: the SetPipelineState / OMSetRenderTargets command-list hooks
+// below are installed unconditionally (the DIBR depth tracker uses OMSetRenderTargets
+// for DSV-bind liveness; SetPipelineState feeds PSO tracking). They fire on every
+// such call on the render thread. In mono / non-DIBR launches the depth tracker is
+// not feeding synthesis, so these env vars let us remove the per-call overhead to
+// measure its cost. Default: hooks ON (unchanged behavior).
+static bool disable_set_pipeline_state_hook() {
+    static const bool d = env_flag_enabled_a("UEVR_DISABLE_SET_PIPELINE_STATE_HOOK");
+    return d;
+}
+static bool disable_om_set_render_targets_hook() {
+    static const bool d = env_flag_enabled_a("UEVR_DISABLE_OM_SET_RENDER_TARGETS_HOOK");
+    return d;
+}
+
 void D3D12Hook::install_command_list_hooks(ID3D12GraphicsCommandList* command_list) {
     if (command_list == nullptr) {
         return;
@@ -3595,28 +3610,32 @@ void D3D12Hook::install_command_list_hooks(ID3D12GraphicsCommandList* command_li
             return;
         }
 
-        add_unique_pointer_hook(
-            iface,
-            SET_PIPELINE_STATE_VTABLE_INDEX,
-            reinterpret_cast<void*>(&D3D12Hook::set_pipeline_state),
-            m_set_pipeline_state_hooks,
-            m_set_pipeline_state_hook_lookup,
-            m_set_pipeline_state_slots
-        );
+        if (!disable_set_pipeline_state_hook()) {
+            add_unique_pointer_hook(
+                iface,
+                SET_PIPELINE_STATE_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::set_pipeline_state),
+                m_set_pipeline_state_hooks,
+                m_set_pipeline_state_hook_lookup,
+                m_set_pipeline_state_slots
+            );
+        }
 
         // Always installed (independent of the diagnostic env): the DIBR depth
         // tracker needs per-frame DSV-bind liveness so it never selects a stale
         // depth target (e.g. a frozen loading-screen depth that matches the
         // swapchain extent). The diagnostic recordings inside the hook body are
         // still gated on enable_d3d12_diagnostic_command_list_hooks().
-        add_unique_pointer_hook(
-            iface,
-            OM_SET_RENDER_TARGETS_VTABLE_INDEX,
-            reinterpret_cast<void*>(&D3D12Hook::om_set_render_targets),
-            m_command_list_diagnostic_hooks,
-            m_command_list_diagnostic_hook_lookup,
-            m_command_list_diagnostic_slots
-        );
+        if (!disable_om_set_render_targets_hook()) {
+            add_unique_pointer_hook(
+                iface,
+                OM_SET_RENDER_TARGETS_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::om_set_render_targets),
+                m_command_list_diagnostic_hooks,
+                m_command_list_diagnostic_hook_lookup,
+                m_command_list_diagnostic_slots
+            );
+        }
 
         if (!enable_d3d12_diagnostic_command_list_hooks()) {
             return;

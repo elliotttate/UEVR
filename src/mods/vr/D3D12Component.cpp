@@ -1493,6 +1493,11 @@ bool frame_profiler_log_enabled() {
     return enabled;
 }
 
+bool mono_right_half_fill_enabled() {
+    static const bool enabled = sn2_env_truthy("UEVR_MONO_FILL_RIGHT_HALF");
+    return enabled;
+}
+
 // Feature #10 (agent OWNEDRES): give the OpenXR native-stereo-array texture and
 // the native (SBS) source resource descriptive RenderDoc-legible names so a
 // capture can tell slice0=left / slice1=right apart and identify the source.
@@ -3603,7 +3608,21 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                                 nullptr);
                         }
                     } else if (m_scene_capture_tex.texture.Get() == nullptr || shf_using_mono_expansion) {
-                        m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, backbuffer.Get(), scene_source_state, nullptr);
+                        if (vr->is_mono_rendering_active()) {
+                            const auto backbuffer_desc = backbuffer->GetDesc();
+                            D3D12_BOX mono_src_box{};
+                            mono_src_box.left = 0;
+                            mono_src_box.top = 0;
+                            mono_src_box.front = 0;
+                            mono_src_box.right = static_cast<UINT>(backbuffer_desc.Width / 2);
+                            mono_src_box.bottom = static_cast<UINT>(backbuffer_desc.Height);
+                            mono_src_box.back = 1;
+
+                            SPDLOG_INFO_ONCE("[Mono] OpenXR submit samples left half for both eyes; copying only left half to the double-wide swapchain");
+                            m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, backbuffer.Get(), scene_source_state, &mono_src_box);
+                        } else {
+                            m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, backbuffer.Get(), scene_source_state, nullptr);
+                        }
                     } else {
                         m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, nullptr, pre_render, std::nullopt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
                     }
@@ -4367,8 +4386,8 @@ void D3D12Component::draw_spectator_view(ID3D12GraphicsCommandList* command_list
     // only show one half of the double wide texture (right side)
     RECT source_rect{};
 
-    // Show left side when using AFR or native stereo fix
-    if (vr->is_using_afr() || vr->is_native_stereo_fix_enabled()) {
+    // Show left side when using AFR, native stereo fix, or Mono's single rendered view.
+    if (vr->is_using_afr() || vr->is_native_stereo_fix_enabled() || vr->is_mono_rendering_active()) {
         source_rect.left = 0;
         source_rect.top = 0;
         source_rect.right = m_backbuffer_size[0] / 2;
@@ -4669,11 +4688,11 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
 
     // Engine-side single-view state (DIBR synthesis or Mono): the stereo hook
     // renders ONLY the reference view (into the left half of the double-wide
-    // backbuffer) while this is true, so every exit from this function must
-    // leave the right half filled - the engine never wrote it. The cooldown
-    // keeps the fill alive for the frames-in-flight window right after the
-    // policy flips off (mode switched, pipeline failure, device reset), when
-    // arriving backbuffers were still rendered with a single view.
+    // backbuffer) while this is true. DIBR fallback paths still physically
+    // fill the right half because downstream consumers may sample it; Mono's
+    // steady state instead submits/spectates the left half for both eyes.
+    // The cooldown keeps the fallback fill alive for the frames-in-flight
+    // window right after single-view policy flips off.
     const bool single_view = vr->is_single_view_rendering_active();
     if (single_view) {
         m_dibr_single_view_cooldown = 3;
@@ -4809,11 +4828,18 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     };
 
     // Mono rendering method: gearmono-style baseline. The engine rendered one
-    // centered union-frustum view into the left half; mirror it to the right
-    // half and skip synthesis entirely.
+    // centered union-frustum view into the left half. OpenXR submits that left
+    // half for both eyes, so the steady-state mono path does not need a
+    // render-thread fence wait plus two GPU copies just to populate an
+    // unsampled right half. UEVR_MONO_FILL_RIGHT_HALF=1 restores the old fill
+    // for capture tools that inspect the raw double-wide backbuffer.
     if (vr->is_mono_rendering_active()) {
-        SPDLOG_INFO_ONCE("[DIBR] Mono rendering method active: mirroring the centered view to both eyes");
-        fill_right_half_mono(true);
+        if (mono_right_half_fill_enabled()) {
+            SPDLOG_INFO_ONCE("[DIBR] Mono rendering method active: mirroring the centered view to both eyes");
+            fill_right_half_mono(true);
+        } else {
+            SPDLOG_INFO_ONCE("[DIBR] Mono rendering method active: skipping right-half mirror; OpenXR samples the left half for both eyes");
+        }
         return;
     }
 

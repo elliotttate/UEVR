@@ -5541,9 +5541,37 @@ std::optional<uint32_t> resolve_post_init_properties_index_from_uobject(uintptr_
 }
 
 namespace {
-bool is_writable_process_range(uintptr_t address, size_t size) {
-    if (address == 0 || size == 0 || address + size < address) {
-        return false;
+// VirtualQuery() is a syscall. is_readable/writable/executable_process_range called
+// it on every probe; looks_like_virtual_function_table issues up to 13 per vtable,
+// and FFakeStereoRenderingHook::slate_draw_window_render_thread runs that per object
+// on the render thread -> a VirtualQuery storm (ETW profiled it at ~12% of process
+// CPU in ntoskrnl!MiGetPageProtection, the dominant SN2 render-thread cost vs stock
+// UEVR). Page protections for the regions these probes touch (module .text/.rdata
+// vtables+code, the UObject heap) are stable, so cache the containing region per
+// thread and reuse it. The cache is periodically dropped to bound staleness for the
+// rare case where heap memory is freed/decommitted between probes.
+bool query_region_protect(uintptr_t address, DWORD& out_protect, uintptr_t& out_base, size_t& out_size) {
+    struct Region { uintptr_t base; size_t size; DWORD protect; };
+    static constexpr size_t kCap = 64;
+    thread_local Region s_cache[kCap]{};
+    thread_local size_t s_count = 0;
+    thread_local size_t s_next = 0;
+    thread_local uint32_t s_queries = 0;
+
+    if (++s_queries >= 2048) {
+        s_queries = 0;
+        s_count = 0;
+        s_next = 0;
+    }
+
+    for (size_t i = 0; i < s_count; ++i) {
+        const auto& r = s_cache[i];
+        if (r.size != 0 && address >= r.base && address - r.base < r.size) {
+            out_protect = r.protect;
+            out_base = r.base;
+            out_size = r.size;
+            return true;
+        }
     }
 
     MEMORY_BASIC_INFORMATION mbi{};
@@ -5551,16 +5579,41 @@ bool is_writable_process_range(uintptr_t address, size_t size) {
         return false;
     }
 
-    const auto base = (uintptr_t)mbi.BaseAddress;
-    if (address + size > base + mbi.RegionSize) {
+    const Region r{ (uintptr_t)mbi.BaseAddress, mbi.RegionSize, mbi.Protect };
+    if (s_count < kCap) {
+        s_cache[s_count++] = r;
+    } else {
+        s_cache[s_next] = r;
+        s_next = (s_next + 1) % kCap;
+    }
+
+    out_protect = mbi.Protect;
+    out_base = (uintptr_t)mbi.BaseAddress;
+    out_size = mbi.RegionSize;
+    return true;
+}
+
+bool is_writable_process_range(uintptr_t address, size_t size) {
+    if (address == 0 || size == 0 || address + size < address) {
         return false;
     }
 
-    if ((mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+    DWORD region_protect{};
+    uintptr_t base{};
+    size_t region_size{};
+    if (!query_region_protect(address, region_protect, base, region_size)) {
         return false;
     }
 
-    const auto protect = mbi.Protect & 0xff;
+    if (address + size > base + region_size) {
+        return false;
+    }
+
+    if ((region_protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+        return false;
+    }
+
+    const auto protect = region_protect & 0xff;
     return protect == PAGE_READWRITE ||
            protect == PAGE_WRITECOPY ||
            protect == PAGE_EXECUTE_READWRITE ||
@@ -5572,21 +5625,22 @@ bool is_readable_process_range(uintptr_t address, size_t size) {
         return false;
     }
 
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery((void*)address, &mbi, sizeof(mbi)) == 0) {
+    DWORD region_protect{};
+    uintptr_t base{};
+    size_t region_size{};
+    if (!query_region_protect(address, region_protect, base, region_size)) {
         return false;
     }
 
-    const auto base = (uintptr_t)mbi.BaseAddress;
-    if (address + size > base + mbi.RegionSize) {
+    if (address + size > base + region_size) {
         return false;
     }
 
-    if ((mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+    if ((region_protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
         return false;
     }
 
-    const auto protect = mbi.Protect & 0xff;
+    const auto protect = region_protect & 0xff;
     return protect == PAGE_READONLY ||
            protect == PAGE_READWRITE ||
            protect == PAGE_WRITECOPY ||
@@ -5600,21 +5654,22 @@ bool is_executable_process_range(uintptr_t address, size_t size) {
         return false;
     }
 
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery((void*)address, &mbi, sizeof(mbi)) == 0) {
+    DWORD region_protect{};
+    uintptr_t base{};
+    size_t region_size{};
+    if (!query_region_protect(address, region_protect, base, region_size)) {
         return false;
     }
 
-    const auto base = (uintptr_t)mbi.BaseAddress;
-    if (address + size > base + mbi.RegionSize) {
+    if (address + size > base + region_size) {
         return false;
     }
 
-    if ((mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+    if ((region_protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
         return false;
     }
 
-    const auto protect = mbi.Protect & 0xff;
+    const auto protect = region_protect & 0xff;
     return protect == PAGE_EXECUTE ||
            protect == PAGE_EXECUTE_READ ||
            protect == PAGE_EXECUTE_READWRITE ||
