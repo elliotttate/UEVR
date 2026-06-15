@@ -1510,9 +1510,12 @@ bool mono_right_half_fill_enabled() {
     return enabled;
 }
 
-bool mono_openxr_unpaced_enabled() {
+bool single_view_openxr_unpaced_enabled() {
     char value[32]{};
-    const auto len = GetEnvironmentVariableA("UEVR_MONO_OPENXR_UNPACED", value, static_cast<DWORD>(sizeof(value)));
+    auto len = GetEnvironmentVariableA("UEVR_SINGLE_VIEW_OPENXR_UNPACED", value, static_cast<DWORD>(sizeof(value)));
+    if (len == 0) {
+        len = GetEnvironmentVariableA("UEVR_MONO_OPENXR_UNPACED", value, static_cast<DWORD>(sizeof(value)));
+    }
     if (len == 0 || len >= sizeof(value)) {
         return true;
     }
@@ -1521,9 +1524,35 @@ bool mono_openxr_unpaced_enabled() {
     return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
 }
 
-bool mono_openxr_async_release_enabled() {
-    static const bool enabled = !sn2_env_explicit_false("UEVR_MONO_OPENXR_ASYNC_RELEASE");
+bool single_view_openxr_async_release_enabled() {
+    static const bool enabled =
+        !sn2_env_explicit_false("UEVR_SINGLE_VIEW_OPENXR_ASYNC_RELEASE") &&
+        !sn2_env_explicit_false("UEVR_MONO_OPENXR_ASYNC_RELEASE");
     return enabled;
+}
+
+bool dibr_direct_openxr_submit_enabled() {
+    static const bool enabled = !sn2_env_explicit_false("UEVR_DIBR_DIRECT_OPENXR_SUBMIT");
+    return enabled;
+}
+
+bool single_view_openxr_pacing_active(VR* vr) {
+    return vr != nullptr && vr->is_single_view_openxr_pacing_active();
+}
+
+uint32_t single_view_openxr_scene_swapchain_index(VR* vr) {
+    const auto double_wide = (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE;
+    const auto native_array = (uint32_t)runtimes::OpenXR::SwapchainIndex::NATIVE_STEREO_ARRAY;
+
+    auto* openxr = vr != nullptr ? vr->get_openxr_runtime() : nullptr;
+    if (openxr != nullptr &&
+        vr->is_native_stereo_array_submit_enabled() &&
+        openxr->swapchains.contains(native_array))
+    {
+        return native_array;
+    }
+
+    return double_wide;
 }
 
 bool env_double_value(const char* name, double& out) {
@@ -1543,9 +1572,15 @@ bool env_double_value(const char* name, double& out) {
     return true;
 }
 
-std::chrono::steady_clock::duration mono_openxr_submit_interval(VR* vr) {
+std::chrono::steady_clock::duration single_view_openxr_submit_interval(VR* vr) {
     double configured_hz = 0.0;
-    if (!env_double_value("UEVR_MONO_OPENXR_SUBMIT_HZ", configured_hz) || configured_hz <= 0.0) {
+    if (!env_double_value("UEVR_SINGLE_VIEW_OPENXR_SUBMIT_HZ", configured_hz) &&
+        (vr == nullptr || !vr->is_mono_rendering_active() || !env_double_value("UEVR_MONO_OPENXR_SUBMIT_HZ", configured_hz)))
+    {
+        return std::chrono::steady_clock::duration::zero();
+    }
+
+    if (configured_hz <= 0.0) {
         return std::chrono::steady_clock::duration::zero();
     }
 
@@ -1554,13 +1589,13 @@ std::chrono::steady_clock::duration mono_openxr_submit_interval(VR* vr) {
         std::chrono::duration<double>{1.0 / hz});
 }
 
-bool should_skip_mono_openxr_submit(VR* vr) {
-    if (vr == nullptr || vr->get_openxr_runtime() == nullptr || !vr->is_mono_rendering_active()) {
+bool should_skip_single_view_openxr_submit(VR* vr) {
+    if (vr == nullptr || vr->get_openxr_runtime() == nullptr || !single_view_openxr_pacing_active(vr)) {
         return false;
     }
 
     auto* openxr = vr->get_openxr_runtime();
-    if (!mono_openxr_unpaced_enabled() || !openxr->can_run_frame_loop() || openxr->debug_submit_empty_frame->value()) {
+    if (!single_view_openxr_unpaced_enabled() || !openxr->can_run_frame_loop() || openxr->debug_submit_empty_frame->value()) {
         return false;
     }
 
@@ -1575,7 +1610,7 @@ bool should_skip_mono_openxr_submit(VR* vr) {
         return false;
     }
 
-    const auto interval = mono_openxr_submit_interval(vr);
+    const auto interval = single_view_openxr_submit_interval(vr);
     if (interval <= std::chrono::steady_clock::duration::zero()) {
         return false;
     }
@@ -2655,21 +2690,21 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     const auto debug_disable_depth_submit = openxr_runtime != nullptr && openxr_runtime->debug_disable_depth_submit->value();
     const auto suppress_scene_copy = debug_submit_empty_frame || debug_skip_scene_copy;
     const auto suppress_ui_copy = debug_submit_empty_frame || debug_skip_ui_copy;
-    const auto mono_submit_throttle_interval = mono_openxr_submit_interval(vr);
-    m_mono_openxr_unpaced_active_this_frame =
+    const auto single_view_submit_throttle_interval = single_view_openxr_submit_interval(vr);
+    m_single_view_openxr_unpaced_active_this_frame =
         openxr_runtime != nullptr &&
-        vr->is_mono_rendering_active() &&
-        mono_openxr_unpaced_enabled() &&
+        single_view_openxr_pacing_active(vr) &&
+        single_view_openxr_unpaced_enabled() &&
         !debug_submit_empty_frame;
-    m_mono_openxr_skipped_submit_this_frame =
-        m_mono_openxr_unpaced_active_this_frame && should_skip_mono_openxr_submit(vr);
+    m_single_view_openxr_skipped_submit_this_frame =
+        m_single_view_openxr_unpaced_active_this_frame && should_skip_single_view_openxr_submit(vr);
 
-    if (m_mono_openxr_unpaced_active_this_frame) {
-        SPDLOG_INFO_ONCE("[OpenXR][mono] OpenXR submit pacing is decoupled from the mono game render loop (UEVR_MONO_OPENXR_UNPACED=0 disables)");
+    if (m_single_view_openxr_unpaced_active_this_frame) {
+        SPDLOG_INFO_ONCE("[OpenXR][single-view] OpenXR submit pacing is decoupled from the single-view game render loop (UEVR_SINGLE_VIEW_OPENXR_UNPACED=0 disables)");
     }
-    if (m_mono_openxr_skipped_submit_this_frame) {
-        ++m_mono_openxr_skipped_submit_count;
-        SPDLOG_INFO_EVERY_N_SEC(2, "[OpenXR][mono] Skipping OpenXR submit for this game frame; mono render loop remains unpaced");
+    if (m_single_view_openxr_skipped_submit_this_frame) {
+        ++m_single_view_openxr_skipped_submit_count;
+        SPDLOG_INFO_EVERY_N_SEC(2, "[OpenXR][single-view] Skipping OpenXR submit for this game frame; render loop remains unpaced");
     }
 
     const auto is_same_frame = m_last_rendered_frame > 0 && m_last_rendered_frame == vr->m_render_frame_count;
@@ -2699,7 +2734,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             defer_stalker2_transition_openxr =
                 vr->should_defer_stalker2_openxr_frame_for_transition("d3d12_pre_wait");
 
-            if (!defer_stalker2_transition_openxr && !m_mono_openxr_skipped_submit_this_frame) {
+            if (!defer_stalker2_transition_openxr && !m_single_view_openxr_skipped_submit_this_frame) {
                 runtime->synchronize_frame(std::nullopt, VRRuntime::SyncFrameCallsite::RuntimeFixFrame);
             }
         } else {
@@ -3209,7 +3244,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             return false;
         }
 
-        if (m_mono_openxr_skipped_submit_this_frame) {
+        if (m_single_view_openxr_skipped_submit_this_frame) {
             return false;
         }
 
@@ -3235,7 +3270,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         return true;
     };
 
-    const bool allow_openxr_first_copy_begin = !vr->is_mono_rendering_active();
+    const bool allow_openxr_first_copy_begin = !single_view_openxr_pacing_active(vr);
 
     if (runtime->is_openvr() && m_openvr.ui_tex.texture.Get() != nullptr) {
         const auto ui_copy_start = std::chrono::steady_clock::now();
@@ -3379,7 +3414,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         m_submitted_left_eye = true;
 
         // OpenXR texture
-        if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop() && !m_mono_openxr_skipped_submit_this_frame) {
+        if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop() && !m_single_view_openxr_skipped_submit_this_frame) {
             const auto swapchain_copy_start = std::chrono::steady_clock::now();
             utility::ScopeGuard swapchain_copy_timing_guard{[&]() {
                 m_perf_swapchain_copy.add(std::chrono::steady_clock::now() - swapchain_copy_start);
@@ -3445,7 +3480,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }};
 
         // OpenXR texture
-        if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop() && !m_mono_openxr_skipped_submit_this_frame) {
+        if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop() && !m_single_view_openxr_skipped_submit_this_frame) {
             const auto swapchain_copy_start = std::chrono::steady_clock::now();
             utility::ScopeGuard swapchain_copy_timing_guard{[&]() {
                 m_perf_swapchain_copy.add(std::chrono::steady_clock::now() - swapchain_copy_start);
@@ -3535,10 +3570,19 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         !vr->is_native_stereo_fix_same_pass_enabled() &&
                         vr->m_openxr->swapchains.contains(native_left_swapchain) &&
                         vr->m_openxr->swapchains.contains(native_right_swapchain);
+                    const auto wants_native_array_submit =
+                        !use_native_split_submit &&
+                        vr->is_native_stereo_array_submit_enabled();
+                    if (wants_native_array_submit &&
+                        !vr->m_openxr->swapchains.contains(native_stereo_array_swapchain))
+                    {
+                        SPDLOG_INFO_ONCE("[DIBR] Native stereo array submit requested; recreating OpenXR scene swapchains");
+                        prepare_openxr_swapchain_recreate(vr, SWAPCHAIN_RECREATE_SCENE_EYE_EXTENT);
+                        m_openxr.create_swapchains();
+                    }
                     const auto use_native_array_submit =
                         !use_native_split_submit &&
-                        vr->is_native_stereo_fix_enabled() &&
-                        !vr->is_native_stereo_fix_same_pass_enabled() &&
+                        wants_native_array_submit &&
                         vr->m_openxr->swapchains.contains(native_stereo_array_swapchain);
 
                     if (use_native_split_submit || use_native_array_submit) {
@@ -3558,27 +3602,33 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                             }
                         }
 
-                        const auto backbuffer_desc = backbuffer->GetDesc();
-                        SPDLOG_INFO_ONCE("[NativeStereoDebug] Split submit source backbuffer={}x{} configured={}x{} state={} mode={}",
-                            backbuffer_desc.Width,
-                            backbuffer_desc.Height,
+                        ComPtr<ID3D12Resource> direct_dibr_submit_source = m_dibr_openxr_submit_source;
+                        ID3D12Resource* submit_source = direct_dibr_submit_source != nullptr ? direct_dibr_submit_source.Get() : backbuffer.Get();
+                        const auto submit_source_state = direct_dibr_submit_source != nullptr ? m_dibr_openxr_submit_source_state : scene_source_state;
+                        const auto submit_source_desc = submit_source->GetDesc();
+                        const auto submit_source_width = static_cast<UINT>(submit_source_desc.Width);
+                        const auto submit_source_height = static_cast<UINT>(submit_source_desc.Height);
+                        SPDLOG_INFO_ONCE("[NativeStereoDebug] Split submit source={}x{} configured={}x{} state={} mode={} direct_dibr={}",
+                            submit_source_desc.Width,
+                            submit_source_desc.Height,
                             m_backbuffer_size[0],
                             m_backbuffer_size[1],
-                            (uint32_t)scene_source_state,
-                            use_native_split_submit ? "per-eye" : "array");
+                            (uint32_t)submit_source_state,
+                            use_native_split_submit ? "per-eye" : "array",
+                            direct_dibr_submit_source != nullptr);
                         D3D12_BOX left_src_box{};
                         left_src_box.left = 0;
                         left_src_box.top = 0;
-                        left_src_box.right = m_backbuffer_size[0] / 2;
-                        left_src_box.bottom = m_backbuffer_size[1];
+                        left_src_box.right = submit_source_width / 2;
+                        left_src_box.bottom = submit_source_height;
                         left_src_box.front = 0;
                         left_src_box.back = 1;
 
                         D3D12_BOX right_src_box{};
-                        right_src_box.left = m_backbuffer_size[0] / 2;
+                        right_src_box.left = submit_source_width / 2;
                         right_src_box.top = 0;
-                        right_src_box.right = m_backbuffer_size[0];
-                        right_src_box.bottom = m_backbuffer_size[1];
+                        right_src_box.right = submit_source_width;
+                        right_src_box.bottom = submit_source_height;
                         right_src_box.front = 0;
                         right_src_box.back = 1;
 
@@ -3586,11 +3636,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                             left_src_box.left, left_src_box.top, left_src_box.right, left_src_box.bottom,
                             right_src_box.left, right_src_box.top, right_src_box.right, right_src_box.bottom);
 
-                        dump_native_stereo_backbuffer_once(backbuffer.Get(), left_src_box, right_src_box, scene_source_state);
+                        dump_native_stereo_backbuffer_once(submit_source, left_src_box, right_src_box, submit_source_state);
 
                         // #10: name the native SBS source for both split + array paths
                         // (the array texture itself is named inside the array-submit lambda).
-                        sn2_name_native_stereo_resources(nullptr, backbuffer.Get());
+                        sn2_name_native_stereo_resources(nullptr, submit_source);
 
                         if (use_native_split_submit) {
                             SPDLOG_INFO_ONCE("[NativeStereoDebug] Split submit using native per-eye OpenXR swapchains");
@@ -3602,12 +3652,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                                     value, (DWORD)std::size(value));
                                 return len > 0 && value[0] != L'\0' && value[0] != L'0';
                             }();
-                            m_openxr.copy(native_left_swapchain, backbuffer.Get(), scene_source_state, &left_src_box);
+                            m_openxr.copy(native_left_swapchain, submit_source, submit_source_state, &left_src_box);
                             if (mirror_left_to_right) {
                                 SPDLOG_INFO_ONCE("[NativeStereoDebug] MIRROR ENABLED: right eye sampling left half of backbuffer");
-                                m_openxr.copy(native_right_swapchain, backbuffer.Get(), scene_source_state, &left_src_box);
+                                m_openxr.copy(native_right_swapchain, submit_source, submit_source_state, &left_src_box);
                             } else {
-                                m_openxr.copy(native_right_swapchain, backbuffer.Get(), scene_source_state, &right_src_box);
+                                m_openxr.copy(native_right_swapchain, submit_source, submit_source_state, &right_src_box);
                             }
                         } else {
                             SPDLOG_INFO_ONCE("[NativeStereoDebug] Array submit using native stereo swapchain slices 0/1");
@@ -3654,59 +3704,60 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                             }
                             const UINT lambda_slice_w = static_cast<UINT>(left_src_box.right - left_src_box.left);
                             const UINT lambda_slice_h = static_cast<UINT>(left_src_box.bottom - left_src_box.top);
-                            const UINT lambda_bb_w   = static_cast<UINT>(m_backbuffer_size[0]);
+                            const UINT lambda_bb_w   = submit_source_width;
+                            ComPtr<ID3D12Resource> lambda_submit_source = direct_dibr_submit_source != nullptr ? direct_dibr_submit_source : backbuffer;
                             m_openxr.copy(
                                 native_stereo_array_swapchain,
                                 nullptr,
-                                [backbuffer, left_src_box, right_src_box, left_top_src_box, scene_source_state,
+                                [submit_source = lambda_submit_source, left_src_box, right_src_box, left_top_src_box, submit_source_state,
                                  mirror = mirror_top_half, mirror_full = mirror_full_left,
                                  scene_depth = lambda_scene_depth,
                                  slice_w = lambda_slice_w, slice_h = lambda_slice_h, bb_w = lambda_bb_w]
                                 (d3d12::CommandContext& commands, ID3D12Resource* dst) mutable {
                                     // #10: name the OpenXR array texture (slice0=left/slice1=right)
                                     // and the native SBS source for RenderDoc/OpenXR legibility.
-                                    sn2_name_native_stereo_resources(dst, backbuffer.Get());
+                                    sn2_name_native_stereo_resources(dst, submit_source.Get());
                                     sn2_openxr_array_diag::clear_source_box_if_enabled(
                                         commands,
-                                        backbuffer.Get(),
+                                        submit_source.Get(),
                                         right_src_box,
-                                        scene_source_state);
+                                        submit_source_state);
                                     // Slice 0 (left eye): full left half
                                     commands.copy_region_to_subresource(
-                                        backbuffer.Get(),
+                                        submit_source.Get(),
                                         dst,
                                         &left_src_box,
                                         0,
-                                        scene_source_state,
+                                        submit_source_state,
                                         D3D12_RESOURCE_STATE_RENDER_TARGET);
                                     // Slice 1 (right eye): default is right half of SBS (right-eye parallax).
                                     // With UEVR_SUBNAUTICA2_MIRROR_LEFT_TO_RIGHT_EYE_FULL=1: skip right_src_box
                                     // entirely and copy LEFT half — both eyes show identical left render.
                                     if (mirror_full) {
                                         commands.copy_region_to_subresource(
-                                            backbuffer.Get(),
+                                            submit_source.Get(),
                                             dst,
                                             &left_src_box,
                                             1,
-                                            scene_source_state,
+                                            submit_source_state,
                                             D3D12_RESOURCE_STATE_RENDER_TARGET);
                                     } else {
                                         commands.copy_region_to_subresource(
-                                            backbuffer.Get(),
+                                            submit_source.Get(),
                                             dst,
                                             &right_src_box,
                                             1,
-                                            scene_source_state,
+                                            submit_source_state,
                                             D3D12_RESOURCE_STATE_RENDER_TARGET);
                                         // Then overlay top half from left eye (the sky region with teal fog)
                                         // ONLY if (top-only) mirror flag is set.
                                         if (mirror) {
                                             commands.copy_region_to_subresource(
-                                                backbuffer.Get(),
+                                                submit_source.Get(),
                                                 dst,
                                                 &left_top_src_box,
                                                 1,
-                                                scene_source_state,
+                                                submit_source_state,
                                                 D3D12_RESOURCE_STATE_RENDER_TARGET);
                                         }
                                     }
@@ -3741,7 +3792,13 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                             SPDLOG_INFO_ONCE("[Mono] OpenXR submit samples the mono source region for both eyes; copying one eye-width region to the mono scene swapchain");
                             m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, backbuffer.Get(), scene_source_state, &mono_src_box);
                         } else {
-                            m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, backbuffer.Get(), scene_source_state, nullptr);
+                            ComPtr<ID3D12Resource> direct_dibr_submit_source = m_dibr_openxr_submit_source;
+                            ID3D12Resource* submit_source = direct_dibr_submit_source != nullptr ? direct_dibr_submit_source.Get() : backbuffer.Get();
+                            const auto submit_source_state = direct_dibr_submit_source != nullptr ? m_dibr_openxr_submit_source_state : scene_source_state;
+                            if (direct_dibr_submit_source != nullptr) {
+                                SPDLOG_INFO_ONCE("[DIBR] OpenXR double-wide submit is sourcing directly from the synthesized DIBR output");
+                            }
+                            m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, submit_source, submit_source_state, nullptr);
                         }
                     } else {
                         m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, nullptr, pre_render, std::nullopt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
@@ -3831,7 +3888,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         ////////////////////////////////////////////////////////////////////////////////
         // OpenXR start ////////////////////////////////////////////////////////////////
         ////////////////////////////////////////////////////////////////////////////////
-        if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop() && !m_mono_openxr_skipped_submit_this_frame) {
+        if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop() && !m_single_view_openxr_skipped_submit_this_frame) {
             const auto openxr_submit_start = std::chrono::steady_clock::now();
             utility::ScopeGuard openxr_submit_timing_guard{[&]() {
                 m_perf_openxr_submit.add(std::chrono::steady_clock::now() - openxr_submit_start);
@@ -3897,17 +3954,18 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             }
 
             const auto submit_depth_layer = scene_depth_tex.Get() != nullptr && !native_stereo_array_submit_active;
-            const auto defer_mono_scene_release_after_end =
-                vr->is_mono_rendering_active() && mono_openxr_async_release_enabled();
-            if (defer_mono_scene_release_after_end) {
-                SPDLOG_INFO_ONCE("[OpenXR][mono] Deferring scene swapchain release to async worker (UEVR_MONO_OPENXR_ASYNC_RELEASE=0 disables)");
+            const auto scene_swapchain_for_single_view = single_view_openxr_scene_swapchain_index(vr);
+            const auto defer_single_view_scene_release_after_end =
+                single_view_openxr_pacing_active(vr) && single_view_openxr_async_release_enabled();
+            if (defer_single_view_scene_release_after_end) {
+                SPDLOG_INFO_ONCE("[OpenXR][single-view] Deferring scene swapchain release to async worker (UEVR_SINGLE_VIEW_OPENXR_ASYNC_RELEASE=0 disables)");
             }
-            if (vr->is_mono_rendering_active() && !defer_mono_scene_release_after_end) {
-                m_openxr.release_acquired((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE);
+            if (single_view_openxr_pacing_active(vr) && !defer_single_view_scene_release_after_end) {
+                m_openxr.release_acquired(scene_swapchain_for_single_view);
             }
             auto result = vr->m_openxr->end_frame(quad_layers, submit_depth_layer);
-            if (defer_mono_scene_release_after_end && result != XR_SUCCESS) {
-                m_openxr.release_acquired((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE);
+            if (defer_single_view_scene_release_after_end && result != XR_SUCCESS) {
+                m_openxr.release_acquired(scene_swapchain_for_single_view);
             }
 
             if (result == XR_ERROR_LAYER_INVALID) {
@@ -3921,8 +3979,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
             vr->m_openxr->needs_pose_update = true;
             vr->m_submitted = result == XR_SUCCESS;
-            if (m_mono_openxr_unpaced_active_this_frame && vr->m_submitted) {
-                vr->request_mono_openxr_async_wait();
+            if (m_single_view_openxr_unpaced_active_this_frame && vr->m_submitted) {
+                vr->request_single_view_openxr_async_wait();
             }
         }
 
@@ -4824,6 +4882,9 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     if (backbuffer == nullptr) {
         return;
     }
+
+    m_dibr_openxr_submit_source.Reset();
+    m_dibr_openxr_submit_source_state = D3D12_RESOURCE_STATE_COMMON;
 
     auto* device = g_framework->get_d3d12_hook()->get_device();
     if (device == nullptr) {
@@ -5949,29 +6010,46 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         depth.Get(), depth_state,
         params);
 
-    // 4) Copy the synthesized pair back over the backbuffer so every
-    // downstream consumer (OpenXR eye copies, OpenVR submits, mirror) sees it.
+    // 4) Prefer submitting the synthesized pair directly to OpenXR. The old
+    // path copied DIBR output back over the double-wide game backbuffer, then
+    // copied that same full-width texture into the OpenXR scene swapchain.
+    // Direct submit keeps the backbuffer path as fallback for non-OpenXR
+    // consumers while avoiding the redundant full-frame copy in the VR path.
     if (output != nullptr) {
-        barrier(cmd_list, output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        barrier(cmd_list, backbuffer, scene_source_state, D3D12_RESOURCE_STATE_COPY_DEST);
+        const auto runtime = vr->get_runtime();
+        const bool direct_openxr_submit =
+            dibr_direct_openxr_submit_enabled() &&
+            runtime != nullptr &&
+            runtime->is_openxr() &&
+            vr->m_openxr != nullptr &&
+            vr->m_openxr->can_run_frame_loop();
 
-        D3D12_BOX full_out{};
-        full_out.right = eye_width * 2;
-        full_out.bottom = eye_height;
-        full_out.back = 1;
+        if (direct_openxr_submit) {
+            m_dibr_openxr_submit_source = output;
+            m_dibr_openxr_submit_source_state = D3D12_RESOURCE_STATE_COMMON;
+            SPDLOG_INFO_ONCE("[DIBR] Direct OpenXR submit source active; skipping synthesized output copy back to the game backbuffer (UEVR_DIBR_DIRECT_OPENXR_SUBMIT=0 disables)");
+        } else {
+            barrier(cmd_list, output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier(cmd_list, backbuffer, scene_source_state, D3D12_RESOURCE_STATE_COPY_DEST);
 
-        D3D12_TEXTURE_COPY_LOCATION out_loc{};
-        out_loc.pResource = output;
-        out_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        out_loc.SubresourceIndex = 0;
-        D3D12_TEXTURE_COPY_LOCATION bb_loc{};
-        bb_loc.pResource = backbuffer;
-        bb_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        bb_loc.SubresourceIndex = 0;
-        cmd_list->CopyTextureRegion(&bb_loc, 0, 0, 0, &out_loc, &full_out);
+            D3D12_BOX full_out{};
+            full_out.right = eye_width * 2;
+            full_out.bottom = eye_height;
+            full_out.back = 1;
 
-        barrier(cmd_list, backbuffer, D3D12_RESOURCE_STATE_COPY_DEST, scene_source_state);
-        barrier(cmd_list, output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            D3D12_TEXTURE_COPY_LOCATION out_loc{};
+            out_loc.pResource = output;
+            out_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            out_loc.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION bb_loc{};
+            bb_loc.pResource = backbuffer;
+            bb_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            bb_loc.SubresourceIndex = 0;
+            cmd_list->CopyTextureRegion(&bb_loc, 0, 0, 0, &out_loc, &full_out);
+
+            barrier(cmd_list, backbuffer, D3D12_RESOURCE_STATE_COPY_DEST, scene_source_state);
+            barrier(cmd_list, output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        }
 
         // Arms single-view mode: from here on the stereo hook may drop the
         // engine's second view, knowing this pass can fill the other eye.
@@ -6332,6 +6410,8 @@ void D3D12Component::on_reset(VR* vr) {
     m_dibr_commands.reset();
     m_dibr.reset();
     m_dibr_source.Reset();
+    m_dibr_openxr_submit_source.Reset();
+    m_dibr_openxr_submit_source_state = D3D12_RESOURCE_STATE_COMMON;
     m_dibr_source_width = 0;
     m_dibr_source_height = 0;
     m_dibr_source_format = DXGI_FORMAT_UNKNOWN;
@@ -6880,7 +6960,7 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
             return err;
         }
 
-        if (vr->is_native_stereo_fix_enabled() && !vr->is_native_stereo_fix_same_pass_enabled()) {
+        if (vr->is_native_stereo_array_submit_enabled()) {
             auto native_stereo_array_create_info = standard_swapchain_create_info;
             auto native_stereo_array_desc = hmd_desc;
 
@@ -7108,11 +7188,11 @@ void D3D12Component::OpenXR::destroy_swapchains() {
     vr->m_openxr->swapchains.clear();
 }
 
-void D3D12Component::pre_acquire_mono_openxr_scene_swapchain() {
+void D3D12Component::pre_acquire_single_view_openxr_scene_swapchain() {
     auto vr = VR::get();
     if (vr == nullptr ||
         vr->m_openxr == nullptr ||
-        !vr->is_mono_rendering_active() ||
+        !single_view_openxr_pacing_active(vr.get()) ||
         !vr->m_openxr->can_run_frame_loop() ||
         !vr->m_openxr->frame_synced ||
         vr->m_openxr->frame_began ||
@@ -7121,20 +7201,20 @@ void D3D12Component::pre_acquire_mono_openxr_scene_swapchain() {
         return;
     }
 
-    m_openxr.pre_acquire((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE);
+    m_openxr.pre_acquire(single_view_openxr_scene_swapchain_index(vr.get()));
 }
 
-void D3D12Component::release_mono_openxr_scene_swapchain() {
+void D3D12Component::release_single_view_openxr_scene_swapchain() {
     auto vr = VR::get();
     if (vr == nullptr ||
         vr->m_openxr == nullptr ||
-        !vr->is_mono_rendering_active() ||
+        !single_view_openxr_pacing_active(vr.get()) ||
         !vr->m_openxr->can_run_frame_loop())
     {
         return;
     }
 
-    m_openxr.release_acquired((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE);
+    m_openxr.release_acquired(single_view_openxr_scene_swapchain_index(vr.get()));
 }
 
 void D3D12Component::OpenXR::pre_acquire(uint32_t swapchain_idx) {
@@ -7365,11 +7445,11 @@ void D3D12Component::OpenXR::copy(
             texture_ctx->commands.execute();
             parent.m_perf_openxr_copy_execute.add(std::chrono::steady_clock::now() - execute_start);
 
-            const bool defer_mono_scene_release =
+            const bool defer_single_view_scene_release =
                 using_pre_acquired &&
-                vr->is_mono_rendering_active() &&
-                swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE;
-            if (defer_mono_scene_release) {
+                single_view_openxr_pacing_active(vr.get()) &&
+                swapchain_idx == single_view_openxr_scene_swapchain_index(vr.get());
+            if (defer_single_view_scene_release) {
                 ctx.release_pending = true;
                 ctx.pre_acquired = false;
                 ctx.last_acquired_frame = vr->get_frame_count();

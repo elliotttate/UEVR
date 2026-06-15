@@ -533,6 +533,10 @@ public:
         return is_mono_rendering_active() || is_dibr_single_view_active();
     }
 
+    bool is_single_view_openxr_pacing_active() const {
+        return is_single_view_rendering_active();
+    }
+
     // The eye the engine's lone view represents: the DIBR reference eye, or
     // eye 0 for Mono (whose view is centered via is_dibr_mono_view_active's
     // offset zeroing + the forced symmetric projection). AFW alternates per
@@ -889,6 +893,25 @@ public:
         return m_native_stereo_fix->value() && m_rendering_method->value() == RenderingMethod::NATIVE_STEREO && !is_using_afr();
     }
 
+    bool is_dibr_native_stereo_array_submit_enabled() const {
+        static const bool enabled = []() {
+            const char* raw = std::getenv("UEVR_DIBR_NATIVE_ARRAY_SUBMIT");
+            if (raw == nullptr || raw[0] == '\0') {
+                return false;
+            }
+
+            const std::string_view value{raw};
+            return value != "0" && value != "false" && value != "FALSE" && value != "off" && value != "OFF";
+        }();
+
+        return enabled && is_dibr_single_view_projection_configured();
+    }
+
+    bool is_native_stereo_array_submit_enabled() const {
+        return is_dibr_native_stereo_array_submit_enabled() ||
+            (is_native_stereo_fix_enabled() && !is_native_stereo_fix_same_pass_enabled());
+    }
+
     bool is_native_stereo_fix_same_pass_enabled() const {
         if (should_force_native_stereo_fix_same_pass()) {
             return true;
@@ -929,10 +952,10 @@ public:
     bool is_controller_camera_conflict_guard_active() const;
     void note_stalker2_transition_stress(const char* reason);
     bool should_defer_stalker2_openxr_frame_for_transition(const char* reason);
-    void request_mono_openxr_async_wait();
-    void ensure_mono_openxr_async_wait_worker();
-    void stop_mono_openxr_async_wait_worker();
-    void mono_openxr_async_wait_worker_loop(std::stop_token stop_token);
+    void request_single_view_openxr_async_wait();
+    void ensure_single_view_openxr_async_wait_worker();
+    void stop_single_view_openxr_async_wait_worker();
+    void single_view_openxr_async_wait_worker_loop(std::stop_token stop_token);
 
     bool is_ghosting_fix_enabled() const {
         return m_ghosting_fix->value();
@@ -1297,11 +1320,11 @@ private:
     std::chrono::steady_clock::time_point m_last_engine_tick{};
     std::chrono::steady_clock::time_point m_last_mod_frame{};
     std::chrono::steady_clock::time_point m_last_tick_gap_log{};
-    std::jthread m_mono_openxr_async_wait_thread{};
-    std::mutex m_mono_openxr_async_wait_mtx{};
-    std::condition_variable m_mono_openxr_async_wait_cv{};
-    std::atomic_bool m_mono_openxr_async_wait_inflight{false};
-    bool m_mono_openxr_async_wait_pending{false};
+    std::jthread m_single_view_openxr_async_wait_thread{};
+    std::mutex m_single_view_openxr_async_wait_mtx{};
+    std::condition_variable m_single_view_openxr_async_wait_cv{};
+    std::atomic_bool m_single_view_openxr_async_wait_inflight{false};
+    bool m_single_view_openxr_async_wait_pending{false};
 
     // DIBR bind-signature remediation (see request_dibr_rt_recreate).
     std::atomic<bool> m_dibr_rt_recreate_requested{false};

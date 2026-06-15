@@ -134,8 +134,8 @@ const char* sync_frame_callsite_name(VRRuntime::SyncFrameCallsite callsite) {
         return "vr_post_present_initial_sync";
     case VRRuntime::SyncFrameCallsite::VRVeryLatePostPresent:
         return "vr_very_late_post_present";
-    case VRRuntime::SyncFrameCallsite::VRMonoAsyncPostPresent:
-        return "vr_mono_async_post_present";
+    case VRRuntime::SyncFrameCallsite::VRSingleViewAsyncPostPresent:
+        return "vr_single_view_async_post_present";
     case VRRuntime::SyncFrameCallsite::OpenXRSessionReady:
         return "openxr_session_ready";
     case VRRuntime::SyncFrameCallsite::OpenXRBeginFrameRecovery:
@@ -3341,13 +3341,13 @@ void OpenXR::log_frame_timing_stats_if_needed() {
     const auto& wait_late = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRLateOnPresent];
     const auto& wait_post_present_initial = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRPostPresentInitialSync];
     const auto& wait_very_late = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRVeryLatePostPresent];
-    const auto& wait_mono_async = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRMonoAsyncPostPresent];
+    const auto& wait_single_view_async = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRSingleViewAsyncPostPresent];
     const auto& wait_session_ready = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::OpenXRSessionReady];
     const auto& wait_recovery = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::OpenXRBeginFrameRecovery];
     const auto pose_age_ms = this->get_pose_update_age_ms(now);
 
     spdlog::info(
-        "[OpenXR][frame-profiler] wait avg={:.2f}ms max={:.2f}ms n={} wait_fix avg={:.2f}ms max={:.2f}ms n={} wait_early avg={:.2f}ms max={:.2f}ms n={} wait_late avg={:.2f}ms max={:.2f}ms n={} wait_post_present_initial avg={:.2f}ms max={:.2f}ms n={} wait_very_late avg={:.2f}ms max={:.2f}ms n={} wait_mono_async avg={:.2f}ms max={:.2f}ms n={} wait_session_ready avg={:.2f}ms max={:.2f}ms n={} wait_recovery avg={:.2f}ms max={:.2f}ms n={} begin avg={:.2f}ms max={:.2f}ms n={} end avg={:.2f}ms max={:.2f}ms n={} pose_update avg={:.2f}ms max={:.2f}ms n={} pose_age_ms={} pose_calls={} pose_view_ext={} pose_runtime={} last_pose_src={} last_pose_frame={} last_pose_result={} last_pose_ms={:.2f} view_locate_ms={:.2f} stage_locate_ms={:.2f} space_locate_ms={:.2f} session={} ready={} synced={} began={} first_poses={} valid_poses={} relaxed_startup={} dbg_empty={} dbg_skip_scene={} dbg_skip_ui={} dbg_no_depth={}",
+        "[OpenXR][frame-profiler] wait avg={:.2f}ms max={:.2f}ms n={} wait_fix avg={:.2f}ms max={:.2f}ms n={} wait_early avg={:.2f}ms max={:.2f}ms n={} wait_late avg={:.2f}ms max={:.2f}ms n={} wait_post_present_initial avg={:.2f}ms max={:.2f}ms n={} wait_very_late avg={:.2f}ms max={:.2f}ms n={} wait_single_view_async avg={:.2f}ms max={:.2f}ms n={} wait_session_ready avg={:.2f}ms max={:.2f}ms n={} wait_recovery avg={:.2f}ms max={:.2f}ms n={} begin avg={:.2f}ms max={:.2f}ms n={} end avg={:.2f}ms max={:.2f}ms n={} pose_update avg={:.2f}ms max={:.2f}ms n={} pose_age_ms={} pose_calls={} pose_view_ext={} pose_runtime={} last_pose_src={} last_pose_frame={} last_pose_result={} last_pose_ms={:.2f} view_locate_ms={:.2f} stage_locate_ms={:.2f} space_locate_ms={:.2f} session={} ready={} synced={} began={} first_poses={} valid_poses={} relaxed_startup={} dbg_empty={} dbg_skip_scene={} dbg_skip_ui={} dbg_no_depth={}",
         this->wait_frame_timing.avg(),
         this->wait_frame_timing.max_ms,
         this->wait_frame_timing.count,
@@ -3366,9 +3366,9 @@ void OpenXR::log_frame_timing_stats_if_needed() {
         wait_very_late.avg(),
         wait_very_late.max_ms,
         wait_very_late.count,
-        wait_mono_async.avg(),
-        wait_mono_async.max_ms,
-        wait_mono_async.count,
+        wait_single_view_async.avg(),
+        wait_single_view_async.max_ms,
+        wait_single_view_async.count,
         wait_session_ready.avg(),
         wait_session_ready.max_ms,
         wait_session_ready.count,

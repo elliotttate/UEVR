@@ -73,12 +73,14 @@ bool vr_env_explicit_false(const char* name) {
     return raw == "0" || raw == "false" || raw == "FALSE" || raw == "off" || raw == "OFF";
 }
 
-bool vr_mono_openxr_unpaced_enabled() {
-    return !vr_env_explicit_false("UEVR_MONO_OPENXR_UNPACED");
+bool vr_single_view_openxr_unpaced_enabled() {
+    return !vr_env_explicit_false("UEVR_SINGLE_VIEW_OPENXR_UNPACED") &&
+        !vr_env_explicit_false("UEVR_MONO_OPENXR_UNPACED");
 }
 
-bool vr_mono_openxr_async_wait_enabled() {
-    return !vr_env_explicit_false("UEVR_MONO_OPENXR_ASYNC_WAIT");
+bool vr_single_view_openxr_async_wait_enabled() {
+    return !vr_env_explicit_false("UEVR_SINGLE_VIEW_OPENXR_ASYNC_WAIT") &&
+        !vr_env_explicit_false("UEVR_MONO_OPENXR_ASYNC_WAIT");
 }
 
 const char* openxr_view_configuration_name(XrViewConfigurationType type) {
@@ -149,31 +151,31 @@ std::shared_ptr<VR>& VR::get() {
 }
 
 VR::~VR() {
-    stop_mono_openxr_async_wait_worker();
+    stop_single_view_openxr_async_wait_worker();
     stop_hitch_snapshot_writer();
 }
 
-void VR::ensure_mono_openxr_async_wait_worker() {
-    if (m_mono_openxr_async_wait_thread.joinable()) {
+void VR::ensure_single_view_openxr_async_wait_worker() {
+    if (m_single_view_openxr_async_wait_thread.joinable()) {
         return;
     }
 
-    m_mono_openxr_async_wait_thread = std::jthread([this](std::stop_token stop_token) {
-        mono_openxr_async_wait_worker_loop(stop_token);
+    m_single_view_openxr_async_wait_thread = std::jthread([this](std::stop_token stop_token) {
+        single_view_openxr_async_wait_worker_loop(stop_token);
     });
 }
 
-void VR::stop_mono_openxr_async_wait_worker() {
-    if (!m_mono_openxr_async_wait_thread.joinable()) {
+void VR::stop_single_view_openxr_async_wait_worker() {
+    if (!m_single_view_openxr_async_wait_thread.joinable()) {
         return;
     }
 
-    m_mono_openxr_async_wait_thread.request_stop();
-    m_mono_openxr_async_wait_cv.notify_all();
+    m_single_view_openxr_async_wait_thread.request_stop();
+    m_single_view_openxr_async_wait_cv.notify_all();
 }
 
-void VR::request_mono_openxr_async_wait() {
-    if (!vr_mono_openxr_async_wait_enabled()) {
+void VR::request_single_view_openxr_async_wait() {
+    if (!vr_single_view_openxr_async_wait_enabled() || !is_single_view_openxr_pacing_active()) {
         return;
     }
 
@@ -187,42 +189,42 @@ void VR::request_mono_openxr_async_wait() {
         return;
     }
 
-    if (m_mono_openxr_async_wait_inflight.exchange(true)) {
+    if (m_single_view_openxr_async_wait_inflight.exchange(true)) {
         return;
     }
 
-    ensure_mono_openxr_async_wait_worker();
+    ensure_single_view_openxr_async_wait_worker();
 
     {
-        std::lock_guard lock{m_mono_openxr_async_wait_mtx};
-        m_mono_openxr_async_wait_pending = true;
+        std::lock_guard lock{m_single_view_openxr_async_wait_mtx};
+        m_single_view_openxr_async_wait_pending = true;
     }
 
-    m_mono_openxr_async_wait_cv.notify_one();
+    m_single_view_openxr_async_wait_cv.notify_one();
 }
 
-void VR::mono_openxr_async_wait_worker_loop(std::stop_token stop_token) {
-    SetThreadDescription(GetCurrentThread(), L"UEVR Mono OpenXR Wait");
+void VR::single_view_openxr_async_wait_worker_loop(std::stop_token stop_token) {
+    SetThreadDescription(GetCurrentThread(), L"UEVR SingleView OpenXR Wait");
     if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST)) {
-        spdlog::warn("[OpenXR][mono] Failed to raise async wait worker priority: {}", GetLastError());
+        spdlog::warn("[OpenXR][single-view] Failed to raise async wait worker priority: {}", GetLastError());
     }
 
     while (!stop_token.stop_requested()) {
         {
-            std::unique_lock lock{m_mono_openxr_async_wait_mtx};
-            m_mono_openxr_async_wait_cv.wait(lock, [this, &stop_token]() {
-                return stop_token.stop_requested() || m_mono_openxr_async_wait_pending;
+            std::unique_lock lock{m_single_view_openxr_async_wait_mtx};
+            m_single_view_openxr_async_wait_cv.wait(lock, [this, &stop_token]() {
+                return stop_token.stop_requested() || m_single_view_openxr_async_wait_pending;
             });
 
             if (stop_token.stop_requested()) {
                 break;
             }
 
-            m_mono_openxr_async_wait_pending = false;
+            m_single_view_openxr_async_wait_pending = false;
         }
 
         utility::ScopeGuard clear_inflight{[this]() {
-            m_mono_openxr_async_wait_inflight.store(false);
+            m_single_view_openxr_async_wait_inflight.store(false);
         }};
 
         auto openxr = m_openxr;
@@ -234,14 +236,14 @@ void VR::mono_openxr_async_wait_worker_loop(std::stop_token stop_token) {
             continue;
         }
 
-        m_d3d12.release_mono_openxr_scene_swapchain();
-        openxr->synchronize_frame(std::nullopt, VRRuntime::SyncFrameCallsite::VRMonoAsyncPostPresent);
+        m_d3d12.release_single_view_openxr_scene_swapchain();
+        openxr->synchronize_frame(std::nullopt, VRRuntime::SyncFrameCallsite::VRSingleViewAsyncPostPresent);
         if (openxr->frame_synced && !openxr->frame_began) {
-            m_d3d12.pre_acquire_mono_openxr_scene_swapchain();
+            m_d3d12.pre_acquire_single_view_openxr_scene_swapchain();
         }
     }
 
-    m_mono_openxr_async_wait_inflight.store(false);
+    m_single_view_openxr_async_wait_inflight.store(false);
 }
 
 bool VR::on_openxr_resolution_scale_changed(
@@ -2853,9 +2855,17 @@ std::optional<std::string> VR::initialize_openxr() {
             disable_optional_extensions_buf[0] != '\0' &&
             disable_optional_extensions_buf[0] != '0';
 
-        if (disable_optional_extensions) {
+        const bool refresh_rate_requested = vr_env_truthy("UEVR_OPENXR_REQUEST_REFRESH_HZ");
+
+        if (disable_optional_extensions && !refresh_rate_requested) {
             spdlog::info("[VR] Optional OpenXR extensions disabled by UEVR_OPENXR_DISABLE_OPTIONAL_EXTENSIONS");
         } else {
+            if (disable_optional_extensions && refresh_rate_requested) {
+                spdlog::info(
+                    "[VR] Optional OpenXR extensions disabled, but allowing {} because UEVR_OPENXR_REQUEST_REFRESH_HZ is set",
+                    XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+            }
+
             // Enumerate available extensions and enable optional composition helpers if available.
             uint32_t extension_count{};
             result = xrEnumerateInstanceExtensionProperties(nullptr, 0, &extension_count, nullptr);
@@ -2870,12 +2880,16 @@ std::optional<std::string> VR::initialize_openxr() {
                         spdlog::info("[VR] Found OpenXR extension: {}", extension_property.extensionName);
                     }
 
-                    const std::unordered_set<std::string> wanted_extensions {
-                        XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
-                        XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME,
-                        XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME
-                        // To be seen if we need more!
-                    };
+                    std::unordered_set<std::string> wanted_extensions{};
+
+                    if (!disable_optional_extensions) {
+                        wanted_extensions.insert(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
+                        wanted_extensions.insert(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
+                    }
+
+                    if (!disable_optional_extensions || refresh_rate_requested) {
+                        wanted_extensions.insert(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+                    }
 
                     for (const auto& extension_property : extension_properties) {
                         if (wanted_extensions.contains(extension_property.extensionName)) {
@@ -7120,13 +7134,13 @@ void VR::on_present() {
 
     const auto is_left_eye_frame = is_using_afr() ? (m_render_frame_count % 2 == m_left_eye_interval) : true;
 
-    const auto mono_openxr_unpaced_late =
+    const auto single_view_openxr_unpaced_late =
         m_is_d3d12 &&
         runtime->is_openxr() &&
-        is_mono_rendering_active() &&
-        vr_mono_openxr_unpaced_enabled();
+        is_single_view_openxr_pacing_active() &&
+        vr_single_view_openxr_unpaced_enabled();
 
-    if (is_left_eye_frame && get_synchronize_stage() == VR::SynchronizeStage::LATE && !mono_openxr_unpaced_late) {
+    if (is_left_eye_frame && get_synchronize_stage() == VR::SynchronizeStage::LATE && !single_view_openxr_unpaced_late) {
         const auto had_sync = runtime->got_first_sync;
         runtime->synchronize_frame(std::nullopt, VRRuntime::SyncFrameCallsite::VRLateOnPresent);
 
@@ -7219,15 +7233,15 @@ void VR::on_post_present() {
         m_d3d12.on_post_present(this);
     }
 
-    const auto d3d12_mono_openxr_unpaced =
-        m_is_d3d12 && m_d3d12.mono_openxr_unpaced_active_this_frame();
+    const auto d3d12_single_view_openxr_unpaced =
+        m_is_d3d12 && m_d3d12.single_view_openxr_unpaced_active_this_frame();
 
-    if (d3d12_mono_openxr_unpaced &&
+    if (d3d12_single_view_openxr_unpaced &&
         runtime->is_openxr() &&
-        !m_mono_openxr_async_wait_inflight.load())
+        !m_single_view_openxr_async_wait_inflight.load())
     {
-        SPDLOG_INFO_ONCE("[OpenXR][mono] Running xrWaitFrame asynchronously after submit (UEVR_MONO_OPENXR_ASYNC_WAIT=0 disables)");
-        request_mono_openxr_async_wait();
+        SPDLOG_INFO_ONCE("[OpenXR][single-view] Running xrWaitFrame asynchronously after submit (UEVR_SINGLE_VIEW_OPENXR_ASYNC_WAIT=0 disables)");
+        request_single_view_openxr_async_wait();
     }
 
     detect_controllers();
@@ -7239,7 +7253,7 @@ void VR::on_post_present() {
             get_synchronize_stage() == VR::SynchronizeStage::VERY_LATE &&
             should_defer_stalker2_very_late_openxr_wait(runtime, m_is_d3d12);
 
-        if (!d3d12_mono_openxr_unpaced &&
+        if (!d3d12_single_view_openxr_unpaced &&
             !should_defer_very_late_wait &&
             (get_synchronize_stage() == VR::SynchronizeStage::VERY_LATE || !runtime->got_first_sync)) {
             const auto had_sync = runtime->got_first_sync;
@@ -7255,7 +7269,7 @@ void VR::on_post_present() {
             SPDLOG_INFO_ONCE("[Stalker2][OpenXR] Deferring VERY_LATE xrWaitFrame to the D3D12 submit path after initial valid poses");
         }
 
-        if (!d3d12_mono_openxr_unpaced &&
+        if (!d3d12_single_view_openxr_unpaced &&
             runtime->is_openxr() && m_openxr->can_run_frame_loop() && get_synchronize_stage() > VR::SynchronizeStage::EARLY) {
             if (!m_is_d3d12 && !m_openxr->frame_began) {
                 m_openxr->begin_frame("vr_post_present");

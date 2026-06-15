@@ -97,9 +97,10 @@ public:
     FfiTiming get_timing_openxr_copy_record()       const;
     FfiTiming get_timing_openxr_copy_execute()      const;
     FfiTiming get_timing_openxr_swapchain_release() const;
-    uint64_t get_mono_openxr_skipped_submit_count() const { return m_mono_openxr_skipped_submit_count; }
-    void pre_acquire_mono_openxr_scene_swapchain();
-    void release_mono_openxr_scene_swapchain();
+    uint64_t get_single_view_openxr_skipped_submit_count() const { return m_single_view_openxr_skipped_submit_count; }
+    uint64_t get_mono_openxr_skipped_submit_count() const { return get_single_view_openxr_skipped_submit_count(); }
+    void pre_acquire_single_view_openxr_scene_swapchain();
+    void release_single_view_openxr_scene_swapchain();
 
     struct HitchFrameSnapshot {
         bool initialized{};
@@ -140,8 +141,10 @@ public:
 
     HitchFrameSnapshot get_hitch_frame_snapshot(VR* vr) const;
     bool has_game_and_ui_textures() const;
-    bool mono_openxr_unpaced_active_this_frame() const { return m_mono_openxr_unpaced_active_this_frame; }
-    bool mono_openxr_skipped_submit_this_frame() const { return m_mono_openxr_skipped_submit_this_frame; }
+    bool single_view_openxr_unpaced_active_this_frame() const { return m_single_view_openxr_unpaced_active_this_frame; }
+    bool single_view_openxr_skipped_submit_this_frame() const { return m_single_view_openxr_skipped_submit_this_frame; }
+    bool mono_openxr_unpaced_active_this_frame() const { return single_view_openxr_unpaced_active_this_frame(); }
+    bool mono_openxr_skipped_submit_this_frame() const { return single_view_openxr_skipped_submit_this_frame(); }
 
 private:
     friend class render::FrameResourceInspector;
@@ -230,9 +233,9 @@ private:
     FrameTimingStats m_perf_openxr_copy_record{};
     FrameTimingStats m_perf_openxr_copy_execute{};
     FrameTimingStats m_perf_openxr_swapchain_release{};
-    uint64_t m_mono_openxr_skipped_submit_count{};
-    bool m_mono_openxr_unpaced_active_this_frame{};
-    bool m_mono_openxr_skipped_submit_this_frame{};
+    uint64_t m_single_view_openxr_skipped_submit_count{};
+    bool m_single_view_openxr_unpaced_active_this_frame{};
+    bool m_single_view_openxr_skipped_submit_this_frame{};
 
     d3d12::TextureContext m_backbuffer_copy{};
 
@@ -258,6 +261,8 @@ private:
     DIBRSynthesis m_dibr{};
     d3d12::CommandContext m_dibr_commands{};
     Microsoft::WRL::ComPtr<ID3D12Resource> m_dibr_source{};
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_dibr_openxr_submit_source{};
+    D3D12_RESOURCE_STATES m_dibr_openxr_submit_source_state{D3D12_RESOURCE_STATE_COMMON};
     uint32_t m_dibr_source_width{};
     uint32_t m_dibr_source_height{};
     DXGI_FORMAT m_dibr_source_format{DXGI_FORMAT_UNKNOWN};
