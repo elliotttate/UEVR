@@ -88,6 +88,7 @@ public:
     FfiTiming get_timing_on_frame()         const;
     FfiTiming get_timing_ui_copy()          const;
     FfiTiming get_timing_swapchain_copy()   const;
+    FfiTiming get_timing_dibr_synthesis()   const;
     FfiTiming get_timing_openxr_submit()    const;
     FfiTiming get_timing_spectator_mirror() const;
     FfiTiming get_timing_post_present()     const;
@@ -134,6 +135,9 @@ public:
         uint64_t perf_swapchain_copy_count{};
         double perf_swapchain_copy_avg_ms{};
         double perf_swapchain_copy_max_ms{};
+        uint64_t perf_dibr_synthesis_count{};
+        double perf_dibr_synthesis_avg_ms{};
+        double perf_dibr_synthesis_max_ms{};
         uint64_t perf_openxr_submit_count{};
         double perf_openxr_submit_avg_ms{};
         double perf_openxr_submit_max_ms{};
@@ -224,6 +228,7 @@ private:
     FrameTimingStats m_perf_on_frame{};
     FrameTimingStats m_perf_ui_copy{};
     FrameTimingStats m_perf_swapchain_copy{};
+    FrameTimingStats m_perf_dibr_synthesis{};
     FrameTimingStats m_perf_openxr_submit{};
     FrameTimingStats m_perf_spectator_mirror{};
     FrameTimingStats m_perf_post_present{};

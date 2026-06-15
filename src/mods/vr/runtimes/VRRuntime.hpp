@@ -39,6 +39,7 @@ struct VRRuntime {
         VRPostPresentInitialSync,
         VRVeryLatePostPresent,
         VRSingleViewAsyncPostPresent,
+        VRAfrAsyncPostPresent,
         OpenXRSessionReady,
         OpenXRBeginFrameRecovery,
         Count,

@@ -2854,6 +2854,7 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_frame_timing_json() {
             {"on_frame",          to_j(d12.get_timing_on_frame())},
             {"ui_copy",           to_j(d12.get_timing_ui_copy())},
             {"swapchain_copy",    to_j(d12.get_timing_swapchain_copy())},
+            {"dibr_synthesis",    to_j(d12.get_timing_dibr_synthesis())},
             {"openxr_submit",     to_j(d12.get_timing_openxr_submit())},
             {"spectator_mirror",  to_j(d12.get_timing_spectator_mirror())},
             {"post_present",      to_j(d12.get_timing_post_present())},
@@ -2915,6 +2916,7 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_frame_timing_json() {
                 {"vr_post_present_initial_sync", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::VRPostPresentInitialSync])},
                 {"vr_very_late_post_present", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::VRVeryLatePostPresent])},
                 {"vr_single_view_async_post_present", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::VRSingleViewAsyncPostPresent])},
+                {"vr_afr_async_post_present", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::VRAfrAsyncPostPresent])},
                 {"openxr_session_ready", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::OpenXRSessionReady])},
                 {"openxr_begin_frame_recovery", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::OpenXRBeginFrameRecovery])},
             };

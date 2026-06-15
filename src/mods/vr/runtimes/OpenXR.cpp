@@ -2,6 +2,7 @@
 #include <TlHelp32.h>
 #include <cmath>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -136,6 +137,8 @@ const char* sync_frame_callsite_name(VRRuntime::SyncFrameCallsite callsite) {
         return "vr_very_late_post_present";
     case VRRuntime::SyncFrameCallsite::VRSingleViewAsyncPostPresent:
         return "vr_single_view_async_post_present";
+    case VRRuntime::SyncFrameCallsite::VRAfrAsyncPostPresent:
+        return "vr_afr_async_post_present";
     case VRRuntime::SyncFrameCallsite::OpenXRSessionReady:
         return "openxr_session_ready";
     case VRRuntime::SyncFrameCallsite::OpenXRBeginFrameRecovery:
@@ -243,17 +246,68 @@ bool has_any_view_tracking(XrViewStateFlags flags) {
     return (flags & tracked) != 0;
 }
 
+bool metaxr_simulator_runtime_active(OpenXR* openxr) {
+    if (openxr != nullptr &&
+        (openxr->enabled_extensions.contains("XR_METAX2_simulator_head_pose") ||
+         openxr->enabled_extensions.contains("XR_METAX1_simulator_compositor_output_capture")))
+    {
+        return true;
+    }
+
+    char runtime_json[1024]{};
+    const auto n = GetEnvironmentVariableA("XR_RUNTIME_JSON", runtime_json, sizeof(runtime_json));
+    if (n == 0 || n >= sizeof(runtime_json)) {
+        return false;
+    }
+
+    std::string path{runtime_json, n};
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    return path.find("metaxr") != std::string::npos ||
+           path.find("meta_openxr_simulator") != std::string::npos;
+}
+
+bool accept_valid_untracked_startup_poses(OpenXR* openxr) {
+    if (openxr == nullptr || openxr->ever_submitted) {
+        return false;
+    }
+
+    static const bool env_enabled = []() {
+        char value[8]{};
+        const auto n = GetEnvironmentVariableA("UEVR_OPENXR_ACCEPT_VALID_UNTRACKED_STARTUP_POSES", value, sizeof(value));
+        return n != 0 && value[0] != '\0' && value[0] != '0';
+    }();
+
+    if (!env_enabled && !metaxr_simulator_runtime_active(openxr)) {
+        return false;
+    }
+
+    return openxr->frame_state.shouldRender == XR_TRUE ||
+           openxr->session_state == XR_SESSION_STATE_VISIBLE ||
+           openxr->session_state == XR_SESSION_STATE_FOCUSED;
+}
+
 bool should_accept_startup_poses(OpenXR* openxr) {
     if (openxr->ever_submitted) {
         return false;
     }
 
-    return has_required_location_validity(openxr->view_space_location.locationFlags) &&
-           has_any_location_tracking(openxr->view_space_location.locationFlags) &&
-           has_required_view_validity(openxr->view_state.viewStateFlags) &&
-           has_any_view_tracking(openxr->view_state.viewStateFlags) &&
-           has_required_view_validity(openxr->stage_view_state.viewStateFlags) &&
-           has_any_view_tracking(openxr->stage_view_state.viewStateFlags);
+    const auto location_valid = has_required_location_validity(openxr->view_space_location.locationFlags);
+    const auto view_valid = has_required_view_validity(openxr->view_state.viewStateFlags);
+    const auto stage_valid = has_required_view_validity(openxr->stage_view_state.viewStateFlags);
+
+    if (!location_valid || !view_valid || !stage_valid) {
+        return false;
+    }
+
+    const auto has_tracking =
+        has_any_location_tracking(openxr->view_space_location.locationFlags) &&
+        has_any_view_tracking(openxr->view_state.viewStateFlags) &&
+        has_any_view_tracking(openxr->stage_view_state.viewStateFlags);
+
+    return has_tracking || accept_valid_untracked_startup_poses(openxr);
 }
 
 void log_pose_validation_failure(OpenXR* openxr, const char* reason, uint32_t frame_count, XrTime display_time) {
@@ -1373,41 +1427,59 @@ VRRuntime::Error OpenXR::update_poses(bool from_view_extensions, uint32_t frame_
 
     pipeline_state.view_space_location = this->view_space_location;
 
-    for (auto i = 0; i < this->hands.size(); ++i) {
-        auto& hand = this->hands[i];
-        hand.aim_location.next = &hand.aim_velocity;
-        result = xrLocateSpace(hand.aim_space, this->stage_space, display_time, &hand.aim_location);
-
-        if (result != XR_SUCCESS) {
-            spdlog::error("[VR] xrLocateSpace for hand space failed: {}", this->get_result_string(result));
-            return finish_pose_update((VRRuntime::Error)result);
+    const auto controller_pose_spaces_available = [&]() {
+        if (this->action_set.handle == XR_NULL_HANDLE) {
+            return false;
         }
 
-        auto orientation_aim = runtimes::OpenXR::to_glm(hand.aim_location.pose.orientation);
-
-        if (const auto pitch = vr->get_controller_pitch_offset(); pitch != 0.0f) {
-            orientation_aim = glm::rotate(orientation_aim, glm::radians(pitch), Vector3f{1.0f, 0.0f, 0.0f});
+        for (const auto& hand : this->hands) {
+            if (hand.aim_space == XR_NULL_HANDLE || hand.grip_space == XR_NULL_HANDLE) {
+                return false;
+            }
         }
 
-        this->aim_matrices[i] = Matrix4x4f{orientation_aim};
-        this->aim_matrices[i][3] = Vector4f{*(Vector3f*)&hand.aim_location.pose.position, 1.0f};
+        return true;
+    }();
 
-        hand.grip_location.next = &hand.grip_velocity;
-        result = xrLocateSpace(hand.grip_space, this->stage_space, display_time, &hand.grip_location);
+    if (!controller_pose_spaces_available) {
+        SPDLOG_INFO_ONCE("[OpenXR] Skipping controller pose location because action spaces are disabled or unavailable");
+    } else {
+        for (auto i = 0; i < this->hands.size(); ++i) {
+            auto& hand = this->hands[i];
+            hand.aim_location.next = &hand.aim_velocity;
+            result = xrLocateSpace(hand.aim_space, this->stage_space, display_time, &hand.aim_location);
 
-        if (result != XR_SUCCESS) {
-            spdlog::error("[VR] xrLocateSpace for hand space failed: {}", this->get_result_string(result));
-            return finish_pose_update((VRRuntime::Error)result);
+            if (result != XR_SUCCESS) {
+                spdlog::error("[VR] xrLocateSpace for hand space failed: {}", this->get_result_string(result));
+                return finish_pose_update((VRRuntime::Error)result);
+            }
+
+            auto orientation_aim = runtimes::OpenXR::to_glm(hand.aim_location.pose.orientation);
+
+            if (const auto pitch = vr->get_controller_pitch_offset(); pitch != 0.0f) {
+                orientation_aim = glm::rotate(orientation_aim, glm::radians(pitch), Vector3f{1.0f, 0.0f, 0.0f});
+            }
+
+            this->aim_matrices[i] = Matrix4x4f{orientation_aim};
+            this->aim_matrices[i][3] = Vector4f{*(Vector3f*)&hand.aim_location.pose.position, 1.0f};
+
+            hand.grip_location.next = &hand.grip_velocity;
+            result = xrLocateSpace(hand.grip_space, this->stage_space, display_time, &hand.grip_location);
+
+            if (result != XR_SUCCESS) {
+                spdlog::error("[VR] xrLocateSpace for hand space failed: {}", this->get_result_string(result));
+                return finish_pose_update((VRRuntime::Error)result);
+            }
+
+            auto orientation_grip = runtimes::OpenXR::to_glm(hand.grip_location.pose.orientation);
+
+            if (const auto pitch = vr->get_controller_pitch_offset(); pitch != 0.0f) {
+                orientation_grip = glm::rotate(orientation_grip, glm::radians(pitch), Vector3f{1.0f, 0.0f, 0.0f});
+            }
+
+            this->grip_matrices[i] = Matrix4x4f{orientation_grip};
+            this->grip_matrices[i][3] = Vector4f{*(Vector3f*)&hand.grip_location.pose.position, 1.0f};
         }
-
-        auto orientation_grip = runtimes::OpenXR::to_glm(hand.grip_location.pose.orientation);
-
-        if (const auto pitch = vr->get_controller_pitch_offset(); pitch != 0.0f) {
-            orientation_grip = glm::rotate(orientation_grip, glm::radians(pitch), Vector3f{1.0f, 0.0f, 0.0f});
-        }
-
-        this->grip_matrices[i] = Matrix4x4f{orientation_grip};
-        this->grip_matrices[i][3] = Vector4f{*(Vector3f*)&hand.grip_location.pose.position, 1.0f};
     }
 
     if (!this->got_first_valid_poses) {
@@ -1557,9 +1629,11 @@ VRRuntime::Error OpenXR::consume_events(std::function<void(void*)> callback) {
                     this->session_ready = true;
                     this->frame_began = false;
                     this->clear_frame_synced("session_ready");
+                    this->last_end_frame_rendered = false;
                     this->last_successful_wait_frame = {};
                     this->last_successful_begin_frame = {};
                     this->last_successful_end_frame = {};
+                    this->last_successful_rendered_end_frame = {};
                     this->last_successful_pose_update = {};
                     this->accepted_relaxed_startup_poses = false;
                     this->session_ready_since = std::chrono::steady_clock::now();
@@ -1586,9 +1660,11 @@ VRRuntime::Error OpenXR::consume_events(std::function<void(void*)> callback) {
                     this->session_ready = false;
                     this->clear_frame_synced("session_stopping");
                     this->frame_began = false;
+                    this->last_end_frame_rendered = false;
                     this->last_successful_wait_frame = {};
                     this->last_successful_begin_frame = {};
                     this->last_successful_end_frame = {};
+                    this->last_successful_rendered_end_frame = {};
                     this->last_successful_pose_update = {};
                     this->accepted_relaxed_startup_poses = false;
                     this->session_ready_since = {};
@@ -1806,6 +1882,10 @@ VRRuntime::Error OpenXR::update_input() {
 
     if (!this->ready() || this->session_state != XR_SESSION_STATE_FOCUSED) {
         return (VRRuntime::Error)XR_ERROR_SESSION_NOT_READY;
+    }
+
+    if (this->action_set.handle == XR_NULL_HANDLE) {
+        return VRRuntime::Error::SUCCESS;
     }
 
     XrActiveActionSet active_action_set{this->action_set.handle, XR_NULL_PATH};
@@ -2102,8 +2182,15 @@ std::optional<std::string> OpenXR::initialize_actions(const std::string& json_st
     strcpy(action_set_create_info.localizedActionSetName, "Default");
     action_set_create_info.priority = 0;
 
-    if (auto result = xrCreateActionSet(this->instance, &action_set_create_info, &this->action_set.handle); result != XR_SUCCESS) {
-        return "xrCreateActionSet failed: " + this->get_result_string(result);
+    XrResult action_set_result = XR_SUCCESS;
+    try {
+        action_set_result = xrCreateActionSet(this->instance, &action_set_create_info, &this->action_set.handle);
+    } catch (...) {
+        return "xrCreateActionSet threw an unknown exception";
+    }
+
+    if (action_set_result != XR_SUCCESS) {
+        return "xrCreateActionSet failed: " + this->get_result_string(action_set_result);
     }
 
     // Parse the JSON string using nlohmann
@@ -3276,6 +3363,7 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
 
     this->begin_profile();
     const auto end_frame_start = std::chrono::steady_clock::now();
+    this->last_end_frame_rendered = false;
     auto result = xrEndFrame(this->session, &frame_end_info);
     this->end_frame_timing.add(std::chrono::steady_clock::now() - end_frame_start);
     this->end_profile("xrEndFrame");
@@ -3290,15 +3378,23 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
     } else {
         this->ever_submitted = true;
         const auto now = std::chrono::steady_clock::now();
+        const bool submitted_rendered_frame =
+            frame_end_info.layerCount > 0 &&
+            pipelined_frame_state.shouldRender == XR_TRUE;
+        this->last_end_frame_rendered = submitted_rendered_frame;
         const auto should_log = this->last_successful_end_frame.time_since_epoch().count() == 0 ||
             now - this->last_successful_end_frame >= std::chrono::seconds(2);
         this->last_successful_end_frame = now;
+        if (submitted_rendered_frame) {
+            this->last_successful_rendered_end_frame = now;
+        }
 
         if (should_log) {
             spdlog::info(
-                "[OpenXR] xrEndFrame succeeded: layers={} shouldRender={} displayTime={}",
+                "[OpenXR] xrEndFrame succeeded: layers={} shouldRender={} rendered={} displayTime={}",
                 frame_end_info.layerCount,
                 pipelined_frame_state.shouldRender,
+                submitted_rendered_frame,
                 frame_end_info.displayTime
             );
         }
@@ -3342,12 +3438,13 @@ void OpenXR::log_frame_timing_stats_if_needed() {
     const auto& wait_post_present_initial = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRPostPresentInitialSync];
     const auto& wait_very_late = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRVeryLatePostPresent];
     const auto& wait_single_view_async = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRSingleViewAsyncPostPresent];
+    const auto& wait_afr_async = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRAfrAsyncPostPresent];
     const auto& wait_session_ready = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::OpenXRSessionReady];
     const auto& wait_recovery = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::OpenXRBeginFrameRecovery];
     const auto pose_age_ms = this->get_pose_update_age_ms(now);
 
     spdlog::info(
-        "[OpenXR][frame-profiler] wait avg={:.2f}ms max={:.2f}ms n={} wait_fix avg={:.2f}ms max={:.2f}ms n={} wait_early avg={:.2f}ms max={:.2f}ms n={} wait_late avg={:.2f}ms max={:.2f}ms n={} wait_post_present_initial avg={:.2f}ms max={:.2f}ms n={} wait_very_late avg={:.2f}ms max={:.2f}ms n={} wait_single_view_async avg={:.2f}ms max={:.2f}ms n={} wait_session_ready avg={:.2f}ms max={:.2f}ms n={} wait_recovery avg={:.2f}ms max={:.2f}ms n={} begin avg={:.2f}ms max={:.2f}ms n={} end avg={:.2f}ms max={:.2f}ms n={} pose_update avg={:.2f}ms max={:.2f}ms n={} pose_age_ms={} pose_calls={} pose_view_ext={} pose_runtime={} last_pose_src={} last_pose_frame={} last_pose_result={} last_pose_ms={:.2f} view_locate_ms={:.2f} stage_locate_ms={:.2f} space_locate_ms={:.2f} session={} ready={} synced={} began={} first_poses={} valid_poses={} relaxed_startup={} dbg_empty={} dbg_skip_scene={} dbg_skip_ui={} dbg_no_depth={}",
+        "[OpenXR][frame-profiler] wait avg={:.2f}ms max={:.2f}ms n={} wait_fix avg={:.2f}ms max={:.2f}ms n={} wait_early avg={:.2f}ms max={:.2f}ms n={} wait_late avg={:.2f}ms max={:.2f}ms n={} wait_post_present_initial avg={:.2f}ms max={:.2f}ms n={} wait_very_late avg={:.2f}ms max={:.2f}ms n={} wait_single_view_async avg={:.2f}ms max={:.2f}ms n={} wait_afr_async avg={:.2f}ms max={:.2f}ms n={} wait_session_ready avg={:.2f}ms max={:.2f}ms n={} wait_recovery avg={:.2f}ms max={:.2f}ms n={} begin avg={:.2f}ms max={:.2f}ms n={} end avg={:.2f}ms max={:.2f}ms n={} pose_update avg={:.2f}ms max={:.2f}ms n={} pose_age_ms={} pose_calls={} pose_view_ext={} pose_runtime={} last_pose_src={} last_pose_frame={} last_pose_result={} last_pose_ms={:.2f} view_locate_ms={:.2f} stage_locate_ms={:.2f} space_locate_ms={:.2f} session={} ready={} synced={} began={} first_poses={} valid_poses={} relaxed_startup={} dbg_empty={} dbg_skip_scene={} dbg_skip_ui={} dbg_no_depth={}",
         this->wait_frame_timing.avg(),
         this->wait_frame_timing.max_ms,
         this->wait_frame_timing.count,
@@ -3369,6 +3466,9 @@ void OpenXR::log_frame_timing_stats_if_needed() {
         wait_single_view_async.avg(),
         wait_single_view_async.max_ms,
         wait_single_view_async.count,
+        wait_afr_async.avg(),
+        wait_afr_async.max_ms,
+        wait_afr_async.count,
         wait_session_ready.avg(),
         wait_session_ready.max_ms,
         wait_session_ready.count,

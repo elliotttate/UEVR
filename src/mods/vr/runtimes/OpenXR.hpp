@@ -395,6 +395,7 @@ public:
     uint32_t last_applied_resolution_height{};
     bool push_dummy_projection{ false };
     bool ever_submitted{false};
+    bool last_end_frame_rendered{false};
     bool has_valid_projection_data{false};
     uint64_t last_wait_trace_sequence{};
     uint32_t last_wait_trace_frame_count{};
@@ -415,6 +416,7 @@ public:
     std::chrono::steady_clock::time_point last_successful_wait_frame{};
     std::chrono::steady_clock::time_point last_successful_begin_frame{};
     std::chrono::steady_clock::time_point last_successful_end_frame{};
+    std::chrono::steady_clock::time_point last_successful_rendered_end_frame{};
     std::chrono::steady_clock::time_point last_successful_pose_update{};
     std::chrono::steady_clock::time_point session_ready_since{};
     std::chrono::steady_clock::time_point last_ready_state_probe_log{};
@@ -560,7 +562,7 @@ public:
     };
 
     struct ActionSet {
-        XrActionSet handle;
+        XrActionSet handle{XR_NULL_HANDLE};
         std::vector<XrAction> actions{};
         std::unordered_map<std::string, XrAction> action_map{}; // XrActions are handles so it's okay.
         std::unordered_map<XrAction, std::string> action_names{};

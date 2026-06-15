@@ -537,6 +537,8 @@ public:
         return is_single_view_rendering_active();
     }
 
+    bool is_afr_openxr_pacing_active() const;
+
     // The eye the engine's lone view represents: the DIBR reference eye, or
     // eye 0 for Mono (whose view is centered via is_dibr_mono_view_active's
     // offset zeroing + the forced symmetric projection). AFW alternates per
@@ -918,6 +920,10 @@ public:
         }
 
         return m_native_stereo_fix_same_pass->value();
+    }
+
+    bool is_native_stereo_fix_preserve_secondary_pass_enabled() const {
+        return m_native_stereo_fix_preserve_secondary_pass->value();
     }
 
     bool is_ahud_compatibility_enabled() const {
@@ -1757,6 +1763,7 @@ private:
     const ModToggle::Ptr m_ghosting_fix{ ModToggle::create(generate_name("GhostingFix"), false) };
     const ModToggle::Ptr m_native_stereo_fix{ ModToggle::create(generate_name("NativeStereoFix"), false) };
     const ModToggle::Ptr m_native_stereo_fix_same_pass{ ModToggle::create(generate_name("NativeStereoFixSamePass"), true) };
+    const ModToggle::Ptr m_native_stereo_fix_preserve_secondary_pass{ ModToggle::create(generate_name("NativeStereoFixPreserveSecondaryPass"), true) };
 
     const ModSlider::Ptr m_custom_z_near{ ModSlider::create(generate_name("CustomZNear"), 0.001f, 100.0f, 0.01f, true) };
     const ModToggle::Ptr m_custom_z_near_enabled{ ModToggle::create(generate_name("EnableCustomZNear"), false, true) };
@@ -2083,6 +2090,7 @@ public:
             *m_ghosting_fix,
             *m_native_stereo_fix,
             *m_native_stereo_fix_same_pass,
+            *m_native_stereo_fix_preserve_secondary_pass,
             *m_splitscreen_compatibility_mode,
             *m_splitscreen_view_index,
             *m_compatibility_skip_pip,

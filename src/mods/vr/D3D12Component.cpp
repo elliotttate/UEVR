@@ -1536,6 +1536,41 @@ bool dibr_direct_openxr_submit_enabled() {
     return enabled;
 }
 
+bool afr_openxr_depth_submit_enabled() {
+    static const bool enabled = sn2_env_truthy("UEVR_AFR_OPENXR_DEPTH_SUBMIT");
+    return enabled;
+}
+
+bool dibr_afw_temporal_history_enabled(VR* vr) {
+    if (vr == nullptr || !vr->is_dibr_temporal_enabled()) {
+        return false;
+    }
+
+    // AFW temporal history currently costs enough GPU/driver time to miss the
+    // 120 Hz Meta simulator cadence, and its history reprojection can visibly
+    // alternate between two positions. Keep plain scatter's temporal default,
+    // but make AFW history an explicit opt-in while the history path is fixed.
+    static const bool enabled = sn2_env_truthy("UEVR_DIBR_AFW_TEMPORAL");
+    return enabled;
+}
+
+bool dibr_afw_parity_anchor_under_naming_enabled() {
+    // Submitted-frame naming fixes which frame is looked up, but the per-launch
+    // eye-label inversion measured by the SAD anchor is independent. Keep the
+    // correction active by default; UEVR_DIBR_AFW_PARITY_ANCHOR_UNDER_NAMING=0
+    // is the bisection switch if the anchor latches noisy in a specific scene.
+    static const bool enabled = !sn2_env_explicit_false("UEVR_DIBR_AFW_PARITY_ANCHOR_UNDER_NAMING");
+    return enabled;
+}
+
+bool d3d12_swapchain_scene_fallback_enabled(VR* vr) {
+    static const bool disabled = sn2_env_explicit_false("UEVR_D3D12_SWAPCHAIN_SCENE_FALLBACK");
+    return !disabled &&
+        vr != nullptr &&
+        (vr->is_mono_rendering_configured() ||
+         (vr->get_dibr_requested_mode() != 0 && vr->is_dibr_rendering_path_compatible()));
+}
+
 bool single_view_openxr_pacing_active(VR* vr) {
     return vr != nullptr && vr->is_single_view_openxr_pacing_active();
 }
@@ -1605,7 +1640,7 @@ bool should_skip_single_view_openxr_submit(VR* vr) {
         return false;
     }
 
-    const auto last_submit = openxr->last_successful_end_frame;
+    const auto last_submit = openxr->last_successful_rendered_end_frame;
     if (last_submit.time_since_epoch().count() == 0) {
         return false;
     }
@@ -1616,6 +1651,26 @@ bool should_skip_single_view_openxr_submit(VR* vr) {
     }
 
     return std::chrono::steady_clock::now() - last_submit < interval;
+}
+
+bool openxr_scene_frame_renderable(VR* vr) {
+    if (vr == nullptr) {
+        return true;
+    }
+
+    const auto runtime = vr->get_runtime();
+    if (runtime == nullptr || !runtime->is_openxr()) {
+        return true;
+    }
+
+    auto* openxr = vr->get_openxr_runtime();
+    if (openxr == nullptr) {
+        return false;
+    }
+
+    return openxr->can_run_frame_loop() &&
+        openxr->frame_synced &&
+        openxr->frame_state.shouldRender == XR_TRUE;
 }
 
 // Feature #10 (agent OWNEDRES): give the OpenXR native-stereo-array texture and
@@ -2637,6 +2692,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         backbuffer = real_backbuffer;
     }
 
+    if (backbuffer == nullptr && d3d12_swapchain_scene_fallback_enabled(vr)) {
+        backbuffer = real_backbuffer;
+        SPDLOG_WARN_ONCE(
+            "[D3D12 VR] Fake-stereo render target unavailable; using DXGI swapchain backbuffer as the scene source for single-view/DIBR setup (UEVR_D3D12_SWAPCHAIN_SCENE_FALLBACK=0 disables)");
+    }
+
     if (backbuffer == nullptr) {
         SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] Failed to get back buffer.");
         return vr::VRCompositorError_None;
@@ -3370,11 +3431,14 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             }
         }
 
-    #ifdef AFR_DEPTH_TEMP_DISABLED
-        if (is_actually_afr) {
+        if (is_actually_afr &&
+            runtime->is_openxr() &&
+            vr->is_afr_openxr_pacing_active() &&
+            !afr_openxr_depth_submit_enabled())
+        {
+            SPDLOG_INFO_ONCE("[OpenXR][AFR] Suppressing AFR composition-depth submit/copy on the 120 Hz pacing path (UEVR_AFR_OPENXR_DEPTH_SUBMIT=1 enables)");
             scene_depth_tex.Reset();
         }
-    #endif
     }
 
     if (shf_using_mono_expansion && scene_depth_tex != nullptr) {
@@ -3876,7 +3940,22 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }
     }
 
-    if (is_right_eye_frame) {
+    const auto afr_openxr_has_both_scene_images =
+        is_actually_afr &&
+        runtime->is_openxr() &&
+        m_openxr.ever_acquired((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE) &&
+        m_openxr.ever_acquired((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE);
+    const auto submit_afr_openxr_left_phase =
+        is_left_eye_frame &&
+        vr->is_afr_openxr_pacing_active() &&
+        afr_openxr_has_both_scene_images;
+    const auto should_submit_openxr_frame = is_right_eye_frame || submit_afr_openxr_left_phase;
+
+    if (submit_afr_openxr_left_phase) {
+        SPDLOG_INFO_ONCE("[OpenXR][AFR] Submitting every alternating AFR phase once both per-eye scene swapchains are live (UEVR_AFR_OPENXR_UNPACED=0 disables)");
+    }
+
+    if (should_submit_openxr_frame) {
         if ((runtime->ready() && vr->get_synchronize_stage() == VR::SynchronizeStage::VERY_LATE) || !runtime->got_first_sync) {
             //vr->update_hmd_state();
         }
@@ -3884,7 +3963,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
     vr::EVRCompositorError e = vr::EVRCompositorError::VRCompositorError_None;
 
-    if (is_right_eye_frame) {
+    if (should_submit_openxr_frame) {
         ////////////////////////////////////////////////////////////////////////////////
         // OpenXR start ////////////////////////////////////////////////////////////////
         ////////////////////////////////////////////////////////////////////////////////
@@ -3978,7 +4057,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             }
 
             vr->m_openxr->needs_pose_update = true;
-            vr->m_submitted = result == XR_SUCCESS;
+            vr->m_submitted = result == XR_SUCCESS && vr->m_openxr->last_end_frame_rendered;
             if (m_single_view_openxr_unpaced_active_this_frame && vr->m_submitted) {
                 vr->request_single_view_openxr_async_wait();
             }
@@ -4031,6 +4110,7 @@ void D3D12Component::log_frame_timing_stats_if_needed(VR* vr) {
     if (m_perf_on_frame.count == 0 &&
         m_perf_ui_copy.count == 0 &&
         m_perf_swapchain_copy.count == 0 &&
+        m_perf_dibr_synthesis.count == 0 &&
         m_perf_openxr_submit.count == 0 &&
         m_perf_spectator_mirror.count == 0 &&
         m_perf_post_present.count == 0)
@@ -4064,7 +4144,7 @@ void D3D12Component::log_frame_timing_stats_if_needed(VR* vr) {
     const auto has_game_tex = m_game_tex.texture.Get() != nullptr;
 
     spdlog::info(
-        "[D3D12][frame-profiler] on_frame avg={:.2f}ms max={:.2f}ms n={} ui_copy avg={:.2f}ms max={:.2f}ms n={} swapchain_copy avg={:.2f}ms max={:.2f}ms n={} openxr_submit avg={:.2f}ms max={:.2f}ms n={} spectator_mirror avg={:.2f}ms max={:.2f}ms n={} post_present avg={:.2f}ms max={:.2f}ms n={} mirror_mode={} desktop_fix={} hmd={} afr={} native_stereo={} has_game_tex={} has_ui_tex={} has_ui_target={} ui_pending={} ui_extent={}x{} submitted={} dbg_empty={} dbg_skip_scene={} dbg_skip_ui={} dbg_no_depth={}",
+        "[D3D12][frame-profiler] on_frame avg={:.2f}ms max={:.2f}ms n={} ui_copy avg={:.2f}ms max={:.2f}ms n={} swapchain_copy avg={:.2f}ms max={:.2f}ms n={} dibr_synthesis avg={:.2f}ms max={:.2f}ms n={} openxr_submit avg={:.2f}ms max={:.2f}ms n={} spectator_mirror avg={:.2f}ms max={:.2f}ms n={} post_present avg={:.2f}ms max={:.2f}ms n={} mirror_mode={} desktop_fix={} hmd={} afr={} native_stereo={} has_game_tex={} has_ui_tex={} has_ui_target={} ui_pending={} ui_extent={}x{} submitted={} dbg_empty={} dbg_skip_scene={} dbg_skip_ui={} dbg_no_depth={}",
         m_perf_on_frame.avg(),
         m_perf_on_frame.max_ms,
         m_perf_on_frame.count,
@@ -4074,6 +4154,9 @@ void D3D12Component::log_frame_timing_stats_if_needed(VR* vr) {
         m_perf_swapchain_copy.avg(),
         m_perf_swapchain_copy.max_ms,
         m_perf_swapchain_copy.count,
+        m_perf_dibr_synthesis.avg(),
+        m_perf_dibr_synthesis.max_ms,
+        m_perf_dibr_synthesis.count,
         m_perf_openxr_submit.avg(),
         m_perf_openxr_submit.max_ms,
         m_perf_openxr_submit.count,
@@ -4105,6 +4188,7 @@ void D3D12Component::log_frame_timing_stats_if_needed(VR* vr) {
     m_perf_on_frame.reset();
     m_perf_ui_copy.reset();
     m_perf_swapchain_copy.reset();
+    m_perf_dibr_synthesis.reset();
     m_perf_openxr_submit.reset();
     m_perf_spectator_mirror.reset();
     m_perf_post_present.reset();
@@ -4259,6 +4343,7 @@ D3D12Component::FfiTiming to_ffi(const auto& s) {
 D3D12Component::FfiTiming D3D12Component::get_timing_on_frame()         const { return to_ffi(m_perf_on_frame); }
 D3D12Component::FfiTiming D3D12Component::get_timing_ui_copy()          const { return to_ffi(m_perf_ui_copy); }
 D3D12Component::FfiTiming D3D12Component::get_timing_swapchain_copy()   const { return to_ffi(m_perf_swapchain_copy); }
+D3D12Component::FfiTiming D3D12Component::get_timing_dibr_synthesis()   const { return to_ffi(m_perf_dibr_synthesis); }
 D3D12Component::FfiTiming D3D12Component::get_timing_openxr_submit()    const { return to_ffi(m_perf_openxr_submit); }
 D3D12Component::FfiTiming D3D12Component::get_timing_spectator_mirror() const { return to_ffi(m_perf_spectator_mirror); }
 D3D12Component::FfiTiming D3D12Component::get_timing_post_present()     const { return to_ffi(m_perf_post_present); }
@@ -4296,6 +4381,9 @@ D3D12Component::HitchFrameSnapshot D3D12Component::get_hitch_frame_snapshot(VR* 
     snapshot.perf_swapchain_copy_count = m_perf_swapchain_copy.count;
     snapshot.perf_swapchain_copy_avg_ms = m_perf_swapchain_copy.avg();
     snapshot.perf_swapchain_copy_max_ms = m_perf_swapchain_copy.max_ms;
+    snapshot.perf_dibr_synthesis_count = m_perf_dibr_synthesis.count;
+    snapshot.perf_dibr_synthesis_avg_ms = m_perf_dibr_synthesis.avg();
+    snapshot.perf_dibr_synthesis_max_ms = m_perf_dibr_synthesis.max_ms;
     snapshot.perf_openxr_submit_count = m_perf_openxr_submit.count;
     snapshot.perf_openxr_submit_avg_ms = m_perf_openxr_submit.avg();
     snapshot.perf_openxr_submit_max_ms = m_perf_openxr_submit.max_ms;
@@ -4879,6 +4967,11 @@ DXGI_FORMAT uav_store_format_for(ID3D12Device* device, DXGI_FORMAT backbuffer_fo
 } // namespace dibr_config
 
 void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D12_RESOURCE_STATES scene_source_state, ID3D12Resource* scene_depth) {
+    const auto dibr_synthesis_start = std::chrono::steady_clock::now();
+    utility::ScopeGuard dibr_synthesis_timing_guard{[&]() {
+        m_perf_dibr_synthesis.add(std::chrono::steady_clock::now() - dibr_synthesis_start);
+    }};
+
     if (backbuffer == nullptr) {
         return;
     }
@@ -5039,6 +5132,19 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         }
     };
 
+    if (!openxr_scene_frame_renderable(vr)) {
+        if (vr != nullptr && vr->m_openxr != nullptr) {
+            SPDLOG_INFO_EVERY_N_SEC(
+                2,
+                "[DIBR] Skipping synthesis until OpenXR provides a renderable frame (state={} synced={} began={} shouldRender={})",
+                vr->m_openxr->get_session_state_string(vr->m_openxr->session_state),
+                vr->m_openxr->frame_synced,
+                vr->m_openxr->frame_began,
+                vr->m_openxr->frame_state.shouldRender);
+        }
+        return;
+    }
+
     // Mono rendering method: gearmono-style baseline. The engine rendered one
     // centered union-frustum view into the left half. OpenXR submits that left
     // half for both eyes, so the steady-state mono path does not need a
@@ -5111,6 +5217,8 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         }
     }
 
+    const bool afw_temporal_history = afw && dibr_afw_temporal_history_enabled(vr);
+
     // AFW: resolve the rendered (reference) eye of the frame being presented.
     // The authoritative source is the stereo hook's per-engine-frame view
     // ring, looked up by m_render_frame_count. VERIFIED by consecutive-frame
@@ -5127,6 +5235,8 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     glm::quat afw_rot_now{};
     glm::vec3 afw_loc_now{};
     glm::vec3 afw_other_loc_now{};
+    bool afw_name_ok = false;
+    bool afw_apply_parity_anchor = false;
     if (afw) {
         static const uint32_t parity_flip = []() {
             const char* v = std::getenv("UEVR_DIBR_AFW_PARITY");
@@ -5245,11 +5355,38 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             return (v != nullptr && v[0] != '\0') ? std::atoi(v) : 0;
         }();
         const uint32_t afw_name_frame = dibr_depth_tracker::get_afw_submitted_frame();
-        const bool afw_name_ok = name_primary && afw_name_frame != 0xFFFFFFFFu;
+        afw_name_ok = name_primary && afw_name_frame != 0xFFFFFFFFu;
         if (afw_name_ok) {
             afw_presented_frame = (uint32_t)((int32_t)afw_name_frame + name_offset);
         }
 
+        // Present can see the command-list naming stream briefly repeat/stale
+        // under 120 Hz load. A one-frame backward key means the synthesized eye
+        // flips to the previous AFW pose/eye after a newer pose was already
+        // submitted, which is the visible two-position oscillation. Clamp small
+        // backward moves; a large drop is treated as a real counter reset.
+        {
+            static std::atomic<uint32_t> s_last_afw_presented_frame{0xFFFFFFFFu};
+            const uint32_t selected_frame = afw_presented_frame;
+            uint32_t prev = s_last_afw_presented_frame.load(std::memory_order_acquire);
+            for (;;) {
+                if (prev == 0xFFFFFFFFu || selected_frame >= prev || (prev - selected_frame) > 8192u) {
+                    if (s_last_afw_presented_frame.compare_exchange_weak(
+                            prev, selected_frame, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                        break;
+                    }
+                    continue;
+                }
+
+                SPDLOG_INFO_EVERY_N_SEC(2, "[DIBR][AFWANOM] stale AFW key clamped: selected={} last={}",
+                    selected_frame, prev);
+                afw_presented_frame = prev;
+                break;
+            }
+        }
+
+        const bool apply_afw_anchor_for_label =
+            !afw_name_ok || dibr_afw_parity_anchor_under_naming_enabled();
         bool afw_ring_hit = vr->get_afw_view(afw_presented_frame, afw_eye_now, afw_rot_now, afw_loc_now, afw_other_loc_now);
         if (!afw_ring_hit) {
             const uint32_t latest = vr->get_afw_latest_frame();
@@ -5260,24 +5397,19 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         }
         if (afw_ring_hit) {
             // Self-calibrated parity anchor (see the calibration block after
-            // synthesis): the counter chain's record<->present alignment is
-            // NONDETERMINISTIC per launch (sync timing shifts the offset), so
-            // the anchor is measured from the pixels each run. The env flip
-            // remains as a manual override on top.
-            //
-            // Stage 4 (corrected 2026-06-13 after AFW2 oscillation): naming
-            // makes the FRAME NUMBER authoritative, but the per-launch eye-LABEL
-            // inversion the SAD anchor corrects is ORTHOGONAL - it is the
-            // present<->output eye-half mapping, which naming does not address.
-            // Disabling the XOR under naming inverted the eye every frame on
-            // anchor=1 launches => whole-image oscillation. Always apply it.
-            if (m_afw_parity_anchor == 1) {
+            // synthesis): submitted-frame naming fixes the frame number, but
+            // the launch-local eye-label inversion measured from pixels is
+            // orthogonal and still needs the same uniform XOR.
+            afw_apply_parity_anchor = apply_afw_anchor_for_label;
+            if (afw_apply_parity_anchor && m_afw_parity_anchor == 1) {
                 afw_eye_now ^= 1;
             }
             yoro_reference_eye = (float)(((uint32_t)afw_eye_now ^ parity_flip) & 1u);
         } else {
             afw_eye_now = -1;
-            yoro_reference_eye = (float)((afw_presented_frame ^ (m_afw_parity_anchor == 1 ? 1u : 0u) ^ parity_flip) & 1u);
+            afw_apply_parity_anchor = apply_afw_anchor_for_label;
+            const uint32_t anchor_flip = (afw_apply_parity_anchor && m_afw_parity_anchor == 1) ? 1u : 0u;
+            yoro_reference_eye = (float)((afw_presented_frame ^ anchor_flip ^ parity_flip) & 1u);
         }
         SPDLOG_INFO_ONCE("[DIBR] AFW active: reference eye alternates per frame (this frame: {})",
             yoro_reference_eye > 0.5f ? "right" : "left");
@@ -5286,10 +5418,11 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         if (single_view) {
             static std::atomic<int> s_afw_trace{0};
             if (s_afw_trace.fetch_add(1, std::memory_order_relaxed) < 240) {
-                SPDLOG_INFO("[DIBR][AFWTRACE] synth key={} rframe={} iframe={} ref={} ring={}",
+                SPDLOG_INFO("[DIBR][AFWTRACE] synth key={} rframe={} iframe={} eye={} ref={} ring={} name={} anchor_used={}",
                     afw_presented_frame, (uint32_t)vr->m_render_frame_count,
-                    (uint32_t)vr->get_runtime()->internal_frame_count, yoro_reference_eye,
-                    afw_eye_now >= 0 ? "hit" : "MISS");
+                    (uint32_t)vr->get_runtime()->internal_frame_count, afw_eye_now,
+                    yoro_reference_eye, afw_eye_now >= 0 ? "hit" : "MISS",
+                    afw_name_ok ? 1 : 0, afw_apply_parity_anchor ? m_afw_parity_anchor : 0);
             }
         }
 
@@ -5782,7 +5915,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             // idealized translate above (isolates the measured-pair math).
             static const bool measured_baseline_disabled = []() {
                 const char* v = std::getenv("UEVR_DIBR_AFW_MEASURED_BASELINE");
-                return v != nullptr && v[0] == '0';
+                return v == nullptr || v[0] != '1';
             }();
             if (afw && !measured_baseline_disabled && afw_eye_now >= 0) {
                 const glm::quat qc{Matrix4x4f{
@@ -5817,7 +5950,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             // Engine-side motion (locomotion, animated cameras) is invisible
             // to this matrix; the fill kernel's depth validation rejects
             // history it can't explain, so it degrades to the scanline fill.
-            if (vr->is_dibr_temporal_enabled() && mode == DIBRSynthesis::Mode::YoroScatter && afw) {
+            if (afw_temporal_history && mode == DIBRSynthesis::Mode::YoroScatter) {
                 // AFW: history is last frame's REAL render of the eye being
                 // synthesized now. Build the reprojection from the hook's
                 // captured per-frame eye cameras - the FULL camera delta
@@ -5835,7 +5968,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                 const int target_eye = ref_left ? 1 : 0;
                 bool prev_ok = afw_eye_now >= 0 &&
                     vr->get_afw_view(afw_presented_frame - 1, prev_eye, prev_rot, prev_loc, prev_other_loc);
-                if (prev_ok && m_afw_parity_anchor == 1) {
+                if (prev_ok && afw_apply_parity_anchor && m_afw_parity_anchor == 1) {
                     prev_eye ^= 1; // uniform label correction (see anchor)
                 }
                 if (prev_ok && prev_eye == target_eye) {
@@ -5900,7 +6033,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                     params.temporal_enabled = 2.0f;
                     params.temporal_blend = vr->get_dibr_temporal_blend();
                 }
-            } else if (vr->is_dibr_temporal_enabled() && mode == DIBRSynthesis::Mode::YoroScatter) {
+            } else if (!afw && vr->is_dibr_temporal_enabled() && mode == DIBRSynthesis::Mode::YoroScatter) {
                 static glm::mat4 s_prev_pose{1.0f};
                 static bool s_prev_valid{false};
 
@@ -5962,7 +6095,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     // device depth) as the next frame's temporal-fill history - under
     // alternation that history IS the real render of the eye being
     // synthesized, so disocclusion holes fill with one-frame-old real pixels.
-    m_dibr.set_alternate_history(afw);
+    m_dibr.set_alternate_history(afw_temporal_history);
     // Per-pass GPU timing needs the queue this list executes on (the same one
     // CommandContext::execute submits to) for GetTimestampFrequency.
     m_dibr.set_gpu_timing_queue(g_framework->get_d3d12_hook()->get_command_queue());
@@ -6182,18 +6315,18 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
                     SPDLOG_INFO("[DIBR] AFW parity calibration: consecutive-frame half shifts L={} R={} -> anchor={} ({})",
                         s_left, s_right, m_afw_parity_anchor,
                         m_afw_parity_anchor == 1 ? "counter alignment INVERTED this run; flipping eye labels" : "aligned");
-                    // Stage 4 watchdog: under authoritative naming the eye comes
-                    // from record[name_F] and the SAD anchor is NOT applied. A
-                    // detected inversion here then indicts the naming itself (a
-                    // real bug to investigate - wrong NAME_OFFSET or a jittery
-                    // tag), not the expected per-launch counter nondeterminism.
+                    // Stage 4 watchdog: under authoritative naming the frame
+                    // number comes from record[name_F], while the SAD anchor
+                    // remains a separate eye-label correction unless explicitly
+                    // disabled for bisection.
                     const bool naming_on = []() {
                         const char* v = std::getenv("UEVR_DIBR_AFW_NAME");
                         return v != nullptr && v[0] == '1';
                     }() && dibr_depth_tracker::get_afw_submitted_frame() != 0xFFFFFFFFu;
                     if (naming_on) {
-                        SPDLOG_INFO("[DIBR][AFWNAME] parity anchor={} applied under naming (eye-label correction is orthogonal to the frame name)",
-                            m_afw_parity_anchor);
+                        SPDLOG_INFO("[DIBR][AFWNAME] parity anchor={} under submitted-frame naming ({})",
+                            m_afw_parity_anchor,
+                            dibr_afw_parity_anchor_under_naming_enabled() ? "applied" : "disabled");
                     }
                     s_calib_rb[0]->Unmap(0, nullptr);
                     s_calib_rb[1]->Unmap(0, nullptr);
@@ -6362,6 +6495,7 @@ void D3D12Component::on_reset(VR* vr) {
     m_perf_on_frame.reset();
     m_perf_ui_copy.reset();
     m_perf_swapchain_copy.reset();
+    m_perf_dibr_synthesis.reset();
     m_perf_openxr_submit.reset();
     m_perf_spectator_mirror.reset();
     m_perf_post_present.reset();
@@ -6536,6 +6670,12 @@ bool D3D12Component::setup() {
 
     if (vr->is_extreme_compatibility_mode_enabled()) {
         backbuffer = real_backbuffer;
+    }
+
+    if (backbuffer == nullptr && d3d12_swapchain_scene_fallback_enabled(vr.get())) {
+        backbuffer = real_backbuffer;
+        SPDLOG_WARN_ONCE(
+            "[D3D12 VR] Fake-stereo render target unavailable; using DXGI swapchain backbuffer as the scene source for single-view/DIBR setup (UEVR_D3D12_SWAPCHAIN_SCENE_FALLBACK=0 disables)");
     }
 
     if (backbuffer == nullptr) {

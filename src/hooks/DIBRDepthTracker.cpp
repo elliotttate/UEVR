@@ -451,16 +451,31 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, u
     // bound this frame. Then exact extent, area, depth format tier, recency.
     const float full_aspect = static_cast<float>(full_width) / static_cast<float>(height);
     const float eye_aspect = static_cast<float>(eye_width) / static_cast<float>(height);
+    const auto dim_delta = [](uint32_t a, uint32_t b) {
+        return a > b ? a - b : b - a;
+    };
+    const auto dim_slop = [](uint32_t v, uint32_t floor) {
+        return std::max<uint32_t>(floor, v / 100u);
+    };
+    const uint32_t full_width_slop = dim_slop(full_width, 8u);
+    const uint32_t eye_width_slop = dim_slop(eye_width, 4u);
+    const uint32_t height_slop = dim_slop(height, 4u);
 
     // A candidate qualifies in either shape family: double-wide (both views
     // packed) or single-eye (single-view rendering allocates SceneDepthZ at
-    // the lone view's extent). Dynamic res shrinks within a family.
+    // the lone view's extent). Dynamic res shrinks within a family. MetaXR's
+    // D3D12-on-Vulkan path can report the DXGI/UI extent a few pixels smaller
+    // than the actual UE scene/depth targets, so permit a tiny overshoot.
     const auto shape_ok = [&](const Candidate& c) {
         const float aspect = static_cast<float>(c.width) / static_cast<float>(c.height);
         const bool full_shape = std::fabs(aspect - full_aspect) <= full_aspect * 0.02f &&
-                                c.width <= full_width && c.width * 2 >= full_width;
+                                c.width <= full_width + full_width_slop &&
+                                c.height <= height + height_slop &&
+                                c.width * 2 >= full_width;
         const bool eye_shape = std::fabs(aspect - eye_aspect) <= eye_aspect * 0.02f &&
-                               c.width <= eye_width && c.width * 2 >= eye_width;
+                               c.width <= eye_width + eye_width_slop &&
+                               c.height <= height + height_slop &&
+                               c.width * 2 >= eye_width;
         return full_shape || eye_shape;
     };
 
@@ -469,7 +484,10 @@ Microsoft::WRL::ComPtr<ID3D12Resource> select_scene_depth(uint32_t full_width, u
     bool best_live = false;
 
     for (const auto& c : g_candidates) {
-        const bool exact = (c.width == full_width || c.width == eye_width) && c.height == height;
+        const bool exact =
+            ((dim_delta(c.width, full_width) <= full_width_slop) ||
+             (dim_delta(c.width, eye_width) <= eye_width_slop)) &&
+            dim_delta(c.height, height) <= height_slop;
         if (!exact && !shape_ok(c)) {
             continue;
         }
@@ -1009,7 +1027,7 @@ void record_afw_depth_bind(ID3D12GraphicsCommandList* cmd_list, SIZE_T rtv0, uin
 
     if (rtv_count != 1 ||
         (rtv_info.format != DXGI_FORMAT_R16G16B16A16_FLOAT && rtv_info.format != DXGI_FORMAT_R11G11B10_FLOAT) ||
-        rtv_info.width < 1024 || dsv_info.dsv_flags == 0 || dsv_info.resource == nullptr) {
+        rtv_info.width < 256 || rtv_info.height < 256 || dsv_info.dsv_flags == 0 || dsv_info.resource == nullptr) {
         g_health_afw_qualify_fail.fetch_add(1, std::memory_order_relaxed);
         return;
     }

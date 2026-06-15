@@ -128,6 +128,18 @@ bool vr_is_subnautica2_process() {
     return result;
 }
 
+bool vr_afr_openxr_unpaced_enabled() {
+    if (vr_env_explicit_false("UEVR_AFR_OPENXR_UNPACED")) {
+        return false;
+    }
+
+    return vr_env_truthy("UEVR_AFR_OPENXR_UNPACED") || vr_is_subnautica2_process();
+}
+
+bool vr_afr_openxr_async_wait_enabled() {
+    return !vr_env_explicit_false("UEVR_AFR_OPENXR_ASYNC_WAIT");
+}
+
 bool vr_disable_gamepad_spoof() {
     static const bool result = []() {
         if (vr_env_truthy("UEVR_DISABLE_GAMEPAD_SPOOF")) {
@@ -174,8 +186,19 @@ void VR::stop_single_view_openxr_async_wait_worker() {
     m_single_view_openxr_async_wait_cv.notify_all();
 }
 
+bool VR::is_afr_openxr_pacing_active() const {
+    return vr_afr_openxr_unpaced_enabled() &&
+        m_rendering_method->value() == RenderingMethod::ALTERNATING;
+}
+
 void VR::request_single_view_openxr_async_wait() {
-    if (!vr_single_view_openxr_async_wait_enabled() || !is_single_view_openxr_pacing_active()) {
+    const auto single_view_pacing = is_single_view_openxr_pacing_active();
+    const auto afr_pacing = is_afr_openxr_pacing_active();
+
+    if ((!single_view_pacing && !afr_pacing) ||
+        (single_view_pacing && !vr_single_view_openxr_async_wait_enabled()) ||
+        (afr_pacing && !vr_afr_openxr_async_wait_enabled()))
+    {
         return;
     }
 
@@ -183,6 +206,7 @@ void VR::request_single_view_openxr_async_wait() {
     if (openxr == nullptr ||
         !openxr->can_run_frame_loop() ||
         !openxr->ever_submitted ||
+        openxr->last_successful_rendered_end_frame.time_since_epoch().count() == 0 ||
         openxr->frame_synced ||
         openxr->frame_began)
     {
@@ -204,9 +228,9 @@ void VR::request_single_view_openxr_async_wait() {
 }
 
 void VR::single_view_openxr_async_wait_worker_loop(std::stop_token stop_token) {
-    SetThreadDescription(GetCurrentThread(), L"UEVR SingleView OpenXR Wait");
+    SetThreadDescription(GetCurrentThread(), L"UEVR OpenXR Async Wait");
     if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST)) {
-        spdlog::warn("[OpenXR][single-view] Failed to raise async wait worker priority: {}", GetLastError());
+        spdlog::warn("[OpenXR][async-wait] Failed to raise async wait worker priority: {}", GetLastError());
     }
 
     while (!stop_token.stop_requested()) {
@@ -236,9 +260,22 @@ void VR::single_view_openxr_async_wait_worker_loop(std::stop_token stop_token) {
             continue;
         }
 
-        m_d3d12.release_single_view_openxr_scene_swapchain();
-        openxr->synchronize_frame(std::nullopt, VRRuntime::SyncFrameCallsite::VRSingleViewAsyncPostPresent);
-        if (openxr->frame_synced && !openxr->frame_began) {
+        const auto single_view_pacing = is_single_view_openxr_pacing_active();
+        const auto afr_pacing = is_afr_openxr_pacing_active();
+        if (!single_view_pacing && !afr_pacing) {
+            continue;
+        }
+
+        if (single_view_pacing) {
+            m_d3d12.release_single_view_openxr_scene_swapchain();
+        }
+
+        openxr->synchronize_frame(
+            std::nullopt,
+            afr_pacing ? VRRuntime::SyncFrameCallsite::VRAfrAsyncPostPresent
+                       : VRRuntime::SyncFrameCallsite::VRSingleViewAsyncPostPresent);
+
+        if (single_view_pacing && openxr->frame_synced && !openxr->frame_began) {
             m_d3d12.pre_acquire_single_view_openxr_scene_swapchain();
         }
     }
@@ -2637,8 +2674,22 @@ std::optional<std::string> VR::clean_initialize() try {
 
     // all OK
     return Mod::on_initialize();
+} catch(const std::exception& e) {
+    spdlog::error("Exception occurred in VR::on_initialize(): {}", e.what());
+
+    m_runtime->error = std::string{"Exception occurred in VR::on_initialize(): "} + e.what();
+    m_openxr->dll_missing = false;
+    m_openvr->dll_missing = false;
+    m_openxr->error = m_runtime->error;
+    m_openvr->error = m_runtime->error;
+    m_openvr->loaded = false;
+    m_openvr->is_hmd_active = false;
+    m_openxr->loaded = false;
+    m_init_finished = false;
+
+    return Mod::on_initialize();
 } catch(...) {
-    spdlog::error("Exception occurred in VR::on_initialize()");
+    spdlog::error("Exception occurred in VR::on_initialize(): unknown exception");
 
     m_runtime->error = "Exception occurred in VR::on_initialize()";
     m_openxr->dll_missing = false;
@@ -3096,7 +3147,11 @@ std::optional<std::string> VR::initialize_openxr() {
         return std::nullopt;
     }
 
-    detect_controllers();
+    if (m_openxr->action_set.handle != XR_NULL_HANDLE) {
+        detect_controllers();
+    } else {
+        spdlog::warn("[VR] Skipping OpenXR controller detection because action bindings are disabled");
+    }
 
     if (m_init_finished) {
         // This is usually done in on_config_load
@@ -3110,10 +3165,30 @@ std::optional<std::string> VR::initialize_openxr() {
 std::optional<std::string> VR::initialize_openxr_input() {
     ZoneScopedN(__FUNCTION__);
 
-    if (auto err = m_openxr->initialize_actions(VR::actions_json)) {
-        m_openxr->error = err.value();
-        spdlog::error("[VR] {}", m_openxr->error.value());
+    const auto disable_openxr_input = [this]() noexcept {
+        m_openxr->action_set.handle = XR_NULL_HANDLE;
+    };
 
+    try {
+        if (auto err = m_openxr->initialize_actions(VR::actions_json)) {
+            spdlog::warn("[VR] OpenXR input initialization failed; continuing without action bindings: {}", err.value());
+            disable_openxr_input();
+
+            return std::nullopt;
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[VR] OpenXR input initialization threw; continuing without action bindings: {}", e.what());
+        disable_openxr_input();
+
+        return std::nullopt;
+    } catch (...) {
+        spdlog::warn("[VR] OpenXR input initialization threw an unknown exception; continuing without action bindings");
+        disable_openxr_input();
+
+        return std::nullopt;
+    }
+
+    if (m_openxr->action_set.handle == XR_NULL_HANDLE) {
         return std::nullopt;
     }
     
@@ -4350,6 +4425,9 @@ void VR::write_hitch_snapshot_request(HitchSnapshotDumpRequest&& request) try {
                 {"perf_swapchain_copy_count", d3d12.perf_swapchain_copy_count},
                 {"perf_swapchain_copy_avg_ms", d3d12.perf_swapchain_copy_avg_ms},
                 {"perf_swapchain_copy_max_ms", d3d12.perf_swapchain_copy_max_ms},
+                {"perf_dibr_synthesis_count", d3d12.perf_dibr_synthesis_count},
+                {"perf_dibr_synthesis_avg_ms", d3d12.perf_dibr_synthesis_avg_ms},
+                {"perf_dibr_synthesis_max_ms", d3d12.perf_dibr_synthesis_max_ms},
                 {"perf_openxr_submit_count", d3d12.perf_openxr_submit_count},
                 {"perf_openxr_submit_avg_ms", d3d12.perf_openxr_submit_avg_ms},
                 {"perf_openxr_submit_max_ms", d3d12.perf_openxr_submit_max_ms},
@@ -7139,8 +7217,16 @@ void VR::on_present() {
         runtime->is_openxr() &&
         is_single_view_openxr_pacing_active() &&
         vr_single_view_openxr_unpaced_enabled();
+    const auto afr_openxr_unpaced_late =
+        m_is_d3d12 &&
+        runtime->is_openxr() &&
+        is_afr_openxr_pacing_active();
 
-    if (is_left_eye_frame && get_synchronize_stage() == VR::SynchronizeStage::LATE && !single_view_openxr_unpaced_late) {
+    if (is_left_eye_frame &&
+        get_synchronize_stage() == VR::SynchronizeStage::LATE &&
+        !single_view_openxr_unpaced_late &&
+        !afr_openxr_unpaced_late)
+    {
         const auto had_sync = runtime->got_first_sync;
         runtime->synchronize_frame(std::nullopt, VRRuntime::SyncFrameCallsite::VRLateOnPresent);
 
@@ -7235,12 +7321,20 @@ void VR::on_post_present() {
 
     const auto d3d12_single_view_openxr_unpaced =
         m_is_d3d12 && m_d3d12.single_view_openxr_unpaced_active_this_frame();
+    const auto d3d12_afr_openxr_unpaced =
+        m_is_d3d12 &&
+        runtime->is_openxr() &&
+        is_afr_openxr_pacing_active();
 
-    if (d3d12_single_view_openxr_unpaced &&
+    if ((d3d12_single_view_openxr_unpaced || d3d12_afr_openxr_unpaced) &&
         runtime->is_openxr() &&
         !m_single_view_openxr_async_wait_inflight.load())
     {
-        SPDLOG_INFO_ONCE("[OpenXR][single-view] Running xrWaitFrame asynchronously after submit (UEVR_SINGLE_VIEW_OPENXR_ASYNC_WAIT=0 disables)");
+        if (d3d12_single_view_openxr_unpaced) {
+            SPDLOG_INFO_ONCE("[OpenXR][single-view] Running xrWaitFrame asynchronously after submit (UEVR_SINGLE_VIEW_OPENXR_ASYNC_WAIT=0 disables)");
+        } else {
+            SPDLOG_INFO_ONCE("[OpenXR][AFR] Running xrWaitFrame asynchronously after submit (UEVR_AFR_OPENXR_UNPACED=0 disables)");
+        }
         request_single_view_openxr_async_wait();
     }
 
@@ -7254,6 +7348,7 @@ void VR::on_post_present() {
             should_defer_stalker2_very_late_openxr_wait(runtime, m_is_d3d12);
 
         if (!d3d12_single_view_openxr_unpaced &&
+            !d3d12_afr_openxr_unpaced &&
             !should_defer_very_late_wait &&
             (get_synchronize_stage() == VR::SynchronizeStage::VERY_LATE || !runtime->got_first_sync)) {
             const auto had_sync = runtime->got_first_sync;
@@ -7270,6 +7365,7 @@ void VR::on_post_present() {
         }
 
         if (!d3d12_single_view_openxr_unpaced &&
+            !d3d12_afr_openxr_unpaced &&
             runtime->is_openxr() && m_openxr->can_run_frame_loop() && get_synchronize_stage() > VR::SynchronizeStage::EARLY) {
             if (!m_is_d3d12 && !m_openxr->frame_began) {
                 m_openxr->begin_frame("vr_post_present");
@@ -7487,6 +7583,11 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             } else {
                 m_native_stereo_fix_same_pass->draw("Use Same Stereo Pass");
             }
+            m_native_stereo_fix_preserve_secondary_pass->draw("Preserve Secondary Pass on UE5.5+");
+            ImGui::TextWrapped(
+                "Recommended for UE5.5 and newer. Keeps the real secondary-eye pass identity for per-eye water, "
+                "post-process, and renderer paths while retaining the Native Fix constructor safety guard. "
+                "Disable only to restore the legacy same-pass behavior.");
             ImGui::TreePop();
         }
 
