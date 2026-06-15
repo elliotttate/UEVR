@@ -328,9 +328,17 @@ struct DIBRStereoParams {
     float pre_inv_src_width{1.0f / 1920.0f};
     float pre_inv_src_height{1.0f / 1080.0f};
     float pre_edge_comp_inv{1.0f};
+    // Normalized UV rect of the real target-eye render inside the double-wide
+    // backbuffer. Hybrid near-field composition uses it because UE may render
+    // the second native pass into a corrected/scissored rect rather than the
+    // full nominal eye half.
+    float hybrid_target_rect_min_x{0.0f};
+    float hybrid_target_rect_min_y{0.0f};
+    float hybrid_target_rect_max_x{0.0f};
+    float hybrid_target_rect_max_y{0.0f};
 };
 
-static_assert(sizeof(DIBRStereoParams) == 256 * 4 + 3 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + 5 flags/pads + three float4x4 + out/synth dims + 4 CPU-resolved constants)");
+static_assert(sizeof(DIBRStereoParams) == 260 * 4 + 3 * 64, "DIBRStereoParams must mirror the HLSL StereoParams cbuffer (243 scalars + 5 flags/pads + three float4x4 + out/synth dims + 4 CPU-resolved constants + hybrid target rect)");
 static_assert(offsetof(DIBRStereoParams, reproj_target_to_prev) % 16 == 0, "temporal reprojection matrix must be 16-byte aligned");
 static_assert(offsetof(DIBRStereoParams, reproj_source_to_left) % 16 == 0, "reprojection matrices must be 16-byte aligned to match HLSL cbuffer packing");
 
@@ -403,6 +411,7 @@ public:
         Mode mode,
         ID3D12Resource* color, D3D12_RESOURCE_STATES color_state,
         ID3D12Resource* depth, D3D12_RESOURCE_STATES depth_state,
+        ID3D12Resource* hybrid_target_color, D3D12_RESOURCE_STATES hybrid_target_color_state,
         DIBRStereoParams params);
 
     // AFW (alternate frame warping): when enabled, each synthesize() call
@@ -508,8 +517,9 @@ private:
     // u0 output, u1/u2 scatter key+color, u3/u4 history color+key, u5 prep
     // UAV, t4 velocity snapshot (SRV, table offset 10 via its own range),
     // t5/t6 AFW background layer read half (SRVs, offsets 11-12), u6/u7
-    // background layer write half (UAVs, offsets 13-14).
-    static constexpr uint32_t kDescriptorsPerSlot = 15;
+    // background layer write half (UAVs, offsets 13-14), t7 hybrid target
+    // eye color (SRV, offset 15).
+    static constexpr uint32_t kDescriptorsPerSlot = 16;
     // Derived, not hardcoded: a fixed value overran the upload buffer when the
     // struct grew (the reprojection matrices pushed it past the old 1024).
     static constexpr uint32_t kCbSlotSize = (sizeof(DIBRStereoParams) + 255u) & ~255u;

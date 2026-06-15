@@ -2750,7 +2750,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     const auto debug_skip_ui_copy = openxr_runtime != nullptr && openxr_runtime->debug_skip_ui_copy->value();
     const auto debug_disable_depth_submit = openxr_runtime != nullptr && openxr_runtime->debug_disable_depth_submit->value();
     const auto suppress_scene_copy = debug_submit_empty_frame || debug_skip_scene_copy;
-    const auto suppress_ui_copy = debug_submit_empty_frame || debug_skip_ui_copy;
+    const bool dibr_hybrid_projection_owns_scene =
+        vr->is_dibr_hybrid_active() &&
+        !vr->is_using_2d_screen();
+    const auto suppress_ui_copy = debug_submit_empty_frame || debug_skip_ui_copy || dibr_hybrid_projection_owns_scene;
     const auto single_view_submit_throttle_interval = single_view_openxr_submit_interval(vr);
     m_single_view_openxr_unpaced_active_this_frame =
         openxr_runtime != nullptr &&
@@ -3365,7 +3368,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }};
 
         if (suppress_ui_copy) {
-            SPDLOG_INFO_EVERY_N_SEC(2, "[OpenXR][debug] Skipping UI copy for perf isolation");
+            if (dibr_hybrid_projection_owns_scene && !debug_submit_empty_frame && !debug_skip_ui_copy) {
+                SPDLOG_INFO_EVERY_N_SEC(2, "[DIBR] Hybrid projection owns the scene; suppressing the OpenXR UI quad layer");
+            } else {
+                SPDLOG_INFO_EVERY_N_SEC(2, "[OpenXR][debug] Skipping UI copy for perf isolation");
+            }
         } else {
             if (is_right_eye_frame) {
                 if (use_2d_screen) {
@@ -5806,6 +5813,12 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     const bool reference_is_right = (mode == DIBRSynthesis::Mode::Yoro || mode == DIBRSynthesis::Mode::YoroScatter) &&
                                     yoro_reference_eye > 0.5f;
     const uint32_t source_x = (!right_half_needs_fill && reference_is_right) ? eye_width : 0;
+    const uint32_t target_x = source_x > 0 ? 0 : eye_width;
+    const bool hybrid_near_stereo =
+        vr->is_dibr_hybrid_active() &&
+        mode == DIBRSynthesis::Mode::YoroScatter &&
+        !afw &&
+        !right_half_needs_fill;
     stage_source(cmd_list, source_x);
 
     // 2) Parameters: vrmod defaults -> persisted UI settings -> env overrides.
@@ -5835,6 +5848,18 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     params.raymarch_steps = env.raymarch_steps.value_or(static_cast<float>(vr->m_dibr_raymarch_steps->value()));
     params.raymarch_foveation_strength = vr->m_dibr_foveation_strength->value();
     params.debug_view_mode = env.debug_view.value_or(static_cast<float>(vr->m_dibr_debug_view->value()));
+
+    if (hybrid_near_stereo) {
+        const float near_z = std::max(params.depth_linearize_near, 0.0001f);
+        const float far_z = std::max(params.depth_linearize_far, near_z + 0.0001f);
+        const float split_z = std::clamp(vr->get_dibr_hybrid_split_distance(), near_z, far_z);
+        const float feather_z = std::max(vr->get_dibr_hybrid_feather_distance(), 0.0f);
+        const float denom = std::max(far_z - near_z, 0.0001f);
+        params.near_field_strength = 1.0f;
+        params.near_field_start = std::clamp((split_z - near_z) / denom, 0.0f, 1.0f);
+        params.near_field_end = std::clamp(feather_z / denom, 0.00001f, 1.0f);
+        SPDLOG_INFO_ONCE("[DIBR] Hybrid near-stereo compose active (split={} feather={} UE units)", split_z, feather_z);
+    }
 
     // --- True-matrix reprojection (R1 redesign) ---
     // Exact clip(source eye) -> clip(target eye) built from the runtime's
@@ -6069,6 +6094,71 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
         }
     }
 
+    if (hybrid_near_stereo) {
+        params.near_field_target = target_x > 0 ? 2.0f : 1.0f;
+
+        const auto rect = vr->get_dibr_hybrid_target_view_rect();
+        const int32_t half_min_x = static_cast<int32_t>(target_x);
+        const int32_t half_max_x = static_cast<int32_t>(target_x + eye_width);
+        const int32_t tex_width = static_cast<int32_t>(std::min<UINT64>(bb_desc.Width, INT32_MAX));
+        const int32_t tex_height = static_cast<int32_t>(std::min<UINT64>(bb_desc.Height, INT32_MAX));
+        int32_t rect_min_x = rect[0];
+        int32_t rect_min_y = rect[1];
+        int32_t rect_max_x = rect[2];
+        int32_t rect_max_y = rect[3];
+
+        // Some UE native-stereo paths keep the right-eye constructor rect
+        // half-local and let SetFinalViewRect shift it later. If only the
+        // constructor value has arrived this frame, move that half-local rect
+        // onto the actual right-half texture coordinates before normalizing.
+        if (target_x > 0 &&
+            rect_min_x >= 0 &&
+            rect_max_x > rect_min_x &&
+            rect_max_x <= static_cast<int32_t>(eye_width))
+        {
+            rect_min_x += static_cast<int32_t>(target_x);
+            rect_max_x += static_cast<int32_t>(target_x);
+        }
+
+        const int32_t clamped_min_x = std::clamp(rect_min_x, half_min_x, half_max_x);
+        const int32_t clamped_max_x = std::clamp(rect_max_x, half_min_x, half_max_x);
+        const int32_t clamped_min_y = std::clamp(rect_min_y, 0, tex_height);
+        const int32_t clamped_max_y = std::clamp(rect_max_y, 0, tex_height);
+        const bool rect_valid =
+            tex_width > 0 &&
+            tex_height > 0 &&
+            clamped_max_x > clamped_min_x &&
+            clamped_max_y > clamped_min_y;
+
+        if (rect_valid) {
+            params.hybrid_target_rect_min_x = static_cast<float>(clamped_min_x) / static_cast<float>(tex_width);
+            params.hybrid_target_rect_min_y = static_cast<float>(clamped_min_y) / static_cast<float>(tex_height);
+            params.hybrid_target_rect_max_x = static_cast<float>(clamped_max_x) / static_cast<float>(tex_width);
+            params.hybrid_target_rect_max_y = static_cast<float>(clamped_max_y) / static_cast<float>(tex_height);
+        } else if (tex_width > 0 && tex_height > 0) {
+            params.hybrid_target_rect_min_x = static_cast<float>(half_min_x) / static_cast<float>(tex_width);
+            params.hybrid_target_rect_min_y = 0.0f;
+            params.hybrid_target_rect_max_x = static_cast<float>(half_max_x) / static_cast<float>(tex_width);
+            params.hybrid_target_rect_max_y = 1.0f;
+        }
+
+        static uint32_t hybrid_rect_log_count = 0;
+        if (hybrid_rect_log_count < 16) {
+            SPDLOG_INFO("[DIBR] Hybrid target rect raw={} {} {} {} normalized={:.4f} {:.4f} {:.4f} {:.4f} target_x={} valid={}",
+                rect[0],
+                rect[1],
+                rect[2],
+                rect[3],
+                params.hybrid_target_rect_min_x,
+                params.hybrid_target_rect_min_y,
+                params.hybrid_target_rect_max_x,
+                params.hybrid_target_rect_max_y,
+                target_x,
+                rect_valid);
+            ++hybrid_rect_log_count;
+        }
+    }
+
     // SceneDepthZ can cover the full double-wide render while the source is a
     // single eye; map output UVs onto the half of the depth texture that the
     // staged color half was rendered with.
@@ -6079,6 +6169,10 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
             params.depth_uv_scale_x = 2.0f; // TransformDepthUv divides: uv.x / 2
             // anchor 1 = top-left half, 2 = bottom-right half (scale_y stays 1, so y is unaffected)
             params.depth_uv_anchor = source_x > 0 ? 2.0f : 1.0f;
+        } else if (hybrid_near_stereo) {
+            // Negative keeps the color-half selector but tells the shader to
+            // fall back to the normal depth transform for non-SBS depth.
+            params.near_field_target = -params.near_field_target;
         }
     }
 
@@ -6141,6 +6235,7 @@ void D3D12Component::run_dibr_synthesis(VR* vr, ID3D12Resource* backbuffer, D3D1
     auto* output = m_dibr.synthesize(device, cmd_list, mode,
         m_dibr_source.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
         depth.Get(), depth_state,
+        hybrid_near_stereo ? backbuffer : nullptr, scene_source_state,
         params);
 
     // 4) Prefer submitting the synthesized pair directly to OpenXR. The old

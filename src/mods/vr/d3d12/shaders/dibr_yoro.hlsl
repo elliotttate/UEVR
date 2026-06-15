@@ -50,6 +50,7 @@ RWTexture2D<uint> g_historyKey : register(u4);
 // device depth). Null descriptor when no snapshot exists; currently consumed
 // by debug view 8 (the select/bind/sample wiring proof).
 Texture2D<float4> g_velocityTex : register(t4);
+Texture2D<float4> g_hybridTargetColorTex : register(t7);
 SamplerState g_linearSampler : register(s0);
 SamplerState g_pointSampler : register(s1);
 
@@ -317,6 +318,10 @@ cbuffer StereoParams : register(b0) {
     float pre_inv_src_width;
     float pre_inv_src_height;
     float pre_edge_comp_inv;
+    float hybrid_target_rect_min_x;
+    float hybrid_target_rect_min_y;
+    float hybrid_target_rect_max_x;
+    float hybrid_target_rect_max_y;
 };
 
 float EffectiveConvergence()
@@ -2048,6 +2053,130 @@ float SampleRawDeviceDepth(float2 uv)
     return SampleDepthTexture(TransformDepthUv(saturate(uv)));
 }
 
+#if SCATTER_COMPOSE
+float HybridLinearDepthFromRaw(float rawDepth)
+{
+    float depth = rawDepth;
+    if (reverse_depth > 0.5f) {
+        depth = 1.0f - depth;
+    }
+    if (depth_value_flip > 0.5f) {
+        depth = 1.0f - depth;
+    }
+    return LinearizeProjectionDepth(saturate(depth));
+}
+
+float HybridTargetSelector()
+{
+    return round(near_field_target);
+}
+
+float4 HybridTargetRect()
+{
+    float selector = abs(HybridTargetSelector());
+    float4 fallbackRect = selector < 1.5f
+        ? float4(0.0f, 0.0f, 0.5f, 1.0f)
+        : float4(0.5f, 0.0f, 1.0f, 1.0f);
+    float4 rect = float4(
+        hybrid_target_rect_min_x,
+        hybrid_target_rect_min_y,
+        hybrid_target_rect_max_x,
+        hybrid_target_rect_max_y);
+    bool rectValid =
+        rect.z > rect.x + 0.0001f &&
+        rect.w > rect.y + 0.0001f;
+    return rectValid ? rect : fallbackRect;
+}
+
+float2 HybridTargetColorUv(float2 uv)
+{
+    float4 rect = HybridTargetRect();
+    return lerp(rect.xy, rect.zw, saturate(uv));
+}
+
+float2 HybridTargetDepthUv(float2 uv)
+{
+    float selector = HybridTargetSelector();
+    if (selector < 0.0f) {
+        return TransformDepthUv(uv);
+    }
+
+    float4 rect = HybridTargetRect();
+    return lerp(rect.xy, rect.zw, saturate(uv));
+}
+
+float HybridTargetHalfEdgeWeight(float2 uv)
+{
+    // Only fade the target pass at the output eye edges. The real target rect
+    // may be narrower than the nominal half; fading in target-rect UV space
+    // would erase useful native stereo pixels inside that valid rect.
+    float edgeDistance = min(saturate(uv.x), 1.0f - saturate(uv.x));
+    float overscanFringe = saturate(1.0f - 1.0f / max(overscan_x, 1.0f));
+    float fadeWidth = max(overscanFringe * 0.5f, 0.006f);
+    return smoothstep(0.0f, fadeWidth, edgeDistance);
+}
+
+float HybridTargetLinearDepth(float2 uv)
+{
+    float mode = floor(depth_sample_mode + 0.5f);
+    float2 duv = saturate(HybridTargetDepthUv(saturate(uv)));
+    float rawDepth = (mode >= 1.0f)
+        ? g_depthTex.SampleLevel(g_pointSampler, duv, 0)
+        : g_depthTex.SampleLevel(g_linearSampler, duv, 0);
+    return HybridLinearDepthFromRaw(rawDepth);
+}
+
+float HybridTargetSignalWeight(float4 color)
+{
+    // A few SN2 passes leave real target-eye pixels as a literal black clear
+    // where the depth still looks close. Do not let those clear pixels punch a
+    // hole through the DIBR fallback; a real dark surface still has enough
+    // nonzero signal/noise to pass this very low threshold.
+    float3 c = abs(color.rgb);
+    float peak = max(c.r, max(c.g, c.b));
+    float luma = dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+    return smoothstep(0.0015f, 0.018f, max(peak, luma));
+}
+
+float HybridTargetNearWeight(float targetDepth, float sourceDepth)
+{
+    float split = saturate(near_field_start);
+    float feather = max(near_field_end, 0.00001f);
+
+    // The native target eye is the only proof that a near-field pixel really
+    // survived the far clip. Source depth can say "a similar surface exists in
+    // the reference eye", but it cannot distinguish a real target pixel from
+    // the clipped clear layer that produced the vertical bands.
+    return 1.0f - smoothstep(split, split + feather, targetDepth);
+}
+
+float HybridTargetCoverageWeight(float2 uv, float targetDepth, float sourceDepth, float4 targetColor)
+{
+    // In hybrid mode the target eye is deliberately far-clipped. Depth alone
+    // has lied in this path, and color alone preserves clipped shadow/clear
+    // pixels, so require both: the target pass must look close AND must have
+    // actually drawn a non-clear pixel.
+    return HybridTargetNearWeight(targetDepth, sourceDepth) *
+        HybridTargetSignalWeight(targetColor) *
+        HybridTargetHalfEdgeWeight(uv);
+}
+
+float4 ApplyHybridNearStereo(float2 uv, float sourceDepth, float4 synthColor)
+{
+    if (near_field_strength < 0.5f) {
+        return synthColor;
+    }
+
+    float targetDepth = HybridTargetLinearDepth(uv);
+    float2 targetUv = saturate(HybridTargetColorUv(uv));
+    float4 realNear = g_hybridTargetColorTex.SampleLevel(g_linearSampler, targetUv, 0);
+    float realNearWeight = HybridTargetCoverageWeight(uv, targetDepth, sourceDepth, realNear);
+    float4 outColor = lerp(synthColor, realNear, realNearWeight);
+    outColor.a = 1.0f;
+    return outColor;
+}
+#endif
+
 // Map a SOURCE-eye pixel + raw device depth (reversed-Z, as stored) to the
 // synthesized TARGET eye's uv through the exact clip->clip matrix. The
 // homogeneous unproject trick makes (ndc, deviceZ, 1) valid input for the
@@ -2284,6 +2413,64 @@ float3 SampleScatterUpscaled(uint ox, uint oy)
     return lerp(lerp(c00, c10, wx), lerp(c01, c11, wx), wy);
 }
 
+float ScatterKeyTrust(uint rawKey)
+{
+    if (near_field_strength < 0.5f) {
+        return 1.0f;
+    }
+
+    if (rawKey == 0u) {
+        return 0.0f;
+    }
+
+    // Nonzero keys mean the scatter/fill pass found a real depth to stand on.
+    // The outer-strip bug is handled earlier by refusing keyless hybrid history;
+    // rejecting all stash/background provenance here creates black halos around
+    // close native stereo geometry.
+    return 1.0f;
+}
+
+float SampleScatterTrustUpscaled(uint ox, uint oy)
+{
+    if (near_field_strength < 0.5f) {
+        return 1.0f;
+    }
+
+    if (synth_width == out_width && synth_height == out_height) {
+        return ScatterKeyTrust(g_scatterKey[uint2(min(ox, synth_width - 1u), min(oy, synth_height - 1u))]);
+    }
+
+    float fx = ((float)ox + 0.5f) * (float)synth_width / (float)out_width - 0.5f;
+    float fy = ((float)oy + 0.5f) * (float)synth_height / (float)out_height - 0.5f;
+    fx = clamp(fx, 0.0f, (float)synth_width - 1.0f);
+    fy = clamp(fy, 0.0f, (float)synth_height - 1.0f);
+    int x0 = (int)floor(fx);
+    int y0 = (int)floor(fy);
+    int x1 = min(x0 + 1, (int)synth_width - 1);
+    int y1 = min(y0 + 1, (int)synth_height - 1);
+    float wx = fx - (float)x0;
+    float wy = fy - (float)y0;
+    float c00 = ScatterKeyTrust(g_scatterKey[uint2(x0, y0)]);
+    float c10 = ScatterKeyTrust(g_scatterKey[uint2(x1, y0)]);
+    float c01 = ScatterKeyTrust(g_scatterKey[uint2(x0, y1)]);
+    float c11 = ScatterKeyTrust(g_scatterKey[uint2(x1, y1)]);
+    return lerp(lerp(c00, c10, wx), lerp(c01, c11, wx), wy);
+}
+
+float3 HybridScatterFallbackColor(float2 uv, float sourceDepth, float3 centerRgb)
+{
+    if (near_field_strength < 0.5f) {
+        return centerRgb;
+    }
+
+    float targetDepth = HybridTargetLinearDepth(uv);
+    float2 targetUv = saturate(HybridTargetColorUv(uv));
+    float4 targetColor = g_hybridTargetColorTex.SampleLevel(g_linearSampler, targetUv, 0);
+    float targetWeight = HybridTargetCoverageWeight(uv, targetDepth, sourceDepth, targetColor);
+
+    return lerp(float3(0.0f, 0.0f, 0.0f), targetColor.rgb, targetWeight);
+}
+
 // AFW CombinedWarping: pull the synthesized eye toward last frame's REAL
 // render of the same eye (reprojected through the exact camera delta and
 // depth-validated). The warp output and a native render of the same view
@@ -2485,6 +2672,22 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
 #if !DIBR_LEAN
     float debugMode = floor(debug_view_mode + 0.5f);
+#if SCATTER_COMPOSE
+    if (debugMode >= 10.5f && near_field_strength >= 0.5f) {
+        float sourceDepth = SamplePreparedDepthBase(SourceRemapUv(uv));
+        float targetDepth = HybridTargetLinearDepth(uv);
+        float2 targetUv = saturate(HybridTargetColorUv(uv));
+        float4 targetColor = g_hybridTargetColorTex.SampleLevel(g_linearSampler, targetUv, 0);
+        float signal = HybridTargetSignalWeight(targetColor);
+        float mask = HybridTargetCoverageWeight(uv, targetDepth, sourceDepth, targetColor);
+        if (debugMode < 11.5f) {
+            WriteStereoPair(x, y, targetColor, targetColor);
+        } else {
+            WriteStereoPair(x, y, float4(mask, targetDepth, signal, 1.0f), float4(mask, targetDepth, signal, 1.0f));
+        }
+        return;
+    }
+#endif
     if (debugMode >= 8.5f) {
         // Debug view 9: fill provenance. Which source produced each pixel of
         // the synthesized eye - the question every reveal-artifact hunt
@@ -2618,8 +2821,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         // is the half-rate ghost outline at the outward screen edge. Keep
         // the guard only for the non-AFW scatter path.
         float edgeKeep = (temporal_enabled > 1.5f) ? 1.0f : ScreenEdgeGuard(uv, searchDepth);
-        rightColor = float4(lerp(centerColor.rgb, SampleScatterUpscaled(x, y), edgeKeep), centerColor.a);
+        edgeKeep *= SampleScatterTrustUpscaled(x, y);
+        rightColor = float4(lerp(HybridScatterFallbackColor(uv, searchDepth, centerColor.rgb), SampleScatterUpscaled(x, y), edgeKeep), centerColor.a);
         rightColor.rgb = ApplyAfwHistoryBlend(uint2(x, y), rightColor.rgb);
+        rightColor = ApplyHybridNearStereo(uv, searchDepth, rightColor);
 #else
         float2 rightSearchUV = YoroSearchUv(uv, -1.0f, searchDepth, boundaryScale, 1.0f);
         rightUV = ApplyOutputEyeAlignment(rightSearchUV + rightInterlaceOffset, -1.0f);
@@ -2653,8 +2858,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         // See the right-eye branch: under AFW the edge guard must not fade
         // the recovered band back to wrong-parallax centerColor.
         float edgeKeep = (temporal_enabled > 1.5f) ? 1.0f : ScreenEdgeGuard(uv, searchDepth);
-        leftColor = float4(lerp(centerColor.rgb, SampleScatterUpscaled(x, y), edgeKeep), centerColor.a);
+        edgeKeep *= SampleScatterTrustUpscaled(x, y);
+        leftColor = float4(lerp(HybridScatterFallbackColor(uv, searchDepth, centerColor.rgb), SampleScatterUpscaled(x, y), edgeKeep), centerColor.a);
         leftColor.rgb = ApplyAfwHistoryBlend(uint2(x, y), leftColor.rgb);
+        leftColor = ApplyHybridNearStereo(uv, searchDepth, leftColor);
 #else
         float2 leftSearchUV = YoroSearchUv(uv, 1.0f, searchDepth, boundaryScale, 1.0f);
         leftUV = ApplyOutputEyeAlignment(leftSearchUV + leftInterlaceOffset, 1.0f);

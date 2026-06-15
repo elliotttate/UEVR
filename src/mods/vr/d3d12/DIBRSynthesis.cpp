@@ -162,11 +162,11 @@ bool validate_cbuffer_layout(const std::vector<uint8_t>& bytecode, const char* n
         // Field count + the last field's offset pin the layout exactly and are
         // backend-independent (FXC reports the cbuffer size padded to 16 bytes,
         // DXC's DXIL reflection may not - so total size is only sanity-ranged).
-        // 256 scalars (incl. reproj/scatter/overscan/temporal flags, out dims
-        // and the CPU-resolved pre_* constants) + three float4x4, which
+        // 260 scalars (incl. reproj/scatter/overscan/temporal flags, out dims,
+        // the CPU-resolved pre_* constants, and the hybrid target rect) + three float4x4, which
         // reflection counts as ONE variable each.
-        constexpr uint32_t expected_fields = 256u + 3u;
-        constexpr uint32_t expected_last_offset = offsetof(DIBRStereoParams, pre_edge_comp_inv);
+        constexpr uint32_t expected_fields = 260u + 3u;
+        constexpr uint32_t expected_last_offset = offsetof(DIBRStereoParams, hybrid_target_rect_max_y);
         constexpr uint32_t expected_size_min = sizeof(DIBRStereoParams);
         constexpr uint32_t expected_size_max = (sizeof(DIBRStereoParams) + 15u) & ~15u;
 
@@ -302,9 +302,9 @@ void DIBRSynthesis::build_async(Microsoft::WRL::ComPtr<ID3D12Device> device, uin
 bool DIBRSynthesis::create_root_signature(ID3D12Device* device, DeviceObjects& objs) {
     // One table with SRV t0..t3 (offset 0), UAV u0..u5 (offset 4) and SRV t4
     // (offset 10 - appended as its own range so the earlier offsets never
-    // move), a root CBV at b0, and static samplers s0 (linear clamp) / s1
-    // (point clamp).
-    D3D12_DESCRIPTOR_RANGE ranges[5]{};
+    // move), plus later opt-in SRVs/UAVs. A root CBV sits at b0, with static
+    // samplers s0 (linear clamp) / s1 (point clamp).
+    D3D12_DESCRIPTOR_RANGE ranges[6]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 4; // t0 color, t1 depth, t2 prepared depth, t3 history color
     ranges[0].BaseShaderRegister = 0;
@@ -325,10 +325,14 @@ bool DIBRSynthesis::create_root_signature(ID3D12Device* device, DeviceObjects& o
     ranges[4].NumDescriptors = 2; // u6/u7 AFW background layer color+key (write half)
     ranges[4].BaseShaderRegister = 6;
     ranges[4].OffsetInDescriptorsFromTableStart = 13;
+    ranges[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[5].NumDescriptors = 1; // t7 hybrid target-eye color (full SBS backbuffer)
+    ranges[5].BaseShaderRegister = 7;
+    ranges[5].OffsetInDescriptorsFromTableStart = 15;
 
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[0].DescriptorTable.NumDescriptorRanges = 5;
+    params[0].DescriptorTable.NumDescriptorRanges = 6;
     params[0].DescriptorTable.pDescriptorRanges = ranges;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -1117,6 +1121,7 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     Mode mode,
     ID3D12Resource* color, D3D12_RESOURCE_STATES color_state,
     ID3D12Resource* depth, D3D12_RESOURCE_STATES depth_state,
+    ID3D12Resource* hybrid_target_color, D3D12_RESOURCE_STATES hybrid_target_color_state,
     DIBRStereoParams params)
 {
     if (!ensure(device) || cmd_list == nullptr || color == nullptr || depth == nullptr) {
@@ -1333,6 +1338,13 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     mix(reinterpret_cast<uintptr_t>(history_key));
     mix(reinterpret_cast<uintptr_t>(m_velocity_tex));
     mix(static_cast<uint64_t>(mode == Mode::YoroScatter));
+    mix(reinterpret_cast<uintptr_t>(hybrid_target_color));
+    if (hybrid_target_color != nullptr) {
+        const auto target_desc = hybrid_target_color->GetDesc();
+        mix(static_cast<uint64_t>(color_srv_format(target_desc.Format)));
+        mix(static_cast<uint64_t>(target_desc.Width));
+        mix(static_cast<uint64_t>(target_desc.Height));
+    }
     // The background layer's read/write halves swap every frame, and the
     // read half is null-bound until its first update has executed.
     const bool afw_bg = m_afw_mode && mode == Mode::YoroScatter && m_afw_bg_color[0] != nullptr;
@@ -1435,6 +1447,20 @@ ID3D12Resource* DIBRSynthesis::synthesize(
                 D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 14 * m_objs.descriptor_stride});
         }
 
+        // t7: full double-wide target color for hybrid DIBR. The compose
+        // shader uses this only when near_field_strength enables the hybrid
+        // path; the null descriptor keeps all other modes on the old path.
+        D3D12_SHADER_RESOURCE_VIEW_DESC target_srv = color_srv;
+        if (hybrid_target_color != nullptr) {
+            const auto target_desc = hybrid_target_color->GetDesc();
+            target_srv.Format = color_srv_format(target_desc.Format);
+            target_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            target_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            target_srv.Texture2D.MipLevels = 1;
+        }
+        device->CreateShaderResourceView(hybrid_target_color, &target_srv,
+            D3D12_CPU_DESCRIPTOR_HANDLE{cpu_base.ptr + slot_offset + 15 * m_objs.descriptor_stride});
+
         // CPU-only twins of the scatter key/color UAVs for
         // ClearUnorderedAccessView* (same inputs, so the same guard applies).
         if (mode == Mode::YoroScatter) {
@@ -1452,11 +1478,17 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     constexpr auto shader_read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const bool color_needs_transition = (color_state & shader_read) != shader_read;
     const bool depth_needs_transition = (depth_state & shader_read) != shader_read;
+    const bool hybrid_target_needs_transition =
+        hybrid_target_color != nullptr &&
+        (hybrid_target_color_state & shader_read) != shader_read;
     if (color_needs_transition) {
         transition(cmd_list, color, color_state, shader_read);
     }
     if (depth_needs_transition) {
         transition(cmd_list, depth, depth_state, shader_read);
+    }
+    if (hybrid_target_needs_transition) {
+        transition(cmd_list, hybrid_target_color, hybrid_target_color_state, shader_read);
     }
     transition(cmd_list, m_output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
@@ -1636,6 +1668,9 @@ ID3D12Resource* DIBRSynthesis::synthesize(
     }
 
     transition(cmd_list, m_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    if (hybrid_target_needs_transition) {
+        transition(cmd_list, hybrid_target_color, shader_read, hybrid_target_color_state);
+    }
     if (depth_needs_transition) {
         transition(cmd_list, depth, shader_read, depth_state);
     }

@@ -7012,7 +7012,12 @@ void FFakeStereoRenderingHook::attempt_hook_fsceneview_constructor() {
 
     auto& vr = VR::get();
 
-    if (!vr->is_ghosting_fix_enabled() && !vr->is_splitscreen_compatibility_enabled() && !vr->is_sceneview_compatibility_enabled() && !vr->is_native_stereo_fix_enabled()) {
+    if (!vr->is_ghosting_fix_enabled() &&
+        !vr->is_splitscreen_compatibility_enabled() &&
+        !vr->is_sceneview_compatibility_enabled() &&
+        !vr->is_native_stereo_fix_enabled() &&
+        !vr->is_dibr_hybrid_active())
+    {
         return;
     }
 
@@ -17444,6 +17449,33 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         }
     }
 
+    const bool dibr_hybrid_target_eye =
+        vr->is_dibr_hybrid_active() &&
+        !vr->is_using_2d_screen() &&
+        true_index != vr->get_dibr_reference_eye();
+
+    if (dibr_hybrid_target_eye) {
+        auto far_clip = vr->get_dibr_hybrid_split_distance();
+        if (far_clip < 1.0f) {
+            far_clip = 1.0f;
+        }
+
+        const auto previous_far_clip = init_options->get_override_far_clipping_plane_distance().value_or(-1.0f);
+
+        if (init_options->set_override_far_clipping_plane_distance(far_clip)) {
+            static uint32_t log_count = 0;
+            if (log_count < 32) {
+                SPDLOG_INFO(
+                    "[DIBR] Hybrid target eye FSceneView far clip {} -> {} UE units",
+                    previous_far_clip,
+                    far_clip);
+                ++log_count;
+            }
+        } else {
+            SPDLOG_WARN_ONCE("[DIBR] Hybrid target eye could not find FSceneViewInitOptions far-clip field");
+        }
+    }
+
     if (subnautica2_is_current_game() &&
         vr->is_native_stereo_fix_enabled() &&
         !vr->is_native_stereo_fix_same_pass_enabled() &&
@@ -17546,6 +17578,30 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
             if (!vr->is_using_2d_screen()) {
                 init_options_projection_matrix = proj_mat;
+            }
+        }
+    }
+
+    if (dibr_hybrid_target_eye) {
+        const auto& init_options_view_rect = is_ue5 ? init_options_ue5->view_rect : init_options->view_rect;
+
+        if (init_options_view_rect[2] > init_options_view_rect[0] &&
+            init_options_view_rect[3] > init_options_view_rect[1])
+        {
+            vr->set_dibr_hybrid_target_view_rect(
+                init_options_view_rect[0],
+                init_options_view_rect[1],
+                init_options_view_rect[2],
+                init_options_view_rect[3]);
+
+            static uint32_t hybrid_rect_log_count = 0;
+            if (hybrid_rect_log_count < 16) {
+                SPDLOG_INFO("[DIBR] Hybrid target eye constructor rect {} {} {} {}",
+                    init_options_view_rect[0],
+                    init_options_view_rect[1],
+                    init_options_view_rect[2],
+                    init_options_view_rect[3]);
+                ++hybrid_rect_log_count;
             }
         }
     }
@@ -19676,6 +19732,32 @@ void FFakeStereoRenderingHook::set_final_view_rect(FFakeStereoRendering* stereo,
         }
     }
 
+    if (rect_to_submit != nullptr &&
+        vr->is_dibr_hybrid_active() &&
+        view_index >= 0 &&
+        view_index < 2 &&
+        view_index != vr->get_dibr_reference_eye() &&
+        rect_to_submit->bounds[2] > rect_to_submit->bounds[0] &&
+        rect_to_submit->bounds[3] > rect_to_submit->bounds[1])
+    {
+        vr->set_dibr_hybrid_target_view_rect(
+            rect_to_submit->bounds[0],
+            rect_to_submit->bounds[1],
+            rect_to_submit->bounds[2],
+            rect_to_submit->bounds[3]);
+
+        static uint32_t hybrid_final_rect_log_count = 0;
+        if (hybrid_final_rect_log_count < 16) {
+            SPDLOG_INFO("[DIBR] Hybrid target eye final rect view_index={} {} {} {} {}",
+                view_index,
+                rect_to_submit->bounds[0],
+                rect_to_submit->bounds[1],
+                rect_to_submit->bounds[2],
+                rect_to_submit->bounds[3]);
+            ++hybrid_final_rect_log_count;
+        }
+    }
+
     if (g_hook->m_set_final_view_rect_hook) {
         g_hook->m_set_final_view_rect_hook.call<void>(stereo, cmd_list, view_index, rect_to_submit);
     }
@@ -20317,7 +20399,12 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         // FOV (the runtime keeps submitting the true per-eye projections).
         // UE row-vector convention: x_clip = x*M[0][0] + z*M[2][0], so scaling
         // both terms widens the tan bounds symmetrically about their center.
-        const float overscan = vr->get_dibr_overscan_factor();
+        // Hybrid keeps the opposite eye as real stereo near-field data. Only
+        // widen the reference eye that feeds the DIBR far layer; widening the
+        // target eye would make the "real near" overlay disagree with OpenXR's
+        // normal per-eye projection.
+        const bool hybrid_target_eye = vr->is_dibr_hybrid_active() && true_index != vr->get_dibr_reference_eye();
+        const float overscan = hybrid_target_eye ? 1.0f : vr->get_dibr_overscan_factor();
         if (overscan > 1.0f) {
             if (!g_hook->m_has_double_precision) {
                 (*out)[0][0] /= overscan;
@@ -20326,6 +20413,26 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
                 double_matrix[0][0] /= (double)overscan;
                 double_matrix[2][0] /= (double)overscan;
             }
+        }
+
+        static const bool hybrid_projection_clamp_enabled = []() {
+            const char* v = std::getenv("UEVR_DIBR_HYBRID_PROJECTION_CLAMP");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (hybrid_projection_clamp_enabled && vr->is_dibr_hybrid_active() && true_index != vr->get_dibr_reference_eye()) {
+            // Hybrid scatter keeps this eye as the real near-field pass. Clip
+            // it at the split plane so far pixels are cheap/empty and the
+            // compose pass can fill them from DIBR instead.
+            const float near_z = std::max(vr->m_nearz, 0.0001f);
+            const float far_z = std::max(vr->get_dibr_hybrid_split_distance(), near_z + 0.0001f);
+            if (!g_hook->m_has_double_precision) {
+                (*out)[2][2] = -near_z / (far_z - near_z);
+                (*out)[3][2] = near_z * far_z / (far_z - near_z);
+            } else {
+                double_matrix[2][2] = -(double)near_z / (double)(far_z - near_z);
+                double_matrix[3][2] = (double)(near_z * far_z) / (double)(far_z - near_z);
+            }
+            SPDLOG_INFO_ONCE("[DIBR] Hybrid near-stereo projection clamp active (split={} UE units)", far_z);
         }
     } else {
         SPDLOG_ERROR("CalculateStereoProjectionMatrix returned nullptr!");

@@ -292,6 +292,10 @@ cbuffer StereoParams : register(b0) {
     float pre_inv_src_width;
     float pre_inv_src_height;
     float pre_edge_comp_inv;
+    float hybrid_target_rect_min_x;
+    float hybrid_target_rect_min_y;
+    float hybrid_target_rect_max_x;
+    float hybrid_target_rect_max_y;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -682,7 +686,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             }
             lookupD = asfloat(ik);
         }
-        if (px >= 0 && px < (int)synth_width && py >= 0 && py < (int)synth_height) {
+        // Hybrid DIBR has a live target-eye render for close geometry. Letting
+        // keyless outer bands adopt old synthesized history paints stale
+        // wrong-parallax content over that layer, which is the blue strip in
+        // debug view 9. Keep keyed reveals stabilized, but leave never-covered
+        // pixels honest so compose can use the target-eye fallback.
+        const bool allowKeylessHistory = near_field_strength < 0.5f || haveKey;
+        if (allowKeylessHistory && px >= 0 && px < (int)synth_width && py >= 0 && py < (int)synth_height) {
             const float tol = max(0.15f * estDepth, 2e-4f);
             float4 h = g_historyColor[uint2(px, py)];
             uint hk = g_historyKey[uint2(px, py)] & 0x7FFFFFFFu; // strip fill marker

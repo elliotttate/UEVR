@@ -517,6 +517,15 @@ public:
     // crop slices its true per-eye FOV back out. Defined in VR.cpp.
     bool is_dibr_single_view_projection_configured() const;
 
+    // Hybrid DIBR keeps both engine views alive, uses the real opposite eye
+    // for close geometry, and lets scatter DIBR replace only the far field.
+    // Defined in VR.cpp.
+    bool is_dibr_hybrid_active() const;
+    float get_dibr_hybrid_split_distance() const;
+    float get_dibr_hybrid_feather_distance() const;
+    void set_dibr_hybrid_target_view_rect(int32_t min_x, int32_t min_y, int32_t max_x, int32_t max_y);
+    std::array<int32_t, 4> get_dibr_hybrid_target_view_rect() const;
+
     // True when the Mono rendering method is active and usable: the engine
     // renders ONE centered union-frustum view (see the projection-override
     // getters) and the D3D12 layer mirrors it flat to both eyes. This is the
@@ -1615,9 +1624,13 @@ private:
     const ModSlider::Ptr m_dibr_foveation_strength{ ModSlider::create(generate_name("DIBR_RaymarchFoveation"), 0.0f, 1.0f, 0.0f) };
     // Scatter-mode knobs (UEVR_DIBR_OVERSCAN / UEVR_DIBR_TEMPORAL env vars
     // override these when set - launcher scripts keep working).
-    const ModSlider::Ptr m_dibr_overscan{ ModSlider::create(generate_name("DIBR_Overscan"), 1.0f, 1.25f, 1.12f) };
+    const ModSlider::Ptr m_dibr_overscan{ ModSlider::create(generate_name("DIBR_Overscan"), 1.0f, 1.5f, 1.12f) };
     const ModToggle::Ptr m_dibr_temporal{ ModToggle::create(generate_name("DIBR_TemporalFill"), true) };
     const ModSlider::Ptr m_dibr_temporal_blend{ ModSlider::create(generate_name("DIBR_TemporalBlend"), 0.0f, 0.95f, 0.85f) };
+    const ModToggle::Ptr m_dibr_hybrid_near_stereo{ ModToggle::create(generate_name("DIBR_HybridNearStereo"), true) };
+    const ModSlider::Ptr m_dibr_hybrid_split{ ModSlider::create(generate_name("DIBR_HybridSplit"), 50.0f, 5000.0f, 2000.0f) };
+    const ModSlider::Ptr m_dibr_hybrid_feather{ ModSlider::create(generate_name("DIBR_HybridFeather"), 1.0f, 1000.0f, 500.0f) };
+    std::array<std::atomic<int32_t>, 4> m_dibr_hybrid_target_view_rect{};
     // Session-only on purpose (not registered in m_options): persisting a debug
     // view would boot the next session into a diagnostic image.
     const ModCombo::Ptr m_dibr_debug_view{ ModCombo::create(generate_name("DIBR_DebugView"), s_dibr_debug_view_names, 0) };
@@ -1979,6 +1992,9 @@ public:
             *m_dibr_overscan,
             *m_dibr_temporal,
             *m_dibr_temporal_blend,
+            *m_dibr_hybrid_near_stereo,
+            *m_dibr_hybrid_split,
+            *m_dibr_hybrid_feather,
             *m_snapturn,
             *m_snapturn_joystick_deadzone,
             *m_snapturn_angle,

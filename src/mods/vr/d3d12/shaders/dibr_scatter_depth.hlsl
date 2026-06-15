@@ -279,6 +279,10 @@ cbuffer StereoParams : register(b0) {
     float pre_inv_src_width;
     float pre_inv_src_height;
     float pre_edge_comp_inv;
+    float hybrid_target_rect_min_x;
+    float hybrid_target_rect_min_y;
+    float hybrid_target_rect_max_x;
+    float hybrid_target_rect_max_y;
 };
 
 float2 TransformDepthUv(float2 uv)
@@ -306,6 +310,43 @@ float SampleRawDeviceDepth(float2 uv)
     return (mode >= 1.0f)
         ? g_depthTex.SampleLevel(g_pointSampler, duv, 0)
         : g_depthTex.SampleLevel(g_linearSampler, duv, 0);
+}
+
+float HybridLinearDepthFromRaw(float rawDepth)
+{
+    float depth = rawDepth;
+    if (reverse_depth > 0.5f) {
+        depth = 1.0f - depth;
+    }
+    if (depth_value_flip > 0.5f) {
+        depth = 1.0f - depth;
+    }
+
+    float strength = saturate(depth_linearize_strength);
+    if (strength <= 0.0f) {
+        return saturate(depth);
+    }
+
+    float nearZ = max(depth_linearize_near, 0.0001f);
+    float farZ = max(depth_linearize_far, nearZ + 0.0001f);
+    float d = saturate(depth);
+    float reversedMode = step(0.5f, floor(depth_linearize_mode + 0.5f));
+    float standardDenom = farZ - d * (farZ - nearZ);
+    float reversedDenom = nearZ + d * (farZ - nearZ);
+    float denom = max(lerp(standardDenom, reversedDenom, reversedMode), 0.0001f);
+    float eyeZ = (nearZ * farZ) / denom;
+    float linearDepth = saturate((eyeZ - nearZ) / (farZ - nearZ));
+    return lerp(saturate(depth), linearDepth, strength);
+}
+
+bool HybridSkipsSourceDepth(float rawDepth)
+{
+    // The compose pass overlays the real target-eye near field. Do not punch
+    // holes in the synthesized layer up front: if the target-eye depth is
+    // absent, mismapped, or one frame late while the hook settles, those holes
+    // turn close geometry into the "behind the layer" failure. Keeping the
+    // source pixel gives us a visible DIBR fallback underneath the real view.
+    return false;
 }
 
 // Source-eye pixel + raw device depth -> synthesized target eye uv through
@@ -368,6 +409,9 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (dtid.x >= srcWidth || dtid.y >= srcHeight) return;
     float2 uv = float2((dtid.x + 0.5f) / (float)srcWidth, (dtid.y + 0.5f) / (float)srcHeight);
     float d = NearBiasedDepth(uv);
+    if (HybridSkipsSourceDepth(d)) {
+        return;
+    }
     float eyeSign = SynthEyeSign();
     float2 tUv = ReprojectSourceUv(uv, d, eyeSign);
     float tx = tUv.x * (float)synth_width - 0.5f;

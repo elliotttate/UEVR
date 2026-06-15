@@ -293,6 +293,10 @@ cbuffer StereoParams : register(b0) {
     float pre_inv_src_width;
     float pre_inv_src_height;
     float pre_edge_comp_inv;
+    float hybrid_target_rect_min_x;
+    float hybrid_target_rect_min_y;
+    float hybrid_target_rect_max_x;
+    float hybrid_target_rect_max_y;
 };
 
 float EffectiveConvergence()

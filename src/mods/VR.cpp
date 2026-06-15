@@ -2254,6 +2254,61 @@ static int dibr_env_requested_mode() {
     return env_mode;
 }
 
+static int dibr_hybrid_env_override() {
+    static const int env_state = []() -> int {
+        const char* v = std::getenv("UEVR_DIBR_HYBRID");
+        if (v == nullptr || v[0] == '\0') {
+            return -1;
+        }
+        std::string m{v};
+        for (auto& c : m) {
+            c = (char)std::tolower((unsigned char)c);
+        }
+        if (m == "0" || m == "off" || m == "false") {
+            return 0;
+        }
+        if (m == "1" || m == "on" || m == "true") {
+            return 1;
+        }
+        spdlog::warn("[DIBR] Unrecognized UEVR_DIBR_HYBRID value '{}'; using the UI toggle", m);
+        return -1;
+    }();
+    return env_state;
+}
+
+static std::optional<float> dibr_env_float(const char* name) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return std::nullopt;
+    }
+    char* end = nullptr;
+    const float parsed = std::strtof(v, &end);
+    if (end == v || !std::isfinite(parsed)) {
+        spdlog::warn("[DIBR] Ignoring invalid {}='{}'", name, v);
+        return std::nullopt;
+    }
+    return parsed;
+}
+
+static std::optional<float> dibr_overscan_env_margin() {
+    const auto parsed = dibr_env_float("UEVR_DIBR_OVERSCAN");
+    if (!parsed) {
+        return std::nullopt;
+    }
+
+    const float v = *parsed;
+    if (v >= 0.0f && v <= 0.5f) {
+        return v;
+    }
+
+    if (v >= 1.0f && v <= 1.5f) {
+        return v - 1.0f;
+    }
+
+    spdlog::warn("[DIBR] Ignoring UEVR_DIBR_OVERSCAN={} (use 0..0.5 margin or 1.0..1.5 factor)", v);
+    return std::nullopt;
+}
+
 // UEVR_RENDERING_METHOD env override: pins the Rendering Method dropdown
 // regardless of the persisted config. The on-disk config.txt value has been
 // observed reverting to Native(0) on some launches (an external pre-launch
@@ -2376,6 +2431,63 @@ bool VR::is_dibr_mono_view_active() const {
     return mode == 3 || mode == 4; // Inverse Warp / Raymarch synthesize both eyes
 }
 
+bool VR::is_dibr_hybrid_active() const {
+    if (!is_dibr_rendering_path_compatible()) {
+        return false;
+    }
+
+    // The first hybrid pass targets the default scatter mode. AFW needs its
+    // own cadence-specific version because the reference eye alternates.
+    if (get_dibr_requested_mode() != 5) {
+        return false;
+    }
+
+    const int env_state = dibr_hybrid_env_override();
+    if (env_state >= 0) {
+        return env_state == 1;
+    }
+
+    return m_dibr_hybrid_near_stereo->value();
+}
+
+float VR::get_dibr_hybrid_split_distance() const {
+    const auto env = dibr_env_float("UEVR_DIBR_HYBRID_SPLIT");
+    float v = env.value_or(m_dibr_hybrid_split->value());
+    if (!env && is_dibr_hybrid_active()) {
+        // Old configs persisted the first experimental 300 cm split. That
+        // leaves close/mid geometry to the synthetic layer, exactly where the
+        // artifacts are most visible. Keep hybrid visually honest by default;
+        // launchers can still opt into smaller splits with the env override.
+        v = std::max(v, 2000.0f);
+    }
+    return std::clamp(v, 1.0f, 100000.0f);
+}
+
+float VR::get_dibr_hybrid_feather_distance() const {
+    const auto env = dibr_env_float("UEVR_DIBR_HYBRID_FEATHER");
+    float v = env.value_or(m_dibr_hybrid_feather->value());
+    if (!env && is_dibr_hybrid_active()) {
+        v = std::max(v, 500.0f);
+    }
+    return std::clamp(v, 0.0f, 100000.0f);
+}
+
+void VR::set_dibr_hybrid_target_view_rect(int32_t min_x, int32_t min_y, int32_t max_x, int32_t max_y) {
+    m_dibr_hybrid_target_view_rect[0].store(min_x, std::memory_order_relaxed);
+    m_dibr_hybrid_target_view_rect[1].store(min_y, std::memory_order_relaxed);
+    m_dibr_hybrid_target_view_rect[2].store(max_x, std::memory_order_relaxed);
+    m_dibr_hybrid_target_view_rect[3].store(max_y, std::memory_order_relaxed);
+}
+
+std::array<int32_t, 4> VR::get_dibr_hybrid_target_view_rect() const {
+    return {
+        m_dibr_hybrid_target_view_rect[0].load(std::memory_order_relaxed),
+        m_dibr_hybrid_target_view_rect[1].load(std::memory_order_relaxed),
+        m_dibr_hybrid_target_view_rect[2].load(std::memory_order_relaxed),
+        m_dibr_hybrid_target_view_rect[3].load(std::memory_order_relaxed),
+    };
+}
+
 float VR::get_dibr_overscan_factor() const {
     // The DIBR single-view path now renders the lone reference at the UNION of
     // both eyes' FOV (HORIZONTAL_SYMMETRIC; see get_horizontal_projection_override)
@@ -2392,26 +2504,27 @@ float VR::get_dibr_overscan_factor() const {
         return 1.0f;
     }
 
-    // Env override beats the UI slider so launcher scripts keep working;
-    // -1 sentinel = no env, use the slider.
-    static const float env_margin = []() {
-        const char* v = std::getenv("UEVR_DIBR_OVERSCAN");
-        if (v == nullptr || v[0] == '\0') {
-            return -1.0f;
-        }
-        const float parsed = static_cast<float>(std::atof(v));
-        return (parsed >= 0.0f && parsed <= 0.5f) ? parsed : -1.0f;
-    }();
-
-    const float margin = (env_margin >= 0.0f) ? env_margin
-                                              : std::clamp(m_dibr_overscan->value() - 1.0f, 0.0f, 0.5f);
+    // Env override beats the UI slider so launcher scripts keep working.
+    static const auto env_margin = dibr_overscan_env_margin();
+    float margin = env_margin.value_or(std::clamp(m_dibr_overscan->value() - 1.0f, 0.0f, 0.5f));
+    if (!env_margin && is_dibr_hybrid_active()) {
+        // Hybrid uses the reference eye only as the far-field fill layer. The
+        // target eye supplies close stereo directly, so the reference projection
+        // needs enough extra angular coverage to avoid edge holes after the IPD
+        // reprojection. The old 1.12 default was fine for pure scatter, but it
+        // left a real no-source band in hybrid.
+        margin = std::max(margin, 0.5f);
+    }
 
     // Scatter-pipeline modes only (5 = scatter, 6 = AFW): these kernels map
     // source->target through the (widened) matrices exactly, while the gather
-    // search assumes source and target share a screen space.
+    // search assumes source and target share a screen space. Hybrid is not a
+    // single-view mode, but its reference eye still needs this projection-only
+    // margin so the synthesized far eye has source pixels at the outer edge.
     const auto overscan_mode = get_dibr_requested_mode();
+    const bool projection_overscan_path = is_dibr_single_view_active() || is_dibr_hybrid_active();
     if (margin <= 0.0f || (overscan_mode != 5 && overscan_mode != 6) ||
-        !is_dibr_single_view_active() || is_mono_rendering_active()) {
+        !projection_overscan_path || is_mono_rendering_active()) {
         return 1.0f;
     }
 
@@ -2432,6 +2545,14 @@ float VR::get_dibr_overscan_rt_factor() const {
     // RT here while the warp/engine no longer overscan would spread the union
     // across a wider target that the crop never accounts for.
     if (get_horizontal_projection_override() == HORIZONTAL_SYMMETRIC) {
+        return 1.0f;
+    }
+
+    // Hybrid DIBR keeps both engine views alive so the target eye can supply
+    // the close field directly. The old scatter overscan target only belongs
+    // to single-view synthesis; growing a two-view target makes the real-eye
+    // half wider than the OpenXR submit half and misaligns the hybrid overlay.
+    if (is_dibr_hybrid_active()) {
         return 1.0f;
     }
 
@@ -2458,17 +2579,8 @@ float VR::get_dibr_overscan_rt_factor() const {
         return 1.0f;
     }
 
-    static const float env_margin = []() {
-        const char* v = std::getenv("UEVR_DIBR_OVERSCAN");
-        if (v == nullptr || v[0] == '\0') {
-            return -1.0f;
-        }
-        const float parsed = static_cast<float>(std::atof(v));
-        return (parsed >= 0.0f && parsed <= 0.5f) ? parsed : -1.0f;
-    }();
-
-    const float margin = (env_margin >= 0.0f) ? env_margin
-                                              : std::clamp(m_dibr_overscan->value() - 1.0f, 0.0f, 0.5f);
+    static const auto env_margin = dibr_overscan_env_margin();
+    const float margin = env_margin.value_or(std::clamp(m_dibr_overscan->value() - 1.0f, 0.0f, 0.5f));
     return (margin > 0.0f) ? 1.0f + margin : 1.0f;
 }
 
@@ -2535,6 +2647,10 @@ bool VR::is_dibr_single_view_active() const {
         return false;
     }
 
+    if (is_dibr_hybrid_active()) {
+        return false;
+    }
+
     // Synchronized sequential drives its own per-frame eye alternation; only
     // plain Native Stereo (or the dedicated Synthetic Stereo / AFW methods)
     // has a second view we can simply not render.
@@ -2574,6 +2690,10 @@ bool VR::is_dibr_single_view_projection_configured() const {
     // has already baked the per-eye projections, so a proven-gated override
     // never takes effect and the synthesized eye keeps its asymmetric-FOV strip.
     if (get_dibr_requested_mode() == 0 || !is_dibr_rendering_path_compatible()) {
+        return false;
+    }
+
+    if (is_dibr_hybrid_active()) {
         return false;
     }
 
@@ -7622,6 +7742,9 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                             "Single-view: the engine renders only the %s eye (~half scene GPU cost)",
                             get_dibr_reference_eye() == 1 ? "right" : "left");
                     }
+                } else if (is_dibr_hybrid_active()) {
+                    ImGui::TextColored(ImVec4{0.4f, 1.0f, 0.4f, 1.0f},
+                        "Hybrid: real near-field stereo with DIBR far-field synthesis");
                 } else if (m_rendering_method->value() == RenderingMethod::NATIVE_STEREO ||
                            m_rendering_method->value() == RenderingMethod::SYNTHETIC_DIBR ||
                            m_rendering_method->value() == RenderingMethod::SYNTHETIC_AFW) {
@@ -7679,6 +7802,16 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 }
                 if (std::getenv("UEVR_DIBR_TEMPORAL") != nullptr) {
                     ImGui::TextDisabled("UEVR_DIBR_TEMPORAL env var is overriding the toggle");
+                }
+                if (get_dibr_requested_mode() == 5) {
+                    m_dibr_hybrid_near_stereo->draw("Hybrid Near Stereo");
+                    if (m_dibr_hybrid_near_stereo->value()) {
+                        m_dibr_hybrid_split->draw("Hybrid Split (UE units)");
+                        m_dibr_hybrid_feather->draw("Hybrid Feather (UE units)");
+                    }
+                    if (std::getenv("UEVR_DIBR_HYBRID") != nullptr) {
+                        ImGui::TextDisabled("UEVR_DIBR_HYBRID env var is overriding the toggle");
+                    }
                 }
             }
 
