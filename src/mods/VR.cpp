@@ -77,6 +77,46 @@ bool vr_mono_openxr_unpaced_enabled() {
     return !vr_env_explicit_false("UEVR_MONO_OPENXR_UNPACED");
 }
 
+bool vr_mono_openxr_async_wait_enabled() {
+    return !vr_env_explicit_false("UEVR_MONO_OPENXR_ASYNC_WAIT");
+}
+
+const char* openxr_view_configuration_name(XrViewConfigurationType type) {
+    switch (type) {
+    case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO:
+        return "PRIMARY_MONO";
+    case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO:
+        return "PRIMARY_STEREO";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+bool openxr_supports_view_configuration(XrInstance instance, XrSystemId system, XrViewConfigurationType target) {
+    uint32_t count{};
+    auto result = xrEnumerateViewConfigurations(instance, system, 0, &count, nullptr);
+    if (result != XR_SUCCESS || count == 0) {
+        spdlog::warn("[OpenXR] Could not enumerate view configurations while checking {}", openxr_view_configuration_name(target));
+        return false;
+    }
+
+    std::vector<XrViewConfigurationType> configs(count);
+    result = xrEnumerateViewConfigurations(instance, system, count, &count, configs.data());
+    if (result != XR_SUCCESS) {
+        spdlog::warn("[OpenXR] Could not read view configurations while checking {}", openxr_view_configuration_name(target));
+        return false;
+    }
+
+    for (const auto config : configs) {
+        spdlog::info("[OpenXR] Runtime supports view configuration {}", openxr_view_configuration_name(config));
+        if (config == target) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool vr_is_subnautica2_process() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -109,7 +149,99 @@ std::shared_ptr<VR>& VR::get() {
 }
 
 VR::~VR() {
+    stop_mono_openxr_async_wait_worker();
     stop_hitch_snapshot_writer();
+}
+
+void VR::ensure_mono_openxr_async_wait_worker() {
+    if (m_mono_openxr_async_wait_thread.joinable()) {
+        return;
+    }
+
+    m_mono_openxr_async_wait_thread = std::jthread([this](std::stop_token stop_token) {
+        mono_openxr_async_wait_worker_loop(stop_token);
+    });
+}
+
+void VR::stop_mono_openxr_async_wait_worker() {
+    if (!m_mono_openxr_async_wait_thread.joinable()) {
+        return;
+    }
+
+    m_mono_openxr_async_wait_thread.request_stop();
+    m_mono_openxr_async_wait_cv.notify_all();
+}
+
+void VR::request_mono_openxr_async_wait() {
+    if (!vr_mono_openxr_async_wait_enabled()) {
+        return;
+    }
+
+    auto openxr = m_openxr;
+    if (openxr == nullptr ||
+        !openxr->can_run_frame_loop() ||
+        !openxr->ever_submitted ||
+        openxr->frame_synced ||
+        openxr->frame_began)
+    {
+        return;
+    }
+
+    if (m_mono_openxr_async_wait_inflight.exchange(true)) {
+        return;
+    }
+
+    ensure_mono_openxr_async_wait_worker();
+
+    {
+        std::lock_guard lock{m_mono_openxr_async_wait_mtx};
+        m_mono_openxr_async_wait_pending = true;
+    }
+
+    m_mono_openxr_async_wait_cv.notify_one();
+}
+
+void VR::mono_openxr_async_wait_worker_loop(std::stop_token stop_token) {
+    SetThreadDescription(GetCurrentThread(), L"UEVR Mono OpenXR Wait");
+    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST)) {
+        spdlog::warn("[OpenXR][mono] Failed to raise async wait worker priority: {}", GetLastError());
+    }
+
+    while (!stop_token.stop_requested()) {
+        {
+            std::unique_lock lock{m_mono_openxr_async_wait_mtx};
+            m_mono_openxr_async_wait_cv.wait(lock, [this, &stop_token]() {
+                return stop_token.stop_requested() || m_mono_openxr_async_wait_pending;
+            });
+
+            if (stop_token.stop_requested()) {
+                break;
+            }
+
+            m_mono_openxr_async_wait_pending = false;
+        }
+
+        utility::ScopeGuard clear_inflight{[this]() {
+            m_mono_openxr_async_wait_inflight.store(false);
+        }};
+
+        auto openxr = m_openxr;
+        if (openxr == nullptr || !openxr->can_run_frame_loop()) {
+            continue;
+        }
+
+        if (openxr->frame_synced || openxr->frame_began) {
+            continue;
+        }
+
+        m_d3d12.release_mono_openxr_scene_swapchain();
+        openxr->synchronize_frame(std::nullopt, VRRuntime::SyncFrameCallsite::VRMonoAsyncPostPresent);
+        if (openxr->frame_synced && !openxr->frame_began) {
+            m_d3d12.pre_acquire_mono_openxr_scene_swapchain();
+        }
+    }
+
+    m_mono_openxr_async_wait_inflight.store(false);
 }
 
 bool VR::on_openxr_resolution_scale_changed(
@@ -2740,7 +2872,8 @@ std::optional<std::string> VR::initialize_openxr() {
 
                     const std::unordered_set<std::string> wanted_extensions {
                         XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
-                        XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME
+                        XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME,
+                        XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME
                         // To be seen if we need more!
                     };
 
@@ -2826,6 +2959,16 @@ std::optional<std::string> VR::initialize_openxr() {
         spdlog::info("[VR] Found existing openxr system");
     }
 
+    if (is_mono_rendering_configured() &&
+        vr_env_truthy("UEVR_OPENXR_PRIMARY_MONO") &&
+        openxr_supports_view_configuration(m_openxr->instance, m_openxr->system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO))
+    {
+        m_openxr->view_config = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO;
+        spdlog::info("[OpenXR][mono] Using XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO (UEVR_OPENXR_PRIMARY_MONO=1)");
+    } else if (is_mono_rendering_configured() && vr_env_truthy("UEVR_OPENXR_PRIMARY_MONO")) {
+        spdlog::warn("[OpenXR][mono] PRIMARY_MONO requested but not supported by this runtime; staying on PRIMARY_STEREO");
+    }
+
     // Step 3: Create a session
     spdlog::info("[VR] Initializing graphics info");
 
@@ -2855,6 +2998,10 @@ std::optional<std::string> VR::initialize_openxr() {
 
         return std::nullopt;
     }
+
+    m_openxr->initialize_display_refresh_rate_extension();
+    m_openxr->request_configured_display_refresh_rate();
+    m_openxr->refresh_display_refresh_rate_state("session_create");
 
     // Step 4: Create a space
     spdlog::info("[VR] Creating OpenXR space");
@@ -7074,6 +7221,14 @@ void VR::on_post_present() {
 
     const auto d3d12_mono_openxr_unpaced =
         m_is_d3d12 && m_d3d12.mono_openxr_unpaced_active_this_frame();
+
+    if (d3d12_mono_openxr_unpaced &&
+        runtime->is_openxr() &&
+        !m_mono_openxr_async_wait_inflight.load())
+    {
+        SPDLOG_INFO_ONCE("[OpenXR][mono] Running xrWaitFrame asynchronously after submit (UEVR_MONO_OPENXR_ASYNC_WAIT=0 disables)");
+        request_mono_openxr_async_wait();
+    }
 
     detect_controllers();
 

@@ -41,6 +41,7 @@
 #include "render/RenderDocCaptureService.hpp"
 #include "render/ShaderOverrideRegistry.hpp"
 #include "render/StereoForensics.hpp"
+#include <sdk/CVar.hpp>
 
 using json = nlohmann::json;
 template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
@@ -66,6 +67,65 @@ std::string format_pointer(uintptr_t pointer) {
     std::ostringstream ss{};
     ss << "0x" << std::hex << std::uppercase << pointer;
     return ss.str();
+}
+
+std::string narrow_ascii(std::wstring_view value) {
+    std::string out;
+    out.reserve(value.size());
+    for (const auto ch : value) {
+        out.push_back(ch >= 0 && ch <= 0x7f ? static_cast<char>(ch) : '?');
+    }
+    return out;
+}
+
+json live_cvar_json(std::wstring_view name) {
+    json out{{"name", narrow_ascii(name)}, {"found", false}};
+
+    try {
+        auto* console_manager = sdk::FConsoleManager::get();
+        if (console_manager == nullptr) {
+            out["error"] = "console_manager_unavailable";
+            return out;
+        }
+
+        auto* object = console_manager->find(name.data());
+        if (object == nullptr) {
+            return out;
+        }
+
+        auto* variable = static_cast<sdk::IConsoleVariable*>(object);
+        out["found"] = true;
+        out["address"] = format_pointer(reinterpret_cast<uintptr_t>(variable));
+        out["int"] = variable->GetInt();
+        out["float"] = variable->GetFloat();
+    } catch (const std::exception& e) {
+        out["error"] = e.what();
+    } catch (...) {
+        out["error"] = "unknown";
+    }
+
+    return out;
+}
+
+json live_pacing_cvars_json() {
+    static constexpr std::wstring_view names[]{
+        L"t.MaxFPS",
+        L"r.VSync",
+        L"rhi.SyncInterval",
+        L"rhi.SyncAllowEarlyKick",
+        L"rhi.SyncSlackMS",
+        L"t.IdleWhenNotForeground",
+        L"r.DynamicRes.OperationMode",
+        L"r.DynamicRes.FrameTimeBudget",
+        L"r.DynamicRes.DynamicFrameTime",
+        L"Sequencer.ApplyDisplayRateToDynamicResolutionFrameTimeBudget",
+    };
+
+    json out = json::object();
+    for (const auto name : names) {
+        out[narrow_ascii(name)] = live_cvar_json(name);
+    }
+    return out;
 }
 
 std::string format_crc32(uint32_t value) {
@@ -2584,6 +2644,7 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_vr_state_json() {
         out["frame_count"] = vr->get_frame_count();
         out["hmd_width"] = vr->get_hmd_width();
         out["hmd_height"] = vr->get_hmd_height();
+        out["live_pacing_cvars"] = live_pacing_cvars_json();
 
         // Runtime info
         json runtime;
@@ -2607,9 +2668,27 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_vr_state_json() {
                     runtime["accepted_relaxed_startup_poses"] = openxr->accepted_relaxed_startup_poses;
                     runtime["ever_submitted"] = openxr->ever_submitted;
                     runtime["frame_state_should_render"] = openxr->frame_state.shouldRender == XR_TRUE;
+                    runtime["predicted_display_time"] = openxr->frame_state.predictedDisplayTime;
+                    runtime["predicted_display_period_ns"] = openxr->frame_state.predictedDisplayPeriod;
+                    runtime["predicted_display_hz"] = openxr->frame_state.predictedDisplayPeriod > 0
+                        ? 1000000000.0 / static_cast<double>(openxr->frame_state.predictedDisplayPeriod)
+                        : 0.0;
                     runtime["internal_frame_count"] = openxr->internal_frame_count;
                     runtime["internal_render_frame_count"] = openxr->internal_render_frame_count;
                     runtime["has_render_frame_count"] = openxr->has_render_frame_count;
+                    runtime["display_refresh_rate_extension_enabled"] = openxr->is_display_refresh_rate_extension_enabled();
+                    runtime["display_refresh_rate_functions_loaded"] = openxr->display_refresh_rate_functions_loaded;
+                    runtime["display_refresh_rate_current_hz"] = openxr->display_refresh_rate_current_hz;
+                    runtime["display_refresh_rate_requested_hz"] = openxr->display_refresh_rate_requested_hz;
+                    runtime["display_refresh_rate_request_attempted"] = openxr->display_refresh_rate_request_attempted;
+                    runtime["display_refresh_rate_request_succeeded"] = openxr->display_refresh_rate_request_succeeded;
+                    runtime["display_refresh_rate_request_result"] = static_cast<int>(openxr->display_refresh_rate_request_result);
+                    runtime["display_refresh_rate_request_result_name"] = openxr->display_refresh_rate_request_attempted
+                        ? openxr->get_result_string(openxr->display_refresh_rate_request_result)
+                        : "";
+                    runtime["display_refresh_rate_get_result"] = static_cast<int>(openxr->display_refresh_rate_get_result);
+                    runtime["display_refresh_rate_get_result_name"] = openxr->get_result_string(openxr->display_refresh_rate_get_result);
+                    runtime["display_refresh_rates_hz"] = openxr->display_refresh_rates_hz;
                     runtime["last_begin_frame_caller"] = openxr->last_begin_frame_caller != nullptr
                         ? openxr->last_begin_frame_caller
                         : "";
@@ -2762,10 +2841,10 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_frame_timing_json() {
         }
         auto& d12 = vr->d3d12();
         auto to_j = [](const auto& t) {
-            return json{{"count", t.count}, {"avg_ms", t.avg_ms}, {"max_ms", t.max_ms}};
+            return json{{"count", t.count}, {"total_ms", t.total_ms}, {"avg_ms", t.avg_ms}, {"max_ms", t.max_ms}};
         };
         auto to_runtime_j = [](const auto& t) {
-            return json{{"count", t.count}, {"avg_ms", t.avg()}, {"max_ms", t.max_ms}};
+            return json{{"count", t.count}, {"total_ms", t.total_ms}, {"avg_ms", t.avg()}, {"max_ms", t.max_ms}};
         };
         auto to_bucket_j = [](const auto& t) {
             return json{{"count", t.count}, {"total_ms", t.total_ms}, {"avg_ms", t.avg_ms}, {"max_ms", t.max_ms}};
@@ -2778,6 +2857,12 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_frame_timing_json() {
             {"openxr_submit",     to_j(d12.get_timing_openxr_submit())},
             {"spectator_mirror",  to_j(d12.get_timing_spectator_mirror())},
             {"post_present",      to_j(d12.get_timing_post_present())},
+            {"openxr_swapchain_acquire", to_j(d12.get_timing_openxr_swapchain_acquire())},
+            {"openxr_swapchain_wait",    to_j(d12.get_timing_openxr_swapchain_wait())},
+            {"openxr_command_wait",      to_j(d12.get_timing_openxr_command_wait())},
+            {"openxr_copy_record",       to_j(d12.get_timing_openxr_copy_record())},
+            {"openxr_copy_execute",      to_j(d12.get_timing_openxr_copy_execute())},
+            {"openxr_swapchain_release", to_j(d12.get_timing_openxr_swapchain_release())},
             {"mono_openxr_skipped_submit_count", d12.get_mono_openxr_skipped_submit_count()},
         };
 
@@ -2820,6 +2905,18 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_frame_timing_json() {
             result["openxr_wait"] = to_runtime_j(openxr->wait_frame_timing);
             result["openxr_begin"] = to_runtime_j(openxr->begin_frame_timing);
             result["openxr_end"] = to_runtime_j(openxr->end_frame_timing);
+            result["openxr_wait_callsites"] = json{
+                {"unknown", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::Unknown])},
+                {"runtime_fix_frame", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::RuntimeFixFrame])},
+                {"vr_late_on_present", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::VRLateOnPresent])},
+                {"vr_early_rhi_command", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::VREarlyRHICommand])},
+                {"vr_d3d11_initial_sync", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::VRD3D11InitialSync])},
+                {"vr_post_present_initial_sync", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::VRPostPresentInitialSync])},
+                {"vr_very_late_post_present", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::VRVeryLatePostPresent])},
+                {"vr_mono_async_post_present", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::VRMonoAsyncPostPresent])},
+                {"openxr_session_ready", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::OpenXRSessionReady])},
+                {"openxr_begin_frame_recovery", to_runtime_j(openxr->wait_frame_callsite_timing[(size_t)VRRuntime::SyncFrameCallsite::OpenXRBeginFrameRecovery])},
+            };
         }
 
         return publish(std::move(result));

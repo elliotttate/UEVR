@@ -74,6 +74,10 @@ struct OpenXR final : public VRRuntime {
         return this->enabled_extensions.contains(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
     }
 
+    bool is_display_refresh_rate_extension_enabled() const {
+        return this->enabled_extensions.contains(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+    }
+
     void on_system_properties_acquired(const XrSystemProperties& props);
 
     void on_config_load(const utility::Config& cfg, bool set_defaults) override;
@@ -165,6 +169,9 @@ public:
     void trace_wait_frame_success(std::optional<uint32_t> frame_count, SyncFrameCallsite callsite);
     void trace_begin_frame_request(const char* caller);
     void clear_frame_synced(const char* reason);
+    void initialize_display_refresh_rate_extension();
+    void request_configured_display_refresh_rate();
+    void refresh_display_refresh_rate_state(const char* reason);
     bool should_trace_frame_flow() const;
     int64_t get_pose_update_age_ms(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
 
@@ -235,6 +242,17 @@ public:
     XrSpaceLocation view_space_location{XR_TYPE_SPACE_LOCATION};
 
     std::unordered_set<std::string> enabled_extensions{};
+    PFN_xrEnumerateDisplayRefreshRatesFB xrEnumerateDisplayRefreshRatesFB_ptr{};
+    PFN_xrGetDisplayRefreshRateFB xrGetDisplayRefreshRateFB_ptr{};
+    PFN_xrRequestDisplayRefreshRateFB xrRequestDisplayRefreshRateFB_ptr{};
+    bool display_refresh_rate_functions_loaded{false};
+    bool display_refresh_rate_request_attempted{false};
+    bool display_refresh_rate_request_succeeded{false};
+    float display_refresh_rate_current_hz{};
+    float display_refresh_rate_requested_hz{};
+    XrResult display_refresh_rate_request_result{XR_SUCCESS};
+    XrResult display_refresh_rate_get_result{XR_SUCCESS};
+    std::vector<float> display_refresh_rates_hz{};
     std::vector<XrCompositionLayerProjection> projection_layer_cache{};
 
     std::vector<XrViewConfigurationView> view_configs{};

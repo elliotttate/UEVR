@@ -70,6 +70,23 @@ float env_float_or(const char* name, float fallback) {
     return end != value ? parsed : fallback;
 }
 
+bool env_float_value(const char* name, float& out) {
+    char value[64]{};
+    const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+    if (len == 0 || len >= sizeof(value)) {
+        return false;
+    }
+
+    char* end = nullptr;
+    const auto parsed = std::strtof(value, &end);
+    if (end == value) {
+        return false;
+    }
+
+    out = parsed;
+    return true;
+}
+
 float mono_openxr_render_scale() {
     static const float scale = []() {
         const auto parsed = env_float_or("UEVR_MONO_OPENXR_RENDER_SCALE", 1.0f);
@@ -117,6 +134,8 @@ const char* sync_frame_callsite_name(VRRuntime::SyncFrameCallsite callsite) {
         return "vr_post_present_initial_sync";
     case VRRuntime::SyncFrameCallsite::VRVeryLatePostPresent:
         return "vr_very_late_post_present";
+    case VRRuntime::SyncFrameCallsite::VRMonoAsyncPostPresent:
+        return "vr_mono_async_post_present";
     case VRRuntime::SyncFrameCallsite::OpenXRSessionReady:
         return "openxr_session_ready";
     case VRRuntime::SyncFrameCallsite::OpenXRBeginFrameRecovery:
@@ -375,6 +394,166 @@ void OpenXR::on_draw_ui() {
         }
         
         ImGui::TreePop();
+    }
+}
+
+void OpenXR::initialize_display_refresh_rate_extension() {
+    this->xrEnumerateDisplayRefreshRatesFB_ptr = nullptr;
+    this->xrGetDisplayRefreshRateFB_ptr = nullptr;
+    this->xrRequestDisplayRefreshRateFB_ptr = nullptr;
+    this->display_refresh_rate_functions_loaded = false;
+    this->display_refresh_rates_hz.clear();
+
+    if (!this->is_display_refresh_rate_extension_enabled()) {
+        spdlog::info("[OpenXR] {} extension is not enabled", XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+        return;
+    }
+
+    if (this->instance == XR_NULL_HANDLE || this->session == XR_NULL_HANDLE) {
+        spdlog::warn("[OpenXR] Cannot initialize display refresh rate extension before instance/session creation");
+        return;
+    }
+
+    auto result = xrGetInstanceProcAddr(
+        this->instance,
+        "xrEnumerateDisplayRefreshRatesFB",
+        reinterpret_cast<PFN_xrVoidFunction*>(&this->xrEnumerateDisplayRefreshRatesFB_ptr));
+    if (XR_FAILED(result) || this->xrEnumerateDisplayRefreshRatesFB_ptr == nullptr) {
+        spdlog::warn("[OpenXR] Failed to load xrEnumerateDisplayRefreshRatesFB: {}", this->get_result_string(result));
+    }
+
+    result = xrGetInstanceProcAddr(
+        this->instance,
+        "xrGetDisplayRefreshRateFB",
+        reinterpret_cast<PFN_xrVoidFunction*>(&this->xrGetDisplayRefreshRateFB_ptr));
+    if (XR_FAILED(result) || this->xrGetDisplayRefreshRateFB_ptr == nullptr) {
+        spdlog::warn("[OpenXR] Failed to load xrGetDisplayRefreshRateFB: {}", this->get_result_string(result));
+    }
+
+    result = xrGetInstanceProcAddr(
+        this->instance,
+        "xrRequestDisplayRefreshRateFB",
+        reinterpret_cast<PFN_xrVoidFunction*>(&this->xrRequestDisplayRefreshRateFB_ptr));
+    if (XR_FAILED(result) || this->xrRequestDisplayRefreshRateFB_ptr == nullptr) {
+        spdlog::warn("[OpenXR] Failed to load xrRequestDisplayRefreshRateFB: {}", this->get_result_string(result));
+    }
+
+    this->display_refresh_rate_functions_loaded =
+        this->xrEnumerateDisplayRefreshRatesFB_ptr != nullptr &&
+        this->xrGetDisplayRefreshRateFB_ptr != nullptr &&
+        this->xrRequestDisplayRefreshRateFB_ptr != nullptr;
+
+    if (this->xrEnumerateDisplayRefreshRatesFB_ptr != nullptr) {
+        uint32_t refresh_rate_count{};
+        result = this->xrEnumerateDisplayRefreshRatesFB_ptr(this->session, 0, &refresh_rate_count, nullptr);
+
+        if (!XR_FAILED(result) && refresh_rate_count > 0) {
+            this->display_refresh_rates_hz.resize(refresh_rate_count);
+            result = this->xrEnumerateDisplayRefreshRatesFB_ptr(
+                this->session,
+                refresh_rate_count,
+                &refresh_rate_count,
+                this->display_refresh_rates_hz.data());
+
+            if (!XR_FAILED(result)) {
+                this->display_refresh_rates_hz.resize(refresh_rate_count);
+
+                std::ostringstream rates;
+                for (size_t i = 0; i < this->display_refresh_rates_hz.size(); ++i) {
+                    if (i > 0) {
+                        rates << ", ";
+                    }
+                    rates << this->display_refresh_rates_hz[i];
+                }
+
+                spdlog::info("[OpenXR] Supported display refresh rates: [{}]", rates.str());
+            } else {
+                this->display_refresh_rates_hz.clear();
+                spdlog::warn("[OpenXR] xrEnumerateDisplayRefreshRatesFB failed: {}", this->get_result_string(result));
+            }
+        } else if (XR_FAILED(result)) {
+            spdlog::warn("[OpenXR] xrEnumerateDisplayRefreshRatesFB count query failed: {}", this->get_result_string(result));
+        }
+    }
+
+    spdlog::info(
+        "[OpenXR] {} enabled, functions_loaded={}",
+        XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME,
+        this->display_refresh_rate_functions_loaded);
+}
+
+void OpenXR::request_configured_display_refresh_rate() {
+    this->display_refresh_rate_request_attempted = false;
+    this->display_refresh_rate_request_succeeded = false;
+    this->display_refresh_rate_requested_hz = 0.0f;
+    this->display_refresh_rate_request_result = XR_SUCCESS;
+
+    float requested_hz{};
+    if (!env_float_value("UEVR_OPENXR_REQUEST_REFRESH_HZ", requested_hz)) {
+        return;
+    }
+
+    requested_hz = std::clamp(requested_hz, 1.0f, 1000.0f);
+    this->display_refresh_rate_requested_hz = requested_hz;
+    this->display_refresh_rate_request_attempted = true;
+
+    if (!this->is_display_refresh_rate_extension_enabled() ||
+        this->xrRequestDisplayRefreshRateFB_ptr == nullptr ||
+        this->session == XR_NULL_HANDLE)
+    {
+        this->display_refresh_rate_request_result = XR_ERROR_EXTENSION_NOT_PRESENT;
+        spdlog::warn(
+            "[OpenXR] UEVR_OPENXR_REQUEST_REFRESH_HZ={} requested, but {} is not available",
+            requested_hz,
+            XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+        return;
+    }
+
+    const auto result = this->xrRequestDisplayRefreshRateFB_ptr(this->session, requested_hz);
+    this->display_refresh_rate_request_result = result;
+    this->display_refresh_rate_request_succeeded = !XR_FAILED(result);
+
+    if (XR_FAILED(result)) {
+        spdlog::warn(
+            "[OpenXR] xrRequestDisplayRefreshRateFB({}) failed: {}",
+            requested_hz,
+            this->get_result_string(result));
+    } else {
+        spdlog::info("[OpenXR] Requested display refresh rate: {} Hz", requested_hz);
+    }
+
+    this->refresh_display_refresh_rate_state("request");
+}
+
+void OpenXR::refresh_display_refresh_rate_state(const char* reason) {
+    if (!this->is_display_refresh_rate_extension_enabled() ||
+        this->xrGetDisplayRefreshRateFB_ptr == nullptr ||
+        this->session == XR_NULL_HANDLE)
+    {
+        return;
+    }
+
+    float current_hz{};
+    const auto result = this->xrGetDisplayRefreshRateFB_ptr(this->session, &current_hz);
+    this->display_refresh_rate_get_result = result;
+
+    if (XR_FAILED(result)) {
+        spdlog::warn("[OpenXR] xrGetDisplayRefreshRateFB failed: {}", this->get_result_string(result));
+        return;
+    }
+
+    const auto previous_hz = this->display_refresh_rate_current_hz;
+    this->display_refresh_rate_current_hz = current_hz;
+
+    const std::string_view reason_view{reason != nullptr ? reason : ""};
+    const bool important_reason = reason_view == "session_create" || reason_view == "request";
+    const bool changed = previous_hz <= 0.0f || std::fabs(previous_hz - current_hz) > 0.01f;
+
+    if (important_reason || changed) {
+        spdlog::info(
+            "[OpenXR] Current display refresh rate: {} Hz ({})",
+            current_hz,
+            reason != nullptr ? reason : "unknown");
     }
 }
 
@@ -1008,6 +1187,12 @@ VRRuntime::Error OpenXR::synchronize_frame(std::optional<uint32_t> frame_count, 
         this->frame_synced = true;
         this->should_update_eye_matrices = true;
         this->trace_wait_frame_success(frame_count, callsite);
+
+        if (this->display_refresh_rate_functions_loaded &&
+            (this->display_refresh_rate_current_hz <= 0.0f || (this->wait_frame_timing.count % 120) == 0))
+        {
+            this->refresh_display_refresh_rate_state("wait_frame");
+        }
     }
     return VRRuntime::Error::SUCCESS;
 }
@@ -1302,7 +1487,7 @@ uint32_t OpenXR::get_width() const {
     auto scale = use_last_applied
         ? this->last_applied_resolution_scale
         : this->resolution_scale->value();
-    if (VR::get()->is_mono_rendering_active()) {
+    if (VR::get()->is_mono_rendering_configured()) {
         const auto mono_scale = mono_openxr_render_scale();
         if (mono_scale != 1.0f) {
             SPDLOG_INFO_ONCE("[OpenXR][mono] Applying UEVR_MONO_OPENXR_RENDER_SCALE={} to OpenXR width", mono_scale);
@@ -1324,7 +1509,7 @@ uint32_t OpenXR::get_height() const {
     auto scale = use_last_applied
         ? this->last_applied_resolution_scale
         : this->resolution_scale->value();
-    if (VR::get()->is_mono_rendering_active()) {
+    if (VR::get()->is_mono_rendering_configured()) {
         const auto mono_scale = mono_openxr_render_scale();
         if (mono_scale != 1.0f) {
             SPDLOG_INFO_ONCE("[OpenXR][mono] Applying UEVR_MONO_OPENXR_RENDER_SCALE={} to OpenXR height", mono_scale);
@@ -2975,9 +3160,18 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
             projection_layer_views[i].subImage.imageArrayIndex = has_native_stereo_array ? (uint32_t)i : 0;
 
             int32_t offset_x = 0, offset_y = 0, extent_x = 0, extent_y = 0;
-            // if we're working with a double-wide texture, use half the view bounds adjustment (as they apply to a single eye)
-            int texture_area_width = (is_afr || has_native_split_eye_swapchains || has_native_stereo_array) ? swapchain->width : swapchain->width / 2;
-            if (is_afr || has_native_split_eye_swapchains || has_native_stereo_array || i == 0 || mono_left_half_submit) {
+            // If the swapchain is per-eye/single-eye, use the full texture width.
+            // Otherwise DOUBLE_WIDE packs left/right eyes side by side. Mono can
+            // run either way during startup/recreate, so only treat it as
+            // single-wide once the scene swapchain width matches a single eye.
+            const bool mono_single_wide_submit =
+                mono_left_half_submit &&
+                VR::get() != nullptr &&
+                swapchain->width <= static_cast<int32_t>(VR::get()->get_dibr_render_eye_width());
+            const bool single_eye_texture =
+                is_afr || has_native_split_eye_swapchains || has_native_stereo_array || mono_single_wide_submit;
+            int texture_area_width = single_eye_texture ? swapchain->width : swapchain->width / 2;
+            if (single_eye_texture || i == 0 || mono_left_half_submit) {
                 offset_x = view_bounds[i][0] * texture_area_width;
                 extent_x = view_bounds[i][1] * texture_area_width - offset_x;
             } else {
@@ -3147,12 +3341,13 @@ void OpenXR::log_frame_timing_stats_if_needed() {
     const auto& wait_late = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRLateOnPresent];
     const auto& wait_post_present_initial = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRPostPresentInitialSync];
     const auto& wait_very_late = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRVeryLatePostPresent];
+    const auto& wait_mono_async = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::VRMonoAsyncPostPresent];
     const auto& wait_session_ready = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::OpenXRSessionReady];
     const auto& wait_recovery = this->wait_frame_callsite_timing[(size_t)SyncFrameCallsite::OpenXRBeginFrameRecovery];
     const auto pose_age_ms = this->get_pose_update_age_ms(now);
 
     spdlog::info(
-        "[OpenXR][frame-profiler] wait avg={:.2f}ms max={:.2f}ms n={} wait_fix avg={:.2f}ms max={:.2f}ms n={} wait_early avg={:.2f}ms max={:.2f}ms n={} wait_late avg={:.2f}ms max={:.2f}ms n={} wait_post_present_initial avg={:.2f}ms max={:.2f}ms n={} wait_very_late avg={:.2f}ms max={:.2f}ms n={} wait_session_ready avg={:.2f}ms max={:.2f}ms n={} wait_recovery avg={:.2f}ms max={:.2f}ms n={} begin avg={:.2f}ms max={:.2f}ms n={} end avg={:.2f}ms max={:.2f}ms n={} pose_update avg={:.2f}ms max={:.2f}ms n={} pose_age_ms={} pose_calls={} pose_view_ext={} pose_runtime={} last_pose_src={} last_pose_frame={} last_pose_result={} last_pose_ms={:.2f} view_locate_ms={:.2f} stage_locate_ms={:.2f} space_locate_ms={:.2f} session={} ready={} synced={} began={} first_poses={} valid_poses={} relaxed_startup={} dbg_empty={} dbg_skip_scene={} dbg_skip_ui={} dbg_no_depth={}",
+        "[OpenXR][frame-profiler] wait avg={:.2f}ms max={:.2f}ms n={} wait_fix avg={:.2f}ms max={:.2f}ms n={} wait_early avg={:.2f}ms max={:.2f}ms n={} wait_late avg={:.2f}ms max={:.2f}ms n={} wait_post_present_initial avg={:.2f}ms max={:.2f}ms n={} wait_very_late avg={:.2f}ms max={:.2f}ms n={} wait_mono_async avg={:.2f}ms max={:.2f}ms n={} wait_session_ready avg={:.2f}ms max={:.2f}ms n={} wait_recovery avg={:.2f}ms max={:.2f}ms n={} begin avg={:.2f}ms max={:.2f}ms n={} end avg={:.2f}ms max={:.2f}ms n={} pose_update avg={:.2f}ms max={:.2f}ms n={} pose_age_ms={} pose_calls={} pose_view_ext={} pose_runtime={} last_pose_src={} last_pose_frame={} last_pose_result={} last_pose_ms={:.2f} view_locate_ms={:.2f} stage_locate_ms={:.2f} space_locate_ms={:.2f} session={} ready={} synced={} began={} first_poses={} valid_poses={} relaxed_startup={} dbg_empty={} dbg_skip_scene={} dbg_skip_ui={} dbg_no_depth={}",
         this->wait_frame_timing.avg(),
         this->wait_frame_timing.max_ms,
         this->wait_frame_timing.count,
@@ -3171,6 +3366,9 @@ void OpenXR::log_frame_timing_stats_if_needed() {
         wait_very_late.avg(),
         wait_very_late.max_ms,
         wait_very_late.count,
+        wait_mono_async.avg(),
+        wait_mono_async.max_ms,
+        wait_mono_async.count,
         wait_session_ready.avg(),
         wait_session_ready.max_ms,
         wait_session_ready.count,

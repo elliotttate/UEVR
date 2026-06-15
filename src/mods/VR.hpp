@@ -523,6 +523,10 @@ public:
     // gearmono-style comparison baseline for DIBR. Defined in VR.cpp.
     bool is_mono_rendering_active() const;
 
+    bool is_mono_rendering_configured() const {
+        return m_rendering_method->value() == RenderingMethod::MONO;
+    }
+
     // Single-view rendering of ANY flavor (Mono or DIBR single-view): the
     // stereo hook's view-count / pose / projection pinning keys off this.
     bool is_single_view_rendering_active() const {
@@ -925,6 +929,10 @@ public:
     bool is_controller_camera_conflict_guard_active() const;
     void note_stalker2_transition_stress(const char* reason);
     bool should_defer_stalker2_openxr_frame_for_transition(const char* reason);
+    void request_mono_openxr_async_wait();
+    void ensure_mono_openxr_async_wait_worker();
+    void stop_mono_openxr_async_wait_worker();
+    void mono_openxr_async_wait_worker_loop(std::stop_token stop_token);
 
     bool is_ghosting_fix_enabled() const {
         return m_ghosting_fix->value();
@@ -1289,6 +1297,11 @@ private:
     std::chrono::steady_clock::time_point m_last_engine_tick{};
     std::chrono::steady_clock::time_point m_last_mod_frame{};
     std::chrono::steady_clock::time_point m_last_tick_gap_log{};
+    std::jthread m_mono_openxr_async_wait_thread{};
+    std::mutex m_mono_openxr_async_wait_mtx{};
+    std::condition_variable m_mono_openxr_async_wait_cv{};
+    std::atomic_bool m_mono_openxr_async_wait_inflight{false};
+    bool m_mono_openxr_async_wait_pending{false};
 
     // DIBR bind-signature remediation (see request_dibr_rt_recreate).
     std::atomic<bool> m_dibr_rt_recreate_requested{false};

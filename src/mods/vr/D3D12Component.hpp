@@ -84,14 +84,22 @@ public:
     const char* get_shf_scene_mode_str() const;
 
     // Per-render-path timing stats as primitives (count, avg ms, max ms).
-    struct FfiTiming { uint64_t count{}; double avg_ms{}; double max_ms{}; };
+    struct FfiTiming { uint64_t count{}; double total_ms{}; double avg_ms{}; double max_ms{}; };
     FfiTiming get_timing_on_frame()         const;
     FfiTiming get_timing_ui_copy()          const;
     FfiTiming get_timing_swapchain_copy()   const;
     FfiTiming get_timing_openxr_submit()    const;
     FfiTiming get_timing_spectator_mirror() const;
     FfiTiming get_timing_post_present()     const;
+    FfiTiming get_timing_openxr_swapchain_acquire() const;
+    FfiTiming get_timing_openxr_swapchain_wait()    const;
+    FfiTiming get_timing_openxr_command_wait()      const;
+    FfiTiming get_timing_openxr_copy_record()       const;
+    FfiTiming get_timing_openxr_copy_execute()      const;
+    FfiTiming get_timing_openxr_swapchain_release() const;
     uint64_t get_mono_openxr_skipped_submit_count() const { return m_mono_openxr_skipped_submit_count; }
+    void pre_acquire_mono_openxr_scene_swapchain();
+    void release_mono_openxr_scene_swapchain();
 
     struct HitchFrameSnapshot {
         bool initialized{};
@@ -216,6 +224,12 @@ private:
     FrameTimingStats m_perf_openxr_submit{};
     FrameTimingStats m_perf_spectator_mirror{};
     FrameTimingStats m_perf_post_present{};
+    FrameTimingStats m_perf_openxr_swapchain_acquire{};
+    FrameTimingStats m_perf_openxr_swapchain_wait{};
+    FrameTimingStats m_perf_openxr_command_wait{};
+    FrameTimingStats m_perf_openxr_copy_record{};
+    FrameTimingStats m_perf_openxr_copy_execute{};
+    FrameTimingStats m_perf_openxr_swapchain_release{};
     uint64_t m_mono_openxr_skipped_submit_count{};
     bool m_mono_openxr_unpaced_active_this_frame{};
     bool m_mono_openxr_skipped_submit_this_frame{};
@@ -396,6 +410,8 @@ private:
         void initialize(XrSessionCreateInfo& session_info);
         std::optional<std::string> create_swapchains();
         void destroy_swapchains();
+        void pre_acquire(uint32_t swapchain_idx);
+        void release_acquired(uint32_t swapchain_idx);
         void copy(uint32_t swapchain_idx, ID3D12Resource* src,
             std::optional<std::function<void(d3d12::CommandContext&, ID3D12Resource*)>> pre_commands = std::nullopt,
             std::optional<std::function<void(d3d12::CommandContext&)>> additional_commands = std::nullopt,
@@ -454,6 +470,8 @@ private:
             uint32_t last_acquired_texture{0};
             uint32_t last_acquired_frame{0};
             bool ever_acquired{false};
+            bool pre_acquired{false};
+            bool release_pending{false};
         };
 
         std::unordered_map<uint32_t, SwapchainContext> contexts{};

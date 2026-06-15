@@ -19376,6 +19376,8 @@ bool FFakeStereoRenderingHook::is_stereo_enabled(FFakeStereoRendering* stereo) {
 // track the same overscan-grown width as the render target it renders into.
 static uint32_t dibr_overscan_render_width(uint32_t base_width);
 
+static uint32_t scene_render_target_width();
+
 void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, int32_t index, int* x, int* y, uint32_t* w, uint32_t* h) {
 #ifdef FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
     SPDLOG_INFO("adjust view rect called! {}", index);
@@ -19418,22 +19420,30 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
         return;
     }
 
-    if (VR::get()->is_stereo_emulation_enabled()) {
+    auto& vr = VR::get();
+
+    if (vr->is_mono_rendering_active()) {
+        *x = 0;
+        *y = 0;
+        *w = vr->get_hmd_width();
+        *h = vr->get_hmd_height();
+        return;
+    }
+
+    if (vr->is_stereo_emulation_enabled()) {
         *w *= 2;
     } else {
         // Track the overscan-grown render target so the lone DIBR view
         // actually renders at the grown width (the RT alone growing leaves
         // the engine rendering a 1:1 view into a wider target).
-        *w = dibr_overscan_render_width(VR::get()->get_hmd_width()) * 2;
-        *h = VR::get()->get_hmd_height();
+        *w = scene_render_target_width();
+        *h = vr->get_hmd_height();
     }
 
 
     *w = *w / 2;
 
     const auto true_index = index_starts_from_one ? ((index + 1) % 2) : (index % 2);
-
-    auto& vr = VR::get();
 
     if (!vr->is_native_stereo_fix_enabled() || !vr->is_native_stereo_fix_same_pass_enabled()) {
         *x += *w * true_index;
@@ -21781,6 +21791,15 @@ static uint32_t dibr_overscan_render_width(uint32_t base_width) {
     return VR::get()->get_dibr_render_eye_width();
 }
 
+static uint32_t scene_render_target_width() {
+    auto& vr = VR::get();
+    if (vr->is_mono_rendering_active()) {
+        return vr->get_hmd_width();
+    }
+
+    return dibr_overscan_render_width(vr->get_hmd_width()) * 2;
+}
+
 void VRRenderTargetManager_Base::calculate_render_target_size(const sdk::FViewport& viewport, uint32_t& x, uint32_t& y) {
     SPDLOG_INFO_ONCE("VRRenderTargetManager_Base::calculate_render_target_size called!");
 
@@ -21798,7 +21817,7 @@ void VRRenderTargetManager_Base::calculate_render_target_size(const sdk::FViewpo
         this->request_dedicated_ui_target(x, y);
     }
 
-    x = dibr_overscan_render_width(VR::get()->get_hmd_width()) * 2;
+    x = scene_render_target_width();
     y = VR::get()->get_hmd_height();
 
     SPDLOG_DEBUG("RenderTargetSize After: {}x{}", x, y);
@@ -21968,7 +21987,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
         ((PrepareDescFn)rtm->texture_desc_prepare_func)(copied_desc.data(), (const void*)ctx.r8);
 
-        const auto scan_x = VR::get()->get_hmd_width() * 2;
+        const auto scan_x = scene_render_target_width();
         const auto scan_y = VR::get()->get_hmd_height();
         const auto requested_width = rtm->get_dedicated_ui_width() != 0 ? rtm->get_dedicated_ui_width() : (uint32_t)g_framework->get_d3d12_rt_size().x;
         const auto requested_height = rtm->get_dedicated_ui_height() != 0 ? rtm->get_dedicated_ui_height() : (uint32_t)g_framework->get_d3d12_rt_size().y;
@@ -22393,7 +22412,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
             // Scan for the render target width and height in the desc
             // and replace it with the desktop resolution (This is for the UI texture)
-            const auto scan_x = VR::get()->get_hmd_width() * 2;
+            const auto scan_x = scene_render_target_width();
             const auto scan_y = VR::get()->get_hmd_height();
 
             std::optional<int32_t> width_offset{};
@@ -22461,7 +22480,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
             // Scan for the render target width and height in the desc
             // and replace it with the desktop resolution (This is for the UI texture)
-            const auto scan_x = VR::get()->get_hmd_width() * 2;
+            const auto scan_x = scene_render_target_width();
             const auto scan_y = VR::get()->get_hmd_height();
 
             std::optional<int32_t> width_offset{};
@@ -22571,7 +22590,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
                 // Scan for the render target width and height in the desc
                 // and replace it with the desktop resolution (This is for the UI texture)
-                const auto scan_x = VR::get()->get_hmd_width() * 2;
+                const auto scan_x = scene_render_target_width();
                 const auto scan_y = VR::get()->get_hmd_height();
 
                 std::optional<int32_t> width_offset{};
