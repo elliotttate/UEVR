@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <DirectXMath.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -1498,6 +1499,74 @@ bool mono_right_half_fill_enabled() {
     return enabled;
 }
 
+bool mono_openxr_unpaced_enabled() {
+    char value[32]{};
+    const auto len = GetEnvironmentVariableA("UEVR_MONO_OPENXR_UNPACED", value, static_cast<DWORD>(sizeof(value)));
+    if (len == 0 || len >= sizeof(value)) {
+        return true;
+    }
+
+    std::string_view raw{value, std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1))};
+    return raw != "0" && raw != "false" && raw != "FALSE" && raw != "off" && raw != "OFF";
+}
+
+bool env_double_value(const char* name, double& out) {
+    char value[64]{};
+    const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+    if (len == 0 || len >= sizeof(value)) {
+        return false;
+    }
+
+    char* end = nullptr;
+    const auto parsed = std::strtod(value, &end);
+    if (end == value) {
+        return false;
+    }
+
+    out = parsed;
+    return true;
+}
+
+std::chrono::steady_clock::duration mono_openxr_submit_interval(VR* vr) {
+    double configured_hz = 0.0;
+    if (!env_double_value("UEVR_MONO_OPENXR_SUBMIT_HZ", configured_hz) || configured_hz <= 0.0) {
+        return std::chrono::steady_clock::duration::zero();
+    }
+
+    const auto hz = std::clamp(configured_hz, 1.0, 500.0);
+    return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>{1.0 / hz});
+}
+
+bool should_skip_mono_openxr_submit(VR* vr) {
+    if (vr == nullptr || vr->get_openxr_runtime() == nullptr || !vr->is_mono_rendering_active()) {
+        return false;
+    }
+
+    auto* openxr = vr->get_openxr_runtime();
+    if (!mono_openxr_unpaced_enabled() || !openxr->can_run_frame_loop() || openxr->debug_submit_empty_frame->value()) {
+        return false;
+    }
+
+    // If OpenXR already has a synchronized or begun frame, consume it instead of
+    // letting a stale predicted display time hang around for a later game frame.
+    if (openxr->frame_synced || openxr->frame_began) {
+        return false;
+    }
+
+    const auto last_submit = openxr->last_successful_end_frame;
+    if (last_submit.time_since_epoch().count() == 0) {
+        return false;
+    }
+
+    const auto interval = mono_openxr_submit_interval(vr);
+    if (interval <= std::chrono::steady_clock::duration::zero()) {
+        return false;
+    }
+
+    return std::chrono::steady_clock::now() - last_submit < interval;
+}
+
 // Feature #10 (agent OWNEDRES): give the OpenXR native-stereo-array texture and
 // the native (SBS) source resource descriptive RenderDoc-legible names so a
 // capture can tell slice0=left / slice1=right apart and identify the source.
@@ -2570,6 +2639,23 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     const auto debug_disable_depth_submit = openxr_runtime != nullptr && openxr_runtime->debug_disable_depth_submit->value();
     const auto suppress_scene_copy = debug_submit_empty_frame || debug_skip_scene_copy;
     const auto suppress_ui_copy = debug_submit_empty_frame || debug_skip_ui_copy;
+    const auto mono_submit_throttle_interval = mono_openxr_submit_interval(vr);
+    m_mono_openxr_unpaced_active_this_frame =
+        openxr_runtime != nullptr &&
+        vr->is_mono_rendering_active() &&
+        mono_openxr_unpaced_enabled() &&
+        !debug_submit_empty_frame &&
+        mono_submit_throttle_interval > std::chrono::steady_clock::duration::zero();
+    m_mono_openxr_skipped_submit_this_frame =
+        m_mono_openxr_unpaced_active_this_frame && should_skip_mono_openxr_submit(vr);
+
+    if (m_mono_openxr_unpaced_active_this_frame) {
+        SPDLOG_INFO_ONCE("[OpenXR][mono] OpenXR submit pacing is decoupled from the mono game render loop (UEVR_MONO_OPENXR_UNPACED=0 disables)");
+    }
+    if (m_mono_openxr_skipped_submit_this_frame) {
+        ++m_mono_openxr_skipped_submit_count;
+        SPDLOG_INFO_EVERY_N_SEC(2, "[OpenXR][mono] Skipping OpenXR submit for this game frame; mono render loop remains unpaced");
+    }
 
     const auto is_same_frame = m_last_rendered_frame > 0 && m_last_rendered_frame == vr->m_render_frame_count;
     m_last_rendered_frame = vr->m_render_frame_count;
@@ -2598,7 +2684,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             defer_stalker2_transition_openxr =
                 vr->should_defer_stalker2_openxr_frame_for_transition("d3d12_pre_wait");
 
-            if (!defer_stalker2_transition_openxr) {
+            if (!defer_stalker2_transition_openxr && !m_mono_openxr_skipped_submit_this_frame) {
                 runtime->synchronize_frame(std::nullopt, VRRuntime::SyncFrameCallsite::RuntimeFixFrame);
             }
         } else {
@@ -3108,6 +3194,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             return false;
         }
 
+        if (m_mono_openxr_skipped_submit_this_frame) {
+            return false;
+        }
+
         if (vr->m_openxr->frame_began) {
             return true;
         }
@@ -3129,6 +3219,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
         return true;
     };
+
+    const bool allow_openxr_first_copy_begin = !vr->is_mono_rendering_active();
 
     if (runtime->is_openvr() && m_openvr.ui_tex.texture.Get() != nullptr) {
         const auto ui_copy_start = std::chrono::steady_clock::now();
@@ -3152,7 +3244,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
         clear_rt(m_openvr.ui_tex.commands);
         m_openvr.ui_tex.commands.execute();
-    } else if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop() && ensure_openxr_frame_began("d3d12_first_copy")) {
+    } else if (runtime->is_openxr() &&
+               vr->m_openxr->can_run_frame_loop() &&
+               (vr->m_openxr->frame_began ||
+                (allow_openxr_first_copy_begin && ensure_openxr_frame_began("d3d12_first_copy")))) {
         const auto ui_copy_start = std::chrono::steady_clock::now();
         utility::ScopeGuard ui_copy_timing_guard{[&]() {
             m_perf_ui_copy.add(std::chrono::steady_clock::now() - ui_copy_start);
@@ -3198,7 +3293,14 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     ComPtr<ID3D12Resource> scene_depth_tex{};
     bool native_stereo_array_submit_active = false;
 
-    if (vr->is_depth_enabled() && runtime->is_depth_allowed()) {
+    // Single-view rendering (Mono / DIBR) never submits a composition depth layer
+    // (it is suppressed below) and run_dibr_synthesis re-resolves its own depth.
+    // So skip the entire SceneDepthZ fetch AND the depth-swapchain resize/recreate
+    // churn for single-view — this keeps Mono truly lean (no DIBR/depth work at all)
+    // instead of fetching depth and recreating the double-wide depth swapchain every
+    // time the engine reshapes. The SN2 depth-blend re-fetches SceneDepthZ itself when
+    // scene_depth_tex is null (see below), so this is safe for the synthesis paths too.
+    if (vr->is_depth_enabled() && runtime->is_depth_allowed() && !vr->is_single_view_rendering_active()) {
         auto& rt_pool = vr->get_render_target_pool_hook();
         scene_depth_tex = rt_pool->get_texture<ID3D12Resource>(L"SceneDepthZ");
 
@@ -3262,7 +3364,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         m_submitted_left_eye = true;
 
         // OpenXR texture
-        if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop()) {
+        if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop() && !m_mono_openxr_skipped_submit_this_frame) {
             const auto swapchain_copy_start = std::chrono::steady_clock::now();
             utility::ScopeGuard swapchain_copy_timing_guard{[&]() {
                 m_perf_swapchain_copy.add(std::chrono::steady_clock::now() - swapchain_copy_start);
@@ -3328,7 +3430,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }};
 
         // OpenXR texture
-        if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop()) {
+        if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop() && !m_mono_openxr_skipped_submit_this_frame) {
             const auto swapchain_copy_start = std::chrono::steady_clock::now();
             utility::ScopeGuard swapchain_copy_timing_guard{[&]() {
                 m_perf_swapchain_copy.add(std::chrono::steady_clock::now() - swapchain_copy_start);
@@ -3711,7 +3813,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         ////////////////////////////////////////////////////////////////////////////////
         // OpenXR start ////////////////////////////////////////////////////////////////
         ////////////////////////////////////////////////////////////////////////////////
-        if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop()) {
+        if (runtime->is_openxr() && vr->m_openxr->can_run_frame_loop() && !m_mono_openxr_skipped_submit_this_frame) {
             const auto openxr_submit_start = std::chrono::steady_clock::now();
             utility::ScopeGuard openxr_submit_timing_guard{[&]() {
                 m_perf_openxr_submit.add(std::chrono::steady_clock::now() - openxr_submit_start);

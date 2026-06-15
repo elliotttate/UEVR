@@ -91,6 +91,7 @@ public:
     FfiTiming get_timing_openxr_submit()    const;
     FfiTiming get_timing_spectator_mirror() const;
     FfiTiming get_timing_post_present()     const;
+    uint64_t get_mono_openxr_skipped_submit_count() const { return m_mono_openxr_skipped_submit_count; }
 
     struct HitchFrameSnapshot {
         bool initialized{};
@@ -131,6 +132,8 @@ public:
 
     HitchFrameSnapshot get_hitch_frame_snapshot(VR* vr) const;
     bool has_game_and_ui_textures() const;
+    bool mono_openxr_unpaced_active_this_frame() const { return m_mono_openxr_unpaced_active_this_frame; }
+    bool mono_openxr_skipped_submit_this_frame() const { return m_mono_openxr_skipped_submit_this_frame; }
 
 private:
     friend class render::FrameResourceInspector;
@@ -213,6 +216,9 @@ private:
     FrameTimingStats m_perf_openxr_submit{};
     FrameTimingStats m_perf_spectator_mirror{};
     FrameTimingStats m_perf_post_present{};
+    uint64_t m_mono_openxr_skipped_submit_count{};
+    bool m_mono_openxr_unpaced_active_this_frame{};
+    bool m_mono_openxr_skipped_submit_this_frame{};
 
     d3d12::TextureContext m_backbuffer_copy{};
 

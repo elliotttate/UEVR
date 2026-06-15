@@ -73,6 +73,10 @@ bool vr_env_explicit_false(const char* name) {
     return raw == "0" || raw == "false" || raw == "FALSE" || raw == "off" || raw == "OFF";
 }
 
+bool vr_mono_openxr_unpaced_enabled() {
+    return !vr_env_explicit_false("UEVR_MONO_OPENXR_UNPACED");
+}
+
 bool vr_is_subnautica2_process() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -6969,7 +6973,13 @@ void VR::on_present() {
 
     const auto is_left_eye_frame = is_using_afr() ? (m_render_frame_count % 2 == m_left_eye_interval) : true;
 
-    if (is_left_eye_frame && get_synchronize_stage() == VR::SynchronizeStage::LATE) {
+    const auto mono_openxr_unpaced_late =
+        m_is_d3d12 &&
+        runtime->is_openxr() &&
+        is_mono_rendering_active() &&
+        vr_mono_openxr_unpaced_enabled();
+
+    if (is_left_eye_frame && get_synchronize_stage() == VR::SynchronizeStage::LATE && !mono_openxr_unpaced_late) {
         const auto had_sync = runtime->got_first_sync;
         runtime->synchronize_frame(std::nullopt, VRRuntime::SyncFrameCallsite::VRLateOnPresent);
 
@@ -7062,6 +7072,9 @@ void VR::on_post_present() {
         m_d3d12.on_post_present(this);
     }
 
+    const auto d3d12_mono_openxr_unpaced =
+        m_is_d3d12 && m_d3d12.mono_openxr_unpaced_active_this_frame();
+
     detect_controllers();
 
     const auto is_left_eye_frame = is_using_afr() ? (is_same_frame || (m_render_frame_count % 2 == m_left_eye_interval)) : true;
@@ -7071,7 +7084,9 @@ void VR::on_post_present() {
             get_synchronize_stage() == VR::SynchronizeStage::VERY_LATE &&
             should_defer_stalker2_very_late_openxr_wait(runtime, m_is_d3d12);
 
-        if (!should_defer_very_late_wait && (get_synchronize_stage() == VR::SynchronizeStage::VERY_LATE || !runtime->got_first_sync)) {
+        if (!d3d12_mono_openxr_unpaced &&
+            !should_defer_very_late_wait &&
+            (get_synchronize_stage() == VR::SynchronizeStage::VERY_LATE || !runtime->got_first_sync)) {
             const auto had_sync = runtime->got_first_sync;
             const auto callsite = get_synchronize_stage() == VR::SynchronizeStage::VERY_LATE
                 ? VRRuntime::SyncFrameCallsite::VRVeryLatePostPresent
@@ -7085,7 +7100,8 @@ void VR::on_post_present() {
             SPDLOG_INFO_ONCE("[Stalker2][OpenXR] Deferring VERY_LATE xrWaitFrame to the D3D12 submit path after initial valid poses");
         }
 
-        if (runtime->is_openxr() && m_openxr->can_run_frame_loop() && get_synchronize_stage() > VR::SynchronizeStage::EARLY) {
+        if (!d3d12_mono_openxr_unpaced &&
+            runtime->is_openxr() && m_openxr->can_run_frame_loop() && get_synchronize_stage() > VR::SynchronizeStage::EARLY) {
             if (!m_is_d3d12 && !m_openxr->frame_began) {
                 m_openxr->begin_frame("vr_post_present");
             }

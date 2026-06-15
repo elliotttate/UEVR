@@ -242,6 +242,20 @@ public:
         m_next_present_interval = interval;
     }
 
+    struct PresentTimingSnapshot {
+        uint64_t count{};
+        double total_ms{};
+        double avg_ms{};
+        double max_ms{};
+        UINT last_sync_interval{};
+        UINT last_flags{};
+        UINT last_original_sync_interval{};
+        UINT last_original_flags{};
+        HRESULT last_result{S_OK};
+    };
+
+    static PresentTimingSnapshot get_present_timing_snapshot();
+
 protected:
     ID3D12Device4* m_device{ nullptr };
     IDXGISwapChain3* m_swap_chain{ nullptr };

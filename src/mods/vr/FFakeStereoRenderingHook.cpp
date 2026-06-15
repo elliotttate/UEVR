@@ -83,6 +83,110 @@
 FFakeStereoRenderingHook* g_hook = nullptr;
 uint32_t g_frame_count{};
 
+namespace {
+struct EngineTickTimingBucket {
+    std::atomic<uint64_t> count{0};
+    std::atomic<uint64_t> total_ns{0};
+    std::atomic<uint64_t> max_ns{0};
+};
+
+EngineTickTimingBucket g_engine_tick_total_timing{};
+EngineTickTimingBucket g_engine_tick_pre_hook_timing{};
+EngineTickTimingBucket g_engine_tick_attempt_hooking_timing{};
+EngineTickTimingBucket g_engine_tick_game_thread_worker_timing{};
+EngineTickTimingBucket g_engine_tick_framework_pre_timing{};
+EngineTickTimingBucket g_engine_tick_tracking_pre_timing{};
+EngineTickTimingBucket g_engine_tick_mods_pre_timing{};
+EngineTickTimingBucket g_engine_tick_mod_framework_config_timing{};
+EngineTickTimingBucket g_engine_tick_mod_vr_timing{};
+EngineTickTimingBucket g_engine_tick_mod_render_inspector_timing{};
+EngineTickTimingBucket g_engine_tick_mod_uobject_hook_timing{};
+EngineTickTimingBucket g_engine_tick_mod_plugin_loader_timing{};
+EngineTickTimingBucket g_engine_tick_mod_lua_loader_timing{};
+EngineTickTimingBucket g_engine_tick_mod_other_timing{};
+EngineTickTimingBucket g_engine_tick_original_timing{};
+EngineTickTimingBucket g_engine_tick_post_hook_timing{};
+
+void update_engine_tick_max(std::atomic<uint64_t>& target, uint64_t value) {
+    auto current = target.load(std::memory_order_relaxed);
+    while (value > current &&
+           !target.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+void record_engine_tick_bucket(EngineTickTimingBucket& bucket, std::chrono::steady_clock::duration duration) {
+    const auto ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+    bucket.count.fetch_add(1, std::memory_order_relaxed);
+    bucket.total_ns.fetch_add(ns, std::memory_order_relaxed);
+    update_engine_tick_max(bucket.max_ns, ns);
+}
+
+EngineTickTimingBucket& engine_tick_bucket_for_mod(std::string_view name) {
+    if (name == "FrameworkConfig") {
+        return g_engine_tick_mod_framework_config_timing;
+    }
+
+    if (name == "VR") {
+        return g_engine_tick_mod_vr_timing;
+    }
+
+    if (name == "Render Inspector") {
+        return g_engine_tick_mod_render_inspector_timing;
+    }
+
+    if (name == "UObjectHook") {
+        return g_engine_tick_mod_uobject_hook_timing;
+    }
+
+    if (name == "PluginLoader") {
+        return g_engine_tick_mod_plugin_loader_timing;
+    }
+
+    if (name == "LuaLoader") {
+        return g_engine_tick_mod_lua_loader_timing;
+    }
+
+    return g_engine_tick_mod_other_timing;
+}
+
+void record_engine_tick_mod_bucket(std::string_view name, std::chrono::steady_clock::duration duration) {
+    record_engine_tick_bucket(engine_tick_bucket_for_mod(name), duration);
+}
+
+FFakeStereoRenderingHook::TimingBucketSnapshot snapshot_engine_tick_bucket(const EngineTickTimingBucket& bucket) {
+    FFakeStereoRenderingHook::TimingBucketSnapshot out{};
+    out.count = bucket.count.load(std::memory_order_relaxed);
+    const auto total_ns = bucket.total_ns.load(std::memory_order_relaxed);
+    const auto max_ns = bucket.max_ns.load(std::memory_order_relaxed);
+    out.total_ms = static_cast<double>(total_ns) / 1000000.0;
+    out.avg_ms = out.count == 0 ? 0.0 : out.total_ms / static_cast<double>(out.count);
+    out.max_ms = static_cast<double>(max_ns) / 1000000.0;
+    return out;
+}
+} // namespace
+
+FFakeStereoRenderingHook::EngineTickTimingSnapshot FFakeStereoRenderingHook::get_engine_tick_timing_snapshot() {
+    EngineTickTimingSnapshot out{};
+    out.total = snapshot_engine_tick_bucket(g_engine_tick_total_timing);
+    out.pre_hook = snapshot_engine_tick_bucket(g_engine_tick_pre_hook_timing);
+    out.attempt_hooking = snapshot_engine_tick_bucket(g_engine_tick_attempt_hooking_timing);
+    out.game_thread_worker = snapshot_engine_tick_bucket(g_engine_tick_game_thread_worker_timing);
+    out.framework_pre = snapshot_engine_tick_bucket(g_engine_tick_framework_pre_timing);
+    out.tracking_pre = snapshot_engine_tick_bucket(g_engine_tick_tracking_pre_timing);
+    out.mods_pre = snapshot_engine_tick_bucket(g_engine_tick_mods_pre_timing);
+    out.mod_framework_config = snapshot_engine_tick_bucket(g_engine_tick_mod_framework_config_timing);
+    out.mod_vr = snapshot_engine_tick_bucket(g_engine_tick_mod_vr_timing);
+    out.mod_render_inspector = snapshot_engine_tick_bucket(g_engine_tick_mod_render_inspector_timing);
+    out.mod_uobject_hook = snapshot_engine_tick_bucket(g_engine_tick_mod_uobject_hook_timing);
+    out.mod_plugin_loader = snapshot_engine_tick_bucket(g_engine_tick_mod_plugin_loader_timing);
+    out.mod_lua_loader = snapshot_engine_tick_bucket(g_engine_tick_mod_lua_loader_timing);
+    out.mod_other = snapshot_engine_tick_bucket(g_engine_tick_mod_other_timing);
+    out.original_tick = snapshot_engine_tick_bucket(g_engine_tick_original_timing);
+    out.post_hook = snapshot_engine_tick_bucket(g_engine_tick_post_hook_timing);
+    return out;
+}
+
 // 2026-05-17 evening: file-external linkage so D3D12Hook.cpp can read the
 // most recent view-0 fog texture pointer (published by the lightscat
 // midhook). Used by the fog descriptor swap to pick which pool entry to
@@ -6174,6 +6278,7 @@ void FFakeStereoRenderingHook::attempt_hook_game_engine_tick(uintptr_t return_ad
 void* FFakeStereoRenderingHook::engine_tick_hook(sdk::UGameEngine* engine, float delta, bool idle) {
     ZoneScopedN("UGameEngine::Tick Hook");
     FrameMarkStart("UGameEngine::Tick");
+    const auto engine_tick_total_start = std::chrono::steady_clock::now();
 
     sdk::UEngine::set_runtime_engine(engine);
 
@@ -6233,12 +6338,18 @@ void* FFakeStereoRenderingHook::engine_tick_hook(sdk::UGameEngine* engine, float
 
     // Dumper mode: skip render-pipeline hooks (see DumperMode.hpp). Engine
     // tick dispatch below still runs, so plugins receive on_pre_engine_tick.
+    auto pre_phase_start = std::chrono::steady_clock::now();
     if (!uevr::is_dumper_mode()) {
         hook->attempt_hooking();
     }
+    auto pre_phase_end = std::chrono::steady_clock::now();
+    record_engine_tick_bucket(g_engine_tick_attempt_hooking_timing, pre_phase_end - pre_phase_start);
 
     // Best place to run game thread jobs.
+    pre_phase_start = pre_phase_end;
     GameThreadWorker::get().execute();
+    pre_phase_end = std::chrono::steady_clock::now();
+    record_engine_tick_bucket(g_engine_tick_game_thread_worker_timing, pre_phase_end - pre_phase_start);
 
     if (hook->m_ignore_next_engine_tick) {
         hook->m_ignored_engine_delta = delta;
@@ -6250,24 +6361,37 @@ void* FFakeStereoRenderingHook::engine_tick_hook(sdk::UGameEngine* engine, float
     // needs a D3D device + swapchain that we never installed, and
     // enable_engine_thread is a VR-only optimization. The mod fan-out below
     // still runs, so plugins still get on_pre_engine_tick callbacks.
+    pre_phase_start = pre_phase_end;
     if (!uevr::is_dumper_mode()) {
         g_framework->enable_engine_thread();
         g_framework->run_imgui_frame(false);
     }
+    pre_phase_end = std::chrono::steady_clock::now();
+    record_engine_tick_bucket(g_engine_tick_framework_pre_timing, pre_phase_end - pre_phase_start);
 
     delta += hook->m_ignored_engine_delta;
     hook->m_ignored_engine_delta = 0.0f;
 
+    pre_phase_start = pre_phase_end;
     if (hook->m_tracking_system_hook != nullptr) {
         hook->m_tracking_system_hook->on_pre_engine_tick(engine, delta);
     }
+    pre_phase_end = std::chrono::steady_clock::now();
+    record_engine_tick_bucket(g_engine_tick_tracking_pre_timing, pre_phase_end - pre_phase_start);
 
     const auto& mods = g_framework->get_mods()->get_mods();
+    pre_phase_start = pre_phase_end;
     for (auto& mod : mods) {
+        const auto mod_start = std::chrono::steady_clock::now();
         mod->on_pre_engine_tick(engine, delta);
+        const auto mod_end = std::chrono::steady_clock::now();
+        record_engine_tick_mod_bucket(mod->get_name(), mod_end - mod_start);
     }
+    pre_phase_end = std::chrono::steady_clock::now();
+    record_engine_tick_bucket(g_engine_tick_mods_pre_timing, pre_phase_end - pre_phase_start);
 
     void* result = nullptr;
+    const auto engine_tick_original_start = pre_phase_end;
 
     {
         if (hook->m_safe_tick_hook->value()) {
@@ -6304,6 +6428,7 @@ void* FFakeStereoRenderingHook::engine_tick_hook(sdk::UGameEngine* engine, float
 #endif
         }
     }
+    const auto engine_tick_original_end = std::chrono::steady_clock::now();
 
     for (auto& mod : mods) {
         mod->on_post_engine_tick(engine, delta);
@@ -6312,6 +6437,12 @@ void* FFakeStereoRenderingHook::engine_tick_hook(sdk::UGameEngine* engine, float
     if (hook->m_tracking_system_hook != nullptr) {
         hook->m_tracking_system_hook->on_post_engine_tick(engine, delta);
     }
+
+    const auto engine_tick_post_end = std::chrono::steady_clock::now();
+    record_engine_tick_bucket(g_engine_tick_total_timing, engine_tick_post_end - engine_tick_total_start);
+    record_engine_tick_bucket(g_engine_tick_pre_hook_timing, engine_tick_original_start - engine_tick_total_start);
+    record_engine_tick_bucket(g_engine_tick_original_timing, engine_tick_original_end - engine_tick_original_start);
+    record_engine_tick_bucket(g_engine_tick_post_hook_timing, engine_tick_post_end - engine_tick_original_end);
 
     return result;
 }
@@ -17158,7 +17289,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         ? (g_frame_count + last_index) % 2
         : (vr->is_single_view_rendering_active() ? vr->get_single_view_reference_eye(g_frame_count) : last_index);
 
-    if (vr->is_dibr_afw_requested() && vr->is_single_view_rendering_active()) {
+    if (vr->is_dibr_single_view_active() && vr->is_dibr_afw_requested()) {
         static std::atomic<int> s_afw_trace{0};
         if (s_afw_trace.fetch_add(1, std::memory_order_relaxed) < 240) {
             SPDLOG_INFO("[DIBR][AFWTRACE] sceneview frame={} eye={}", g_frame_count, true_index);
@@ -17889,7 +18020,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
     // (it flows through enqueue_render_poses to m_render_frame_count) - so
     // the rendered-eye association is structural, immune to the
     // internal_frame_count wobble from out-of-band synchronize_frame calls.
-    if (vr->is_dibr_afw_requested()) {
+    if (vr->is_dibr_single_view_active() && vr->is_dibr_afw_requested()) {
         vr->set_afw_family_frame(frame_count);
         // Tag the depth-snapshot machinery with the same frame so the copy
         // recorded at this frame's depth bind is keyed to it.
@@ -19448,12 +19579,13 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     // last pass of the frame, so the per-frame bookkeeping gated on
     // true_index 0/1 below must also fire.
     const auto dibr_single_view = !vr->is_using_afr() && vr->is_single_view_rendering_active();
+    const auto dibr_afw_single_view = dibr_single_view && vr->is_dibr_single_view_active() && vr->is_dibr_afw_requested();
     const auto has_double_precision = g_hook->m_has_double_precision;
     const auto rot_d = (Rotator<double>*)view_rotation;
 
     // AFW parity forensics: which sites actually run in this title, with
     // which frame counters (correlate with the [DIBR][AFWTRACE] synth lines).
-    if (vr->is_dibr_afw_requested()) {
+    if (dibr_afw_single_view) {
         static std::atomic<int> s_afw_trace{0};
         if (s_afw_trace.fetch_add(1, std::memory_order_relaxed) < 240) {
             SPDLOG_INFO("[DIBR][AFWTRACE] offset_entry frame={} view_index={} full={} single_view={}",
@@ -19524,7 +19656,7 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         // AFW parity forensics: correlate against the synthesis-side trace
         // ([DIBR][AFWTRACE] synth ...) to prove the rendered-eye/warp-direction
         // association per engine frame.
-        if (vr->is_dibr_afw_requested()) {
+        if (dibr_afw_single_view) {
             static std::atomic<int> s_afw_trace{0};
             if (s_afw_trace.fetch_add(1, std::memory_order_relaxed) < 240) {
                 SPDLOG_INFO("[DIBR][AFWTRACE] offset frame={} eye={} full={}", g_frame_count, true_index, is_full_pass);
@@ -19703,7 +19835,7 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         // for the authoritative rendered eye and the exact camera delta the
         // temporal history reprojection needs (engine-side camera motion is
         // invisible to a pure HMD-pose delta).
-        if (dibr_single_view && vr->is_dibr_afw_requested()) {
+        if (dibr_afw_single_view) {
             const auto final_loc = !has_double_precision
                 ? glm::vec3{view_location->x, view_location->y, view_location->z}
                 : glm::vec3{(float)view_d->x, (float)view_d->y, (float)view_d->z};
@@ -19949,7 +20081,7 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
             // The lone engine view is the reference eye (DIBR) / eye 0 (Mono);
             // under AFW the eye alternates with the engine frame.
             true_index = vr->get_single_view_reference_eye(g_frame_count);
-            if (vr->is_dibr_afw_requested()) {
+            if (vr->is_dibr_single_view_active() && vr->is_dibr_afw_requested()) {
                 static std::atomic<int> s_afw_trace{0};
                 if (s_afw_trace.fetch_add(1, std::memory_order_relaxed) < 240) {
                     SPDLOG_INFO("[DIBR][AFWTRACE] projection frame={} eye={}", g_frame_count, true_index);

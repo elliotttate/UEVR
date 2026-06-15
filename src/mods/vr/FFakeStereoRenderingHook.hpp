@@ -341,6 +341,34 @@ class FFakeStereoRenderingHook : public ModComponent {
 public:
     FFakeStereoRenderingHook();
 
+    struct TimingBucketSnapshot {
+        uint64_t count{};
+        double total_ms{};
+        double avg_ms{};
+        double max_ms{};
+    };
+
+    struct EngineTickTimingSnapshot {
+        TimingBucketSnapshot total{};
+        TimingBucketSnapshot pre_hook{};
+        TimingBucketSnapshot attempt_hooking{};
+        TimingBucketSnapshot game_thread_worker{};
+        TimingBucketSnapshot framework_pre{};
+        TimingBucketSnapshot tracking_pre{};
+        TimingBucketSnapshot mods_pre{};
+        TimingBucketSnapshot mod_framework_config{};
+        TimingBucketSnapshot mod_vr{};
+        TimingBucketSnapshot mod_render_inspector{};
+        TimingBucketSnapshot mod_uobject_hook{};
+        TimingBucketSnapshot mod_plugin_loader{};
+        TimingBucketSnapshot mod_lua_loader{};
+        TimingBucketSnapshot mod_other{};
+        TimingBucketSnapshot original_tick{};
+        TimingBucketSnapshot post_hook{};
+    };
+
+    static EngineTickTimingSnapshot get_engine_tick_timing_snapshot();
+
     VRRenderTargetManager_Base* get_render_target_manager() {
         if (m_uses_old_rendertarget_manager) {
             return static_cast<VRRenderTargetManager_Base*>(&m_rtm_418);

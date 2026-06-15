@@ -2,6 +2,7 @@
 #include <TlHelp32.h>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -55,6 +56,26 @@ bool env_truthy(const char* name) {
 bool frame_profiler_log_enabled() {
     static const bool enabled = env_truthy("UEVR_OPENXR_FRAME_PROFILER_LOG");
     return enabled;
+}
+
+float env_float_or(const char* name, float fallback) {
+    char value[64]{};
+    const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+    if (len == 0 || len >= sizeof(value)) {
+        return fallback;
+    }
+
+    char* end = nullptr;
+    const auto parsed = std::strtof(value, &end);
+    return end != value ? parsed : fallback;
+}
+
+float mono_openxr_render_scale() {
+    static const float scale = []() {
+        const auto parsed = env_float_or("UEVR_MONO_OPENXR_RENDER_SCALE", 1.0f);
+        return std::clamp(parsed, 0.1f, 3.0f);
+    }();
+    return scale;
 }
 
 struct ScopedOpenXRTiming {
@@ -1278,9 +1299,16 @@ uint32_t OpenXR::get_width() const {
     const auto use_last_applied =
         (this->resolution_scale_reconfigure_pending || this->resolution_scale_live_apply_deferred) &&
         this->last_applied_resolution_width != 0;
-    const auto scale = use_last_applied
+    auto scale = use_last_applied
         ? this->last_applied_resolution_scale
         : this->resolution_scale->value();
+    if (VR::get()->is_mono_rendering_active()) {
+        const auto mono_scale = mono_openxr_render_scale();
+        if (mono_scale != 1.0f) {
+            SPDLOG_INFO_ONCE("[OpenXR][mono] Applying UEVR_MONO_OPENXR_RENDER_SCALE={} to OpenXR width", mono_scale);
+        }
+        scale *= mono_scale;
+    }
 
     return (uint32_t)((float)this->view_configs[0].recommendedImageRectWidth * scale * eye_width_adjustment);
 }
@@ -1293,9 +1321,16 @@ uint32_t OpenXR::get_height() const {
     const auto use_last_applied =
         (this->resolution_scale_reconfigure_pending || this->resolution_scale_live_apply_deferred) &&
         this->last_applied_resolution_height != 0;
-    const auto scale = use_last_applied
+    auto scale = use_last_applied
         ? this->last_applied_resolution_scale
         : this->resolution_scale->value();
+    if (VR::get()->is_mono_rendering_active()) {
+        const auto mono_scale = mono_openxr_render_scale();
+        if (mono_scale != 1.0f) {
+            SPDLOG_INFO_ONCE("[OpenXR][mono] Applying UEVR_MONO_OPENXR_RENDER_SCALE={} to OpenXR height", mono_scale);
+        }
+        scale *= mono_scale;
+    }
 
     return (uint32_t)((float)this->view_configs[0].recommendedImageRectHeight * scale * eye_height_adjustment);
 }

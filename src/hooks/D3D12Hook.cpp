@@ -85,6 +85,60 @@ static D3D12Hook* g_d3d12_hook = nullptr;
 using Sn2EclFn = void(WINAPI*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 static std::atomic<Sn2EclFn> g_sn2_ecl_original{ nullptr };
 
+namespace {
+std::atomic<uint64_t> g_dxgi_present_count{0};
+std::atomic<uint64_t> g_dxgi_present_total_ns{0};
+std::atomic<uint64_t> g_dxgi_present_max_ns{0};
+std::atomic<UINT> g_dxgi_present_last_sync_interval{0};
+std::atomic<UINT> g_dxgi_present_last_flags{0};
+std::atomic<UINT> g_dxgi_present_last_original_sync_interval{0};
+std::atomic<UINT> g_dxgi_present_last_original_flags{0};
+std::atomic<long> g_dxgi_present_last_result{S_OK};
+
+void update_atomic_max(std::atomic<uint64_t>& target, uint64_t value) {
+    auto current = target.load(std::memory_order_relaxed);
+    while (value > current &&
+           !target.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+void record_dxgi_present_timing(
+    std::chrono::steady_clock::duration duration,
+    UINT sync_interval,
+    UINT flags,
+    UINT original_sync_interval,
+    UINT original_flags,
+    HRESULT result
+) {
+    const auto ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+    g_dxgi_present_count.fetch_add(1, std::memory_order_relaxed);
+    g_dxgi_present_total_ns.fetch_add(ns, std::memory_order_relaxed);
+    update_atomic_max(g_dxgi_present_max_ns, ns);
+    g_dxgi_present_last_sync_interval.store(sync_interval, std::memory_order_relaxed);
+    g_dxgi_present_last_flags.store(flags, std::memory_order_relaxed);
+    g_dxgi_present_last_original_sync_interval.store(original_sync_interval, std::memory_order_relaxed);
+    g_dxgi_present_last_original_flags.store(original_flags, std::memory_order_relaxed);
+    g_dxgi_present_last_result.store(static_cast<long>(result), std::memory_order_relaxed);
+}
+} // namespace
+
+D3D12Hook::PresentTimingSnapshot D3D12Hook::get_present_timing_snapshot() {
+    PresentTimingSnapshot out{};
+    out.count = g_dxgi_present_count.load(std::memory_order_relaxed);
+    const auto total_ns = g_dxgi_present_total_ns.load(std::memory_order_relaxed);
+    const auto max_ns = g_dxgi_present_max_ns.load(std::memory_order_relaxed);
+    out.total_ms = static_cast<double>(total_ns) / 1000000.0;
+    out.avg_ms = out.count == 0 ? 0.0 : out.total_ms / static_cast<double>(out.count);
+    out.max_ms = static_cast<double>(max_ns) / 1000000.0;
+    out.last_sync_interval = g_dxgi_present_last_sync_interval.load(std::memory_order_relaxed);
+    out.last_flags = g_dxgi_present_last_flags.load(std::memory_order_relaxed);
+    out.last_original_sync_interval = g_dxgi_present_last_original_sync_interval.load(std::memory_order_relaxed);
+    out.last_original_flags = g_dxgi_present_last_original_flags.load(std::memory_order_relaxed);
+    out.last_result = static_cast<HRESULT>(g_dxgi_present_last_result.load(std::memory_order_relaxed));
+    return out;
+}
+
 // 2026-05-17 evening: published by FFakeStereoRenderingHook's lightscat
 // midhook on every view-0 compute_volumetric_fog call. Read here by the
 // fog descriptor swap to identify "view 0's currently-correct fog texture"
@@ -4794,8 +4848,11 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
     ++g_present_depth;
 
     auto result = S_OK;
+    const auto dxgi_present_start = std::chrono::steady_clock::now();
+    bool dxgi_present_called = false;
     
     if (!d3d12->m_ignore_next_present) {
+        dxgi_present_called = true;
         result = present_fn(swap_chain, sync_interval, flags, params);
 
         if (result == DXGI_ERROR_INVALID_CALL &&
@@ -4829,6 +4886,16 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
         }
     } else {
         d3d12->m_ignore_next_present = false;
+    }
+
+    if (dxgi_present_called) {
+        record_dxgi_present_timing(
+            std::chrono::steady_clock::now() - dxgi_present_start,
+            sync_interval,
+            flags,
+            original_sync_interval,
+            original_flags,
+            result);
     }
 
     --g_present_depth;

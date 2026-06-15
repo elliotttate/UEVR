@@ -2764,14 +2764,65 @@ extern "C" UEVR_RENDER_CAPI const char* uevr_render_diag_frame_timing_json() {
         auto to_j = [](const auto& t) {
             return json{{"count", t.count}, {"avg_ms", t.avg_ms}, {"max_ms", t.max_ms}};
         };
-        return publish(json{
+        auto to_runtime_j = [](const auto& t) {
+            return json{{"count", t.count}, {"avg_ms", t.avg()}, {"max_ms", t.max_ms}};
+        };
+        auto to_bucket_j = [](const auto& t) {
+            return json{{"count", t.count}, {"total_ms", t.total_ms}, {"avg_ms", t.avg_ms}, {"max_ms", t.max_ms}};
+        };
+
+        json result{
             {"on_frame",          to_j(d12.get_timing_on_frame())},
             {"ui_copy",           to_j(d12.get_timing_ui_copy())},
             {"swapchain_copy",    to_j(d12.get_timing_swapchain_copy())},
             {"openxr_submit",     to_j(d12.get_timing_openxr_submit())},
             {"spectator_mirror",  to_j(d12.get_timing_spectator_mirror())},
             {"post_present",      to_j(d12.get_timing_post_present())},
-        });
+            {"mono_openxr_skipped_submit_count", d12.get_mono_openxr_skipped_submit_count()},
+        };
+
+        const auto dxgi_present = D3D12Hook::get_present_timing_snapshot();
+        result["dxgi_present"] = json{
+            {"count", dxgi_present.count},
+            {"total_ms", dxgi_present.total_ms},
+            {"avg_ms", dxgi_present.avg_ms},
+            {"max_ms", dxgi_present.max_ms},
+            {"last_sync_interval", dxgi_present.last_sync_interval},
+            {"last_flags", dxgi_present.last_flags},
+            {"last_original_sync_interval", dxgi_present.last_original_sync_interval},
+            {"last_original_flags", dxgi_present.last_original_flags},
+            {"last_result", dxgi_present.last_result},
+        };
+
+        const auto engine_tick = FFakeStereoRenderingHook::get_engine_tick_timing_snapshot();
+        result["engine_tick"] = json{
+            {"total", to_bucket_j(engine_tick.total)},
+            {"pre_hook", to_bucket_j(engine_tick.pre_hook)},
+            {"attempt_hooking", to_bucket_j(engine_tick.attempt_hooking)},
+            {"game_thread_worker", to_bucket_j(engine_tick.game_thread_worker)},
+            {"framework_pre", to_bucket_j(engine_tick.framework_pre)},
+            {"tracking_pre", to_bucket_j(engine_tick.tracking_pre)},
+            {"mods_pre", to_bucket_j(engine_tick.mods_pre)},
+            {"mods", json{
+                {"FrameworkConfig", to_bucket_j(engine_tick.mod_framework_config)},
+                {"VR", to_bucket_j(engine_tick.mod_vr)},
+                {"Render Inspector", to_bucket_j(engine_tick.mod_render_inspector)},
+                {"UObjectHook", to_bucket_j(engine_tick.mod_uobject_hook)},
+                {"PluginLoader", to_bucket_j(engine_tick.mod_plugin_loader)},
+                {"LuaLoader", to_bucket_j(engine_tick.mod_lua_loader)},
+                {"Other", to_bucket_j(engine_tick.mod_other)},
+            }},
+            {"original_tick", to_bucket_j(engine_tick.original_tick)},
+            {"post_hook", to_bucket_j(engine_tick.post_hook)},
+        };
+
+        if (auto* openxr = vr->get_openxr_runtime(); openxr != nullptr) {
+            result["openxr_wait"] = to_runtime_j(openxr->wait_frame_timing);
+            result["openxr_begin"] = to_runtime_j(openxr->begin_frame_timing);
+            result["openxr_end"] = to_runtime_j(openxr->end_frame_timing);
+        }
+
+        return publish(std::move(result));
     } catch (const std::exception& e) {
         return publish(json{{"error", e.what()}});
     }
