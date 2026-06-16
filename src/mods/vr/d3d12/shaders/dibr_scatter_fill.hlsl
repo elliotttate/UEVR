@@ -373,6 +373,30 @@ bool SolidCoverage(int2 p, int2 away, out uint key)
     return true;
 }
 
+bool RealCovered(int x, int y, out uint key)
+{
+    key = 0u;
+    if (x < 0 || x >= (int)synth_width || y < 0 || y >= (int)synth_height) {
+        return false;
+    }
+    uint k = g_scatterKey[uint2(x, y)];
+    if (k == 0u || (k & 0x80000000u) != 0u || g_scatterColor[uint2(x, y)].a <= 0.5f) {
+        return false;
+    }
+    key = k;
+    return true;
+}
+
+bool BackgroundDepthOk(uint key, uint refKey)
+{
+    float refDepth = asfloat(refKey);
+    float depthTol = max(0.05f * refDepth, 0.01f);
+    // Reversed-Z: larger device depth is closer to the eye. For a reveal
+    // source we can walk to equal/farther surfaces, but we should not cross
+    // back onto the foreground silhouette.
+    return asfloat(key) <= refDepth + depthTol;
+}
+
 // Average a short run of covered BACKGROUND pixels starting at a scanline
 // neighbour and stepping `dir` further AWAY from the hole (always into
 // already-covered territory). This dilutes the anti-aliased occluder-edge
@@ -400,6 +424,88 @@ float3 SampleBackgroundRun(int startX, int y, int dir, uint refKey)
         wsum += w;
     }
     return (wsum > 0.0f) ? (acc / wsum) : g_scatterColor[uint2(startX, y)].rgb;
+}
+
+float3 SampleBackgroundRunRows(int startX, int startY, int dir, uint refKey)
+{
+    float3 acc = float3(0.0f, 0.0f, 0.0f);
+    float wsum = 0.0f;
+
+    [unroll]
+    for (int oi = 0; oi < 5; ++oi) {
+        int oy = (oi == 0) ? 0 : ((oi == 1) ? -1 : ((oi == 2) ? 1 : ((oi == 3) ? -2 : 2)));
+        int y = startY + oy;
+        uint k;
+        if (!RealCovered(startX, y, k) || !BackgroundDepthOk(k, refKey)) {
+            continue;
+        }
+
+        // Adjacent rows keep thin foliage reveals from becoming horizontal
+        // ladders, but the center row still owns the decision.
+        float rowWeight = (oy == 0) ? 4.0f : ((abs(oy) == 1) ? 1.5f : 0.75f);
+        acc += SampleBackgroundRun(startX, y, dir, refKey) * rowWeight;
+        wsum += rowWeight;
+    }
+
+    return (wsum > 0.0f) ? (acc / wsum) : SampleBackgroundRun(startX, startY, dir, refKey);
+}
+
+bool FindBackgroundOnRow(int x0, int y, int dir, out int bx, out uint bkey)
+{
+    bx = -1;
+    bkey = 0u;
+
+    if (y < 0 || y >= (int)synth_height) {
+        return false;
+    }
+
+    const int kFineSearch = 8;
+    const int kCoarseStep = 4;
+    const int kMaxSearch = 96;
+
+    int i = 1;
+    int hits = 0;
+    [loop]
+    while (i <= kMaxSearch) {
+        int x = x0 + dir * i;
+        if (x < 0 || x >= (int)synth_width) break;
+
+        uint k;
+        if (SolidCoverage(int2(x, y), int2(dir, 0), k)) {
+            if (bx < 0 || asfloat(k) < asfloat(bkey)) {
+                bx = x;
+                bkey = k;
+            }
+            if (++hits >= 4) break;
+            i += 6; // hop past this surface before the next census tap
+        } else {
+            i += (i < kFineSearch) ? 1 : kCoarseStep;
+        }
+    }
+
+    return bx >= 0;
+}
+
+bool FindBackgroundNeighborhood(int2 hole, int dir, out int bx, out int by, out uint bkey)
+{
+    bx = -1;
+    by = -1;
+    bkey = 0u;
+
+    [unroll]
+    for (int oi = 0; oi < 5; ++oi) {
+        int oy = (oi == 0) ? 0 : ((oi == 1) ? -1 : ((oi == 2) ? 1 : ((oi == 3) ? -2 : 2)));
+        int rowX = -1;
+        uint rowKey = 0u;
+        if (FindBackgroundOnRow(hole.x, hole.y + oy, dir, rowX, rowKey)) {
+            bx = rowX;
+            by = hole.y + oy;
+            bkey = rowKey;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 [numthreads(DIBR_TG, DIBR_TG, 1)]
@@ -483,7 +589,9 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     uint prov = 0u;
     float4 c = float4(0.0f, 0.0f, 0.0f, 1.0f);
     uint fillKey = 0u;
-    bool haveFallback = false;
+    int bx = -1;
+    int by = -1;
+    uint bkey = 0u;
 
     if (xl >= 0 && xr >= 0) {
         float dl = asfloat(kl);
@@ -520,20 +628,18 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 return;
             }
         }
-        // Mixed-depth edge gap: a REVEAL band. The provenance view showed the
-        // interpolated gradient claiming virtually every reveal (the early
-        // return here starved the stash/background paths) - and a synthetic
-        // gradient on synth frames alternating against REAL content on real
-        // frames IS the half-rate band flicker. The gradient is demoted to
-        // the FALLBACK; the temporal block below tries last frame's real
-        // render first, then the accumulated background layer.
-        c = float4(col, 1.0f);
-        fillKey = (dl < dr) ? kl : kr; // farther side = the reveal's content
-        prov = 1u;
-        haveFallback = true;
+        // Mixed-depth edge gap: a REVEAL band. A two-sided gradient looks
+        // smooth in one row but boils against the real frame when the head
+        // moves. Seed the reveal from the known far side, then let the
+        // directional/background-history path do the actual fill.
+        const bool leftIsFar = (dl < dr); // reversed-Z: smaller = farther
+        bx = leftIsFar ? xl : xr;
+        by = (int)dtid.y;
+        bkey = leftIsFar ? kl : kr;
+        fillKey = bkey;
     }
 
-    if (!haveFallback && (xl < 0 || xr < 0)) {
+    if (xl < 0 || xr < 0) {
         // Thin VERTICAL geometry (fronds, coral stalks) drops sparse texels
         // under head rotation: horizontally the gap sees one side or none,
         // and the reveal machinery would paint the background from BEHIND
@@ -585,11 +691,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // land slightly farther out - fine for background extension). No hit
     // (image edge, peripheral gate) falls back to the source color at this
     // position (flat mono fill, real content where the temporal gate passes).
-    const int kFineSearch = 8;
-    const int kCoarseStep = 4;
-    const int kMaxSearch = 96;
     const int dir = (SynthEyeSign() < 0.0f) ? 1 : -1; // toward the background side
-    int bx = -1; uint bkey = 0u;
 
     // Peripheral gate (PD doctrine): reveals far from the view center sit in
     // the lens periphery where the compose's edge guard already compresses
@@ -602,7 +704,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // Keys with the MSB marker were committed by this fill pass itself (other
     // threads, this dispatch) - skip them so hole pixels never adopt other
     // hole pixels' fill as real geometry (that ordering race would shimmer).
-    if (central && !haveFallback) {
+    if (central && bx < 0) {
         // Depth-aware: at thin-object reveals (plant fronds, railings) the
         // FIRST covered texel along the walk is often the NEXT occluder
         // strand - foreground, not the background the reveal exposes -
@@ -611,37 +713,21 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         // few px past each hit so a strand's run counts once) and keep the
         // FARTHEST (smallest reversed-Z key): reveals expose background by
         // definition.
-        int i = 1;
-        int hits = 0;
-        [loop]
-        while (i <= kMaxSearch) {
-            int x = (int)dtid.x + dir * i;
-            if (x < 0 || x >= (int)synth_width) break;
-            uint k = g_scatterKey[uint2(x, dtid.y)];
-            if (k != 0u && (k & 0x80000000u) == 0u && g_scatterColor[uint2(x, dtid.y)].a > 0.5f) {
-                if (bx < 0 || asfloat(k) < asfloat(bkey)) { bx = x; bkey = k; }
-                if (++hits >= 3) break;
-                i += 6; // hop past this surface before the next census tap
-            } else {
-                i += (i < kFineSearch) ? 1 : kCoarseStep;
-            }
-        }
+        FindBackgroundNeighborhood(int2((int)dtid.x, (int)dtid.y), dir, bx, by, bkey);
     }
 
-    if (!haveFallback) {
-        if (bx >= 0) {
-            // Average a short run a few pixels INTO the background (stepping
-            // away from the hole) instead of copying the single hole-edge
-            // pixel, whose color is the anti-aliased boundary.
-            c = float4(SampleBackgroundRun(bx, (int)dtid.y, dir, bkey), 1.0f);
-            fillKey = bkey;
-        } else {
-            float2 srcUv = holeUv;
-            if (overscan_x > 1.0f) {
-                srcUv.x = 0.5f + (srcUv.x - 0.5f) / overscan_x; // crop overscanned source to true FOV
-            }
-            c = float4(g_colorTex.SampleLevel(g_linearSampler, srcUv, 0).rgb, 1.0f);
+    if (bx >= 0) {
+        // Average a short run a few pixels INTO the background (stepping
+        // away from the hole) instead of copying the single hole-edge
+        // pixel, whose color is the anti-aliased boundary.
+        c = float4(SampleBackgroundRunRows(bx, (by >= 0) ? by : (int)dtid.y, dir, bkey), 1.0f);
+        fillKey = bkey;
+    } else {
+        float2 srcUv = holeUv;
+        if (overscan_x > 1.0f) {
+            srcUv.x = 0.5f + (srcUv.x - 0.5f) / overscan_x; // crop overscanned source to true FOV
         }
+        c = float4(g_colorTex.SampleLevel(g_linearSampler, srcUv, 0).rgb, 1.0f);
     }
 
     // R3 temporal reuse: reproject this hole into LAST frame's synthesized eye

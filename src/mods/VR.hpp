@@ -1627,7 +1627,7 @@ private:
     const ModSlider::Ptr m_dibr_overscan{ ModSlider::create(generate_name("DIBR_Overscan"), 1.0f, 1.5f, 1.12f) };
     const ModToggle::Ptr m_dibr_temporal{ ModToggle::create(generate_name("DIBR_TemporalFill"), true) };
     const ModSlider::Ptr m_dibr_temporal_blend{ ModSlider::create(generate_name("DIBR_TemporalBlend"), 0.0f, 0.95f, 0.85f) };
-    const ModToggle::Ptr m_dibr_hybrid_near_stereo{ ModToggle::create(generate_name("DIBR_HybridNearStereo"), true) };
+    const ModToggle::Ptr m_dibr_hybrid_near_stereo{ ModToggle::create(generate_name("DIBR_HybridNearStereo"), false) };
     const ModSlider::Ptr m_dibr_hybrid_split{ ModSlider::create(generate_name("DIBR_HybridSplit"), 50.0f, 5000.0f, 2000.0f) };
     const ModSlider::Ptr m_dibr_hybrid_feather{ ModSlider::create(generate_name("DIBR_HybridFeather"), 1.0f, 1000.0f, 500.0f) };
     std::array<std::atomic<int32_t>, 4> m_dibr_hybrid_target_view_rect{};

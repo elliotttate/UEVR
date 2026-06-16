@@ -268,6 +268,7 @@ void VR::single_view_openxr_async_wait_worker_loop(std::stop_token stop_token) {
 
         if (single_view_pacing) {
             m_d3d12.release_single_view_openxr_scene_swapchain();
+            m_d3d12.pre_acquire_single_view_openxr_scene_swapchain(true);
         }
 
         openxr->synchronize_frame(

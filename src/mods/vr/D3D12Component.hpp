@@ -100,7 +100,7 @@ public:
     FfiTiming get_timing_openxr_swapchain_release() const;
     uint64_t get_single_view_openxr_skipped_submit_count() const { return m_single_view_openxr_skipped_submit_count; }
     uint64_t get_mono_openxr_skipped_submit_count() const { return get_single_view_openxr_skipped_submit_count(); }
-    void pre_acquire_single_view_openxr_scene_swapchain();
+    void pre_acquire_single_view_openxr_scene_swapchain(bool allow_unsynced_frame = false);
     void release_single_view_openxr_scene_swapchain();
 
     struct HitchFrameSnapshot {
@@ -160,7 +160,14 @@ private:
         std::optional<DirectX::SpriteBatchPipelineStateDescription> pd = std::nullopt
     );
 
-    void draw_spectator_view(ID3D12GraphicsCommandList* command_list, bool is_right_eye_frame, d3d12::TextureContext* game_tex_override = nullptr);
+    void draw_spectator_view(
+        ID3D12GraphicsCommandList* command_list,
+        bool is_right_eye_frame,
+        d3d12::TextureContext* game_tex_override = nullptr,
+        std::optional<D3D12_RESOURCE_STATES> game_tex_state = std::nullopt,
+        std::optional<DirectX::XMUINT2> game_tex_size = std::nullopt,
+        bool force_opaque_game_layer = false,
+        bool suppress_ui_layer = false);
     void clear_backbuffer();
     bool ensure_2d_screen_textures(ID3D12Device* device, const D3D12_RESOURCE_DESC& base_desc);
     void dump_native_stereo_backbuffer_once(
@@ -246,6 +253,8 @@ private:
 
     d3d12::TextureContext m_game_ui_tex{};
     d3d12::TextureContext m_game_tex{};
+    d3d12::TextureContext m_dibr_spectator_tex{};
+    d3d12::CommandContext m_dibr_spectator_commands{};
     d3d12::TextureContext m_scene_capture_tex{};
     d3d12::TextureContext m_shf_mono_scene_tex{};
     std::array<d3d12::CommandContext, 3> m_game_tex_commands{};
@@ -324,6 +333,8 @@ private:
 
     std::unique_ptr<DirectX::DX12::GraphicsMemory> m_graphics_memory{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_backbuffer_batch{};
+    std::unique_ptr<DirectX::DX12::SpriteBatch> m_backbuffer_opaque_batch{};
+    std::unique_ptr<DirectX::DX12::SpriteBatch> m_openxr_scene_ui_batch{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_game_batch{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_ui_batch_alpha_invert{};
 
@@ -426,7 +437,8 @@ private:
             std::optional<std::function<void(d3d12::CommandContext&, ID3D12Resource*)>> pre_commands = std::nullopt,
             std::optional<std::function<void(d3d12::CommandContext&)>> additional_commands = std::nullopt,
             D3D12_RESOURCE_STATES src_state = D3D12_RESOURCE_STATE_PRESENT, D3D12_BOX* src_box = nullptr,
-            uint32_t dst_subresource = 0);
+            uint32_t dst_subresource = 0,
+            std::optional<std::function<void(d3d12::CommandContext&, d3d12::TextureContext&)>> texture_commands = std::nullopt);
 
         void copy(uint32_t swapchain_idx, ID3D12Resource* src,
             D3D12_RESOURCE_STATES src_state = D3D12_RESOURCE_STATE_PRESENT, D3D12_BOX* src_box = nullptr)

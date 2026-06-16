@@ -554,8 +554,47 @@ void CommandContext::execute() {
     std::scoped_lock _{this->mtx};
     
     if (this->has_commands) {
-        if (FAILED(this->cmd_list->Close())) {
-            spdlog::error("[VR] Failed to close command list. ({})", utility::narrow(this->internal_name));
+        const auto close_hr = this->cmd_list->Close();
+        if (FAILED(close_hr)) {
+            spdlog::error(
+                "[VR] Failed to close command list. ({}) hr=0x{:08x}",
+                utility::narrow(this->internal_name),
+                static_cast<unsigned long>(close_hr));
+            this->has_commands = false;
+            this->waiting_for_fence = false;
+
+            HRESULT allocator_hr = E_POINTER;
+            HRESULT list_hr = E_POINTER;
+
+            if (this->cmd_allocator != nullptr) {
+                allocator_hr = this->cmd_allocator->Reset();
+            }
+
+            if (SUCCEEDED(allocator_hr) && this->cmd_list != nullptr) {
+                list_hr = this->cmd_list->Reset(this->cmd_allocator.Get(), nullptr);
+            }
+
+            if (SUCCEEDED(allocator_hr) && SUCCEEDED(list_hr)) {
+                spdlog::warn(
+                    "[VR] Recovered command list after Close failure. ({})",
+                    utility::narrow(this->internal_name));
+                return;
+            }
+
+            spdlog::error(
+                "[VR] Failed to recover command list after Close failure. ({}) allocator_hr=0x{:08x} list_hr=0x{:08x}",
+                utility::narrow(this->internal_name),
+                static_cast<unsigned long>(allocator_hr),
+                static_cast<unsigned long>(list_hr));
+
+            const auto name = this->internal_name;
+            this->reset();
+
+            if (!this->setup(name.c_str())) {
+                spdlog::error(
+                    "[VR] Failed to rebuild command context after Close failure. ({})",
+                    utility::narrow(name));
+            }
             return;
         }
         
